@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S2.3 — tskit `.trees` analysis (feat, Stage 2)
+- `scripts/slim_analyze.py` (tskit): reads a SLiM `.trees` → JSON stats (num_samples/individuals/trees/sites/
+  mutations, segregating sites, mean+max derived-allele freq ∈ [0,1], nucleotide diversity). Stats come from
+  the genealogy, not file bytes (provenance timestamps differ).
+- `crates/oracle-slim/examples/produce_trees.rs`: runs the S2.2 driver → writes `data/runs/slim_demo/out.trees`
+  → prints path; chains S2.2 → S2.3 (`cargo run -p oracle-slim --example produce_trees <seed>`).
+- **Verified SLiM genetics are reproducible** for a fixed seed (identical stats twice; different seed differs)
+  — de-risks the S2.4 golden gate.
+- Python stack pinned in `scripts/requirements.txt` (`.venv`, gitignored): tskit 1.0.3 / pyslim 1.1.1 /
+  numpy 2.4.6 (MIT/MIT/BSD) + msprime 1.4.2 (**GPL-3, standalone-analysis-only — never linked**, invariant #1
+  unaffected; same pattern as the SLiM subprocess). DECISIONS rows added.
+
 ### S2.2 — oracle-slim SLiM subprocess driver (feat, Stage 2)
 - `crates/oracle-slim`: **dependency-free** (std-only) driver — `SlimParams` → `write_model` generates a
   self-contained SLiM 5 Eidos model (params baked via `defineConstant`, `initializeTreeSeq()`, final

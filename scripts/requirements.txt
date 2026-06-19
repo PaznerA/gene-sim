@@ -1,0 +1,13 @@
+# Python analysis stack for the SLiM tree-sequence oracle (scripts/, slice S2.3+).
+#
+# These run ONLY in standalone analysis scripts (separate processes) — they are NEVER linked into the game
+# binary or any Rust crate. So a GPL tool here does NOT affect invariant #1 (the shippable core stays
+# GPL-free; `cargo tree` has no GPL): it is the same accepted pattern as the SLiM subprocess (SPEC §2.1.1).
+#
+# Reproducible env:
+#   python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
+# Pinned (invariant #7); the .venv itself is gitignored.
+tskit==1.0.3     # MIT  — tree-sequence I/O & stats
+pyslim==1.1.1    # MIT  — SLiM .trees helpers
+numpy==2.4.6     # BSD-3-Clause
+msprime==1.4.2   # GPL-3 — OPTIONAL (neutral-mutation overlay, S2.4); standalone analysis only, never linked
