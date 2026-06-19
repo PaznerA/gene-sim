@@ -56,7 +56,7 @@
 - [x] **S3.4** Confirm the ~10k-named-agent ceiling (invariant #6): actions stay operator/species level, never per-organism. AC: a test/assert that the action space is species-granular. ✅ DONE (satisfied by S3.1: `Action` has no per-organism variant — unrepresentable by construction; `action_space_is_species_granular` compile-guard test). **← Stage 3 COMPLETE.**
 
 ### Stage 4 — Godot UI (LAST) (`godot/`) — SPEC §8
-- [ ] 🛑 **S4.1** `tools/install_godot.sh`: pin Godot minor (SPEC §W3), `godot/` project skeleton, `godot --headless --quit` smoke. *Build order gate — only after the core is headless + deterministic (invariant #4).* AC: pinned version recorded; headless smoke passes.
+- [x] 🛑 **S4.1** `tools/install_godot.sh`: pin Godot minor (SPEC §W3), `godot/` project skeleton, `godot --headless --quit` smoke. *Build order gate — only after the core is headless + deterministic (invariant #4).* AC: pinned version recorded; headless smoke passes. ✅ DONE (human signed off; Godot **4.7** pinned; `godot/` project + read-only `main.gd` (inv #2); headless smoke "UI booted … OK"). Build-order precondition met (Stages 0–3 headless+deterministic).
 - [ ] **S4.2** Snapshot reader in `godot/`: read `data/runs/<id>/snapshots/*.bin` (bincode, SPEC §5). **GDScript reads only — no biology (invariant #2).** AC: loads a snapshot and reports entity count.
 - [ ] **S4.3** 2D TileMap ecosystem view of one scope (field/forest/pond). AC: renders a live run from snapshots.
 - [ ] **S4.4** ≥2 toggleable data-layer shaders (per-cell data texture: density, allele freq, fitness, edit penetrance) + viewport zoom scopes (SPEC §W10). AC: layers toggle; zoom switches scope.

@@ -4,6 +4,14 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S4.1 — Godot UI skeleton + headless smoke (chore, Stage 4; human-signed-off 🛑)
+- `godot/` thin 2D project (Godot **4.7**, GL-compatibility): `project.godot`, `Main.tscn`, `main.gd`. The
+  script is **read-only** — boots, prints version, exits under headless (invariant #2: no biology in GDScript).
+- `tools/install_godot.sh` (SPEC §W3): brew-cask install + version check + `godot --headless --path godot --quit`
+  smoke. Godot pinned 4.7 in DECISIONS (commit `5b4e0cb0`). Build-order gate satisfied — core is headless +
+  deterministic through Stage 3 (invariant #4). UI-only slice; cargo gates unaffected, verified via the Godot
+  headless smoke (`UI booted … headless smoke OK`).
+
 ### S3.3 — parallel batch runner + columnar Parquet stats (feat, Stage 3)
 - `harness --per-gen-stats`: drives the stepwise `Simulation` and writes `data/runs/<run_id>/per_gen.csv`
   (run_index, generation, population_size, allele_freq + 5 trait columns), additive — final stats hash
