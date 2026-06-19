@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Cargo.lock IS committed (reproducibility / pinned versions — SPEC §2.1.7).
+
+# macOS
+.DS_Store
+
+# Large / fetched-once data caches (SPEC §5)
+/data/genomes/
+/data/ontology/*
+!/data/ontology/.gitkeep
+/data/runs/*
+!/data/runs/.gitkeep
+
+# Criterion bench raw output (baselines are recorded in docs, not committed)
+/target/criterion
+
+# Godot (built LAST — Stage 4)
+/godot/.godot/
+/godot/.import/
+
+# Python glue
+__pycache__/
+*.pyc
+.venv/
