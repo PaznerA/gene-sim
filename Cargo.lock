@@ -499,6 +499,7 @@ dependencies = [
  "bio",
  "genome",
  "proptest",
+ "rand_chacha 0.10.0",
  "ron",
  "serde",
 ]

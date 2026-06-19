@@ -14,6 +14,7 @@ genome = { workspace = true }
 serde = { workspace = true }
 ron = { workspace = true }
 bio = { workspace = true }
+rand_chacha = { workspace = true }  # seeded ChaCha8 RNG for edit application (inv. #3); use rand_chacha::rand_core
 
 [dev-dependencies]
 proptest = { workspace = true }

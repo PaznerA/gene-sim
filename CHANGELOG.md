@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S1.4 — gated edit application (feat, Stage 1)
+- `crates/crispr`: `apply_edit(genome, edit, variants, on, off, thresholds, rng)` — the core CRISPR mechanic
+  (SPEC §4): resolve cas+locus → find PAM → score (on/off) → gate. Pass ⇒ mutate the target Parameter
+  (magnitude from on-eff); fail ⇒ realistic off-target perturbations on *other* loci. `Edit`,
+  `EditThresholds {min_on_target, max_off_target}` (default 0.5/5), `EditFailure`, `EditOutcome {Applied|Failed}`.
+- Determinism (inv. #3): the passed-in `&mut ChaCha8Rng` is the ONLY randomness source (same `rng_unit` as
+  sim-core); ordered-Vec selection, no HashMap. Generic over the S1.3 score traits (inv. #5 preserved).
+- §10.4 property gates: `genome.is_valid()` always holds after a valid-input edit (every mutation clamps);
+  forced-fail edits never return `Applied` and never touch the target Parameter. 30 unit + 5 proptests.
+- Dep edge: `rand_chacha` added to crispr (already workspace-pinned; no new crate, no DECISIONS change).
+  Loop: implementer → gate (GREEN) → reviewer (adversarial APPROVE).
+
 ### S1.3 — pluggable Score traits + in-core default impls (feat, Stage 1)
 - `crates/crispr`: `OnTargetScore`/`OffTargetScore` traits (match TAXONOMY §3.3) — the invariant-#5 swappable
   science boundary (object-safe + generic-usable; proven by an alternate impl substituting with no trait/

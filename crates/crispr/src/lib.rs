@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 use bio::alphabets::dna;
+use genome::{LocusId, ParamId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -454,6 +455,315 @@ impl OffTargetScore for DefaultOffTargetScore {
         }
         total
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gated edit application (slice S1.4) — SPEC §4; TAXONOMY.md §3.2.
+//
+// `apply_edit` resolves a `(CasVariant, target_locus, guide)` triple, gates it on on-target
+// efficiency + off-target hit count (S1.3 traits), and either mutates the target Parameter(s)
+// (success) or perturbs Parameter(s) on OTHER loci (failure / off-target side effects). Every
+// mutated `ParamValue` is `clamp_into_domain()`'d, so `apply_edit` never yields an invalid genome
+// (SPEC §10.4). A failed edit is an EXPLICIT non-`Applied` outcome and never performs the success
+// mutation (SPEC §10.4: failed edits never silently succeed).
+//
+// Determinism (inv. #3): ALL randomness flows from the passed-in `&mut ChaCha8Rng`. There is no
+// thread/global RNG, no internally-seeded RNG, and no `HashMap` iteration — locus/param choices are
+// made over the ordered `genome.loci` / `locus.parameters` `Vec`s only. The RNG is drawn via
+// `rand_chacha::rand_core::Rng::next_u64`, mirroring `sim-core` so the stream stays consistent.
+// ---------------------------------------------------------------------------
+
+use rand_chacha::rand_core::Rng as _;
+use rand_chacha::ChaCha8Rng;
+
+/// An edit to apply: a Cas variant, a target locus, and a guide (TAXONOMY.md §3.2).
+///
+/// `cas` is resolved against a `&[CasVariant]` table (e.g. [`default_cas_variants`]) by id, and
+/// `target` against the ordered `genome.loci`. Both being plain ids keeps an `Edit` cheap to log and
+/// replay (SPEC §5) and free of borrowed sim state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edit {
+    /// Which Cas variant performs the edit (resolved against the variant table by id).
+    pub cas: CasVariantId,
+    /// The locus to edit (resolved against `genome.loci` by id).
+    pub target: LocusId,
+    /// The guide (spacer) sequence.
+    pub guide: GuideSequence,
+}
+
+/// Explicit gating thresholds for [`apply_edit`] (SPEC §4 step 2/3).
+///
+/// An edit succeeds only when on-target efficiency `>= min_on_target` **and** the off-target hit
+/// count `<= max_off_target`. Both bounds are inclusive. Kept explicit (not magic numbers buried in
+/// the algorithm) so gating policy is visible and tunable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditThresholds {
+    /// Minimum on-target efficiency in `[0, 1]` required to succeed (inclusive).
+    pub min_on_target: f64,
+    /// Maximum tolerated off-target hit count to succeed (inclusive).
+    pub max_off_target: u32,
+}
+
+impl Default for EditThresholds {
+    /// A sane default: require at least moderate on-target efficiency and few off-targets.
+    fn default() -> Self {
+        Self {
+            min_on_target: 0.5,
+            max_off_target: 5,
+        }
+    }
+}
+
+/// Why an edit did not produce a clean on-target success (carried by [`EditOutcome::Failed`]).
+///
+/// A failed edit is **never** a silent success: the target Parameter is left as-is (apart from the
+/// realistic off-target perturbations applied *elsewhere*), and the caller gets an explicit reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditFailure {
+    /// The cas-variant id did not resolve against the supplied variant table.
+    UnknownCasVariant,
+    /// The `target` locus id did not resolve against `genome.loci`.
+    UnknownTargetLocus,
+    /// No PAM for the Cas variant was found in the target locus — nothing to cut (SPEC §4 step 1).
+    NoPamSite,
+    /// On-target efficiency was below [`EditThresholds::min_on_target`].
+    OnTargetTooLow,
+    /// Off-target hit count exceeded [`EditThresholds::max_off_target`].
+    OffTargetTooHigh,
+    /// The gate passed but the target locus has no Parameters to mutate — nothing to edit.
+    NothingToEdit,
+}
+
+/// The result of [`apply_edit`] — an **explicit** success/failure split so a failed edit can never be
+/// mistaken for a success (SPEC §10.4). On `Applied` the target Parameter was mutated; on `Failed`
+/// the target Parameter was **not** success-mutated and any perturbations landed on *other* loci.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditOutcome {
+    /// The edit passed gating and the target Parameter was mutated in place.
+    Applied {
+        /// The locus that was edited.
+        locus: LocusId,
+        /// The Parameter that was mutated.
+        param: ParamId,
+        /// The on-target efficiency that cleared the gate (in `[0, 1]`).
+        on_efficiency: f64,
+        /// The off-target hit count that cleared the gate.
+        off_target_hits: u32,
+    },
+    /// The edit failed gating. The target Parameter is **not** success-mutated. Off-target side
+    /// effects (if any) perturbed Parameters on OTHER loci — listed here in application order.
+    Failed {
+        /// Why the edit failed (SPEC §4 — no PAM / on-target too low / off-target too high / …).
+        reason: EditFailure,
+        /// `(locus, param)` of every off-target perturbation applied, in deterministic order.
+        off_target_perturbations: Vec<(LocusId, ParamId)>,
+    },
+}
+
+/// Draw a unit `[0, 1)` f64 from the seeded RNG, matching `sim-core`'s `unit_f64` (top 53 bits).
+///
+/// Keeping the conversion identical to sim-core means the same RNG stream maps to the same floats
+/// across crates — part of the single-RNG determinism story (inv. #3).
+fn rng_unit(rng: &mut ChaCha8Rng) -> f64 {
+    (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Apply one [`ParamValue`] perturbation in place from a `signed` delta in `[-1, 1]` scaled by
+/// `magnitude`, then clamp back into the value's domain so the genome stays valid (SPEC §10.4).
+///
+/// - `Numeric`: shift by `magnitude * signed * (max - min)` (a fraction of the domain width), clamp.
+/// - `Enum`: with enough magnitude, step the category by ±1 within `[0, cardinality)`.
+/// - `Bool`: with enough magnitude, flip.
+///
+/// Every branch ends inside the domain (`clamp_into_domain` for `Numeric`; explicit bounds for the
+/// discrete kinds), so the mutated Parameter is always valid.
+fn perturb_value(value: &mut genome::ParamValue, magnitude: f64, signed: f64) {
+    use genome::ParamValue;
+    match value {
+        ParamValue::Numeric { value: v, min, max } => {
+            let width = (*max - *min).max(0.0);
+            *v += magnitude * signed * width;
+            // Clamped into [min, max] by clamp_into_domain() below.
+        }
+        ParamValue::Enum {
+            value: v,
+            cardinality,
+        } => {
+            if *cardinality > 1 && magnitude >= 0.5 {
+                if signed >= 0.0 {
+                    *v = (*v + 1).min(*cardinality - 1);
+                } else {
+                    *v = v.saturating_sub(1);
+                }
+            }
+        }
+        ParamValue::Bool(b) => {
+            if magnitude >= 0.5 {
+                *b = !*b;
+            }
+        }
+    }
+    value.clamp_into_domain();
+}
+
+/// Apply an [`Edit`] to `genome`, gated on on-target efficiency and off-target hit count (SPEC §4).
+///
+/// Algorithm (SPEC §4 / TAXONOMY.md §3.2):
+/// 1. Resolve `edit.cas` against `variants` and `edit.target` against `genome.loci` (ordered scan).
+/// 2. Find PAM sites for the variant in the target locus ([`find_pam_sites_in`], S1.2). No PAM ⇒
+///    fail (`NoPamSite`) — there is nowhere to cut.
+/// 3. Compute on-target efficiency (`on`) and off-target hit count (`off`) (S1.3 traits).
+/// 4. If `on_eff >= min_on_target` **and** `off_hits <= max_off_target` ⇒ **success**: mutate one
+///    target Parameter (magnitude derived from `on_eff` and an RNG draw), `clamp_into_domain`, return
+///    [`EditOutcome::Applied`]. Otherwise ⇒ **failed**: apply realistic off-target side effects —
+///    perturb Parameters on OTHER loci (count + magnitude scaled by `off_hits`, choices drawn from
+///    `rng`), each clamped — and return [`EditOutcome::Failed`]. A failed edit never touches the
+///    target Parameter as a success would.
+///
+/// **Determinism (inv. #3):** the only randomness is `rng`; loci/params are chosen over ordered
+/// `Vec`s, never a `HashMap`. Same `(genome, edit, variants, scorers, thresholds, rng-state)` ⇒
+/// identical outcome and identical resulting genome.
+///
+/// **Validity (SPEC §10.4):** every mutated `ParamValue` is `clamp_into_domain`'d, so on return
+/// `genome.is_valid()` holds whenever it held before the call.
+pub fn apply_edit<On: OnTargetScore, Off: OffTargetScore>(
+    genome: &mut genome::Genome,
+    edit: &Edit,
+    variants: &[CasVariant],
+    on: &On,
+    off: &Off,
+    thresholds: &EditThresholds,
+    rng: &mut ChaCha8Rng,
+) -> EditOutcome {
+    // 1. Resolve the cas variant (ordered scan; ids are small integers, inv. #3).
+    let Some(cas) = variants.iter().find(|v| v.id == edit.cas) else {
+        return EditOutcome::Failed {
+            reason: EditFailure::UnknownCasVariant,
+            off_target_perturbations: Vec::new(),
+        };
+    };
+
+    // 1. Resolve the target locus index in the ordered loci Vec.
+    let Some(target_idx) = genome.loci.iter().position(|l| l.id == edit.target) else {
+        return EditOutcome::Failed {
+            reason: EditFailure::UnknownTargetLocus,
+            off_target_perturbations: Vec::new(),
+        };
+    };
+
+    // 2. Find PAM sites in the target locus. No PAM ⇒ nothing to cut.
+    let has_pam = !find_pam_sites_in(&genome.loci[target_idx].sequence, cas).is_empty();
+    if !has_pam {
+        let perturbations = apply_off_target(genome, target_idx, 1, rng);
+        return EditOutcome::Failed {
+            reason: EditFailure::NoPamSite,
+            off_target_perturbations: perturbations,
+        };
+    }
+
+    // 3. On-target efficiency + off-target hit count (S1.3 traits, deterministic & RNG-free).
+    let on_eff = on
+        .efficiency(&genome.loci[target_idx], &edit.guide, cas)
+        .clamp(0.0, 1.0);
+    let off_hits = off.hit_count(genome, &edit.guide, cas);
+
+    // 4. Gate.
+    if on_eff < thresholds.min_on_target {
+        let perturbations = apply_off_target(genome, target_idx, off_hits, rng);
+        return EditOutcome::Failed {
+            reason: EditFailure::OnTargetTooLow,
+            off_target_perturbations: perturbations,
+        };
+    }
+    if off_hits > thresholds.max_off_target {
+        let perturbations = apply_off_target(genome, target_idx, off_hits, rng);
+        return EditOutcome::Failed {
+            reason: EditFailure::OffTargetTooHigh,
+            off_target_perturbations: perturbations,
+        };
+    }
+
+    // Success requires a target Parameter to mutate. A target locus with no Parameters has nothing
+    // to edit; report it as nothing-to-edit rather than a phantom success (never an Applied with no
+    // mutation). No off-target side effects: gating passed, so there was no off-target failure.
+    if genome.loci[target_idx].parameters.is_empty() {
+        return EditOutcome::Failed {
+            reason: EditFailure::NothingToEdit,
+            off_target_perturbations: Vec::new(),
+        };
+    }
+
+    // Mutate one target Parameter. Magnitude derived from on_eff (stronger edits move it more) and
+    // an RNG draw for direction/scale — chosen deterministically over the ordered parameters Vec.
+    let locus = &mut genome.loci[target_idx];
+    let locus_id = locus.id;
+    let pick = (rng.next_u64() % locus.parameters.len() as u64) as usize;
+    let signed = rng_unit(rng) * 2.0 - 1.0; // direction/scale in [-1, 1)
+    let magnitude = on_eff;
+    let param_id = locus.parameters[pick].id;
+    perturb_value(&mut locus.parameters[pick].value, magnitude, signed);
+
+    EditOutcome::Applied {
+        locus: locus_id,
+        param: param_id,
+        on_efficiency: on_eff,
+        off_target_hits: off_hits,
+    }
+}
+
+/// Apply realistic off-target side effects to loci OTHER than `target_idx` (SPEC §4 failed path).
+///
+/// The number of perturbations scales with `off_hits` (at least one when there are eligible loci),
+/// capped by the available off-target parameters. Each affected `(locus, param)` is chosen
+/// deterministically from `rng` over the ordered `genome.loci` / `parameters` `Vec`s (never a
+/// `HashMap`, inv. #3), perturbed, and `clamp_into_domain`'d so the genome stays valid (SPEC §10.4).
+///
+/// Returns the `(LocusId, ParamId)` of every perturbation in application order. The target locus is
+/// never touched here, so a failed edit never performs the success mutation on the target.
+fn apply_off_target(
+    genome: &mut genome::Genome,
+    target_idx: usize,
+    off_hits: u32,
+    rng: &mut ChaCha8Rng,
+) -> Vec<(LocusId, ParamId)> {
+    // Build the ordered list of off-target (locus_idx, param_idx) candidates — every parameter on
+    // every locus except the target. Ordered iteration over Vecs (inv. #3).
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    for (li, locus) in genome.loci.iter().enumerate() {
+        if li == target_idx {
+            continue;
+        }
+        for pi in 0..locus.parameters.len() {
+            candidates.push((li, pi));
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // How many side effects: scale with off_hits, at least 1, capped at the candidate count.
+    let want = (off_hits as usize).max(1).min(candidates.len());
+
+    let mut applied = Vec::with_capacity(want);
+    // Off-target magnitude grows (mildly) with the off-target load, bounded to a small fraction.
+    let load_factor = (0.1 + 0.05 * off_hits as f64).min(0.5);
+
+    for _ in 0..want {
+        if candidates.is_empty() {
+            break;
+        }
+        // Draw a candidate index deterministically; swap-remove to avoid hitting the same param twice.
+        let k = (rng.next_u64() % candidates.len() as u64) as usize;
+        let (li, pi) = candidates.swap_remove(k);
+        let signed = rng_unit(rng) * 2.0 - 1.0;
+        let magnitude = load_factor * rng_unit(rng);
+        let locus = &mut genome.loci[li];
+        let locus_id = locus.id;
+        let param_id = locus.parameters[pi].id;
+        perturb_value(&mut locus.parameters[pi].value, magnitude, signed);
+        applied.push((locus_id, param_id));
+    }
+    applied
 }
 
 #[cfg(test)]
@@ -947,6 +1257,353 @@ mod tests {
         assert_eq!(off.hit_count(&g, &guide, &cas), 0);
     }
 
+    // ---- Edit application (slice S1.4) ----
+
+    use rand_chacha::rand_core::SeedableRng;
+
+    /// A const off-target impl returning a fixed hit count — lets tests force the gate either way.
+    struct ConstOffTarget(u32);
+    impl OffTargetScore for ConstOffTarget {
+        fn hit_count(
+            &self,
+            _genome: &genome::Genome,
+            _guide: &GuideSequence,
+            _cas: &CasVariant,
+        ) -> u32 {
+            self.0
+        }
+    }
+
+    /// A two-locus genome whose FIRST locus carries a forward NGG PAM and a numeric Parameter, and a
+    /// second locus with its own parameters (an off-target landing zone). Used across S1.4 tests.
+    fn editable_genome() -> genome::Genome {
+        let mut g = genome::Genome {
+            version: 1,
+            loci: vec![
+                {
+                    // "ACGTACGTAC" + "TGG" (an NGG PAM) so SpCas9 finds a PAM here.
+                    let mut l = locus_with_sequence(b"ACGTACGTACTGGAAAAAA");
+                    l.id = genome::LocusId(0);
+                    l.parameters = vec![genome::Parameter {
+                        id: genome::ParamId(0),
+                        value: genome::ParamValue::Numeric {
+                            value: 0.5,
+                            min: 0.0,
+                            max: 1.0,
+                        },
+                    }];
+                    l
+                },
+                {
+                    let mut l = locus_with_sequence(b"GGGGGGGGGGGGGGGGGGGG");
+                    l.id = genome::LocusId(1);
+                    l.parameters = vec![
+                        genome::Parameter {
+                            id: genome::ParamId(0),
+                            value: genome::ParamValue::Numeric {
+                                value: 0.5,
+                                min: 0.0,
+                                max: 1.0,
+                            },
+                        },
+                        genome::Parameter {
+                            id: genome::ParamId(1),
+                            value: genome::ParamValue::Enum {
+                                value: 1,
+                                cardinality: 4,
+                            },
+                        },
+                    ];
+                    l
+                },
+            ],
+        };
+        assert!(g.is_valid());
+        // Touch g mutably so a later edit shares the same starting point regardless of construction.
+        g.version = 1;
+        g
+    }
+
+    fn numeric(value: f64) -> genome::ParamValue {
+        genome::ParamValue::Numeric {
+            value,
+            min: 0.0,
+            max: 1.0,
+        }
+    }
+
+    #[test]
+    fn clearly_passing_edit_applies_and_mutates_target() {
+        let variants = default_cas_variants();
+        let cas = variant("SpCas9").id;
+        let guide = GuideSequence::new(*b"ACGTACGTAC").unwrap(); // protospacer at target, PAM-adjacent
+        let edit = Edit {
+            cas,
+            target: genome::LocusId(0),
+            guide,
+        };
+        let mut g = editable_genome();
+        let before = g.loci[0].parameters[0].value;
+
+        // Force a clean pass: high on-target, zero off-target.
+        let on = ConstOnTarget(0.95);
+        let off = ConstOffTarget(0);
+        let thresholds = EditThresholds::default();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+
+        let outcome = apply_edit(&mut g, &edit, &variants, &on, &off, &thresholds, &mut rng);
+        match outcome {
+            EditOutcome::Applied {
+                locus,
+                param,
+                on_efficiency,
+                off_target_hits,
+            } => {
+                assert_eq!(locus, genome::LocusId(0));
+                assert_eq!(param, genome::ParamId(0));
+                assert!((on_efficiency - 0.95).abs() < 1e-12);
+                assert_eq!(off_target_hits, 0);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        // The target Parameter changed, and the genome is still valid.
+        assert_ne!(g.loci[0].parameters[0].value, before);
+        assert!(g.is_valid());
+    }
+
+    #[test]
+    fn failing_edit_on_target_too_low_does_not_mutate_target() {
+        let variants = default_cas_variants();
+        let cas = variant("SpCas9").id;
+        let guide = GuideSequence::new(*b"ACGTACGTAC").unwrap();
+        let edit = Edit {
+            cas,
+            target: genome::LocusId(0),
+            guide,
+        };
+        let mut g = editable_genome();
+        let target_before = g.loci[0].parameters[0].value;
+
+        // Force on-target below the threshold; off-target benign.
+        let on = ConstOnTarget(0.01);
+        let off = ConstOffTarget(0);
+        let thresholds = EditThresholds::default();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+
+        let outcome = apply_edit(&mut g, &edit, &variants, &on, &off, &thresholds, &mut rng);
+        match &outcome {
+            EditOutcome::Failed {
+                reason,
+                off_target_perturbations,
+            } => {
+                assert_eq!(*reason, EditFailure::OnTargetTooLow);
+                // Any perturbations are on OTHER loci, never the target.
+                for (lid, _) in off_target_perturbations {
+                    assert_ne!(*lid, genome::LocusId(0), "off-target hit the target locus");
+                }
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // The target Parameter is NOT success-mutated (left exactly as it was).
+        assert_eq!(g.loci[0].parameters[0].value, target_before);
+        assert!(g.is_valid());
+    }
+
+    #[test]
+    fn failing_edit_off_target_too_high_perturbs_elsewhere_only() {
+        let variants = default_cas_variants();
+        let cas = variant("SpCas9").id;
+        let guide = GuideSequence::new(*b"ACGTACGTAC").unwrap();
+        let edit = Edit {
+            cas,
+            target: genome::LocusId(0),
+            guide,
+        };
+        let mut g = editable_genome();
+        let target_before = g.loci[0].parameters[0].value;
+
+        // On-target fine, but off-target over the cap.
+        let on = ConstOnTarget(0.95);
+        let off = ConstOffTarget(100);
+        let thresholds = EditThresholds::default();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+
+        let outcome = apply_edit(&mut g, &edit, &variants, &on, &off, &thresholds, &mut rng);
+        match &outcome {
+            EditOutcome::Failed {
+                reason,
+                off_target_perturbations,
+            } => {
+                assert_eq!(*reason, EditFailure::OffTargetTooHigh);
+                assert!(
+                    !off_target_perturbations.is_empty(),
+                    "high off-target load should perturb at least one other param"
+                );
+                for (lid, _) in off_target_perturbations {
+                    assert_ne!(*lid, genome::LocusId(0), "off-target hit the target locus");
+                }
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Target untouched; genome still valid after off-target perturbations + clamps.
+        assert_eq!(g.loci[0].parameters[0].value, target_before);
+        assert!(g.is_valid());
+    }
+
+    #[test]
+    fn no_pam_site_fails_without_success_mutation() {
+        let variants = default_cas_variants();
+        // AsCas12a needs a TTTV PAM; the target locus below has none.
+        let cas = variant("AsCas12a").id;
+        let guide = GuideSequence::new(*b"ACGTACGTAC").unwrap();
+        let edit = Edit {
+            cas,
+            target: genome::LocusId(0),
+            guide,
+        };
+        // Target locus with no TTTV anywhere (and no reverse AAAB either).
+        let mut g = genome::Genome {
+            version: 1,
+            loci: vec![
+                {
+                    let mut l = locus_with_sequence(b"ACGCACGCACGCACGC");
+                    l.id = genome::LocusId(0);
+                    l.parameters = vec![genome::Parameter {
+                        id: genome::ParamId(0),
+                        value: numeric(0.5),
+                    }];
+                    l
+                },
+                {
+                    let mut l = locus_with_sequence(b"ACGCACGCACGCACGC");
+                    l.id = genome::LocusId(1);
+                    l.parameters = vec![genome::Parameter {
+                        id: genome::ParamId(0),
+                        value: numeric(0.5),
+                    }];
+                    l
+                },
+            ],
+        };
+        let target_before = g.loci[0].parameters[0].value;
+        // Sanity: the target really has no PAM for this variant.
+        assert!(find_pam_sites_in(&g.loci[0].sequence, &variant("AsCas12a")).is_empty());
+
+        let on = ConstOnTarget(0.99);
+        let off = ConstOffTarget(0);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let outcome = apply_edit(
+            &mut g,
+            &edit,
+            &variants,
+            &on,
+            &off,
+            &EditThresholds::default(),
+            &mut rng,
+        );
+        match &outcome {
+            EditOutcome::Failed { reason, .. } => assert_eq!(*reason, EditFailure::NoPamSite),
+            other => panic!("expected Failed(NoPamSite), got {other:?}"),
+        }
+        assert_eq!(g.loci[0].parameters[0].value, target_before);
+        assert!(g.is_valid());
+    }
+
+    #[test]
+    fn unknown_variant_and_locus_fail_cleanly() {
+        let variants = default_cas_variants();
+        let on = ConstOnTarget(0.99);
+        let off = ConstOffTarget(0);
+        let t = EditThresholds::default();
+
+        // Unknown cas id.
+        let mut g = editable_genome();
+        let before = g.clone();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
+        let bad_cas = Edit {
+            cas: CasVariantId(u16::MAX),
+            target: genome::LocusId(0),
+            guide: GuideSequence::new(*b"ACGTACGTAC").unwrap(),
+        };
+        let out = apply_edit(&mut g, &bad_cas, &variants, &on, &off, &t, &mut rng);
+        assert!(matches!(
+            out,
+            EditOutcome::Failed {
+                reason: EditFailure::UnknownCasVariant,
+                ..
+            }
+        ));
+        assert_eq!(g, before, "unknown variant must not mutate the genome");
+
+        // Unknown target locus.
+        let mut g = editable_genome();
+        let before = g.clone();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
+        let bad_locus = Edit {
+            cas: variant("SpCas9").id,
+            target: genome::LocusId(999),
+            guide: GuideSequence::new(*b"ACGTACGTAC").unwrap(),
+        };
+        let out = apply_edit(&mut g, &bad_locus, &variants, &on, &off, &t, &mut rng);
+        assert!(matches!(
+            out,
+            EditOutcome::Failed {
+                reason: EditFailure::UnknownTargetLocus,
+                ..
+            }
+        ));
+        assert_eq!(g, before, "unknown target must not mutate the genome");
+    }
+
+    #[test]
+    fn same_seed_yields_identical_outcome_and_genome() {
+        let variants = default_cas_variants();
+        let edit = Edit {
+            cas: variant("SpCas9").id,
+            target: genome::LocusId(0),
+            guide: GuideSequence::new(*b"ACGTACGTAC").unwrap(),
+        };
+        // Use the DEFAULT (real) scorers so the whole pipeline is exercised, and a high off-target
+        // count to drive the failing path's RNG-based perturbation choices.
+        let on = DefaultOnTargetScore;
+        let off = ConstOffTarget(7); // > default max_off_target ⇒ failing path uses the RNG
+        let t = EditThresholds::default();
+
+        let run = || {
+            let mut g = editable_genome();
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(2024);
+            let outcome = apply_edit(&mut g, &edit, &variants, &on, &off, &t, &mut rng);
+            (outcome, g)
+        };
+        let (o1, g1) = run();
+        let (o2, g2) = run();
+        assert_eq!(o1, o2, "same seed must give identical outcome");
+        assert_eq!(g1, g2, "same seed must give identical resulting genome");
+    }
+
+    #[test]
+    fn success_path_is_also_deterministic() {
+        let variants = default_cas_variants();
+        let edit = Edit {
+            cas: variant("SpCas9").id,
+            target: genome::LocusId(0),
+            guide: GuideSequence::new(*b"ACGTACGTAC").unwrap(),
+        };
+        let on = ConstOnTarget(0.9);
+        let off = ConstOffTarget(0);
+        let t = EditThresholds::default();
+        let run = || {
+            let mut g = editable_genome();
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(55);
+            let o = apply_edit(&mut g, &edit, &variants, &on, &off, &t, &mut rng);
+            (o, g)
+        };
+        let (o1, g1) = run();
+        let (o2, g2) = run();
+        assert_eq!(o1, o2);
+        assert_eq!(g1, g2);
+    }
+
     #[cfg(feature = "proptest")]
     mod prop {
         use super::*;
@@ -991,6 +1648,65 @@ mod tests {
                 ),
                 proptest::sample::select(table),
             )
+        }
+
+        /// An arbitrary ACGT byte vector (used for both locus sequences and guides).
+        fn arb_acgt(max: usize) -> impl Strategy<Value = Vec<u8>> {
+            proptest::collection::vec(
+                prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')],
+                0..max,
+            )
+        }
+
+        /// An arbitrary VALID multi-locus genome (every ParamValue starts in its domain). Sequences
+        /// are non-empty so PAM finding has something to chew on.
+        fn arb_genome() -> impl Strategy<Value = genome::Genome> {
+            let locus = (
+                proptest::collection::vec(
+                    prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')],
+                    1..32,
+                ),
+                // 0..3 parameters per locus, each a valid numeric/enum/bool.
+                proptest::collection::vec(
+                    prop_oneof![
+                        (0.0f64..1.0).prop_map(|v| genome::ParamValue::Numeric {
+                            value: v,
+                            min: 0.0,
+                            max: 1.0
+                        }),
+                        (1u16..6, 0u16..6).prop_map(|(card, v)| genome::ParamValue::Enum {
+                            value: v % card,
+                            cardinality: card
+                        }),
+                        any::<bool>().prop_map(genome::ParamValue::Bool),
+                    ],
+                    0..3,
+                ),
+            );
+            proptest::collection::vec(locus, 1..4).prop_map(|loci| genome::Genome {
+                version: 1,
+                loci: loci
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (seq, params))| genome::Locus {
+                        id: genome::LocusId(i as u32),
+                        name: format!("locus_{i}"),
+                        sequence: genome::DnaSequence::new(seq).expect("ACGT"),
+                        parameters: params
+                            .into_iter()
+                            .enumerate()
+                            .map(|(pi, value)| genome::Parameter {
+                                id: genome::ParamId(pi as u32),
+                                value,
+                            })
+                            .collect(),
+                        tags: genome::OntologyTags {
+                            so_term: genome::SoTermId(704),
+                            go_refs: Vec::new(),
+                        },
+                    })
+                    .collect(),
+            })
         }
 
         proptest! {
@@ -1055,6 +1771,102 @@ mod tests {
                     prop_assert!((0.0..=1.0).contains(&e), "efficiency {} out of [0,1]", e);
                     // Deterministic: same inputs → same output.
                     prop_assert_eq!(e, scorer.efficiency(locus, &guide, &v));
+                }
+            }
+
+            /// §10.4 property gate: for ANY seed/guide/threshold/genome, `apply_edit` leaves the
+            /// genome VALID (every mutated ParamValue is clamped into its domain). Uses the real
+            /// default scorers so the whole gated pipeline is exercised.
+            #[test]
+            fn apply_edit_always_leaves_genome_valid(
+                seed in any::<u64>(),
+                guide_bytes in arb_acgt(40),
+                min_on_target in 0.0f64..=1.0,
+                max_off_target in any::<u32>(),
+                target_idx in 0usize..4,
+                mut genome in arb_genome(),
+                v in proptest::sample::select(default_cas_variants()),
+            ) {
+                prop_assume!(genome.is_valid());
+                let variants = vec![v.clone()];
+                let target = genome.loci[target_idx % genome.loci.len()].id;
+                let guide = GuideSequence::new(guide_bytes).expect("ACGT guide");
+                let edit = Edit { cas: v.id, target, guide };
+                let thresholds = EditThresholds { min_on_target, max_off_target };
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+
+                let _outcome = apply_edit(
+                    &mut genome,
+                    &edit,
+                    &variants,
+                    &DefaultOnTargetScore,
+                    &DefaultOffTargetScore::default(),
+                    &thresholds,
+                    &mut rng,
+                );
+                // The §10.4 invariant: an edit never yields an invalid genome.
+                prop_assert!(genome.is_valid(), "apply_edit produced an invalid genome");
+            }
+
+            /// §10.4 property gate: a FORCED-fail edit never returns `Applied` and never applies the
+            /// success mutation to the target Parameter. We force failure two ways (on-target below
+            /// any non-zero threshold; off-target above any finite cap) and check the target is
+            /// byte-identical afterwards.
+            #[test]
+            fn forced_fail_edit_never_applies_and_never_mutates_target(
+                seed in any::<u64>(),
+                guide_bytes in arb_acgt(40),
+                force_low in any::<bool>(),
+                mut genome in arb_genome(),
+                target_idx in 0usize..4,
+            ) {
+                prop_assume!(genome.is_valid());
+                let v = variant("SpCas9");
+                let variants = vec![v.clone()];
+                let ti = target_idx % genome.loci.len();
+                let target = genome.loci[ti].id;
+                let guide = GuideSequence::new(guide_bytes).expect("ACGT guide");
+                let edit = Edit { cas: v.id, target, guide };
+
+                // Snapshot the target locus's parameters before the edit.
+                let target_params_before = genome.loci[ti].parameters.clone();
+
+                // Force a guaranteed fail: either on-target below threshold OR off-target above cap.
+                struct ZeroOn;
+                impl OnTargetScore for ZeroOn {
+                    fn efficiency(&self, _l: &genome::Locus, _g: &GuideSequence, _c: &CasVariant) -> f64 { 0.0 }
+                }
+                struct FloodOff;
+                impl OffTargetScore for FloodOff {
+                    fn hit_count(&self, _g: &genome::Genome, _gd: &GuideSequence, _c: &CasVariant) -> u32 { u32::MAX }
+                }
+                let thresholds = EditThresholds { min_on_target: 0.5, max_off_target: 5 };
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+
+                let outcome = if force_low {
+                    apply_edit(&mut genome, &edit, &variants, &ZeroOn, &DefaultOffTargetScore::default(), &thresholds, &mut rng)
+                } else {
+                    apply_edit(&mut genome, &edit, &variants, &ConstOnTarget(1.0), &FloodOff, &thresholds, &mut rng)
+                };
+
+                // Never Applied.
+                prop_assert!(
+                    !matches!(outcome, EditOutcome::Applied { .. }),
+                    "forced-fail edit returned Applied: {:?}", outcome
+                );
+                // The target Parameter(s) are NOT success-mutated.
+                prop_assert_eq!(
+                    &genome.loci[ti].parameters,
+                    &target_params_before,
+                    "forced-fail edit mutated the target locus's parameters"
+                );
+                // And the genome is still valid (off-target perturbations were clamped).
+                prop_assert!(genome.is_valid());
+                // Any reported perturbations are on OTHER loci.
+                if let EditOutcome::Failed { off_target_perturbations, .. } = &outcome {
+                    for (lid, _) in off_target_perturbations {
+                        prop_assert_ne!(*lid, target, "off-target perturbation hit the target locus");
+                    }
                 }
             }
         }
