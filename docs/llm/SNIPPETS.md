@@ -70,13 +70,12 @@ On/off-target scores are traits (`OnTargetScore`/`OffTargetScore`). sim-core dep
 concrete impl — swapping the in-core default for a subprocess-backed one touches no sim-core logic.
 
 ## The gates (SPEC §10) — run before every commit
+One command runs them all (PASS/FAIL per item, hard exit on red — see docs/llm/LOOP.md §4):
 ```bash
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace
-./tools/check_determinism.sh
-# later stages add: --features proptest, cargo bench -p sim-core, ./scripts/check_license.sh
+tools/gate.sh                 # fmt · clippy -D warnings · test · determinism · proptest · (bench skip) · license
+GATE_BENCH=1 tools/gate.sh    # + criterion perf bench (slow) — at stage exits (§11)
 ```
+HARD gates (never skip): determinism (`tools/check_determinism.sh`) and license (`scripts/check_license.sh`).
 
 ## Gotchas
 - **Cargo.lock is committed** (reproducibility, inv. #7). Don't gitignore it.

@@ -40,14 +40,17 @@ Violating one is a "stop the line" event: **halt, surface to the human, do not w
 ## The per-slice loop (SPEC §7.2)
 
 A **slice** is the smallest vertical change that leaves the build green and demonstrably advances the
-bar (SPEC §1.2). Run it with `/iterate`:
+bar (SPEC §1.2). Run it with `/iterate` (or just say "run the next slice" / "jeď dál"). The full,
+robust runbook — roles, autonomy, stop conditions, resumability — is **[docs/llm/LOOP.md](docs/llm/LOOP.md)**;
+the one gate command for everything is **`tools/gate.sh`**. Default mode is **autonomous until a gate goes
+red, a slice touches an invariant (🛑 in TASKS.md), or the backlog empties.**
 
 1. **LOAD** — read SPEC invariants + the top slice in TASKS.md + DECISIONS.
 2. **PLAN** — restate the slice goal + acceptance criteria in TASKS.md.
    If the slice is >~1 day **or** touches an invariant (§2.1) → **STOP, ask the human.**
 3. **IMPLEMENT** — code AND tests together, fewest crates touched. Respect invariants
    (no GPL linking, no genome logic in `godot/`, seeded RNG only).
-4. **GATE** — run `/gate`. Any red → fix or revert. **Never proceed on red.**
+4. **GATE** — run `tools/gate.sh` (the `/gate` skill). Any red → fix or revert. **Never proceed on red.**
 5. **REFLECT** — load-bearing choice made → append an ADR to DECISIONS.md. Update CHANGELOG.
 6. **COMMIT** — conventional commit; one slice = one commit/PR.
 7. **CLOSE** — mark the slice done in TASKS.md, emit a 3-line summary.
