@@ -1,0 +1,5 @@
+# Pinned toolchain (invariant #7 / ADR-001). The determinism gate runs on this exact toolchain.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

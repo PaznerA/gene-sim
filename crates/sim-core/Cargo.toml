@@ -1,0 +1,23 @@
+[package]
+name = "sim-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless, deterministic Bevy ECS tick loop + seeded ChaCha8 RNG (SPEC §2, §6). No renderer."
+
+[features]
+proptest = []
+
+[dependencies]
+genome = { workspace = true }
+bevy_ecs = { workspace = true }
+rand_chacha = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "tick"
+harness = false

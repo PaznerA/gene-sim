@@ -44,7 +44,10 @@ pub struct Locus {
 }
 
 /// DNA-ish sequence: validated upper-case ACGT bytes (rust-bio operates on these in Stage 1).
-pub struct DnaSequence(pub Vec<u8>);   // invariant: every byte ∈ {b'A', b'C', b'G', b'T'}
+/// The inner buffer is PRIVATE and built via `DnaSequence::new(bytes) -> Result<Self, usize>`, which
+/// enforces the invariant (every byte ∈ {A,C,G,T}) at construction and returns the first bad index on
+/// failure. Read access via `.bases()` / `.len()` / `.is_empty()`.
+pub struct DnaSequence(/* private */ Vec<u8>);
 ```
 
 ### 1.2 Parameter ✅

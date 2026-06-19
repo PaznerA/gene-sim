@@ -1,0 +1,17 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless batch runner: N seeded deterministic runs + --hash-only determinism artifact (SPEC §2.2, §W6-W8)."
+
+[features]
+proptest = []
+
+[dependencies]
+sim-core = { workspace = true }
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"

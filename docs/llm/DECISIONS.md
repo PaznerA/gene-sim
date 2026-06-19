@@ -10,8 +10,8 @@
 |---|---|---|---|
 | Reference platform | macOS (Darwin 25.3) / Apple Silicon **M4 Max**, 14 cores | active | The single determinism reference platform (SPEC §6). |
 | Rust toolchain | **stable 1.96.0** (`ac68faa20`, 2026-05-25) | installed | Native aarch64-apple-darwin. `rust-toolchain.toml` pins it in-repo. |
-| `bevy_ecs` | **0.18** (resolved `0.18.x` — see Cargo.lock) | installed (Stage 0) | ECS only, **no render plugins** (SPEC §2.2). |
-| `rand_chacha` | **0.9** (`ChaCha8Rng`) | installed (Stage 0) | The one portable, reproducible RNG (invariant #3). |
+| `bevy_ecs` | **0.19.0** (locked in Cargo.lock) | installed (Stage 0) | ECS only, **no render plugins** (SPEC §2.2). |
+| `rand_chacha` | **0.10.0** (`ChaCha8Rng`; uses `rand_core` 0.10.1) | installed (Stage 0) | The one portable, reproducible RNG (invariant #3). Runtime tree uses its re-exported `rand_core`. |
 | SLiM | **tag `v5.2`** (latest stable v5.x) | NOT yet built — Stage 2 | Built from source via `tools/install_slim.sh`; confirm `slim -version` then. **GPL-3, subprocess only.** |
 | Crisflash | latest release | NOT yet built — Stage 2+ | Off-target oracle (CPU). Optional realism. |
 | crisprScore | (Bioconductor) | optional — not on critical path | On-target realism only (SPEC §2.2). |
@@ -50,8 +50,8 @@ platform-sensitive choices that must be locked now so later stages don't drift:
 4. **crisprScore (on-target realism) is optional** and off the critical path (SPEC §2.2); Stage 1 ships an
    in-core heuristic on-target score and a naive in-core off-target count — zero external deps.
 5. **Pin every version** in the table above. Confirmed-installed at Stage 0: **Rust stable 1.96.0**,
-   **`bevy_ecs` 0.18**, **`rand_chacha` 0.9**. Deferred-but-pinned: **SLiM `v5.2`** (Stage 2),
-   **Godot 4.x exact minor** (Stage 4), **Crisflash** (Stage 2+).
+   **`bevy_ecs` 0.19.0**, **`rand_chacha` 0.10.0** (locked in `Cargo.lock`). Deferred-but-pinned:
+   **SLiM `v5.2`** (Stage 2), **Godot 4.x exact minor** (Stage 4), **Crisflash** (Stage 2+).
 
 ### Consequences
 - **+** Maximum native performance on M4 Max; one clean determinism reference platform.
@@ -91,3 +91,23 @@ would break this.
   stage; documented in SNIPPETS.md.
 - **−** Sim logic forgoes Bevy's automatic parallelism (acceptable at PoC entity counts; revisit per SPEC §11
   if the perf gate forces it — parallelism would then need a deterministic reduction).
+
+---
+
+## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
+
+Recorded at the end of **Stage 0 / slice S0** on the reference platform (Apple M4 Max, native aarch64,
+`release` profile: `lto = "thin"`, `codegen-units = 1`). Source: `cargo bench -p sim-core`
+(`crates/sim-core/benches/tick.rs`). The perf gate (§10.7) fails on a regression **below** this baseline.
+
+| Workload (entities × generations) | Median wall time | Throughput |
+|---|---|---|
+| 1 000 × 50  | **302.6 µs** | ~165 M organism-updates/s |
+| 5 000 × 50  | **1.438 ms** | ~174 M organism-updates/s |
+| 10 000 × 50 | **2.856 ms** | ~175 M organism-updates/s |
+
+**Headline baseline:** ~**175 M organism-updates/s** (≈ steady throughput; 10 000 entities advance 50
+generations in ~2.86 ms ⇒ ~17.5 k generations/s at 10 k entities). Well clear of the SPEC §11 trigger to
+move the hot path to GPU or coarsen organisms into cohorts; revisit if a later stage's per-organism work
+drops throughput below this line. (Stage 0's per-organism work is a placeholder; absolute numbers will move
+as real phenotype/selection lands — re-baseline at the stage that adds it, and update this table in the same slice.)

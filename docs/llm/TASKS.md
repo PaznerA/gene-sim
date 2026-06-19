@@ -9,7 +9,7 @@
 
 ## ▶ CURRENT SLICE
 
-### [ ] S0 — Stage 0: Headless deterministic core skeleton
+### [x] S0 — Stage 0: Headless deterministic core skeleton  ✅ DONE (gate green; ADR-001, ADR-002)
 **Goal:** A Cargo workspace whose headless sim core runs N seeded instances and is bit-reproducible — no graphics, no CRISPR yet.
 
 **Scope (fewest crates):** `crates/genome`, `crates/sim-core`, `crates/harness` (+ empty `crates/crispr`, `crates/oracle-slim` stubs so the workspace is whole).
@@ -71,4 +71,7 @@
 ---
 
 ## DONE
-_(none yet — S0 is the first slice and is currently being run through `/iterate`.)_
+- **S0** — Stage 0 headless deterministic core skeleton. DoD met: `cargo run -p harness -- --seed 42
+  --runs 1 --generations 200` works; `--runs 8` produces 8 distinct-seed runs; determinism gate GREEN
+  (`3393427b072eb803`); baseline bench recorded (~175 M organism-updates/s, M4 Max). See CHANGELOG +
+  DECISIONS (ADR-001, ADR-002, baseline table).

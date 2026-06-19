@@ -1,0 +1,15 @@
+[package]
+name = "oracle-slim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SLiM (GPL-3) subprocess driver — invariant #1: shells out ONLY, never links GPL. Stage 2."
+
+[features]
+proptest = []
+
+# INVARIANT #1 (SPEC §2.1.1): this crate MUST carry ZERO GPL dependencies. It may only invoke the `slim`
+# CLI via std::process::Command. Keep [dependencies] free of any GPL-licensed crate — enforced by the
+# license gate (scripts/check_license.sh, §10.8) once it lands in Stage 2.
+[dependencies]

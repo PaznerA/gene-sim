@@ -1,0 +1,16 @@
+[package]
+name = "genome"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Parametric genome data model (Loci → typed Parameters + ontology tags). SPEC §4 / TAXONOMY.md."
+
+[features]
+# Empty flag enabling the proptest-gated property tests under `cargo test --features proptest` (gate §10.4).
+proptest = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
