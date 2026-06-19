@@ -4,6 +4,13 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S2.1 — build SLiM from source, pinned (chore, Stage 2; human-signed-off 🛑)
+- `tools/install_slim.sh`: clones MesserLab/SLiM, checks out the pinned tag (`v5.2`), CMake Release build,
+  symlinks the CLI to `~/.local/bin/slim`. GPL-subprocess-only contract documented at the top (inv. #1).
+- Built + installed **SLiM v5.2** (commit `f11de0d`); `slim -version` confirmed. Recorded in DECISIONS
+  (SLiM row flipped to installed). Invariant #1 verified: license gate green, `oracle-slim` still depless,
+  no GPL crate in the workspace tree (SLiM is purely an external binary — never linked).
+
 ### S1.5 — genotype→phenotype map + selection (feat, Stage 1; **Stage 1 complete**)
 - `crates/sim-core/gp.rs`: `Trait`/`Phenotype`/`GenotypePhenotypeMap` (TAXONOMY §2) + `WeightedSumMap` (transparent
   weighted sum of genome param unit-scalars → traits, clamped [0,1]). Pure/deterministic; trait boundary (inv. #5).

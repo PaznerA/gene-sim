@@ -43,7 +43,7 @@
 - [x] **S1.5** `GenotypePhenotypeMap` (Parameters → Traits, weighted-sum / simple GRN) feeding selection in `sim-core`. AC: trait values deterministic for a fixed genome; selection responds to a trait; property test: allele freq ∈ [0,1]. ✅ DONE (WeightedSumMap + constant-N Wright-Fisher selection, allele_freq directional; gate green incl. re-baselined bench; reviewer APPROVE; ADR-005). **← Stage 1 COMPLETE.**
 
 ### Stage 2 — Genetics realism (`crates/oracle-slim`, SLiM subprocess) — SPEC §8
-- [ ] 🛑 **S2.1** `tools/install_slim.sh`: build SLiM from source at the pinned tag (SPEC §W2), record `slim -version` in DECISIONS.md. *Touches invariant #1 + #7 — human sign-off before linking decisions.* AC: `slim -version` matches the pinned tag.
+- [x] 🛑 **S2.1** `tools/install_slim.sh`: build SLiM from source at the pinned tag (SPEC §W2), record `slim -version` in DECISIONS.md. *Touches invariant #1 + #7 — human sign-off before linking decisions.* AC: `slim -version` matches the pinned tag. ✅ DONE (human signed off; SLiM v5.2 / commit f11de0d built + installed; license gate confirms no GPL crate; oracle-slim depless).
 - [ ] **S2.2** `crates/oracle-slim` subprocess driver: generate an Eidos model, run `slim -seed <derived> -d ... model.slim` via `std::process::Command`. **No GPL crate in the dep tree.** AC: driver produces a `.trees` file for a fixed seed; `cargo tree -p oracle-slim` shows zero GPL crates.
 - [ ] **S2.3** `scripts/slim_analyze.py` (tskit/pyslim): read back allele freqs / fitness from `.trees`. AC: parses the S2.2 output into a stats dict.
 - [ ] **S2.4** Golden-file oracle gate: pinned seed → allele freq within tolerance of `data/golden/<case>.json` (SPEC §8 Stage 2, §10.6). AC: gate passes within tolerance; determinism preserved.
