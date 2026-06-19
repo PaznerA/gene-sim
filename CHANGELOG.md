@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S3.1 — gym-like environment (reset/step/seed) (feat, Stage 3)
+- `crates/sim-core`: public stepwise `Simulation` handle (`reset`/`step`/`observe`/`species_genome`/
+  `with_genome_and_rng`) + public `Observation { generation, population_size, allele_freq, phenotype }`.
+  `run_headless` reimplemented on top of it — **bit-identical** (determinism hash unchanged `fde0e0b6…`).
+- `crates/harness` (now lib+bin): `Env` trait (`reset/step/seed`) + `GeneSimEnv`; `Action { Advance(u64),
+  ApplyEdit(EditAction) }` — **species/operator-granular only** (invariant #6; per-organism actions
+  unrepresentable). `ApplyEdit` runs `crispr::apply_edit` on the species genome and re-expresses phenotype.
+- Determinism (inv. #3): one ChaCha8Rng seeded once in `reset`, threaded through step + edit via
+  `std::mem::replace` (stream position preserved — no re-seed/clone). reward = `allele_freq` ∈ [0,1].
+- Tests: stepwise==one-shot, observe-is-pure, edit-changes-phenotype, reset/step/seed cycles, replay
+  determinism (+proptest). Loop: implementer → gate (GREEN) → reviewer (APPROVE).
+
 ### S2.4 + S2.5 — golden oracle gate + license gate (feat, Stage 2; **Stage 2 complete**)
 - **S2.4** golden oracle gate (SPEC §10.6): `data/golden/slim_case1.json` records the stats for a pinned case
   (seed 1234 + the produce_trees params, SLiM v5.2). `slim_analyze.py --check` compares a fresh run to the

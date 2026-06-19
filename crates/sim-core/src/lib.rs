@@ -18,13 +18,16 @@
 use bevy_ecs::prelude::*;
 use genome::Genome;
 use rand_chacha::rand_core::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 
 pub mod det;
 pub mod gp;
 
 pub use det::derive_seed;
 pub use gp::{GenotypePhenotypeMap, Phenotype, Trait, WeightedSumMap};
+
+// Re-export the exact `ChaCha8Rng` the core threads, so dependents (e.g. the harness env) draw the
+// species-edit action from the SAME seeded stream type without pinning a second `rand_chacha` (inv. #3).
+pub use rand_chacha::ChaCha8Rng;
 
 /// Configuration for a single headless run.
 #[derive(Debug, Clone)]
@@ -187,52 +190,175 @@ fn mean_genotype(world: &mut World) -> f64 {
     sum / rows.len() as f64
 }
 
+// --- public stepwise simulation handle ------------------------------------------------------------
+
+/// A point-in-time, deterministic snapshot of the simulation state (SPEC §2.2 gym-like `observe`).
+///
+/// Returned by [`Simulation::observe`]. Every field is a pure function of the seeded run so far
+/// (invariant #3): `allele_freq` is the population statistic the selection loop drives, and
+/// `phenotype` is the species genome re-expressed through the [`WeightedSumMap`] (invariant #2 —
+/// genotype→phenotype only here / in `genome`/`sim-core`). A fixed (seed, step/edit sequence) always
+/// yields an identical sequence of `Observation`s.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observation {
+    /// Generations advanced so far (the [`Tick`] counter).
+    pub generation: u64,
+    /// Number of living organisms.
+    pub population_size: u32,
+    /// Mean per-individual [`Genotype`] in `[0, 1]` — the allele frequency under selection.
+    pub allele_freq: f64,
+    /// The species genome re-expressed into trait values (deterministic; ordered, never a `HashMap`).
+    pub phenotype: Phenotype,
+}
+
+/// A stepwise, deterministic headless simulation handle (SPEC §2.2 — the gym-like env builds on this).
+///
+/// Owns the ECS [`World`], the explicitly-ordered [`Schedule`], and — as the `SimRng` world resource —
+/// the **single** seeded [`ChaCha8Rng`] for the whole run. Unlike the one-shot [`run_headless`], a
+/// `Simulation` exposes [`reset`](Self::reset) / [`step`](Self::step) / [`observe`](Self::observe) so a
+/// caller can drive generations and apply species-level edits between them.
+///
+/// **Determinism (inv. #3):** the RNG is seeded **once** in [`reset`] and never re-seeded mid-run.
+/// [`step`] advances the same stream; [`with_genome_and_rng`](Self::with_genome_and_rng) hands a
+/// species-level edit that same stream. No thread/global RNG, no `HashMap` iteration in sim logic.
+pub struct Simulation {
+    world: World,
+    schedule: Schedule,
+    config: SimConfig,
+}
+
+impl Simulation {
+    /// Build a fresh simulation: seed the [`ChaCha8Rng`] **once**, express the genome→phenotype once,
+    /// and spawn the population — exactly as the one-shot [`run_headless`] does (invariant #3, #2).
+    #[must_use]
+    pub fn reset(config: &SimConfig) -> Self {
+        let mut world = World::new();
+        // Seed the single RNG ONCE for the whole episode (inv. #3 — never re-seeded mid-run).
+        let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+
+        // Express the genome → phenotype ONCE (invariant #2; genotype→phenotype only here / in `genome`).
+        // The Wright-Fisher loop then selects over per-individual genotypes modulated by base growth rate.
+        let genome = genome::sample_genome();
+        let phenotype = WeightedSumMap.express(&genome);
+        let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
+
+        for i in 0..config.entity_count {
+            // Per-individual genotype in [0,1] seeded from the single RNG so individuals VARY (the standing
+            // variation selection acts on); energy keeps the Stage-0 metabolism behaviour.
+            let g0 = unit_f64(rng.next_u64());
+            let init = base_growth * unit_f64(rng.next_u64());
+            world.spawn((OrgId(i), Energy(init), Genotype(g0)));
+        }
+
+        world.insert_resource(SimRng(rng));
+        world.insert_resource(Tick::default());
+        world.insert_resource(GenomeRes(genome));
+        world.insert_resource(BaseGrowthRate(base_growth));
+
+        let mut schedule = Schedule::default();
+        // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
+        // metabolism each generation.
+        schedule.add_systems((advance_tick, metabolism, selection).chain());
+
+        Self {
+            world,
+            schedule,
+            config: config.clone(),
+        }
+    }
+
+    /// Advance `generations` generations using the SAME seeded RNG (no re-seeding mid-run, inv. #3).
+    pub fn step(&mut self, generations: u64) {
+        for _ in 0..generations {
+            self.schedule.run(&mut self.world);
+        }
+    }
+
+    /// Observe the current state (generation, population size, allele frequency, expressed phenotype).
+    ///
+    /// Pure w.r.t. the run so far — calling it does not advance the RNG or the schedule (inv. #3).
+    #[must_use]
+    pub fn observe(&mut self) -> Observation {
+        let allele_freq = mean_genotype(&mut self.world);
+        let generation = self.world.resource::<Tick>().0;
+        let population_size = self.world.query::<&OrgId>().iter(&self.world).count() as u32;
+        // Re-express the (possibly edited) species genome into traits — the only genotype→phenotype site.
+        let phenotype = WeightedSumMap.express(&self.world.resource::<GenomeRes>().0);
+        Observation {
+            generation,
+            population_size,
+            allele_freq,
+            phenotype,
+        }
+    }
+
+    /// The species genome currently wired into the core (read-only; invariant #2 — biology lives here).
+    #[must_use]
+    pub fn species_genome(&self) -> &Genome {
+        &self.world.resource::<GenomeRes>().0
+    }
+
+    /// Mutate the **species** genome with access to the run's single seeded RNG, then re-express the
+    /// `BaseGrowthRate` so the edit changes subsequent selection dynamics (SPEC §4; invariant #2, #3, #6).
+    ///
+    /// This is the species/operator-granular hook the harness's `ApplyEdit` action uses: `f` receives
+    /// `(&mut Genome, &mut ChaCha8Rng)` — the SAME `ChaCha8Rng` that drives the rest of the run, so the
+    /// edit draws only from the single seeded stream (inv. #3). The closure's return value is passed
+    /// back to the caller. After `f` runs, the genome→phenotype is re-expressed (invariant #2: the only
+    /// place biology is computed) and the [`BaseGrowthRate`] resource updated, so a species edit affects
+    /// the next [`step`](Self::step)'s fitness.
+    pub fn with_genome_and_rng<R>(
+        &mut self,
+        f: impl FnOnce(&mut Genome, &mut ChaCha8Rng) -> R,
+    ) -> R {
+        // Briefly take the RNG out of the world so we can hand both it and the genome to `f` (Bevy
+        // resources can't be borrowed mutably two at a time). The RNG is the same instance; its stream
+        // position is preserved — no re-seeding (inv. #3).
+        let mut rng = std::mem::replace(
+            &mut self.world.resource_mut::<SimRng>().0,
+            ChaCha8Rng::seed_from_u64(0),
+        );
+        let out = {
+            let genome = &mut self.world.resource_mut::<GenomeRes>().0;
+            f(genome, &mut rng)
+        };
+        self.world.resource_mut::<SimRng>().0 = rng;
+
+        // Re-express phenotype after the genome change so the edit feeds subsequent fitness (invariant #2).
+        let phenotype = WeightedSumMap.express(&self.world.resource::<GenomeRes>().0);
+        let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
+        self.world.resource_mut::<BaseGrowthRate>().0 = base_growth;
+        out
+    }
+
+    /// Fold the current state into the deterministic [`RunStats`] artifact (SPEC §6). Mirrors what the
+    /// one-shot [`run_headless`] returns at the end of a run.
+    #[must_use]
+    pub fn run_stats(&mut self) -> RunStats {
+        let allele_freq = mean_genotype(&mut self.world);
+        let config = self.config.clone();
+        RunStats {
+            seed: config.seed,
+            generations: config.generations,
+            entity_count: config.entity_count,
+            allele_freq,
+            hash: hash_world(&mut self.world, &config, allele_freq),
+        }
+    }
+}
+
 // --- public entry point ---------------------------------------------------------------------------
 
 /// Run one headless, deterministic simulation and return its [`RunStats`].
 ///
-/// Same `config` + same build + same platform ⇒ identical `hash` (SPEC §6).
+/// Same `config` + same build + same platform ⇒ identical `hash` (SPEC §6). Implemented on top of
+/// [`Simulation`] (reset → step the full generation count → fold the stats), so the one-shot and
+/// stepwise paths share one code path and one RNG-threading story.
 #[must_use]
 pub fn run_headless(config: &SimConfig) -> RunStats {
-    let mut world = World::new();
-    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
-
-    // Express the genome → phenotype ONCE (invariant #2; genotype→phenotype only here / in `genome`).
-    // The Wright-Fisher loop then selects over per-individual genotypes modulated by this base growth rate.
-    let genome = genome::sample_genome();
-    let phenotype = WeightedSumMap.express(&genome);
-    let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
-
-    for i in 0..config.entity_count {
-        // Per-individual genotype in [0,1] seeded from the single RNG so individuals VARY (the standing
-        // variation selection acts on); energy keeps the Stage-0 metabolism behaviour.
-        let g0 = unit_f64(rng.next_u64());
-        let init = base_growth * unit_f64(rng.next_u64());
-        world.spawn((OrgId(i), Energy(init), Genotype(g0)));
-    }
-
-    world.insert_resource(SimRng(rng));
-    world.insert_resource(Tick::default());
-    world.insert_resource(GenomeRes(genome));
-    world.insert_resource(BaseGrowthRate(base_growth));
-
-    let mut schedule = Schedule::default();
-    // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
-    // metabolism each generation.
-    schedule.add_systems((advance_tick, metabolism, selection).chain());
-
-    for _ in 0..config.generations {
-        schedule.run(&mut world);
-    }
-
-    let allele_freq = mean_genotype(&mut world);
-    RunStats {
-        seed: config.seed,
-        generations: config.generations,
-        entity_count: config.entity_count,
-        allele_freq,
-        hash: hash_world(&mut world, config, allele_freq),
-    }
+    let mut sim = Simulation::reset(config);
+    sim.step(config.generations);
+    sim.run_stats()
 }
 
 /// Deterministic, build-scoped hash of final world state (SNIPPETS.md "stable end-of-run hash").
@@ -348,6 +474,76 @@ mod tests {
             (0.0..=1.0).contains(&r.allele_freq),
             "allele_freq {} out of [0,1]",
             r.allele_freq
+        );
+    }
+
+    #[test]
+    fn simulation_stepwise_matches_one_shot() {
+        // The stepwise handle must reproduce the one-shot run_headless bit-for-bit (same RNG threading).
+        let cfg = SimConfig {
+            seed: 1234,
+            generations: 200,
+            entity_count: 500,
+        };
+        let one_shot = run_headless(&cfg);
+
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let stepwise = sim.run_stats();
+        assert_eq!(one_shot, stepwise);
+
+        // Advancing in two chunks must match advancing in one (same single stream, no re-seed).
+        let mut split = Simulation::reset(&cfg);
+        split.step(120);
+        split.step(80);
+        assert_eq!(split.run_stats(), one_shot);
+    }
+
+    #[test]
+    fn observe_is_pure_and_tracks_generation() {
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 0,
+            entity_count: 100,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let o0 = sim.observe();
+        assert_eq!(o0.generation, 0);
+        assert_eq!(o0.population_size, 100);
+        // observe() must not advance state: calling it twice yields an identical observation.
+        assert_eq!(sim.observe(), o0);
+
+        sim.step(10);
+        let o1 = sim.observe();
+        assert_eq!(o1.generation, 10);
+        assert!((0.0..=1.0).contains(&o1.allele_freq));
+    }
+
+    #[test]
+    fn species_edit_uses_run_rng_and_changes_phenotype() {
+        // A species-level genome edit via the run's own RNG re-expresses the phenotype and base growth.
+        let cfg = SimConfig {
+            seed: 99,
+            generations: 0,
+            entity_count: 50,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let before = sim.observe().phenotype.get(Trait::GrowthRate).unwrap();
+
+        // Bump the growth parameter (locus 0, param 0) to the top of its domain using a draw from the
+        // run RNG (confirms the hook hands the same seeded stream into the mutation).
+        sim.with_genome_and_rng(|g, rng| {
+            let _draw = rng.next_u64(); // edits draw from the single seeded stream (inv. #3)
+            if let genome::ParamValue::Numeric { value, max, .. } =
+                &mut g.loci[0].parameters[0].value
+            {
+                *value = *max;
+            }
+        });
+        let after = sim.observe().phenotype.get(Trait::GrowthRate).unwrap();
+        assert!(
+            after > before,
+            "species edit should raise GrowthRate ({before} -> {after})"
         );
     }
 

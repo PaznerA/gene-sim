@@ -11,7 +11,16 @@ proptest = []
 
 [dependencies]
 sim-core = { workspace = true }
+genome = { workspace = true }   # parametric genome data model — LocusId targets for species edits (S3.1)
+crispr = { workspace = true }   # Cas-variant table + apply_edit — the species-granular CRISPR action (S3.1)
+
+[lib]
+name = "harness"
+path = "src/lib.rs"
 
 [[bin]]
 name = "harness"
 path = "src/main.rs"
+
+[dev-dependencies]
+proptest = { workspace = true }
