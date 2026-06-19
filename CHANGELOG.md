@@ -4,6 +4,15 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S1.1 — Cas-variant data table + loader (feat, Stage 1)
+- `data/cas_variants.ron`: seed table of 7 Cas variants (SpCas9 NGG, SaCas9 NNGRRT, AsCas12a TTTV, Cas9-NG,
+  SpRY NRN, BE4 base editor, PE2 prime editor) — *data, not code* (SPEC §4).
+- `crates/crispr`: `CasVariant`/`CasVariantId`/`EditType` matching TAXONOMY §3.1; `load_cas_variants_from_str`
+  (clean `LoadError`) + `default_cas_variants()` embedding the RON via `include_str!`. Ordered `Vec` (inv. #3).
+- Deps pinned: `serde = "1"`, `ron = "0.12"` (both MIT/Apache; ADR-003 — 0.8 not in registry, 0.12 is current).
+- Tests: round-trip (+proptest), ≥5 variants, literature PAMs, all edit types, PAM-relaxed, non-zero base
+  window, malformed-RON error. Driven through the multi-agent loop (implementer → gate → reviewer: APPROVE).
+
 ### Dev loop hardened (chore)
 - `tools/gate.sh`: single robust gate runner — fmt · clippy `-D warnings` · test · determinism · proptest ·
   bench (opt-in `GATE_BENCH=1`) · license; PASS/FAIL/SKIP/N-A per item, non-zero exit on any red.

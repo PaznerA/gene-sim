@@ -36,7 +36,7 @@
 ## BACKLOG
 
 ### Stage 1 — CRISPR mechanic (`crates/crispr`) — SPEC §8
-- [ ] **S1.1** Cas-variant data table in `data/cas_variants.ron` (SpCas9 NGG, SaCas9 NNGRRT, Cas12a TTTV, SpRY/NG, base/prime) + a loader. *Table is data, not code (SPEC §4).* AC: loader round-trips the table; unit test asserts ≥5 variants with PAM + cut offset + edit type.
+- [x] **S1.1** Cas-variant data table in `data/cas_variants.ron` (SpCas9 NGG, SaCas9 NNGRRT, Cas12a TTTV, SpRY/NG, base/prime) + a loader. *Table is data, not code (SPEC §4).* AC: loader round-trips the table; unit test asserts ≥5 variants with PAM + cut offset + edit type. ✅ DONE (7 variants; gate green; reviewer APPROVE; ADR-003).
 - [ ] **S1.2** PAM finding via **rust-bio** (MIT) in `crates/crispr`: given a locus sequence + Cas variant, return PAM/cut sites. AC: unit tests on known sequences for NGG and TTTV; property test: every reported site actually matches the PAM regex.
 - [ ] **S1.3** `Score` traits (`OnTargetScore`, `OffTargetScore`) + in-core default impls (heuristic on-target eff, naive off-target hit count). *Pluggable behind a trait — invariant #5.* AC: trait + default impl unit-tested; swapping impls compiles without touching sim-core.
 - [ ] **S1.4** Edit application: `(CasVariant, target_locus, guide)` → gate on on-target eff + off-target count → mutate Parameter(s); failed-edit path = off-target perturbation elsewhere (never a silent success). AC: unit + property tests — edit never yields an invalid genome; failed edits never silently succeed.

@@ -1,0 +1,74 @@
+// Cas-variant seed table — DATA, not code (SPEC §4: "Keep it in data/ as a table, not in code").
+//
+// Each row maps 1:1 to `crispr::CasVariant` (TAXONOMY.md §3.1). PAMs are IUPAC strings (N=any,
+// R=A/G, V=A/C/G). `cut_offset` is bp relative to the PAM (blunt vs PAM-distal/staggered);
+// `edit_window` is the base-/prime-editor activity window (relative positions), (0, 0) for pure DSB.
+//
+// Literature-plausible values (SPEC §4 seed table / research §2):
+//   - SpCas9    NGG     — S. pyogenes Cas9; blunt cut ~3 bp 5' of PAM (Jinek 2012; Doudna/Charpentier).
+//   - SaCas9    NNGRRT  — S. aureus Cas9; compact, longer PAM (Ran 2015).
+//   - AsCas12a  TTTV    — Acidaminococcus Cas12a/Cpf1; T-rich 5' PAM, staggered PAM-distal cut (Zetsche 2015).
+//   - Cas9-NG   NG      — engineered PAM-relaxed SpCas9 variant (Nishimasu 2018).
+//   - SpRY      NRN     — near-PAMless SpCas9 (prefers NRN > NYN) (Walton 2020).
+//   - BE4-SpCas9 NGG    — cytosine base editor; deaminase window ~protospacer positions 4-8 (Komor 2016).
+//   - PE2-SpCas9 NGG    — prime editor; nCas9-RT, edit window set by pegRNA RTT (Anzalone 2019).
+//
+// IDs are stable small integers (inv. #3); kept in load order as an ordered Vec.
+[
+    (
+        id: (0),
+        name: "SpCas9",
+        pam: "NGG",
+        cut_offset: -3,
+        edit_window: (0, 0),
+        edit_type: Dsb,
+    ),
+    (
+        id: (1),
+        name: "SaCas9",
+        pam: "NNGRRT",
+        cut_offset: -3,
+        edit_window: (0, 0),
+        edit_type: Dsb,
+    ),
+    (
+        id: (2),
+        name: "AsCas12a",
+        pam: "TTTV",
+        cut_offset: 18,
+        edit_window: (0, 0),
+        edit_type: Dsb,
+    ),
+    (
+        id: (3),
+        name: "Cas9-NG",
+        pam: "NG",
+        cut_offset: -3,
+        edit_window: (0, 0),
+        edit_type: Dsb,
+    ),
+    (
+        id: (4),
+        name: "SpRY",
+        pam: "NRN",
+        cut_offset: -3,
+        edit_window: (0, 0),
+        edit_type: Dsb,
+    ),
+    (
+        id: (5),
+        name: "BE4-SpCas9",
+        pam: "NGG",
+        cut_offset: 0,
+        edit_window: (4, 8),
+        edit_type: BaseEdit,
+    ),
+    (
+        id: (6),
+        name: "PE2-SpCas9",
+        pam: "NGG",
+        cut_offset: 0,
+        edit_window: (1, 30),
+        edit_type: Prime,
+    ),
+]

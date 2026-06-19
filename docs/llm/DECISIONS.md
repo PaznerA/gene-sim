@@ -12,6 +12,8 @@
 | Rust toolchain | **stable 1.96.0** (`ac68faa20`, 2026-05-25) | installed | Native aarch64-apple-darwin. `rust-toolchain.toml` pins it in-repo. |
 | `bevy_ecs` | **0.19.0** (locked in Cargo.lock) | installed (Stage 0) | ECS only, **no render plugins** (SPEC §2.2). |
 | `rand_chacha` | **0.10.0** (`ChaCha8Rng`; uses `rand_core` 0.10.1) | installed (Stage 0) | The one portable, reproducible RNG (invariant #3). Runtime tree uses its re-exported `rand_core`. |
+| `serde` (+derive) | **1** (locked 1.0.228) | installed (Stage 1, S1.1) | (De)serialization for the Cas-variant data table. MIT/Apache-2.0. |
+| `ron` | **0.12** (locked 0.12.1) | installed (Stage 1, S1.1) | Rusty Object Notation — git-friendly config/data (SPEC §5). MIT/Apache-2.0. See ADR-003. |
 | SLiM | **tag `v5.2`** (latest stable v5.x) | NOT yet built — Stage 2 | Built from source via `tools/install_slim.sh`; confirm `slim -version` then. **GPL-3, subprocess only.** |
 | Crisflash | latest release | NOT yet built — Stage 2+ | Off-target oracle (CPU). Optional realism. |
 | crisprScore | (Bioconductor) | optional — not on critical path | On-target realism only (SPEC §2.2). |
@@ -91,6 +93,33 @@ would break this.
   stage; documented in SNIPPETS.md.
 - **−** Sim logic forgoes Bevy's automatic parallelism (acceptable at PoC entity counts; revisit per SPEC §11
   if the perf gate forces it — parallelism would then need a deterministic reduction).
+
+---
+
+## ADR-003 — Cas-variant table format & pins: RON + serde (Stage 1, S1.1)
+
+- **Date:** 2026-06-19
+- **Status:** Accepted
+- **Stage:** 1 (slice S1.1)
+
+### Context
+The Cas-variant table must be **data, not code** (SPEC §4) and live in `data/` as a git-friendly, human-
+readable file (SPEC §5 names RON or JSON as the config/data format). Loading it needs a (de)serializer.
+
+### Decision
+- Encode the seed table as **RON** at `data/cas_variants.ron`; load via **`serde`** + **`ron`**. The default
+  table is embedded with `include_str!` so it ships in the binary and tests are hermetic, while remaining an
+  editable RON file. Variants are parsed into an ordered `Vec<CasVariant>` (load order preserved — inv. #3).
+- **Pins:** `serde = "1"` (locked 1.0.228), **`ron = "0.12"`** (locked 0.12.1). Note: the implementer's brief
+  suggested `ron = "0.8"`, but 0.8 is not in the registry; **0.12 is the current minor**, so it was pinned
+  instead (consistent with the repo's caret style; exact versions locked in `Cargo.lock`). Both are MIT/Apache-2.0.
+
+### Consequences
+- **+** Table is editable data, diff-friendly, and validated at load (clean `LoadError` on malformed RON).
+- **+** No GPL added — license gate stays green (inv. #1).
+- **−** RON `0.x` is pre-1.0; a future minor bump could change syntax. Pinned + lock-file'd; re-confirm on bump.
+- **−** Only an embedded/string loader exists today; a runtime path-based loader can be added when a stage
+  needs user-supplied tables (noted by the reviewer; not required by S1.1).
 
 ---
 

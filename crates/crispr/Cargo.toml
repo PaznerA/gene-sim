@@ -11,3 +11,8 @@ proptest = []
 
 [dependencies]
 genome = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
