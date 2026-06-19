@@ -4,6 +4,19 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S2.2 — oracle-slim SLiM subprocess driver (feat, Stage 2)
+- `crates/oracle-slim`: **dependency-free** (std-only) driver — `SlimParams` → `write_model` generates a
+  self-contained SLiM 5 Eidos model (params baked via `defineConstant`, `initializeTreeSeq()`, final
+  `<gen> late()` → `treeSeqOutput` + `simulationFinished`) → `run_model` shells out
+  `Command::new(slim).arg("-seed").arg(seed).arg(model)` and returns the `.trees` path. `SlimError` carries
+  SLiM's stderr; `resolve_slim_bin` = `SLIM_BIN` → `~/.local/bin/slim` → PATH.
+- **Invariant #1 verified (adversarial review):** zero deps (`cargo tree` shows the crate alone), no FFI/
+  `#[link]`/`build.rs`/linkage — `slim` is invoked as a subprocess only, never linked. Seed passed in
+  (caller derives via `sim-core::derive_seed`); oracle-slim adds no entropy.
+- Tests: model-generation unit tests (no slim needed) + an integration test that actually runs slim
+  (fixed seed → non-empty `.trees`) and **skips gracefully** when slim is absent. Does not byte-compare
+  `.trees` (SLiM provenance timestamps differ). Loop: implementer → gate (GREEN) → reviewer (APPROVE).
+
 ### S2.1 — build SLiM from source, pinned (chore, Stage 2; human-signed-off 🛑)
 - `tools/install_slim.sh`: clones MesserLab/SLiM, checks out the pinned tag (`v5.2`), CMake Release build,
   symlinks the CLI to `~/.local/bin/slim`. GPL-subprocess-only contract documented at the top (inv. #1).

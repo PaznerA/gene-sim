@@ -1,25 +1,333 @@
 //! SLiM subprocess driver (SPEC §8 Stage 2, §W9).
 //!
-//! **Invariant #1 (STOP THE LINE):** SLiM is GPL-3. This crate invokes the `slim` CLI as a separate
-//! subprocess (`std::process::Command`) **only**, and must never link GPL code or depend on any GPL
-//! crate. The license gate (`scripts/check_license.sh`) enforces a GPL-free dependency tree.
+//! **Invariant #1 (STOP THE LINE):** SLiM is GPL-3. This crate generates a self-contained SLiM 5 Eidos
+//! model and invokes the `slim` CLI as a separate subprocess (`std::process::Command`) **only**. It must
+//! never link GPL code or depend on any GPL crate — and in fact it depends on nothing at all (std-only).
+//! The license gate (`scripts/check_license.sh`) enforces a GPL-free dependency tree.
 //!
-//! Stage 0 placeholder — no driver yet. The real Eidos-model generation + `slim -seed <derived>` call
-//! arrives in Stage 2; until then this crate deliberately depends on nothing.
+//! The flow (§W9): generate an Eidos model with the parameters baked in via `defineConstant(...)`, run
+//! `slim -seed <derived> <model.slim>`, and produce a tree-sequence `.trees` file. The `seed` is derived
+//! by the caller (`sim-core::derive_seed`, invariant #3) and passed in; this crate does not depend on
+//! `sim-core`. Reading the `.trees` back (allele freqs / fitness) is a separate concern (S2.3, tskit).
 
 #![forbid(unsafe_code)]
 
-/// Placeholder marker for the not-yet-implemented driver. Returns the (future) CLI binary name so call
-/// sites and tests can already reference the subprocess boundary without linking anything.
+use std::error::Error;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The bare CLI name used when neither `SLIM_BIN` nor `$HOME/.local/bin/slim` resolves (PATH lookup).
+const SLIM_CLI_NAME: &str = "slim";
+
+/// Parameters for one SLiM run. Plain data — baked into the generated Eidos model via `defineConstant`.
+///
+/// The `seed` is derived by the caller (e.g. `sim-core::derive_seed(master, stream)`, invariant #3) and
+/// passed in; `oracle-slim` does not derive seeds itself. SLiM is invoked with `-seed <seed>`, which
+/// overrides any seed the model might set, keeping a single source of truth for the run's randomness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlimParams {
+    /// Diploid census size of the single subpopulation (`p1`).
+    pub population_size: u32,
+    /// Per-base, per-generation mutation rate.
+    pub mutation_rate: f64,
+    /// Per-base, per-generation recombination rate.
+    pub recombination_rate: f64,
+    /// Length of the simulated chromosome, in base pairs.
+    pub sequence_length: u64,
+    /// The generation at which the model writes the `.trees` output and finishes.
+    pub generations: u32,
+    /// The RNG seed passed to `slim -seed` (derived by the caller).
+    pub seed: u64,
+}
+
+impl Default for SlimParams {
+    /// A small, fast, neutral model — adequate as a smoke test and a starting point for golden cases.
+    fn default() -> Self {
+        SlimParams {
+            population_size: 100,
+            mutation_rate: 1e-7,
+            recombination_rate: 1e-8,
+            sequence_length: 100_000,
+            generations: 100,
+            seed: 0,
+        }
+    }
+}
+
+/// Resolve the `slim` binary path **robustly**, so callers and tests work regardless of `PATH`:
+///
+/// 1. `$SLIM_BIN`, if set (explicit override);
+/// 2. else `$HOME/.local/bin/slim`, if it exists (the pinned install location, DECISIONS.md S2.1);
+/// 3. else the bare name `"slim"`, resolved via `PATH` by the OS.
 #[must_use]
-pub fn slim_cli_name() -> &'static str {
-    "slim"
+pub fn resolve_slim_bin() -> PathBuf {
+    if let Some(bin) = std::env::var_os("SLIM_BIN") {
+        return PathBuf::from(bin);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = Path::new(&home).join(".local/bin/slim");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(SLIM_CLI_NAME)
+}
+
+/// Render a **self-contained, valid SLiM 5 Eidos model** for `params` that writes its tree sequence to
+/// `trees_path` and then finishes. The parameters are baked in with `defineConstant(...)` inside
+/// `initialize()` (robust — avoids `-d` string-quoting pain), and the final generation is written as a
+/// literal block (we generate the file, so we know it).
+fn render_model(params: &SlimParams, trees_path: &Path) -> String {
+    // Eidos string literals use double quotes; escape backslashes and double quotes in the path so a
+    // path with spaces or odd characters round-trips correctly.
+    let escaped_path = trees_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+
+    // `sequence_length` bp spans positions [0, L-1]. SLiM 5 uses tick-based events; `<gen> late()` runs
+    // at the named generation. `f64` rates are emitted via Rust's `{}`, which yields a valid Eidos float.
+    format!(
+        "// Auto-generated by crates/oracle-slim (SPEC §8 Stage 2, §W9). Do not edit by hand.\n\
+         // Self-contained: parameters baked in via defineConstant; run with `slim -seed <seed>`.\n\
+         initialize() {{\n\
+         \tinitializeTreeSeq();\n\
+         \tdefineConstant(\"N\", {population_size});\n\
+         \tdefineConstant(\"L\", {sequence_length});\n\
+         \tdefineConstant(\"MU\", {mutation_rate});\n\
+         \tdefineConstant(\"RHO\", {recombination_rate});\n\
+         \tinitializeMutationRate(MU);\n\
+         \tinitializeMutationType(\"m1\", 0.5, \"f\", 0.0);\n\
+         \tinitializeGenomicElementType(\"g1\", m1, 1.0);\n\
+         \tinitializeGenomicElement(g1, 0, L - 1);\n\
+         \tinitializeRecombinationRate(RHO);\n\
+         }}\n\
+         1 early() {{\n\
+         \tsim.addSubpop(\"p1\", N);\n\
+         }}\n\
+         {generations} late() {{\n\
+         \tsim.treeSeqOutput(\"{escaped_path}\");\n\
+         \tsim.simulationFinished();\n\
+         }}\n",
+        population_size = params.population_size,
+        sequence_length = params.sequence_length,
+        mutation_rate = params.mutation_rate,
+        recombination_rate = params.recombination_rate,
+        generations = params.generations,
+    )
+}
+
+/// Write a self-contained SLiM 5 Eidos model for `params` to `model_path`. The model writes its tree
+/// sequence to `trees_path` when run. Parent directories are created as needed.
+pub fn write_model(params: &SlimParams, model_path: &Path, trees_path: &Path) -> io::Result<()> {
+    if let Some(parent) = model_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(model_path, render_model(params, trees_path))
+}
+
+/// The result of a successful [`run_model`] call: where the model and its tree-sequence output live.
+#[derive(Debug, Clone)]
+pub struct SlimRun {
+    /// Path to the generated Eidos model that was run.
+    pub model_path: PathBuf,
+    /// Path to the produced tree-sequence `.trees` file.
+    pub trees_path: PathBuf,
+}
+
+/// Error returned by [`run_model`]. Carries enough context (including SLiM's stderr) to debug a failure.
+#[derive(Debug)]
+pub enum SlimError {
+    /// Writing the model or creating the work directory failed.
+    Io(io::Error),
+    /// The `slim` process could not be spawned (e.g. binary not found / not executable).
+    Spawn { bin: PathBuf, source: io::Error },
+    /// `slim` ran but exited non-zero. `stderr` is SLiM's captured standard error.
+    NonZeroExit { status: String, stderr: String },
+    /// `slim` exited zero but the expected `.trees` file was not produced (or is empty).
+    MissingOutput { trees_path: PathBuf },
+}
+
+impl fmt::Display for SlimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SlimError::Io(e) => write!(f, "io error preparing slim run: {e}"),
+            SlimError::Spawn { bin, source } => {
+                write!(f, "failed to spawn slim binary {}: {source}", bin.display())
+            }
+            SlimError::NonZeroExit { status, stderr } => {
+                write!(f, "slim exited {status}; stderr:\n{stderr}")
+            }
+            SlimError::MissingOutput { trees_path } => write!(
+                f,
+                "slim exited 0 but produced no usable .trees at {}",
+                trees_path.display()
+            ),
+        }
+    }
+}
+
+impl Error for SlimError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            SlimError::Io(e) => Some(e),
+            SlimError::Spawn { source, .. } => Some(source),
+            SlimError::NonZeroExit { .. } | SlimError::MissingOutput { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for SlimError {
+    fn from(e: io::Error) -> Self {
+        SlimError::Io(e)
+    }
+}
+
+/// Generate the model for `params` inside `work_dir`, run `slim` as a subprocess, and return where the
+/// produced `.trees` lives.
+///
+/// The model is fully self-contained; the seed is passed via `slim -seed <seed>` (which overrides), so
+/// the same `params` (same derived seed, same SLiM build/platform) is reproducible (invariant #3). The
+/// work directory is created if missing. SLiM's stderr is captured and surfaced in [`SlimError`].
+pub fn run_model(params: &SlimParams, work_dir: &Path) -> Result<SlimRun, SlimError> {
+    std::fs::create_dir_all(work_dir)?;
+    let model_path = work_dir.join("model.slim");
+    let trees_path = work_dir.join("out.trees");
+
+    write_model(params, &model_path, &trees_path)?;
+
+    let slim_bin = resolve_slim_bin();
+    let output = Command::new(&slim_bin)
+        .arg("-seed")
+        .arg(params.seed.to_string())
+        .arg(&model_path)
+        .output()
+        .map_err(|source| SlimError::Spawn {
+            bin: slim_bin.clone(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(SlimError::NonZeroExit {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    // Genetic determinism is validated downstream (S2.4 via tskit), not by byte comparison — SLiM writes
+    // a timestamped provenance record, so two same-seed `.trees` differ byte-for-byte. Here we only
+    // confirm the run actually produced a non-empty output file.
+    match std::fs::metadata(&trees_path) {
+        Ok(m) if m.len() > 0 => Ok(SlimRun {
+            model_path,
+            trees_path,
+        }),
+        _ => Err(SlimError::MissingOutput { trees_path }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn subprocess_boundary_is_named() {
-        assert_eq!(super::slim_cli_name(), "slim");
+    fn model_is_self_contained_and_bakes_params() {
+        let params = SlimParams {
+            population_size: 250,
+            mutation_rate: 1e-7,
+            recombination_rate: 1e-8,
+            sequence_length: 50_000,
+            generations: 80,
+            seed: 12345,
+        };
+        let trees = Path::new("/tmp/gene-sim-test/out.trees");
+        let model = render_model(&params, trees);
+
+        // Tree-sequence recording + output + the subpop add must all be present.
+        assert!(model.contains("initializeTreeSeq()"), "model:\n{model}");
+        assert!(model.contains("treeSeqOutput("), "model:\n{model}");
+        assert!(
+            model.contains("sim.addSubpop(\"p1\", N)"),
+            "model:\n{model}"
+        );
+        assert!(
+            model.contains("sim.simulationFinished()"),
+            "model:\n{model}"
+        );
+
+        // Baked-in constants.
+        assert!(
+            model.contains("defineConstant(\"N\", 250)"),
+            "model:\n{model}"
+        );
+        assert!(
+            model.contains("defineConstant(\"L\", 50000)"),
+            "model:\n{model}"
+        );
+        assert!(
+            model.contains("defineConstant(\"MU\", 0.0000001)"),
+            "model:\n{model}"
+        );
+
+        // Final-generation event written as a literal, and the output path quoted as an Eidos string.
+        assert!(model.contains("80 late()"), "model:\n{model}");
+        assert!(
+            model.contains("treeSeqOutput(\"/tmp/gene-sim-test/out.trees\")"),
+            "model:\n{model}"
+        );
+    }
+
+    #[test]
+    fn output_path_is_escaped() {
+        let params = SlimParams::default();
+        let weird = Path::new("/tmp/has \"quote\"/out.trees");
+        let model = render_model(&params, weird);
+        assert!(
+            model.contains(r#"treeSeqOutput("/tmp/has \"quote\"/out.trees")"#),
+            "model:\n{model}"
+        );
+    }
+
+    /// Integration test: actually run `slim` for a fixed seed and assert a non-empty `.trees` is produced.
+    /// Skips gracefully (no failure) if `slim` is not found/executable, so the workspace gate stays green
+    /// on machines without SLiM. On the pinned dev machine (SLiM v5.2 at ~/.local/bin/slim) this runs.
+    #[test]
+    fn runs_slim_and_produces_trees() {
+        let slim_bin = resolve_slim_bin();
+        // Probe whether slim is actually invocable before committing to a real run.
+        let probe = Command::new(&slim_bin).arg("-version").output();
+        let available = matches!(probe, Ok(o) if o.status.success());
+        if !available {
+            eprintln!(
+                "SKIP runs_slim_and_produces_trees: slim not found/executable at {} \
+                 (set SLIM_BIN or install per tools/install_slim.sh)",
+                slim_bin.display()
+            );
+            return;
+        }
+
+        let params = SlimParams {
+            population_size: 50,
+            mutation_rate: 1e-7,
+            recombination_rate: 1e-8,
+            sequence_length: 10_000,
+            generations: 20,
+            seed: 424242,
+        };
+        let work_dir =
+            std::env::temp_dir().join(format!("gene-sim-oracle-slim-test-{}", params.seed));
+        // Clean any stale output from a prior run so we know this run produced the file.
+        let _ = std::fs::remove_dir_all(&work_dir);
+
+        let run = run_model(&params, &work_dir).expect("slim run should succeed");
+
+        let meta = std::fs::metadata(&run.trees_path).expect("trees file should exist");
+        assert!(meta.is_file(), "trees output should be a regular file");
+        assert!(meta.len() > 0, "trees output should be non-empty");
+
+        // Best-effort cleanup; ignore errors.
+        let _ = std::fs::remove_dir_all(&work_dir);
     }
 }

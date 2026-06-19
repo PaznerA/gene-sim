@@ -44,9 +44,9 @@
 
 ### Stage 2 — Genetics realism (`crates/oracle-slim`, SLiM subprocess) — SPEC §8
 - [x] 🛑 **S2.1** `tools/install_slim.sh`: build SLiM from source at the pinned tag (SPEC §W2), record `slim -version` in DECISIONS.md. *Touches invariant #1 + #7 — human sign-off before linking decisions.* AC: `slim -version` matches the pinned tag. ✅ DONE (human signed off; SLiM v5.2 / commit f11de0d built + installed; license gate confirms no GPL crate; oracle-slim depless).
-- [ ] **S2.2** `crates/oracle-slim` subprocess driver: generate an Eidos model, run `slim -seed <derived> -d ... model.slim` via `std::process::Command`. **No GPL crate in the dep tree.** AC: driver produces a `.trees` file for a fixed seed; `cargo tree -p oracle-slim` shows zero GPL crates.
+- [x] **S2.2** `crates/oracle-slim` subprocess driver: generate an Eidos model, run `slim -seed <derived> -d ... model.slim` via `std::process::Command`. **No GPL crate in the dep tree.** AC: driver produces a `.trees` file for a fixed seed; `cargo tree -p oracle-slim` shows zero GPL crates. ✅ DONE (std-only, zero deps; runs slim v5.2 → `.trees`; graceful skip when slim absent; reviewer APPROVE on invariant #1).
 - [ ] **S2.3** `scripts/slim_analyze.py` (tskit/pyslim): read back allele freqs / fitness from `.trees`. AC: parses the S2.2 output into a stats dict.
-- [ ] **S2.4** Golden-file oracle gate: pinned seed → allele freq within tolerance of `data/golden/<case>.json` (SPEC §8 Stage 2, §10.6). AC: gate passes within tolerance; determinism preserved.
+- [ ] **S2.4** Golden-file oracle gate: pinned seed → allele freq within tolerance of `data/golden/<case>.json` (SPEC §8 Stage 2, §10.6). AC: gate passes within tolerance; determinism preserved. *Note (from S2.2 review): the current model sets a non-zero in-model mutation rate with a neutral mutation type — SLiM warns this is "legal but usually undesirable". When golden genetics land here, prefer MU=0 in-model + overlay neutral mutations via `scripts/slim_analyze.py` (tskit `sim_mutations`), or accept the warning deliberately.*
 - [ ] **S2.5** `scripts/check_license.sh` (gate #8): assert no GPL crate in `cargo tree`; assert `oracle-slim` only shells out. AC: script exits non-zero if a GPL crate appears; wired into `/gate`.
 
 ### Stage 3 — AI harness (`crates/harness`) — SPEC §8
