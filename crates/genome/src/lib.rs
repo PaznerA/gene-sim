@@ -10,8 +10,14 @@
 
 #![forbid(unsafe_code)]
 
+use serde::{Deserialize, Serialize};
+
 /// Stable, ordered handle into a [`Genome`]'s locus list (equals the index in `Genome::loci`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Serde-(de)serializable so it can ride in replay logs (`actions.ndjson`, SPEC §5): a trivial `u32`
+/// newtype, serialized transparently as the bare integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LocusId(pub u32);
 
 /// Stable handle for a [`Parameter`] within a [`Locus`].
@@ -297,6 +303,16 @@ mod tests {
             let s = v.as_unit_scalar();
             assert!((0.0..=1.0).contains(&s), "scalar {s} out of [0,1]");
         }
+    }
+
+    #[test]
+    fn locus_id_serde_round_trips_as_bare_u32() {
+        // SPEC §5: LocusId rides in replay logs. `#[serde(transparent)]` ⇒ encoded as the bare integer.
+        let id = LocusId(7);
+        let json = serde_json::to_string(&id).expect("serialize LocusId");
+        assert_eq!(json, "7", "LocusId should serialize as a bare u32");
+        let back: LocusId = serde_json::from_str(&json).expect("deserialize LocusId");
+        assert_eq!(back, id);
     }
 
     #[test]

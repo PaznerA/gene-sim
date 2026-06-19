@@ -51,7 +51,7 @@
 
 ### Stage 3 — AI harness (`crates/harness`) — SPEC §8
 - [x] **S3.1** Gym-like env: `reset()` / `step(action)` / `seed()` (SPEC §2.2, §5). Action = `EditAction` at **species/operator** granularity (invariant #6). AC: env trait + unit test of one reset/step/seed cycle. ✅ DONE (stepwise `Simulation` in sim-core + `GeneSimEnv` in harness; species-granular `Action`; determinism hash unchanged; gate green; reviewer APPROVE).
-- [ ] **S3.2** Replay logs: `seed.json` (master + derived seeds + pinned versions) + `actions.ndjson`. Replaying `seed + actions` is bit-identical (SPEC §5, §6). AC: replay of a logged run reproduces the same stats hash.
+- [x] **S3.2** Replay logs: `seed.json` (master + derived seeds + pinned versions) + `actions.ndjson`. Replaying `seed + actions` is bit-identical (SPEC §5, §6). AC: replay of a logged run reproduces the same stats hash. ✅ DONE (`harness::replay` record/replay share one path → bit-identical hash; serde on LocusId/GuideSequence/Action; validation-preserving guide deser; gate green; reviewer APPROVE).
 - [ ] **S3.3** Parallel batch runner `tools/run_batch.sh` (SPEC §W7): hundreds of deterministic runs; per-generation stats to Parquet. AC: M parallel runs reproduce; columnar stats written.
 - [ ] **S3.4** Confirm the ~10k-named-agent ceiling (invariant #6): actions stay operator/species level, never per-organism. AC: a test/assert that the action space is species-granular.
 

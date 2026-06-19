@@ -18,3 +18,4 @@ rand_chacha = { workspace = true }  # seeded ChaCha8 RNG for edit application (i
 
 [dev-dependencies]
 proptest = { workspace = true }
+serde_json = { workspace = true }  # JSON round-trip tests for the GuideSequence serde impl (SPEC §5)

@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S3.2 — replay logs: seed.json + actions.ndjson (feat, Stage 3)
+- `crates/harness/src/replay.rs`: `record_episode(config, seed, actions, dir)` writes `data/runs/<run_id>/`
+  `seed.json` (master seed + config + pinned tool versions, SPEC §5) + `actions.ndjson` (one `Action`/line);
+  `replay(dir)` re-runs and returns the final stats hash. Record & replay share one private `run_episode`, so
+  **replay is bit-identical by construction** (SPEC §6). Deterministic `run_id` (no wall-clock).
+- serde plumbing: `genome::LocusId` (`#[serde(transparent)]` u32), `crispr::GuideSequence` (hand-rolled serde —
+  deserialize routes through `GuideSequence::new`, so a non-ACGT guide in a log fails to load), `Action`/
+  `EditAction` derive serde. `serde_json` added (workspace dep, MIT/Apache; DECISIONS row).
+- Determinism hash unchanged (`fde0e0b6…`). Tests: record→replay bit-identical, malformed-guide rejected,
+  action_count mismatch rejected, serde round-trips. Loop: implementer → gate (GREEN) → reviewer (send-back
+  for the `serde_json` pin → recorded → APPROVE).
+
 ### S3.1 — gym-like environment (reset/step/seed) (feat, Stage 3)
 - `crates/sim-core`: public stepwise `Simulation` handle (`reset`/`step`/`observe`/`species_genome`/
   `with_genome_and_rng`) + public `Observation { generation, population_size, allele_freq, phenotype }`.

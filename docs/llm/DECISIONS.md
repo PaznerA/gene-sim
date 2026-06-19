@@ -13,6 +13,7 @@
 | `bevy_ecs` | **0.19.0** (locked in Cargo.lock) | installed (Stage 0) | ECS only, **no render plugins** (SPEC §2.2). |
 | `rand_chacha` | **0.10.0** (`ChaCha8Rng`; uses `rand_core` 0.10.1) | installed (Stage 0) | The one portable, reproducible RNG (invariant #3). Runtime tree uses its re-exported `rand_core`. |
 | `serde` (+derive) | **1** (locked 1.0.228) | installed (Stage 1, S1.1) | (De)serialization for the Cas-variant data table. MIT/Apache-2.0. |
+| `serde_json` | **1** (locked 1.0.150) | installed (Stage 3, S3.2) | JSON for replay logs — seed.json + actions.ndjson (SPEC §5). MIT/Apache-2.0. |
 | `ron` | **0.12** (locked 0.12.1) | installed (Stage 1, S1.1) | Rusty Object Notation — git-friendly config/data (SPEC §5). MIT/Apache-2.0. See ADR-003. |
 | `bio` (rust-bio) | **4.0** (locked 4.0.0) | installed (Stage 1, S1.2) | Sequence ops / PAM finding — the SPEC §2.2 chosen lib. MIT. See ADR-004. |
 | SLiM | **tag `v5.2`** (commit `f11de0d`) | **installed (Stage 2, S2.1)** | Built from source via `tools/install_slim.sh` → `slim -version` = "SLiM version 5.2". GPL-3 — **subprocess only, never linked** (inv. #1). Binary at `~/.local/bin/slim`. |

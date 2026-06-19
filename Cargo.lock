@@ -502,6 +502,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "ron",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -815,6 +816,8 @@ name = "genome"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -889,6 +892,8 @@ dependencies = [
  "crispr",
  "genome",
  "proptest",
+ "serde",
+ "serde_json",
  "sim-core",
 ]
 

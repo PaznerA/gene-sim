@@ -296,6 +296,33 @@ impl GuideSequence {
     }
 }
 
+// `GuideSequence` is serde-(de)serializable for replay logs (`actions.ndjson`, SPEC §5), but its
+// validation invariant (every byte ∈ {A,C,G,T}) MUST survive the round-trip. We hand-roll the impls
+// rather than deriving over the private inner `Vec<u8>`:
+// - serialize as the human-readable ACGT String (validated bases are always valid ASCII/UTF-8);
+// - deserialize a String and rebuild via `GuideSequence::new`, so a malformed guide in a log FAILS to
+//   deserialize — the construction-time check stays the single source of truth (validation preserved).
+impl Serialize for GuideSequence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Inner bytes are validated ACGT ⇒ always valid UTF-8; `from_utf8` cannot fail here.
+        let s = std::str::from_utf8(&self.0).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for GuideSequence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        // Route through the validating constructor — an invalid base is a deserialization error, so an
+        // invalid guide can never be replayed (SPEC §5; validation preserved).
+        GuideSequence::new(s.into_bytes()).map_err(|bad_index| {
+            serde::de::Error::custom(format!(
+                "invalid guide sequence: non-ACGT base at index {bad_index}"
+            ))
+        })
+    }
+}
+
 /// On-target efficiency scoring (TAXONOMY.md §3.3, invariant #5 — pluggable behind a trait).
 ///
 /// Implementations return a cleavage-efficiency estimate in `[0, 1]`. The in-core default is
@@ -1602,6 +1629,33 @@ mod tests {
         let (o2, g2) = run();
         assert_eq!(o1, o2);
         assert_eq!(g1, g2);
+    }
+
+    // ---- Guide serde (slice S3.2) — validation preserved across the round-trip (SPEC §5) ----
+
+    #[test]
+    fn guide_sequence_serializes_as_acgt_string_and_round_trips() {
+        let guide = GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap();
+        let json = serde_json::to_string(&guide).expect("serialize guide");
+        // Human-readable: the bare ACGT string (SPEC §5).
+        assert_eq!(json, "\"ACGTGGACGTTTTAGGCCGG\"");
+        let back: GuideSequence = serde_json::from_str(&json).expect("deserialize guide");
+        assert_eq!(back, guide);
+    }
+
+    #[test]
+    fn malformed_guide_fails_to_deserialize() {
+        // A non-ACGT base in a serialized guide must FAIL to deserialize (validation preserved): an
+        // invalid guide can never be replayed from a log.
+        let err = serde_json::from_str::<GuideSequence>("\"ACGXACGT\"");
+        assert!(err.is_err(), "non-ACGT guide must not deserialize");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("invalid guide sequence"),
+            "unexpected error message: {msg}"
+        );
+        // Lower-case is rejected too (the constructor only admits upper-case ACGT).
+        assert!(serde_json::from_str::<GuideSequence>("\"acgt\"").is_err());
     }
 
     #[cfg(feature = "proptest")]

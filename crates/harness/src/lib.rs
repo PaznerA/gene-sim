@@ -26,7 +26,10 @@ use crispr::{
     DefaultOnTargetScore, Edit, EditOutcome, EditThresholds, GuideSequence,
 };
 use genome::LocusId;
+use serde::{Deserialize, Serialize};
 use sim_core::{Observation, SimConfig, Simulation};
+
+pub mod replay;
 
 /// The result of one [`Env::step`]: the new observation plus a scalar reward and an episode-`done` flag
 /// (Gymnasium `step` shape, SPEC §2.2).
@@ -65,7 +68,11 @@ pub trait Env {
 /// species genome, never an individual.
 ///
 /// Resolved through [`crispr::apply_edit`] against the env's Cas-variant table and the species genome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde-(de)serializable so it can be logged to `actions.ndjson` and replayed bit-identically (SPEC
+/// §5/§6): `cas`/`target` ride as their integer ids; `guide` as its validated ACGT string (a malformed
+/// guide in a log fails to deserialize — see [`crispr::GuideSequence`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditAction {
     /// Which Cas variant performs the edit (resolved by id against the variant table).
     pub cas: CasVariantId,
@@ -77,7 +84,11 @@ pub struct EditAction {
 
 /// The species/operator-granular action space (invariant #6). There is deliberately **no** per-organism
 /// variant: the agent only advances time or edits the shared species genome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde-(de)serializable so an action sequence can be logged one-per-line to `actions.ndjson` and
+/// replayed bit-identically (SPEC §5/§6). Encoded as an externally-tagged enum, e.g.
+/// `{"Advance":10}` / `{"ApplyEdit":{ ... }}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     /// Advance the simulation by `N` generations using the run's single seeded RNG.
     Advance(u64),
@@ -139,6 +150,17 @@ impl GeneSimEnv {
             .as_mut()
             .expect("GeneSimEnv::observe called before reset")
             .observe()
+    }
+
+    /// The deterministic [`sim_core::RunStats`] of the episode so far — its `hash` is the bit-identical
+    /// replay artifact (SPEC §6). Folds in the same final RNG word as the one-shot path, so it must be
+    /// called once at the **end** of an episode (panics if called before `reset`).
+    #[must_use]
+    pub fn run_stats(&mut self) -> sim_core::RunStats {
+        self.sim
+            .as_mut()
+            .expect("GeneSimEnv::run_stats called before reset")
+            .run_stats()
     }
 
     /// Reward for an observation: the population `allele_freq` (the trait under selection), in `[0, 1]`.
@@ -344,6 +366,29 @@ mod tests {
             // EditAction targets a species LocusId — never an organism/entity id (inv. #6).
             Action::ApplyEdit(EditAction { target: _, .. }) => {}
         }
+    }
+
+    #[test]
+    fn action_and_edit_action_round_trip_through_serde() {
+        // AC (S3.2): an Action / EditAction (incl. an ApplyEdit with a real guide) survives a JSON
+        // round-trip — the `actions.ndjson` line encoding (SPEC §5).
+        let advance = Action::Advance(42);
+        let j = serde_json::to_string(&advance).unwrap();
+        assert_eq!(j, "{\"Advance\":42}");
+        assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), advance);
+
+        let edit = Action::ApplyEdit(EditAction {
+            cas: cas_id("SpCas9"),
+            target: LocusId(0),
+            guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+        });
+        let j = serde_json::to_string(&edit).unwrap();
+        // The guide rides as its validated ACGT string; ids as bare integers.
+        assert!(
+            j.contains("\"ACGTGGACGTTTTAGGCCGG\""),
+            "guide string missing: {j}"
+        );
+        assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), edit);
     }
 
     #[cfg(feature = "proptest")]

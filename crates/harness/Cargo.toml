@@ -13,6 +13,8 @@ proptest = []
 sim-core = { workspace = true }
 genome = { workspace = true }   # parametric genome data model — LocusId targets for species edits (S3.1)
 crispr = { workspace = true }   # Cas-variant table + apply_edit — the species-granular CRISPR action (S3.1)
+serde = { workspace = true }       # derive(Serialize/Deserialize) for Action/EditAction + replay schemas (S3.2)
+serde_json = { workspace = true }  # seed.json + actions.ndjson replay logs (SPEC §5)
 
 [lib]
 name = "harness"
