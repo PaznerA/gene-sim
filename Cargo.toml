@@ -26,6 +26,7 @@ proptest = "1"
 criterion = { version = "0.8", default-features = false }
 serde = { version = "1", features = ["derive"] }  # MIT/Apache-2.0 — data (de)serialization for the Cas table
 ron = "0.12"  # MIT/Apache-2.0 — Rusty Object Notation; git-friendly config/data format (SPEC §5)
+bio = "4.0"  # MIT — rust-bio: sequence ops / PAM finding (SPEC §2.2 chosen lib); pinned to current minor
 
 [profile.release]
 # Determinism is build-scoped (SPEC §6); keep the release profile fixed for the reference build.

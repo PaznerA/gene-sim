@@ -14,6 +14,7 @@
 | `rand_chacha` | **0.10.0** (`ChaCha8Rng`; uses `rand_core` 0.10.1) | installed (Stage 0) | The one portable, reproducible RNG (invariant #3). Runtime tree uses its re-exported `rand_core`. |
 | `serde` (+derive) | **1** (locked 1.0.228) | installed (Stage 1, S1.1) | (De)serialization for the Cas-variant data table. MIT/Apache-2.0. |
 | `ron` | **0.12** (locked 0.12.1) | installed (Stage 1, S1.1) | Rusty Object Notation — git-friendly config/data (SPEC §5). MIT/Apache-2.0. See ADR-003. |
+| `bio` (rust-bio) | **4.0** (locked 4.0.0) | installed (Stage 1, S1.2) | Sequence ops / PAM finding — the SPEC §2.2 chosen lib. MIT. See ADR-004. |
 | SLiM | **tag `v5.2`** (latest stable v5.x) | NOT yet built — Stage 2 | Built from source via `tools/install_slim.sh`; confirm `slim -version` then. **GPL-3, subprocess only.** |
 | Crisflash | latest release | NOT yet built — Stage 2+ | Off-target oracle (CPU). Optional realism. |
 | crisprScore | (Bioconductor) | optional — not on critical path | On-target realism only (SPEC §2.2). |
@@ -120,6 +121,36 @@ readable file (SPEC §5 names RON or JSON as the config/data format). Loading it
 - **−** RON `0.x` is pre-1.0; a future minor bump could change syntax. Pinned + lock-file'd; re-confirm on bump.
 - **−** Only an embedded/string loader exists today; a runtime path-based loader can be added when a stage
   needs user-supplied tables (noted by the reviewer; not required by S1.1).
+
+---
+
+## ADR-004 — rust-bio for sequence ops; IUPAC degeneracy in-house (Stage 1, S1.2)
+
+- **Date:** 2026-06-19
+- **Status:** Accepted
+- **Stage:** 1 (slice S1.2)
+
+### Context
+PAM finding (SPEC §4) needs DNA sequence handling (reverse-complement, alphabet) and degenerate-motif
+matching (IUPAC codes: N, R, Y, V, …). SPEC §2.2 pre-chose **rust-bio** (`bio`) for sequence ops / PAM
+finding. SPEC §0.4 requires an ADR when any subsystem is built from scratch instead of reusing the chosen FOSS.
+
+### Decision
+- Use **`bio` (rust-bio), pinned `4.0` (locked 4.0.0, MIT)** for sequence primitives — specifically
+  `bio::alphabets::dna::revcomp` for the reverse strand and DNA alphabet handling.
+- Implement **IUPAC degenerate matching in-house** (a small `iupac_matches` table + a windowed PAM scan).
+  This is CRISPR domain logic, **not** a reimplementation of a rust-bio component — rust-bio's pattern
+  matchers are exact/approximate string search, not IUPAC-degenerate PAM semantics. So §0.4's "reinventing"
+  clause does not apply; no human sign-off required.
+- `find_pam_sites` returns an ordered, `(position, strand)`-sorted `Vec<PamSite>` (inv. #3). All coordinates
+  are in the forward-sequence frame; the cut-site convention is documented on `PamSite`.
+
+### Consequences
+- **+** Reuses the SPEC-chosen lib for the hard sequence primitives; keeps the small, CRISPR-specific
+  degeneracy logic transparent and testable (proptest: no false-positive PAM sites).
+- **+** License stays clean — `bio`'s full tree (~160 crates) is permissive; GPL gate green.
+- **−** `bio` is a large dependency (longer cold builds). Acceptable; it's the chosen lib and will be reused
+  for off-target search / FM-index in later stages.
 
 ---
 

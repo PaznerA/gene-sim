@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S1.2 — PAM finding via rust-bio (feat, Stage 1)
+- `crates/crispr`: `find_pam_sites(seq, variant)` (+ `_in` for `genome::DnaSequence`) returning ordered,
+  `(position, strand)`-sorted `PamSite { position, strand, cut_site }` on both strands. `Strand` enum;
+  public `iupac_matches` (full IUPAC set, case-insensitive, U→T). Reverse strand via `bio::alphabets::dna::revcomp`.
+- Cut-site convention documented on `PamSite` (forward frame; forward `position+cut_offset`, reverse
+  `(position+pam_len-1)-cut_offset`). Determinism preserved (sorted Vec, no HashMap; inv. #3).
+- Dep: `bio` (rust-bio) `4.0`, MIT, GPL-free tree verified (ADR-004 — rust-bio for seq ops, IUPAC degeneracy
+  kept in-house per SPEC §0.4).
+- Tests: NGG/TTTV known sequences incl. reverse hit + cut math, TTTT-excluded, IUPAC table, determinism;
+  proptest: every reported site truly matches the PAM (no false positives). Loop: implementer → gate (GREEN)
+  → reviewer (send-back for the missing `bio` pin → fixed → APPROVE).
+
 ### S1.1 — Cas-variant data table + loader (feat, Stage 1)
 - `data/cas_variants.ron`: seed table of 7 Cas variants (SpCas9 NGG, SaCas9 NNGRRT, AsCas12a TTTV, Cas9-NG,
   SpRY NRN, BE4 base editor, PE2 prime editor) — *data, not code* (SPEC §4).
