@@ -242,6 +242,220 @@ pub fn find_pam_sites_in(seq: &genome::DnaSequence, variant: &CasVariant) -> Vec
     find_pam_sites(seq.bases(), variant)
 }
 
+// ---------------------------------------------------------------------------
+// Scoring (slice S1.3) — SPEC §4 step 2; TAXONOMY.md §3.2/§3.3.
+//
+// On-/off-target scoring sits behind traits (invariant #5: science is pluggable). The in-core
+// default impls below are *one* implementation; Stage 2+ can swap in subprocess-backed "realistic"
+// impls (Crisflash off-target, crisprScore on-target) without touching sim-core. The defaults are
+// pure deterministic functions — NO RNG, no `HashMap` iteration (inv. #3).
+// ---------------------------------------------------------------------------
+
+/// A guide (spacer) sequence: validated upper-case ACGT bytes (TAXONOMY.md §3.2).
+///
+/// Mirrors the design of [`genome::DnaSequence`]: the inner buffer is **private** and built via
+/// [`GuideSequence::new`], which enforces the invariant (every byte ∈ {A,C,G,T}) at construction and
+/// returns the first bad-byte index on failure. Read access via [`bases`](Self::bases) /
+/// [`len`](Self::len) / [`is_empty`](Self::is_empty).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuideSequence(Vec<u8>);
+
+impl GuideSequence {
+    /// Build a guide, validating that every base is one of `A`, `C`, `G`, `T` (upper-case).
+    ///
+    /// # Errors
+    /// Returns the 0-based index of the first offending byte on failure.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, usize> {
+        let bytes = bytes.into();
+        if let Some(i) = bytes
+            .iter()
+            .position(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
+        {
+            return Err(i);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The raw ACGT bytes.
+    #[must_use]
+    pub fn bases(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Number of bases.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the guide is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// On-target efficiency scoring (TAXONOMY.md §3.3, invariant #5 — pluggable behind a trait).
+///
+/// Implementations return a cleavage-efficiency estimate in `[0, 1]`. The in-core default is
+/// [`DefaultOnTargetScore`]; subprocess-backed realistic impls plug in later without touching sim-core.
+pub trait OnTargetScore {
+    /// On-target efficiency for `guide` cutting in `locus` with `cas`. **Always in `[0, 1]`.**
+    fn efficiency(&self, locus: &genome::Locus, guide: &GuideSequence, cas: &CasVariant) -> f64;
+}
+
+/// Off-target hit-count scoring (TAXONOMY.md §3.3, invariant #5 — pluggable behind a trait).
+///
+/// Implementations count near-matches of `guide` elsewhere in the `genome`. The in-core default is
+/// [`DefaultOffTargetScore`] (a naive scan); realistic impls (Crisflash) plug in later.
+pub trait OffTargetScore {
+    /// Number of off-target near-matches of `guide` across `genome` for `cas`.
+    fn hit_count(&self, genome: &genome::Genome, guide: &GuideSequence, cas: &CasVariant) -> u32;
+}
+
+/// In-core default on-target heuristic (invariant #5 — one impl; deterministic, pure, no RNG).
+///
+/// **Formula** — `efficiency = (0.5 * gc + 0.3 * length + 0.2 * pam)`, clamped to `[0, 1]`, where each
+/// factor is itself in `[0, 1]`:
+/// - `gc`: GC-content score, peaking at a favorable ~50% GC and falling off linearly toward 0%/100%
+///   (`1 - 2 * |gc_fraction - 0.5|`); an empty guide scores `0`.
+/// - `length`: guide-length sanity — full credit for the ~17–24 nt window typical of SpCas9/Cas12a
+///   spacers, ramping in below 17 nt and decaying above 24 nt.
+/// - `pam`: `1.0` if the guide occurs in the locus (either strand) **with a valid `cas` PAM adjacent**
+///   to the match (so the guide is actually targetable there), else `0.0`.
+///
+/// This is a transparent placeholder, not a published score model — it is monotone in the obvious
+/// directions and bounded, which is all S1.3 needs (realistic on-target scoring is a Stage 2+ upgrade).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultOnTargetScore;
+
+impl DefaultOnTargetScore {
+    /// GC-content factor in `[0, 1]`, peaking at 50% GC (empty guide → 0).
+    fn gc_factor(guide: &[u8]) -> f64 {
+        if guide.is_empty() {
+            return 0.0;
+        }
+        let gc = guide.iter().filter(|&&b| b == b'G' || b == b'C').count();
+        let frac = gc as f64 / guide.len() as f64;
+        (1.0 - 2.0 * (frac - 0.5).abs()).clamp(0.0, 1.0)
+    }
+
+    /// Guide-length sanity factor in `[0, 1]`: full credit in `[17, 24]`, ramping/decaying outside.
+    fn length_factor(len: usize) -> f64 {
+        match len {
+            0 => 0.0,
+            17..=24 => 1.0,
+            l if l < 17 => l as f64 / 17.0,
+            // Above 24 nt: decay linearly, hitting 0 by 48 nt.
+            l => (1.0 - (l - 24) as f64 / 24.0).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Whether `guide` occurs in `seq` (either strand) with a valid `cas` PAM adjacent to the match.
+    ///
+    /// "Adjacent" = the guide's match window touches a PAM site reported by [`find_pam_sites`]: the
+    /// PAM either immediately follows the protospacer (3' PAM, e.g. SpCas9 `NGG`) or immediately
+    /// precedes it (5' PAM, e.g. Cas12a `TTTV`). Both orientations are accepted so the factor works
+    /// across the seed table without baking per-variant geometry into the heuristic.
+    fn has_targetable_match(seq: &[u8], guide: &[u8], cas: &CasVariant) -> bool {
+        let g = guide.len();
+        if g == 0 || g > seq.len() {
+            return false;
+        }
+        let sites = find_pam_sites(seq, cas);
+        let pam_len = cas.pam.len();
+        // Forward-frame guide matches (the guide is given 5'→3' on the forward strand).
+        for start in 0..=(seq.len() - g) {
+            if &seq[start..start + g] != guide {
+                continue;
+            }
+            let end = start + g; // exclusive
+            for site in &sites {
+                let p = site.position;
+                // 3' PAM immediately after the protospacer, or 5' PAM immediately before it.
+                if p == end || p + pam_len == start {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl OnTargetScore for DefaultOnTargetScore {
+    fn efficiency(&self, locus: &genome::Locus, guide: &GuideSequence, cas: &CasVariant) -> f64 {
+        let bases = guide.bases();
+        let gc = Self::gc_factor(bases);
+        let length = Self::length_factor(guide.len());
+        let pam = if Self::has_targetable_match(locus.sequence.bases(), bases, cas) {
+            1.0
+        } else {
+            0.0
+        };
+        (0.5 * gc + 0.3 * length + 0.2 * pam).clamp(0.0, 1.0)
+    }
+}
+
+/// In-core default off-target scoring (invariant #5 — one impl; deterministic, pure, no RNG).
+///
+/// A **naive** count: scan every locus sequence in the genome on **both** strands and count windows
+/// that match the guide within [`mismatch_budget`](Self::mismatch_budget) substitutions (a Hamming
+/// near-match). Iterates the ordered `genome.loci` [`Vec`] only — never a `HashMap` (inv. #3).
+///
+/// This counts *every* near-match including the intended on-target site(s); it is a coarse upper
+/// bound on off-target load, not a CFD-style specificity score. Realistic off-target counting
+/// (Crisflash / Cas-OFFinder) is a Stage 2+ subprocess upgrade that plugs in via [`OffTargetScore`].
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultOffTargetScore {
+    /// Maximum Hamming mismatches for a window to count as a near-match.
+    pub mismatch_budget: u8,
+}
+
+impl Default for DefaultOffTargetScore {
+    /// A sensible default budget of 3 mismatches (a common off-target search radius).
+    fn default() -> Self {
+        Self { mismatch_budget: 3 }
+    }
+}
+
+impl DefaultOffTargetScore {
+    /// Count windows of length `guide.len()` in `seq` within the mismatch budget of `guide`.
+    fn count_near_matches(&self, seq: &[u8], guide: &[u8]) -> u32 {
+        let g = guide.len();
+        if g == 0 || g > seq.len() {
+            return 0;
+        }
+        let budget = usize::from(self.mismatch_budget);
+        let mut hits = 0u32;
+        for start in 0..=(seq.len() - g) {
+            let mismatches = seq[start..start + g]
+                .iter()
+                .zip(guide.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            if mismatches <= budget {
+                hits = hits.saturating_add(1);
+            }
+        }
+        hits
+    }
+}
+
+impl OffTargetScore for DefaultOffTargetScore {
+    fn hit_count(&self, genome: &genome::Genome, guide: &GuideSequence, _cas: &CasVariant) -> u32 {
+        let g = guide.bases();
+        let mut total = 0u32;
+        // Ordered iteration over loci (inv. #3) — both strands per locus.
+        for locus in &genome.loci {
+            let fwd = locus.sequence.bases();
+            total = total.saturating_add(self.count_near_matches(fwd, g));
+            let rc = dna::revcomp(fwd);
+            total = total.saturating_add(self.count_near_matches(&rc, g));
+        }
+        total
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +739,214 @@ mod tests {
         }
     }
 
+    // ---- Scoring (slice S1.3) ----
+
+    #[test]
+    fn guide_validation_mirrors_dnasequence() {
+        assert!(GuideSequence::new(*b"ACGTACGT").is_ok());
+        // First bad byte index reported, like DnaSequence::new.
+        assert_eq!(GuideSequence::new(*b"ACGXACGT"), Err(3));
+        assert!(GuideSequence::new(*b"acgt").is_err()); // lower-case rejected
+        let g = GuideSequence::new(*b"ACGTGG").unwrap();
+        assert_eq!(g.len(), 6);
+        assert!(!g.is_empty());
+        assert_eq!(g.bases(), b"ACGTGG");
+        assert!(GuideSequence::new(Vec::new()).unwrap().is_empty());
+    }
+
+    /// Build a single-locus genome whose sequence is exactly `seq` (panics on non-ACGT).
+    fn locus_with_sequence(seq: &[u8]) -> genome::Locus {
+        genome::Locus {
+            id: genome::LocusId(0),
+            name: "test_locus".to_string(),
+            sequence: genome::DnaSequence::new(seq.to_vec()).expect("valid ACGT"),
+            parameters: Vec::new(),
+            tags: genome::OntologyTags {
+                so_term: genome::SoTermId(704),
+                go_refs: Vec::new(),
+            },
+        }
+    }
+
+    fn genome_with_sequences(seqs: &[&[u8]]) -> genome::Genome {
+        genome::Genome {
+            version: 1,
+            loci: seqs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let mut l = locus_with_sequence(s);
+                    l.id = genome::LocusId(i as u32);
+                    l
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn on_target_efficiency_is_in_range_for_several_guides_and_loci() {
+        let scorer = DefaultOnTargetScore;
+        let cas = variant("SpCas9");
+        let g = genome::sample_genome();
+        let guides: Vec<GuideSequence> = [
+            &b"ACGTGG"[..],
+            &b"ACGTGGACGTTTTAGGCCGG"[..], // == the growth locus sequence
+            &b"GGGGGGGGGGGGGGGGG"[..],    // 100% GC, 17 nt
+            &b"ATATATATATATATATAT"[..],   // 0% GC
+            &b"AC"[..],                   // too short
+            &b""[..],                     // empty
+        ]
+        .iter()
+        .map(|b| GuideSequence::new(b.to_vec()).unwrap())
+        .collect();
+
+        for locus in &g.loci {
+            for guide in &guides {
+                let e = scorer.efficiency(locus, guide, &cas);
+                assert!(
+                    (0.0..=1.0).contains(&e),
+                    "efficiency {e} out of [0,1] for {:?} on {}",
+                    guide.bases(),
+                    locus.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn on_target_pam_factor_rewards_a_targetable_guide() {
+        let scorer = DefaultOnTargetScore;
+        let cas = variant("SpCas9");
+        // Protospacer "ACGTACGTAC" immediately followed by an NGG PAM ("TGG").
+        let locus = locus_with_sequence(b"ACGTACGTACTGGAAAAAA");
+        let targetable = GuideSequence::new(*b"ACGTACGTAC").unwrap();
+        // Same GC/length, but absent from the locus → no PAM-adjacent match.
+        let absent = GuideSequence::new(*b"GCGCGCGCGC").unwrap();
+        let with_pam = scorer.efficiency(&locus, &targetable, &cas);
+        let without = scorer.efficiency(&locus, &absent, &cas);
+        // The 0.2 PAM term is present for the targetable guide; both share the favorable GC band.
+        assert!(
+            with_pam > without,
+            "targetable guide ({with_pam}) should outscore the absent one ({without})"
+        );
+    }
+
+    #[test]
+    fn off_target_count_zero_when_guide_absent() {
+        let scorer = DefaultOffTargetScore::default();
+        let cas = variant("SpCas9");
+        // A genome with no near-match (within 3 mismatches) of this 12-nt guide.
+        let g = genome_with_sequences(&[b"AAAAAAAAAAAAAAAA", b"TTTTTTTTTTTTTTTT"]);
+        let guide = GuideSequence::new(*b"GCGCGCGCGCGC").unwrap();
+        assert_eq!(scorer.hit_count(&g, &guide, &cas), 0);
+    }
+
+    #[test]
+    fn off_target_count_positive_when_guide_present() {
+        let cas = variant("SpCas9");
+        // Exact-match scanning isolates the "present" case from the mismatch budget.
+        let exact = DefaultOffTargetScore { mismatch_budget: 0 };
+        let guide = GuideSequence::new(*b"ACGTACGTACGT").unwrap();
+        // Embed the guide verbatim in a locus.
+        let g = genome_with_sequences(&[b"GGGGACGTACGTACGTCCCC"]);
+        let hits = exact.hit_count(&g, &guide, &cas);
+        assert!(
+            hits > 0,
+            "expected >0 hits when the guide is present, got {hits}"
+        );
+    }
+
+    #[test]
+    fn off_target_budget_widens_the_count() {
+        let cas = variant("SpCas9");
+        let guide = GuideSequence::new(*b"ACGTACGT").unwrap();
+        // One window equals the guide, neighbours differ by a few bases.
+        let g = genome_with_sequences(&[b"ACGTACGTACGAACGT"]);
+        let strict = DefaultOffTargetScore { mismatch_budget: 0 }.hit_count(&g, &guide, &cas);
+        let loose = DefaultOffTargetScore { mismatch_budget: 3 }.hit_count(&g, &guide, &cas);
+        assert!(
+            loose >= strict && loose > 0,
+            "looser budget should not reduce the count (strict={strict}, loose={loose})"
+        );
+    }
+
+    #[test]
+    fn scoring_is_deterministic() {
+        let on = DefaultOnTargetScore;
+        let off = DefaultOffTargetScore::default();
+        let cas = variant("AsCas12a");
+        let g = genome::sample_genome();
+        let guide = GuideSequence::new(*b"TTTAGGCCGG").unwrap();
+        let locus = &g.loci[0];
+        // Same inputs → same outputs, twice.
+        assert_eq!(
+            on.efficiency(locus, &guide, &cas),
+            on.efficiency(locus, &guide, &cas)
+        );
+        assert_eq!(
+            off.hit_count(&g, &guide, &cas),
+            off.hit_count(&g, &guide, &cas)
+        );
+    }
+
+    // ---- Pluggability proof (AC: swapping impls compiles without touching sim-core) ----
+
+    /// An alternate on-target impl that always returns a fixed value (clamped to [0,1]).
+    struct ConstOnTarget(f64);
+    impl OnTargetScore for ConstOnTarget {
+        fn efficiency(
+            &self,
+            _locus: &genome::Locus,
+            _guide: &GuideSequence,
+            _cas: &CasVariant,
+        ) -> f64 {
+            self.0.clamp(0.0, 1.0)
+        }
+    }
+
+    /// An alternate off-target impl that always reports zero hits.
+    struct StubOffTarget;
+    impl OffTargetScore for StubOffTarget {
+        fn hit_count(
+            &self,
+            _genome: &genome::Genome,
+            _guide: &GuideSequence,
+            _cas: &CasVariant,
+        ) -> u32 {
+            0
+        }
+    }
+
+    /// Generic helper across ANY `OnTargetScore` — proves the trait is the swap boundary.
+    fn score_with<S: OnTargetScore>(
+        s: &S,
+        locus: &genome::Locus,
+        guide: &GuideSequence,
+        cas: &CasVariant,
+    ) -> f64 {
+        s.efficiency(locus, guide, cas)
+    }
+
+    #[test]
+    fn alternate_impls_substitute_for_the_default() {
+        let cas = variant("SpCas9");
+        let g = genome::sample_genome();
+        let locus = &g.loci[0];
+        let guide = GuideSequence::new(*b"ACGTGG").unwrap();
+
+        // The SAME generic helper works with the default AND the alternate impl.
+        let d = score_with(&DefaultOnTargetScore, locus, &guide, &cas);
+        let c = score_with(&ConstOnTarget(0.42), locus, &guide, &cas);
+        assert!((0.0..=1.0).contains(&d));
+        assert_eq!(c, 0.42);
+
+        // Object-safety: both traits are usable as trait objects (dynamic swap, e.g. config-selected).
+        let on: &dyn OnTargetScore = &DefaultOnTargetScore;
+        let off: &dyn OffTargetScore = &StubOffTarget;
+        assert!((0.0..=1.0).contains(&on.efficiency(locus, &guide, &cas)));
+        assert_eq!(off.hit_count(&g, &guide, &cas), 0);
+    }
+
     #[cfg(feature = "proptest")]
     mod prop {
         use super::*;
@@ -613,6 +1035,27 @@ mod tests {
                     .windows(2)
                     .all(|w| (w[0].position, w[0].strand) <= (w[1].position, w[1].strand));
                 prop_assert!(is_sorted);
+            }
+
+            /// On-target efficiency is ALWAYS in [0,1] for an arbitrary ACGT guide against the sample
+            /// genome with any seed-table variant (invariant #5 default impl is well-bounded).
+            #[test]
+            fn on_target_efficiency_always_in_unit_interval(
+                guide_bytes in proptest::collection::vec(
+                    prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')],
+                    0..40,
+                ),
+                v in proptest::sample::select(default_cas_variants()),
+            ) {
+                let guide = GuideSequence::new(guide_bytes).expect("ACGT-only guide is valid");
+                let g = genome::sample_genome();
+                let scorer = DefaultOnTargetScore;
+                for locus in &g.loci {
+                    let e = scorer.efficiency(locus, &guide, &v);
+                    prop_assert!((0.0..=1.0).contains(&e), "efficiency {} out of [0,1]", e);
+                    // Deterministic: same inputs → same output.
+                    prop_assert_eq!(e, scorer.efficiency(locus, &guide, &v));
+                }
             }
         }
     }

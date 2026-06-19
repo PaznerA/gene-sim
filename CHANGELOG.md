@@ -4,6 +4,17 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S1.3 — pluggable Score traits + in-core default impls (feat, Stage 1)
+- `crates/crispr`: `OnTargetScore`/`OffTargetScore` traits (match TAXONOMY §3.3) — the invariant-#5 swappable
+  science boundary (object-safe + generic-usable; proven by an alternate impl substituting with no trait/
+  sim-core change). `GuideSequence` (validated ACGT, mirrors `DnaSequence`).
+- `DefaultOnTargetScore`: pure heuristic `clamp_[0,1](0.5·gc + 0.3·length + 0.2·pam)` (gc peaks at 50%, length
+  favors 17–24 nt, pam = valid PAM adjacent to the guide's locus match). `DefaultOffTargetScore { mismatch_budget=3 }`:
+  naive Hamming near-match count across all loci, both strands, iterating the ordered `Vec` (inv. #3).
+- No new deps. Tests: efficiency ∈ [0,1], off-target absent=0/present>0/monotone-in-budget, determinism,
+  pluggability (generic + `dyn`), proptest (efficiency always in unit interval). Loop: implementer → gate
+  (GREEN) → reviewer (APPROVE). TAXONOMY §3.2 `GuideSequence` synced to the validated form.
+
 ### S1.2 — PAM finding via rust-bio (feat, Stage 1)
 - `crates/crispr`: `find_pam_sites(seq, variant)` (+ `_in` for `genome::DnaSequence`) returning ordered,
   `(position, strand)`-sorted `PamSite { position, strand, cut_site }` on both strands. `Strand` enum;

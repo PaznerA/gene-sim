@@ -132,7 +132,10 @@ PAM-relaxed `NG`/SpRY, plus base/prime editors.
 
 ### 3.2 Edit
 ```rust
-pub struct GuideSequence(pub Vec<u8>);   // ACGT
+/// Validated upper-ACGT, mirroring `DnaSequence`: PRIVATE inner buffer, built via
+/// `GuideSequence::new(bytes) -> Result<Self, usize>` (first bad-byte index on failure); read via
+/// `.bases()` / `.len()` / `.is_empty()`. (Implemented in S1.3; lives in `crates/crispr`.)
+pub struct GuideSequence(/* private */ Vec<u8>);
 pub struct Edit {
     pub cas: CasVariantId,
     pub target: LocusId,
