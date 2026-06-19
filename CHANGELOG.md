@@ -4,6 +4,19 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S1.5 — genotype→phenotype map + selection (feat, Stage 1; **Stage 1 complete**)
+- `crates/sim-core/gp.rs`: `Trait`/`Phenotype`/`GenotypePhenotypeMap` (TAXONOMY §2) + `WeightedSumMap` (transparent
+  weighted sum of genome param unit-scalars → traits, clamped [0,1]). Pure/deterministic; trait boundary (inv. #5).
+- Selection wired into the tick loop: per-organism `Genotype∈[0,1]` (seeded), constant-N **Wright-Fisher**
+  resampling ∝ fitness (`0.05 + base_growth·genotype`), drawn from the single `SimRng` in `OrgId` order (inv. #3;
+  ordered cumulative table + binary search; BTreeMap write-back). `allele_freq` (mean genotype) in `RunStats`,
+  folded into the hash, surfaced by the harness. No extinction (constant N).
+- Determinism hash updated `3393…`→`fde0e0b61b9e23e6` (expected; gate compares two runs, still GREEN).
+- Perf re-baselined at Stage 1 exit (~175 M→~19 M organism-updates/s at 10k; selection added — DECISIONS table).
+- ADR-005 (selection model). Tests: express-deterministic, selection-responds-to-trait (directional allele_freq),
+  proptest allele_freq+traits ∈ [0,1], same-seed-same-stats. Loop: implementer → gate (GREEN incl. bench) →
+  reviewer APPROVE. Follow-ups F1/F2 tracked in TASKS.
+
 ### S1.4 — gated edit application (feat, Stage 1)
 - `crates/crispr`: `apply_edit(genome, edit, variants, on, off, thresholds, rng)` — the core CRISPR mechanic
   (SPEC §4): resolve cas+locus → find PAM → score (on/off) → gate. Pass ⇒ mutate the target Parameter

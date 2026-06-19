@@ -40,7 +40,7 @@
 - [x] **S1.2** PAM finding via **rust-bio** (MIT) in `crates/crispr`: given a locus sequence + Cas variant, return PAM/cut sites. AC: unit tests on known sequences for NGG and TTTV; property test: every reported site actually matches the PAM regex. ✅ DONE (both strands, IUPAC-degenerate; gate green; reviewer APPROVE; ADR-004).
 - [x] **S1.3** `Score` traits (`OnTargetScore`, `OffTargetScore`) + in-core default impls (heuristic on-target eff, naive off-target hit count). *Pluggable behind a trait — invariant #5.* AC: trait + default impl unit-tested; swapping impls compiles without touching sim-core. ✅ DONE (object-safe + generic-swappable; gate green; reviewer APPROVE).
 - [x] **S1.4** Edit application: `(CasVariant, target_locus, guide)` → gate on on-target eff + off-target count → mutate Parameter(s); failed-edit path = off-target perturbation elsewhere (never a silent success). AC: unit + property tests — edit never yields an invalid genome; failed edits never silently succeed. ✅ DONE (seeded ChaCha8 threaded; both §10.4 props; gate green; adversarial reviewer APPROVE).
-- [ ] **S1.5** `GenotypePhenotypeMap` (Parameters → Traits, weighted-sum / simple GRN) feeding selection in `sim-core`. AC: trait values deterministic for a fixed genome; selection responds to a trait; property test: allele freq ∈ [0,1].
+- [x] **S1.5** `GenotypePhenotypeMap` (Parameters → Traits, weighted-sum / simple GRN) feeding selection in `sim-core`. AC: trait values deterministic for a fixed genome; selection responds to a trait; property test: allele freq ∈ [0,1]. ✅ DONE (WeightedSumMap + constant-N Wright-Fisher selection, allele_freq directional; gate green incl. re-baselined bench; reviewer APPROVE; ADR-005). **← Stage 1 COMPLETE.**
 
 ### Stage 2 — Genetics realism (`crates/oracle-slim`, SLiM subprocess) — SPEC §8
 - [ ] 🛑 **S2.1** `tools/install_slim.sh`: build SLiM from source at the pinned tag (SPEC §W2), record `slim -version` in DECISIONS.md. *Touches invariant #1 + #7 — human sign-off before linking decisions.* AC: `slim -version` matches the pinned tag.
@@ -70,8 +70,19 @@
 
 ---
 
+## FOLLOW-UPS / TECH DEBT (non-blocking; pick up when convenient)
+- [ ] **F1** sim-core selection write-back: replace the per-generation `BTreeMap<u32,f64>` with a `Vec` indexed
+  by contiguous `OrgId` (O(N) vs O(N log N) + allocation). Would lift the Stage 1 perf baseline (ADR-005).
+- [ ] **F2** sim-core `metabolism`: it draws from `SimRng` *inside* `Query<&mut Energy>` iteration — safe today
+  (single archetype, no structural changes) but harden (snapshot to ordered Vec, or draw outside the query) if
+  any system later adds/removes components per-organism. (Reviewer note, S1.5.)
+
 ## DONE
 - **S0** — Stage 0 headless deterministic core skeleton. DoD met: `cargo run -p harness -- --seed 42
   --runs 1 --generations 200` works; `--runs 8` produces 8 distinct-seed runs; determinism gate GREEN
-  (`3393427b072eb803`); baseline bench recorded (~175 M organism-updates/s, M4 Max). See CHANGELOG +
-  DECISIONS (ADR-001, ADR-002, baseline table).
+  (`3393427b072eb803`, superseded by `fde0e0b6…` after S1.5); baseline bench recorded. See CHANGELOG +
+  DECISIONS (ADR-001, ADR-002).
+- **Stage 1 (S1.1–S1.5)** — CRISPR mechanic complete: Cas-variant table (S1.1), PAM finding via rust-bio
+  (S1.2), pluggable Score traits (S1.3), gated edit application (S1.4), GP map + Wright-Fisher selection
+  (S1.5). ADR-003/004/005. Every slice ran through the multi-agent loop (implementer → tools/gate.sh →
+  reviewer APPROVE) and was committed individually. Determinism hash now `fde0e0b61b9e23e6`.

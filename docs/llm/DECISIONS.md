@@ -154,20 +154,58 @@ finding. SPEC §0.4 requires an ADR when any subsystem is built from scratch ins
 
 ---
 
+## ADR-005 — In-core selection model: constant-N Wright-Fisher with a fitness floor (Stage 1, S1.5)
+
+- **Date:** 2026-06-19
+- **Status:** Accepted
+- **Stage:** 1 (slice S1.5)
+
+### Context
+S1.5 needs *selection that responds to a trait* in the headless core, while staying deterministic (inv. #3)
+and not going extinct (so the harness keeps producing meaningful stats). It must remain a lightweight in-core
+default — the rigorous pop-gen genetics is the Stage 2 SLiM oracle's job (SPEC §8), not this.
+
+### Decision
+- Each organism carries a per-individual `Genotype ∈ [0,1]` (seeded at spawn from the single `SimRng`).
+- **Fitness** = `0.05 + base_growth · genotype`, where `base_growth` is the genome's `GrowthRate` trait from
+  the `WeightedSumMap` GP map (expressed once into a `BaseGrowthRate` resource — genotype→phenotype stays in
+  sim-core, inv. #2). The `0.05` floor keeps every weight strictly positive (no zero-weight degeneracy / div-by-zero).
+- **Selection** = constant-population **Wright-Fisher** resampling: each generation draw exactly N offspring
+  with probability ∝ fitness, via an ordered cumulative-weight table + binary search, consuming the threaded
+  `SimRng` in `OrgId` order. Constant N ⇒ no extinction. `allele_freq` = mean `Genotype` over the id-sorted
+  population (∈ [0,1]), reported in `RunStats` and folded into the determinism hash.
+
+### Consequences
+- **+** Deterministic, transparent, directional selection (the AC `allele_freq` shift); a clean stand-in until
+  the SLiM oracle (Stage 2) carries real genetics, which can then be validated against this baseline behavior.
+- **+** No extinction edge cases; the harness always yields stats.
+- **−** It's a toy model (one scalar genotype, one trait → fitness); not population genetics. Intentional for the PoC.
+- **−** The per-generation write-back uses a `BTreeMap` (O(N log N) + allocation) — correct and ordered, but a
+  `Vec` indexed by contiguous `OrgId` would be O(N). Tracked as a perf follow-up (TASKS); drove the Stage 1 re-baseline.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
-Recorded at the end of **Stage 0 / slice S0** on the reference platform (Apple M4 Max, native aarch64,
-`release` profile: `lto = "thin"`, `codegen-units = 1`). Source: `cargo bench -p sim-core`
-(`crates/sim-core/benches/tick.rs`). The perf gate (§10.7) fails on a regression **below** this baseline.
+Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).
+Source: `cargo bench -p sim-core` (`crates/sim-core/benches/tick.rs`), run via `GATE_BENCH=1 tools/gate.sh`.
+The perf gate (§10.7) fails on a regression **below the CURRENT baseline**. Re-baseline at each stage that
+changes the hot path, in the same slice (this is anticipated — see the Stage 0 row note).
 
+### Current baseline — Stage 1 exit (slice S1.5): empty loop + Wright-Fisher selection
 | Workload (entities × generations) | Median wall time | Throughput |
 |---|---|---|
-| 1 000 × 50  | **302.6 µs** | ~165 M organism-updates/s |
-| 5 000 × 50  | **1.438 ms** | ~174 M organism-updates/s |
-| 10 000 × 50 | **2.856 ms** | ~175 M organism-updates/s |
+| 1 000 × 50  | **1.645 ms** | ~30 M organism-updates/s |
+| 5 000 × 50  | **10.48 ms** | ~24 M organism-updates/s |
+| 10 000 × 50 | **25.97 ms** | ~19 M organism-updates/s |
 
-**Headline baseline:** ~**175 M organism-updates/s** (≈ steady throughput; 10 000 entities advance 50
-generations in ~2.86 ms ⇒ ~17.5 k generations/s at 10 k entities). Well clear of the SPEC §11 trigger to
-move the hot path to GPU or coarsen organisms into cohorts; revisit if a later stage's per-organism work
-drops throughput below this line. (Stage 0's per-organism work is a placeholder; absolute numbers will move
-as real phenotype/selection lands — re-baseline at the stage that adds it, and update this table in the same slice.)
+**Headline (current):** ~**19 M organism-updates/s** at 10 k entities (10 k advance 50 generations of
+*real selection* in ~26 ms ⇒ ~1.9 k generations/s). The ~9× drop vs the Stage 0 row is **expected**: S1.5
+added the per-generation Wright-Fisher selection step (cumulative-fitness sampling + write-back) where Stage 0
+had an empty loop. Still far from the SPEC §11 trigger to move to GPU / cohorts. Known cheap win (tracked in
+TASKS follow-ups): the selection write-back uses a `BTreeMap` (O(N log N) + allocation); a `Vec` indexed by the
+contiguous `OrgId` would be O(N) — would lift this baseline materially when done.
+
+### Historical — Stage 0 (slice S0): empty deterministic loop (no selection)
+| 1 000 × 50 → **302.6 µs** · 5 000 × 50 → **1.438 ms** · 10 000 × 50 → **2.856 ms** (~175 M updates/s). |
+| Superseded by the Stage 1 row above once real selection landed; kept for the record. |

@@ -133,8 +133,8 @@ fn main() -> ExitCode {
     );
     for (i, r) in indices.iter().zip(&results) {
         println!(
-            "  run {i:>4}  seed={:<20}  entities={:<7}  generations={:<6}  hash={:016x}",
-            r.seed, r.entity_count, r.generations, r.hash
+            "  run {i:>4}  seed={:<20}  entities={:<7}  generations={:<6}  allele_freq={:<8.6}  hash={:016x}",
+            r.seed, r.entity_count, r.generations, r.allele_freq, r.hash
         );
     }
     println!("combined_hash={combined:016x}");
@@ -204,10 +204,11 @@ fn write_run_artifacts(
     let mut ndjson = String::new();
     for (i, r) in indices.iter().zip(results) {
         ndjson.push_str(&format!(
-            "{{\"run_index\": {i}, \"seed\": {seed}, \"entity_count\": {ec}, \"generations\": {g}, \"hash\": \"{h:016x}\"}}\n",
+            "{{\"run_index\": {i}, \"seed\": {seed}, \"entity_count\": {ec}, \"generations\": {g}, \"allele_freq\": {af}, \"hash\": \"{h:016x}\"}}\n",
             seed = r.seed,
             ec = r.entity_count,
             g = r.generations,
+            af = r.allele_freq,
             h = r.hash,
         ));
     }
