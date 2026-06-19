@@ -1,0 +1,13 @@
+{
+  "_case": "produce_trees example: N=500, mu=1e-7, rho=1e-8, L=1e6, generations=200, seed=1234; SLiM v5.2 (commit f11de0d). Re-record + ADR if SLiM version changes.",
+  "max_allele_freq": 0.283,
+  "mean_allele_freq": 0.022241273100616018,
+  "nucleotide_diversity": 3.9124134134134206e-05,
+  "num_individuals": 500,
+  "num_mutations": 974,
+  "num_samples": 1000,
+  "num_segregating_sites": 974,
+  "num_sites": 974,
+  "num_trees": 90,
+  "sequence_length": 1000000.0
+}

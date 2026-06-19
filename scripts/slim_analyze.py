@@ -57,13 +57,62 @@ def analyze(path: str) -> dict:
     return stats
 
 
+# Integer fields are reproducible EXACTLY within a pinned SLiM version (SPEC §6/§12); float fields are
+# compared with a small relative tolerance (FP / serialization). A mismatch usually means SLiM drifted
+# (e.g. a version bump) — re-record the golden and write an ADR (invariant #7).
+_INT_FIELDS = frozenset(
+    {
+        "num_samples",
+        "num_individuals",
+        "num_trees",
+        "num_sites",
+        "num_mutations",
+        "num_segregating_sites",
+    }
+)
+
+
+def compare(stats: dict, golden: dict, rel_tol: float) -> list:
+    diffs = []
+    for key, gv in golden.items():
+        if key.startswith("_"):
+            continue  # metadata (e.g. "_case": params/seed that produced this golden) — not a stat
+        if key not in stats:
+            diffs.append(f"{key}: missing from computed stats")
+            continue
+        sv = stats[key]
+        if key in _INT_FIELDS:
+            if int(sv) != int(gv):
+                diffs.append(f"{key}: {sv} != golden {gv} (exact match required)")
+        else:
+            denom = abs(gv) if gv != 0 else 1.0
+            if abs(float(sv) - float(gv)) / denom > rel_tol:
+                diffs.append(f"{key}: {sv} vs golden {gv} (rel diff > {rel_tol})")
+    return diffs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Summarize a SLiM .trees into JSON stats.")
     ap.add_argument("trees", help="path to a .trees tree-sequence file")
     ap.add_argument("-o", "--out", help="write JSON here instead of stdout")
+    ap.add_argument("--check", metavar="GOLDEN", help="compare stats against a golden JSON; exit 1 on mismatch")
+    ap.add_argument("--tol", type=float, default=1e-6, help="relative tolerance for float fields (default 1e-6)")
     args = ap.parse_args()
 
     stats = analyze(args.trees)
+
+    if args.check:
+        with open(args.check) as fh:
+            golden = json.load(fh)
+        diffs = compare(stats, golden, args.tol)
+        if diffs:
+            sys.stderr.write("ORACLE GATE FAIL — stats diverged from golden:\n")
+            for d in diffs:
+                sys.stderr.write(f"  - {d}\n")
+            return 1
+        sys.stdout.write(f"ORACLE GATE OK — {len(golden)} fields match golden within tol={args.tol}\n")
+        return 0
+
     text = json.dumps(stats, indent=2, sort_keys=True)
     if args.out:
         with open(args.out, "w") as fh:

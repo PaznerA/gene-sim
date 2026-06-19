@@ -16,6 +16,7 @@ It runs, in order, and reports PASS/FAIL/SKIP/N-A per item (SPEC §10):
 4. `./tools/check_determinism.sh`            — same seed twice → identical hash (**HARD**, inv. #3)
 5. `cargo test --workspace --features proptest`   — invariant property tests
 6. `cargo bench -p sim-core`                 — perf not regressed below baseline (§11; opt-in via GATE_BENCH=1)
-7. `./scripts/check_license.sh`              — no GPL crate in the dep tree; oracle-slim shells out only (**HARD**, inv. #1)
+7. `./tools/check_slim_oracle.sh`            — Stage 2 oracle: pinned seed → SLiM stats within tol of the golden (§10.6; skips if slim/.venv absent)
+8. `./scripts/check_license.sh`              — no GPL crate in the dep tree; oracle-slim shells out only (**HARD**, inv. #1)
 
 `tools/gate.sh` exits non-zero if ANY gate FAILED. **Any red = STOP THE LINE.** Do not proceed to commit.

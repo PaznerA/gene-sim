@@ -4,6 +4,16 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S2.4 + S2.5 — golden oracle gate + license gate (feat, Stage 2; **Stage 2 complete**)
+- **S2.4** golden oracle gate (SPEC §10.6): `data/golden/slim_case1.json` records the stats for a pinned case
+  (seed 1234 + the produce_trees params, SLiM v5.2). `slim_analyze.py --check` compares a fresh run to the
+  golden (integer fields exact, floats within rel-tol 1e-6); `tools/check_slim_oracle.sh` drives it and skips
+  gracefully if slim/.venv/golden are absent. Wired into `tools/gate.sh` as gate 7/8. Verified: passes on a
+  fresh run, fails on a tampered golden. This pins the genetics to SLiM v5.2 (re-record + ADR on a version bump).
+- **S2.5** license gate — already delivered in the dev-loop hardening (`scripts/check_license.sh`, gate 8/8):
+  SPDX-OR-aware GPL detector + `oracle-slim` depless assertion. Marked done; no new work.
+- `tools/gate.sh` is now an 8-gate suite (added the oracle gate); the `gate` skill lists it.
+
 ### S2.3 — tskit `.trees` analysis (feat, Stage 2)
 - `scripts/slim_analyze.py` (tskit): reads a SLiM `.trees` → JSON stats (num_samples/individuals/trees/sites/
   mutations, segregating sites, mean+max derived-allele freq ∈ [0,1], nucleotide diversity). Stats come from
