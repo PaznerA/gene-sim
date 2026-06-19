@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S3.3 — parallel batch runner + columnar Parquet stats (feat, Stage 3)
+- `harness --per-gen-stats`: drives the stepwise `Simulation` and writes `data/runs/<run_id>/per_gen.csv`
+  (run_index, generation, population_size, allele_freq + 5 trait columns), additive — final stats hash
+  unchanged (proven). `run_id` for `--run-index` now keyed `_i{index}` so parallel jobs don't collide.
+- `tools/run_batch.sh [MASTER] [RUNS] [GENS]` (SPEC §W7): builds release once, runs `target/release/harness`
+  in parallel via `xargs -P $(nproc)` over derived seeds. **Two batches → byte-identical per_gen.csv** (reproducible).
+- `scripts/aggregate_parquet.py` (pyarrow): globs `data/runs/*/per_gen.csv` → one columnar **Parquet**
+  (pinned schema, lossless concat). Verified: 8 runs → 400 rows × 9 cols.
+- `pyarrow 24.0.0` pinned (`scripts/requirements.txt` + DECISIONS row; Apache-2.0, analysis-only, never linked).
+  Determinism hash unchanged (`fde0e0b6…`). Loop: implementer (Rust+shell) + orchestrator (Python) → gate
+  (GREEN) → reviewer (send-back for the pyarrow pin → recorded → APPROVE).
+
 ### S3.2 — replay logs: seed.json + actions.ndjson (feat, Stage 3)
 - `crates/harness/src/replay.rs`: `record_episode(config, seed, actions, dir)` writes `data/runs/<run_id>/`
   `seed.json` (master seed + config + pinned tool versions, SPEC §5) + `actions.ndjson` (one `Action`/line);

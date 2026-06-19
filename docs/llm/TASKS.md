@@ -52,8 +52,8 @@
 ### Stage 3 — AI harness (`crates/harness`) — SPEC §8
 - [x] **S3.1** Gym-like env: `reset()` / `step(action)` / `seed()` (SPEC §2.2, §5). Action = `EditAction` at **species/operator** granularity (invariant #6). AC: env trait + unit test of one reset/step/seed cycle. ✅ DONE (stepwise `Simulation` in sim-core + `GeneSimEnv` in harness; species-granular `Action`; determinism hash unchanged; gate green; reviewer APPROVE).
 - [x] **S3.2** Replay logs: `seed.json` (master + derived seeds + pinned versions) + `actions.ndjson`. Replaying `seed + actions` is bit-identical (SPEC §5, §6). AC: replay of a logged run reproduces the same stats hash. ✅ DONE (`harness::replay` record/replay share one path → bit-identical hash; serde on LocusId/GuideSequence/Action; validation-preserving guide deser; gate green; reviewer APPROVE).
-- [ ] **S3.3** Parallel batch runner `tools/run_batch.sh` (SPEC §W7): hundreds of deterministic runs; per-generation stats to Parquet. AC: M parallel runs reproduce; columnar stats written.
-- [ ] **S3.4** Confirm the ~10k-named-agent ceiling (invariant #6): actions stay operator/species level, never per-organism. AC: a test/assert that the action space is species-granular.
+- [x] **S3.3** Parallel batch runner `tools/run_batch.sh` (SPEC §W7): hundreds of deterministic runs; per-generation stats to Parquet. AC: M parallel runs reproduce; columnar stats written. ✅ DONE (`harness --per-gen-stats` → per_gen.csv; `run_batch.sh` parallel via xargs (two batches byte-identical); `scripts/aggregate_parquet.py` → columnar Parquet (8 runs → 400×9); pyarrow pinned; hash unchanged; reviewer APPROVE).
+- [x] **S3.4** Confirm the ~10k-named-agent ceiling (invariant #6): actions stay operator/species level, never per-organism. AC: a test/assert that the action space is species-granular. ✅ DONE (satisfied by S3.1: `Action` has no per-organism variant — unrepresentable by construction; `action_space_is_species_granular` compile-guard test). **← Stage 3 COMPLETE.**
 
 ### Stage 4 — Godot UI (LAST) (`godot/`) — SPEC §8
 - [ ] 🛑 **S4.1** `tools/install_godot.sh`: pin Godot minor (SPEC §W3), `godot/` project skeleton, `godot --headless --quit` smoke. *Build order gate — only after the core is headless + deterministic (invariant #4).* AC: pinned version recorded; headless smoke passes.
@@ -86,3 +86,7 @@
   (S1.2), pluggable Score traits (S1.3), gated edit application (S1.4), GP map + Wright-Fisher selection
   (S1.5). ADR-003/004/005. Every slice ran through the multi-agent loop (implementer → tools/gate.sh →
   reviewer APPROVE) and was committed individually. Determinism hash now `fde0e0b61b9e23e6`.
+- **Stage 2 (S2.1–S2.5)** — Genetics realism: SLiM v5.2 built (subprocess-only), `oracle-slim` driver (zero
+  deps), tskit `.trees` analysis, golden oracle gate (pins genetics to v5.2), license gate. Invariant #1 clean.
+- **Stage 3 (S3.1–S3.4)** — AI harness: gym-like `reset/step/seed` env (species-granular actions, inv. #6),
+  bit-identical replay logs (seed.json + actions.ndjson), parallel batch runner + columnar Parquet stats.

@@ -22,6 +22,7 @@
 | Python (analysis) | **3.13.14** | installed (Stage 2, S2.3) | For the `.trees` analysis scripts; in the gitignored `.venv` (`scripts/requirements.txt`). |
 | `tskit` / `pyslim` / `numpy` | **1.0.3 / 1.1.1 / 2.4.6** | installed (Stage 2, S2.3) | `.trees` read-back + stats. MIT / MIT / BSD. |
 | `msprime` | **1.4.2** | installed, optional | **GPL-3** — used ONLY by standalone analysis scripts (separate process, never linked); same pattern as the SLiM subprocess, so invariant #1 is unaffected. Optional (neutral-mutation overlay, S2.4). |
+| `pyarrow` | **24.0.0** | installed (Stage 3, S3.3) | Apache-2.0 — columnar Parquet for batch analytics (SPEC §5). Analysis-only (separate process), never linked. |
 | Godot | **4.x** (pin the exact minor at install) | NOT yet installed — Stage 4 | Thin 2D UI, built LAST; `tools/install_godot.sh`. |
 
 > Rows marked "NOT yet …" record the **intended** pin; the exact tag/minor is confirmed and the Status

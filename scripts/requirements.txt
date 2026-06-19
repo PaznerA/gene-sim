@@ -11,3 +11,4 @@ tskit==1.0.3     # MIT  — tree-sequence I/O & stats
 pyslim==1.1.1    # MIT  — SLiM .trees helpers
 numpy==2.4.6     # BSD-3-Clause
 msprime==1.4.2   # GPL-3 — OPTIONAL (neutral-mutation overlay, S2.4); standalone analysis only, never linked
+pyarrow==24.0.0  # Apache-2.0 — columnar Parquet for batch analytics (S3.3, SPEC §5)

@@ -5,11 +5,12 @@
 //! `tools/check_determinism.sh`. In normal mode it also writes `data/runs/<run_id>/{seed.json,stats.ndjson}`.
 
 use std::collections::hash_map::DefaultHasher;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sim_core::{derive_seed, run_headless, RunStats, SimConfig};
+use sim_core::{derive_seed, run_headless, RunStats, SimConfig, Simulation, Trait};
 
 const USAGE: &str = "\
 gene-sim harness — headless deterministic sim runner
@@ -24,13 +25,14 @@ OPTIONS:
     --run-index <u32>     Run only this single index off the master seed (for batch sharding, §W7)
     --generations <u64>   Generations per run. Default: 200
     --entities <u32>      Organisms spawned per run. Default: 1000
+    --per-gen-stats       Also write per-generation columnar stats to data/runs/<id>/per_gen.csv
     --hash-only           Print only the combined determinism hash (no files written)
     -h, --help            Show this help
 
 Examples:
     harness --seed 42 --runs 1 --generations 200
     harness --seed 1234 --generations 300 --hash-only
-    harness --master-seed 42 --run-index 3 --generations 500
+    harness --master-seed 42 --run-index 3 --generations 500 --per-gen-stats
 ";
 
 struct Args {
@@ -40,6 +42,7 @@ struct Args {
     generations: u64,
     entities: u32,
     hash_only: bool,
+    per_gen_stats: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -50,6 +53,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut generations: u64 = 200;
     let mut entities: u32 = 1000;
     let mut hash_only = false;
+    let mut per_gen_stats = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -59,6 +63,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--hash-only" => hash_only = true,
+            "--per-gen-stats" => per_gen_stats = true,
             "--seed" => seed = Some(parse_num(&take("--seed")?, "--seed")?),
             "--master-seed" => {
                 master_seed = Some(parse_num(&take("--master-seed")?, "--master-seed")?)
@@ -79,6 +84,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         generations,
         entities,
         hash_only,
+        per_gen_stats,
     }))
 }
 
@@ -106,14 +112,23 @@ fn main() -> ExitCode {
         None => (0..args.runs).collect(),
     };
 
+    let want_per_gen = args.per_gen_stats && !args.hash_only;
+
     let mut results: Vec<RunStats> = Vec::with_capacity(indices.len());
+    // Per-run, per-generation CSV rows (only populated when --per-gen-stats and not --hash-only).
+    let mut per_gen: Vec<String> = Vec::with_capacity(if want_per_gen { indices.len() } else { 0 });
     for &i in &indices {
         let cfg = SimConfig {
             seed: derive_seed(args.master, u64::from(i)),
             generations: args.generations,
             entity_count: args.entities,
         };
+        // The determinism hash always comes from the one-shot path (provably unchanged by --per-gen-stats):
+        // `run_headless` is reset → step(generations) → run_stats. Per-gen stepping is collected separately.
         results.push(run_headless(&cfg));
+        if want_per_gen {
+            per_gen.push(collect_per_gen_csv(i, &cfg));
+        }
     }
 
     let combined = combine_hashes(results.iter().map(|r| r.hash));
@@ -139,7 +154,7 @@ fn main() -> ExitCode {
     }
     println!("combined_hash={combined:016x}");
 
-    match write_run_artifacts(&args, &indices, &results, combined) {
+    match write_run_artifacts(&args, &indices, &results, combined, &per_gen) {
         Ok(dir) => println!("wrote {}", dir.display()),
         Err(e) => {
             eprintln!("warning: could not write run artifacts: {e}");
@@ -157,21 +172,67 @@ fn combine_hashes(hashes: impl Iterator<Item = u64>) -> u64 {
     h.finish()
 }
 
+/// CSV header for the per-generation columnar stats (SPEC §5). Fixed, deterministic column order.
+const PER_GEN_HEADER: &str =
+    "run_index,generation,population_size,allele_freq,growth_rate,reflectance,drought_tolerance,fecundity,kill_switch_linkage";
+
+/// Drive the stepwise [`Simulation`] for run `i`, advancing ONE generation at a time and calling
+/// `observe()` after each, building the per-generation CSV body (one row per generation; no header).
+///
+/// Stepping 1-gen-at-a-time `N` times is bit-identical to one-shot `step(N)` (proven by sim-core's
+/// `simulation_stepwise_matches_one_shot` — one seeded stream, no re-seed) and `observe()` is pure, so
+/// this does NOT influence the determinism hash, which comes from the one-shot `run_headless` path
+/// (invariant #3). Trait values are pulled in fixed [`Trait::ALL`] order from each `Observation.phenotype`.
+fn collect_per_gen_csv(i: u32, cfg: &SimConfig) -> String {
+    let mut sim = Simulation::reset(cfg);
+    // One data row per generation (generations 1..=cfg.generations), deterministic order.
+    let mut body = String::new();
+    for _ in 0..cfg.generations {
+        sim.step(1);
+        let o = sim.observe();
+        let p = &o.phenotype;
+        // Trait values in canonical Trait::ALL order; `0.0` for any (shouldn't happen) missing trait.
+        let _ = writeln!(
+            body,
+            "{run},{gen},{pop},{af},{gr},{refl},{dt},{fec},{ksl}",
+            run = i,
+            gen = o.generation,
+            pop = o.population_size,
+            af = o.allele_freq,
+            gr = p.get(Trait::GrowthRate).unwrap_or(0.0),
+            refl = p.get(Trait::Reflectance).unwrap_or(0.0),
+            dt = p.get(Trait::DroughtTolerance).unwrap_or(0.0),
+            fec = p.get(Trait::Fecundity).unwrap_or(0.0),
+            ksl = p.get(Trait::KillSwitchLinkage).unwrap_or(0.0),
+        );
+    }
+    body
+}
+
 /// Write `data/runs/<run_id>/{seed.json,stats.ndjson}` (human-readable; replay contract seed, SPEC §5).
-/// `run_id` is deterministic (no wall-clock) so the path itself is reproducible.
+/// `run_id` is deterministic (no wall-clock) so the path itself is reproducible. When a single
+/// `--run-index i` is selected (batch sharding, §W7) the id is keyed by that index (`_i{i}`) so parallel
+/// batch jobs write to distinct, non-colliding directories; otherwise it is keyed by the run count.
 fn write_run_artifacts(
     args: &Args,
     indices: &[u32],
     results: &[RunStats],
     combined: u64,
+    per_gen: &[String],
 ) -> std::io::Result<PathBuf> {
-    let run_id = format!(
-        "m{}_g{}_n{}_r{}",
-        args.master,
-        args.generations,
-        args.entities,
-        indices.len()
-    );
+    let run_id = match args.run_index {
+        Some(i) => format!(
+            "m{}_g{}_n{}_i{}",
+            args.master, args.generations, args.entities, i
+        ),
+        None => format!(
+            "m{}_g{}_n{}_r{}",
+            args.master,
+            args.generations,
+            args.entities,
+            indices.len()
+        ),
+    };
     let dir = PathBuf::from("data/runs").join(&run_id);
     std::fs::create_dir_all(&dir)?;
 
@@ -213,6 +274,18 @@ fn write_run_artifacts(
         ));
     }
     std::fs::write(dir.join("stats.ndjson"), ndjson)?;
+
+    // Per-generation columnar stats (SPEC §5), only when --per-gen-stats was set. One header + one row
+    // per generation per run, concatenated in stable run-index order (the Parquet step aggregates these).
+    if !per_gen.is_empty() {
+        let mut csv = String::with_capacity(PER_GEN_HEADER.len() + 1);
+        csv.push_str(PER_GEN_HEADER);
+        csv.push('\n');
+        for rows in per_gen {
+            csv.push_str(rows);
+        }
+        std::fs::write(dir.join("per_gen.csv"), csv)?;
+    }
 
     Ok(dir)
 }
