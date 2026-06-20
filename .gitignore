@@ -32,5 +32,8 @@ __pycache__/
 /crates/godot-sim/target/
 # CI-staged Godot export artifacts (release.yml writes these into godot/ transiently)
 /godot/libgodot_sim.*
+/godot/godot_sim.dll
 /godot/gene_sim.gdextension
 /build/
+/dist/
+/debroot/

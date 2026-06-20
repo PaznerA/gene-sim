@@ -1,10 +1,18 @@
 name: Release
 
-# Build distributable executables on a version tag (v*) or manual dispatch:
-#   • binaries: the headless `harness` CLI + the `godot_sim` cdylib (LiveSim), for Linux/macOS/Windows.
-#   • godot-export: the Godot game executable for Linux, with the LiveSim cdylib bundled (best-effort:
-#     needs the committed godot/export_presets.cfg + the 4.6 export templates; allowed to fail so the
-#     reliable cargo binaries always publish).
+# Build distributable artifacts on a version tag (v*) or manual dispatch.
+#   • binaries    — the headless `harness` CLI + the `godot_sim` cdylib (LiveSim), per OS (dev/SDK artifacts).
+#   • game-linux  — the playable Godot game exported for Linux, packaged as a .deb installer.
+#   • game-windows— the playable Godot game exported for Windows, packaged as a .zip (gene-sim.exe + godot_sim.dll).
+#   • publish     — on a TAG push only, attach the .deb + .zip (+ raw binaries) to the GitHub Release.
+#
+# macOS .dmg is intentionally deferred (needs an Apple Developer ID cert + notarization to avoid Gatekeeper
+# quarantine); the `binaries` job still ships the macOS harness CLI + dylib for headless/SDK use.
+#
+# The GAME jobs auto-register LiveSim in the exported build via a staged res://gene_sim.gdextension whose
+# [libraries] entry points at the cdylib; Godot exports that native lib as a SIBLING file next to the
+# executable (GDExtension shared objects are not embedded in the PCK), so each package ships the binary AND
+# its lib together. Renderer stays read-only — biology is in the Rust core (inv #2).
 on:
   push:
     tags: ['v*']
@@ -13,7 +21,12 @@ on:
 permissions:
   contents: read
 
+env:
+  GODOT_VERSION: '4.6-stable'
+  GODOT_TEMPLATES_DIR: '4.6.stable'
+
 jobs:
+  # ── 1) Dev/SDK artifacts: the guaranteed deliverable (the headless CLI + the LiveSim cdylib). ───────────────
   binaries:
     name: binaries (${{ matrix.label }})
     strategy:
@@ -53,8 +66,7 @@ jobs:
             *)       cp target/release/harness        dist/; lib="libgodot_sim.so";    key="linux.x86_64" ;;
           esac
           cp "crates/godot-sim/target/release/$lib" dist/
-          # A per-OS GDExtension descriptor keyed for THIS platform, pointing at the flat lib beside it in dist/
-          # (the committed macOS-only descriptor would be wrong for Linux/Windows — see review).
+          # A per-OS GDExtension descriptor keyed for THIS platform, pointing at the flat lib beside it in dist/.
           cat > dist/gene_sim.gdextension <<EOF
           [configuration]
           entry_symbol = "gdext_rust_init"
@@ -72,10 +84,10 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  godot-export:
-    name: godot game executable (linux, best-effort)
+  # ── 2) Linux game → .deb installer. ────────────────────────────────────────────────────────────────────────
+  game-linux:
+    name: linux game (.deb)
     runs-on: ubuntu-latest
-    continue-on-error: true  # the cargo binaries above are the guaranteed deliverable; this is a bonus
     steps:
       - uses: actions/checkout@v4
       - name: Show Rust toolchain
@@ -85,17 +97,18 @@ jobs:
       - name: Build LiveSim cdylib (linux release)
         run: cargo build --release --manifest-path crates/godot-sim/Cargo.toml
 
-      - name: Install Godot 4.6 + export templates
+      - name: Install Godot ${{ env.GODOT_VERSION }} + export templates (linux)
         run: |
           set -euo pipefail
-          base="https://github.com/godotengine/godot/releases/download/4.6-stable"
-          curl -fsSL -o /tmp/godot.zip "$base/Godot_v4.6-stable_linux.x86_64.zip"
+          base="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}"
+          curl -fsSL -o /tmp/godot.zip "$base/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
           unzip -q /tmp/godot.zip -d /tmp/godot
-          sudo install -m 755 /tmp/godot/Godot_v4.6-stable_linux.x86_64 /usr/local/bin/godot
-          curl -fsSL -o /tmp/templates.tpz "$base/Godot_v4.6-stable_export_templates.tpz"
-          mkdir -p "$HOME/.local/share/godot/export_templates/4.6.stable"
+          sudo install -m 755 "/tmp/godot/Godot_v${GODOT_VERSION}_linux.x86_64" /usr/local/bin/godot
+          curl -fsSL -o /tmp/templates.tpz "$base/Godot_v${GODOT_VERSION}_export_templates.tpz"
           unzip -q /tmp/templates.tpz -d /tmp/templates
-          mv /tmp/templates/templates/* "$HOME/.local/share/godot/export_templates/4.6.stable/"
+          dest="$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIR}"
+          mkdir -p "$dest"
+          mv /tmp/templates/templates/* "$dest/"
 
       - name: Stage the LiveSim GDExtension into the project (export bundles res:// only)
         run: |
@@ -105,12 +118,13 @@ jobs:
           [configuration]
           entry_symbol = "gdext_rust_init"
           compatibility_minimum = 4.6
+          reloadable = true
           [libraries]
           linux.x86_64.debug = "res://libgodot_sim.so"
           linux.x86_64.release = "res://libgodot_sim.so"
           EOF
 
-      - name: Export the Linux executable
+      - name: Export the Linux game executable
         run: |
           set -euo pipefail
           mkdir -p build
@@ -118,10 +132,156 @@ jobs:
           godot --headless --path godot --import 2>/dev/null || true
           godot --headless --path godot --export-release "Linux" "$GITHUB_WORKSPACE/build/gene-sim.x86_64"
           chmod +x build/gene-sim.x86_64 || true
+          # GDExtension shared objects export as siblings; guarantee the lib is beside the binary (safety net).
+          [ -f build/libgodot_sim.so ] || cp crates/godot-sim/target/release/libgodot_sim.so build/libgodot_sim.so
           ls -la build
+          test -f build/gene-sim.x86_64
+
+      - name: Package .deb
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME:-main}"
+          if [[ "$REF" == v* ]]; then VER="${REF#v}"; else VER="0.1.0-beta"; fi
+          DEB_VER="$(echo "$VER" | sed 's/-/~/')-1"   # 0.1.0-beta -> 0.1.0~beta-1 (prerelease sorts correctly)
+          echo "Packaging gene-sim $DEB_VER"
+          root="debroot"
+          rm -rf "$root"
+          mkdir -p "$root/DEBIAN" "$root/opt/gene-sim" "$root/usr/bin" "$root/usr/share/applications"
+          # The game + its GDExtension lib live together; the binary auto-loads the sibling libgodot_sim.so.
+          cp build/gene-sim.x86_64 "$root/opt/gene-sim/gene-sim.x86_64"
+          cp build/libgodot_sim.so "$root/opt/gene-sim/libgodot_sim.so"
+          chmod 755 "$root/opt/gene-sim/gene-sim.x86_64"
+          cat > "$root/usr/bin/gene-sim" <<'EOF'
+          #!/bin/sh
+          exec /opt/gene-sim/gene-sim.x86_64 "$@"
+          EOF
+          chmod 755 "$root/usr/bin/gene-sim"
+          cat > "$root/usr/share/applications/gene-sim.desktop" <<'EOF'
+          [Desktop Entry]
+          Name=gene-sim
+          Comment=2D CRISPR ecosystem simulator (beta)
+          Exec=/usr/bin/gene-sim
+          Terminal=false
+          Type=Application
+          Categories=Science;Education;Simulation;
+          EOF
+          installed_kb=$(du -sk "$root/opt" | cut -f1)
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: gene-sim
+          Version: ${DEB_VER}
+          Section: science
+          Priority: optional
+          Architecture: amd64
+          Maintainer: gene-sim <gene-sim@users.noreply.github.com>
+          Installed-Size: ${installed_kb}
+          Description: 2D CRISPR ecosystem simulator (beta)
+           A data-layer-driven CRISPR ecosystem sandbox: a headless-deterministic Rust
+           core (genome -> phenotype, seeded) with a Godot renderer. This is a beta build.
+          EOF
+          mkdir -p dist
+          dpkg-deb --build --root-owner-group "$root" "dist/gene-sim_${DEB_VER}_amd64.deb"
+          ls -la dist
+          dpkg-deb --info "dist/gene-sim_${DEB_VER}_amd64.deb"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gene-sim-godot-linux
-          path: build/
-          if-no-files-found: warn
+          name: gene-sim-linux-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # ── 3) Windows game → gene-sim.exe (+ godot_sim.dll), zipped. ─────────────────────────────────────────────
+  game-windows:
+    name: windows game (.exe)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build LiveSim cdylib (windows release)
+        run: cargo build --release --manifest-path crates/godot-sim/Cargo.toml
+
+      - name: Install Godot ${{ env.GODOT_VERSION }} + export templates (windows)
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}"
+          curl -fsSL -o /tmp/godot.zip "$base/Godot_v${GODOT_VERSION}_win64.exe.zip"
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          mv "/tmp/godot/Godot_v${GODOT_VERSION}_win64.exe" /tmp/godot/godot.exe
+          curl -fsSL -o /tmp/templates.tpz "$base/Godot_v${GODOT_VERSION}_export_templates.tpz"
+          unzip -q /tmp/templates.tpz -d /tmp/templates
+          dest="$(cygpath -u "$APPDATA")/Godot/export_templates/${GODOT_TEMPLATES_DIR}"
+          mkdir -p "$dest"
+          mv /tmp/templates/templates/* "$dest/"
+
+      - name: Stage the LiveSim GDExtension into the project
+        run: |
+          set -euo pipefail
+          cp crates/godot-sim/target/release/godot_sim.dll godot/godot_sim.dll
+          cat > godot/gene_sim.gdextension <<'EOF'
+          [configuration]
+          entry_symbol = "gdext_rust_init"
+          compatibility_minimum = 4.6
+          reloadable = true
+          [libraries]
+          windows.x86_64.debug = "res://godot_sim.dll"
+          windows.x86_64.release = "res://godot_sim.dll"
+          EOF
+
+      - name: Export the Windows game executable
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          /tmp/godot/godot.exe --headless --path godot --import 2>/dev/null || true
+          /tmp/godot/godot.exe --headless --path godot --export-release "Windows Desktop" "$(pwd)/build/gene-sim.exe"
+          [ -f build/godot_sim.dll ] || cp crates/godot-sim/target/release/godot_sim.dll build/godot_sim.dll
+          ls -la build
+          test -f build/gene-sim.exe
+
+      - name: Zip the Windows package (gene-sim.exe + godot_sim.dll)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $ref = $env:GITHUB_REF_NAME; if (-not $ref) { $ref = 'main' }
+          $ver = if ($ref -like 'v*') { $ref.Substring(1) } else { '0.1.0-beta' }
+          Compress-Archive -Path build/* -DestinationPath "dist/gene-sim_${ver}_windows-x86_64.zip" -Force
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gene-sim-windows-exe
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── 4) Publish: on a TAG push only, attach every installer to the GitHub Release. ────────────────────────────
+  # workflow_dispatch runs jobs 1-3 (artifacts only) for verification WITHOUT creating a public release.
+  publish:
+    name: publish GitHub Release
+    needs: [binaries, game-linux, game-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach installers to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          # the installers (.deb / .zip) + the per-OS dev artifact bundles (zipped) for completeness.
+          find artifacts -type f \( -name '*.deb' -o -name '*.zip' \) -exec cp {} upload/ \;
+          ls -la upload
+          tag="${GITHUB_REF_NAME}"
+          notes="gene-sim ${tag} — beta. Installers: Linux .deb, Windows .zip (gene-sim.exe + godot_sim.dll). macOS .dmg deferred (unsigned). Headless harness CLI + LiveSim cdylib attached for SDK use."
+          gh release create "$tag" upload/* --title "$tag" --notes "$notes" --prerelease \
+            || gh release upload "$tag" upload/* --clobber
