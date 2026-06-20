@@ -4,6 +4,22 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S4.3 — 2D ecosystem view: live run render from snapshots (feat, Stage 4)
+- `godot/main.gd` now builds a **2D ecosystem view of one scope** in code (all read-only — invariant #2):
+  a tiled **grass field** (`TileMapLayer` from a procedurally-generated shade atlas), a per-cell **data
+  overlay** (`Sprite2D` heat texture: density / allele_freq / fitness), an **organism dot layer**
+  (`godot/organisms.gd`: per-cell markers, hue=allele_freq, brightness=fitness, count∝density — hash-jittered
+  scatter is presentation only, not a spatial model), a framing `Camera2D`, and a HUD (gen / pop / grid / layer).
+- **Live run playback:** `--run <dir>` loads every `snap_*.bin` ordered by generation and auto-advances on a
+  timer (loops); with no args + a display it auto-discovers the newest `data/runs/<id>/` holding snapshots.
+  Keys: Space pause · D cycle overlay (off/density/allele/fitness) · `,`/`.` step. The gen-0→gen-60 render
+  visibly tracks selection (more amber organisms + warmer overlay as allele_freq shifts).
+- **Verification harness:** windowed `--shot <png> [--gen N]` captures the real viewport to PNG (human/agent
+  eyeballing); headless `--check` builds the scene and prints `render scene OK` (no GPU). The Godot gate
+  (`tools/check_godot_snapshot.sh`, step 9/9) now runs **both** the S4.2 reader check and the S4.3 render
+  smoke — catching GDScript parse/logic errors in CI. Fixed a `:=` type-inference parse error (untyped
+  `Array` index → `Variant`). Determinism hash unchanged; cargo gates unaffected. See ADR-006.
+
 ### S4.2 — snapshot reader: Rust→GDScript render bridge (feat, Stage 4)
 - `crates/sim-core/src/snapshot.rs`: `GridSnapshot` — a **derived, read-only** per-cell grid
   (`density` / `allele_freq` / `fitness`, each `[0,1]` row-major) produced by `Simulation::snapshot(w,h)`.

@@ -190,6 +190,46 @@ default — the rigorous pop-gen genetics is the Stage 2 SLiM oracle's job (SPEC
 
 ---
 
+## ADR-006 — Renderer architecture & verification harness (Stage 4, S4.2–S4.3)
+
+- **Date:** 2026-06-20
+- **Status:** Accepted
+- **Stage:** 4 (slices S4.2, S4.3)
+
+### Context
+Stage 4 opens the renderer. It must stay a **thin, read-only** layer over the headless core (inv. #2: no
+biology in GDScript) and remain testable under the headless gate (inv. #4) even though real rendering needs a
+GPU. The first windowed run also surfaced a Godot headless trap.
+
+### Decision
+- **Snapshot bridge (S4.2):** sim-core emits a derived per-cell `GridSnapshot` (`std`-only `"GSS1"` binary,
+  channels density/allele_freq/fitness) produced **off** the determinism-hash path (no RNG draw, no mutation),
+  so emitting snapshots can never change the hash (inv. #3). GDScript only parses + draws these bytes.
+- **No `class_name` globals in the renderer.** Godot only registers `class_name` globals during an editor
+  *import* pass, so a fresh `godot --headless` run (CI / the gate) leaves a bare `Snapshot` identifier
+  unresolved. The reader is loaded via `preload("res://snapshot.gd")` (+ a self-preload const for its own
+  static factory) — resolved at parse time, needs no `.godot/` cache. **Rule for all renderer scripts.**
+- **Scene built in code (S4.3).** `main.gd` constructs the node tree (terrain `TileMapLayer` from a
+  procedurally-generated grass atlas, a per-cell data-overlay `Sprite2D`, an organism dot layer, a `Camera2D`,
+  a HUD `CanvasLayer`) rather than authoring a fat `.tscn`. Keeps the read-only presentation logic in one
+  reviewable place and avoids binary scene churn. Organism dot scatter is deterministic hash *jitter* —
+  presentation only, **not** a spatial model (the core owns placement).
+- **Dual verification harness.** Renderers can't be screenshot under headless (dummy GPU). So: (a) a headless
+  `--check` smoke builds the full scene and prints `render scene OK` — wired into the gate
+  (`tools/check_godot_snapshot.sh`, step 9/9, skip-if-absent) to catch GDScript parse/logic errors in CI; and
+  (b) a windowed `--shot <png>` captures the real viewport for human/agent visual review. The gate enforces
+  (a); (b) is for eyeballing the actual pixels.
+
+### Consequences
+- **+** UI is gated headless (inv. #4 holds for Stage 4); the `class_name`/headless regression can't recur.
+- **+** Snapshots are provably hash-neutral; biology stays in the core (inv. #2/#3 intact).
+- **−** The headless `--check` builds the scene but can't validate pixels — true visual checks need the
+  windowed `--shot` (a human/agent step, not the automated gate). Acceptable: the gate proves *construction*,
+  the screenshot proves *appearance*.
+- **−** Scene-in-code means no editor-authored layout; fine for a thin PoC renderer, revisit if the UI grows.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

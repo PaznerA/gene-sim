@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# tools/check_godot_snapshot.sh — S4.2 UI gate: the read-only Godot snapshot reader parses a snapshot
-# written by the Rust core, headlessly (invariant #4: every feature is tested with no renderer state).
-#
-# It generates a tiny deterministic snapshot with the headless harness, then has `godot --headless` parse
-# it and assert it reports "snapshot OK". This guards the headless `class_name`/global-cache regression
-# fixed in S4.2 (a bare `Snapshot` global is unresolved without an editor import pass; the reader must
-# `preload` instead). SKIPs cleanly when godot is absent — mirroring the slim oracle gate.
+# tools/check_godot_snapshot.sh — Godot UI gate (invariant #4: every feature tested with no renderer state).
+# Two headless checks against snapshots written by the Rust core:
+#   1. S4.2 reader  — `--snap <file>` parses one snapshot and reports "snapshot OK".
+#   2. S4.3 render  — `--run <dir> --check` builds the full ecosystem scene (terrain TileMap, data overlay,
+#                     organism layer, HUD) and reports "render scene OK" — proving the render path compiles
+#                     and constructs without a GPU (catches GDScript parse/logic errors in CI).
+# Both guard the headless `class_name`/global-cache trap (a bare global is unresolved without an editor
+# import pass; the scripts `preload` instead). SKIPs cleanly when godot is absent — like the slim oracle gate.
 #
 # Exit: 0 = PASS or SKIP (prints "SKIP — ..."), non-zero = FAIL.
 set -uo pipefail
@@ -30,11 +31,21 @@ fi
 SNAP="$(ls "$TMP"/snap_*.bin 2>/dev/null | sort | tail -1)"
 [ -n "$SNAP" ] && [ -f "$SNAP" ] || { echo "FAIL — harness wrote no snap_*.bin into $TMP"; exit 1; }
 
+# 1. S4.2 reader.
 OUT="$(godot --headless --path godot -- --snap "$SNAP" 2>&1)"
-if printf '%s' "$OUT" | grep -q "snapshot OK"; then
-  echo "GODOT READER OK — $(printf '%s' "$OUT" | grep 'snapshot OK')"
-  exit 0
+if ! printf '%s' "$OUT" | grep -q "snapshot OK"; then
+  echo "FAIL — Godot reader did not report 'snapshot OK'. Full output:"
+  printf '%s\n' "$OUT"
+  exit 1
 fi
-echo "FAIL — Godot reader did not report 'snapshot OK'. Full output:"
-printf '%s\n' "$OUT"
-exit 1
+echo "GODOT READER OK — $(printf '%s' "$OUT" | grep 'snapshot OK')"
+
+# 2. S4.3 render scene (headless build smoke).
+ROUT="$(godot --headless --path godot -- --run "$TMP" --check 2>&1)"
+if ! printf '%s' "$ROUT" | grep -q "render scene OK"; then
+  echo "FAIL — Godot render scene did not report 'render scene OK'. Full output:"
+  printf '%s\n' "$ROUT"
+  exit 1
+fi
+echo "GODOT RENDER OK — $(printf '%s' "$ROUT" | grep 'render scene OK')"
+exit 0
