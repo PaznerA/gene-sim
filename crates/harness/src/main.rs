@@ -26,6 +26,8 @@ OPTIONS:
     --generations <u64>   Generations per run. Default: 200
     --entities <u32>      Organisms spawned per run. Default: 1000
     --per-gen-stats       Also write per-generation columnar stats to data/runs/<id>/per_gen.csv
+    --snapshots <DIR>     Write per-cell render snapshots (snap_<gen>.bin) to <DIR> every epoch (SPEC §W10)
+    --grid <W>x<H>        Snapshot grid size for --snapshots. Default: 64x64
     --hash-only           Print only the combined determinism hash (no files written)
     -h, --help            Show this help
 
@@ -33,7 +35,12 @@ Examples:
     harness --seed 42 --runs 1 --generations 200
     harness --seed 1234 --generations 300 --hash-only
     harness --master-seed 42 --run-index 3 --generations 500 --per-gen-stats
+    harness --seed 7 --generations 50 --snapshots data/runs/snaptest --grid 32x32
 ";
+
+/// How often (in generations) a snapshot is written when `--snapshots` is set; the final generation is
+/// always written too. Read-only (does not affect the determinism hash — invariant #3).
+const SNAPSHOT_EPOCH: u64 = 10;
 
 struct Args {
     master: u64,
@@ -43,6 +50,8 @@ struct Args {
     entities: u32,
     hash_only: bool,
     per_gen_stats: bool,
+    snapshots: Option<PathBuf>,
+    grid: (u32, u32),
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -54,6 +63,8 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut entities: u32 = 1000;
     let mut hash_only = false;
     let mut per_gen_stats = false;
+    let mut snapshots: Option<PathBuf> = None;
+    let mut grid: (u32, u32) = (64, 64);
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -72,6 +83,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--run-index" => run_index = Some(parse_num(&take("--run-index")?, "--run-index")?),
             "--generations" => generations = parse_num(&take("--generations")?, "--generations")?,
             "--entities" => entities = parse_num(&take("--entities")?, "--entities")?,
+            "--snapshots" => snapshots = Some(PathBuf::from(take("--snapshots")?)),
+            "--grid" => grid = parse_grid(&take("--grid")?)?,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -85,7 +98,24 @@ fn parse_args() -> Result<Option<Args>, String> {
         entities,
         hash_only,
         per_gen_stats,
+        snapshots,
+        grid,
     }))
+}
+
+/// Parse a `<W>x<H>` grid spec (e.g. `32x32`) into `(width, height)`; both must be non-zero.
+fn parse_grid(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("invalid --grid {s:?} (expected <W>x<H>, e.g. 64x64)"))?;
+    let width: u32 = parse_num(w, "--grid width")?;
+    let height: u32 = parse_num(h, "--grid height")?;
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "invalid --grid {s:?}: width and height must be > 0"
+        ));
+    }
+    Ok((width, height))
 }
 
 fn parse_num<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, String> {
@@ -113,10 +143,12 @@ fn main() -> ExitCode {
     };
 
     let want_per_gen = args.per_gen_stats && !args.hash_only;
+    let want_snapshots = args.snapshots.is_some() && !args.hash_only;
 
     let mut results: Vec<RunStats> = Vec::with_capacity(indices.len());
     // Per-run, per-generation CSV rows (only populated when --per-gen-stats and not --hash-only).
     let mut per_gen: Vec<String> = Vec::with_capacity(if want_per_gen { indices.len() } else { 0 });
+    let multi_run = indices.len() > 1;
     for &i in &indices {
         let cfg = SimConfig {
             seed: derive_seed(args.master, u64::from(i)),
@@ -128,6 +160,15 @@ fn main() -> ExitCode {
         results.push(run_headless(&cfg));
         if want_per_gen {
             per_gen.push(collect_per_gen_csv(i, &cfg));
+        }
+        if want_snapshots {
+            // ADDITIVE & read-only: snapshots derive from a fresh stepwise Simulation and never feed the
+            // hash (snapshot() draws no RNG, mutates nothing — invariant #3).
+            if let Some(dir) = &args.snapshots {
+                if let Err(e) = write_snapshots(dir, i, multi_run, &cfg, args.grid) {
+                    eprintln!("warning: could not write snapshots for run {i}: {e}");
+                }
+            }
         }
     }
 
@@ -207,6 +248,45 @@ fn collect_per_gen_csv(i: u32, cfg: &SimConfig) -> String {
         );
     }
     body
+}
+
+/// Drive a fresh stepwise [`Simulation`] for run `i` and write a compact per-cell render snapshot
+/// (`snap_<generation>.bin`, SPEC §5/§W10) every [`SNAPSHOT_EPOCH`] generations and at the final
+/// generation. With multiple run indices the files are namespaced by run (`run<i>/`) to avoid collisions.
+///
+/// Read-only & ADDITIVE: `snapshot()` draws no RNG and mutates nothing, and the determinism hash comes
+/// solely from the one-shot `run_headless` path above — so emitting snapshots cannot change it (inv. #3).
+/// Generation `0` (the initial state, before any step) is also captured.
+fn write_snapshots(
+    base: &std::path::Path,
+    i: u32,
+    multi_run: bool,
+    cfg: &SimConfig,
+    grid: (u32, u32),
+) -> std::io::Result<()> {
+    let dir = if multi_run {
+        base.join(format!("run{i}"))
+    } else {
+        base.to_path_buf()
+    };
+    std::fs::create_dir_all(&dir)?;
+
+    let (w, h) = grid;
+    let mut sim = Simulation::reset(cfg);
+    let write_one = |sim: &mut Simulation, gen: u64| -> std::io::Result<()> {
+        sim.snapshot(w, h)
+            .write_to(dir.join(format!("snap_{gen}.bin")))
+    };
+
+    // Initial state, then one snapshot per epoch and a final one (deduped if the end lands on an epoch).
+    write_one(&mut sim, 0)?;
+    for gen in 1..=cfg.generations {
+        sim.step(1);
+        if gen % SNAPSHOT_EPOCH == 0 || gen == cfg.generations {
+            write_one(&mut sim, gen)?;
+        }
+    }
+    Ok(())
 }
 
 /// Write `data/runs/<run_id>/{seed.json,stats.ndjson}` (human-readable; replay contract seed, SPEC §5).

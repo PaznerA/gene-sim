@@ -4,6 +4,23 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S4.2 — snapshot reader: Rust→GDScript render bridge (feat, Stage 4)
+- `crates/sim-core/src/snapshot.rs`: `GridSnapshot` — a **derived, read-only** per-cell grid
+  (`density` / `allele_freq` / `fitness`, each `[0,1]` row-major) produced by `Simulation::snapshot(w,h)`.
+  Placement is a pure function of `OrgId` (splitmix, no RNG draw, no mutation) → byte-identical for a fixed
+  `(seed, generation, grid)` and **cannot** change the determinism hash (invariant #3). `std`-only binary
+  format `"GSS1"` (LE header + 3 channel-major `f32` planes); round-trip + read-only tests in-crate.
+- `harness --snapshots <DIR> --grid WxH`: writes `snap_<gen>.bin` per epoch + final, off the hash path (additive).
+- `godot/snapshot.gd` (**read-only**, invariant #2): parses `GSS1` bytes → channels + `to_data_image()`
+  (RGBF data texture for the S4.4 shader). `godot/main.gd --snap <file>` loads one headless and reports
+  `WxH, gen, population, cells, channels`.
+- **Headless robustness fix:** dropped the `class_name Snapshot` global (only registered by an editor import
+  pass, so unresolved under a fresh `--headless` run) in favour of `preload` + a self-preload const — the
+  reader now parses cleanly with no `.godot/` cache.
+- New gate **9/9** `tools/check_godot_snapshot.sh`: generates a snapshot with the headless core and asserts
+  the Godot reader reports `snapshot OK`; SKIPs when godot is absent (mirrors the slim oracle gate). Enforces
+  invariant #4 for the first UI feature and locks in the headless fix. Determinism hash unchanged.
+
 ### S4.1 — Godot UI skeleton + headless smoke (chore, Stage 4; human-signed-off 🛑)
 - `godot/` thin 2D project (Godot **4.7**, GL-compatibility): `project.godot`, `Main.tscn`, `main.gd`. The
   script is **read-only** — boots, prints version, exits under headless (invariant #2: no biology in GDScript).

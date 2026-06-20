@@ -21,9 +21,11 @@ use rand_chacha::rand_core::{Rng, SeedableRng};
 
 pub mod det;
 pub mod gp;
+pub mod snapshot;
 
 pub use det::derive_seed;
 pub use gp::{GenotypePhenotypeMap, Phenotype, Trait, WeightedSumMap};
+pub use snapshot::{GridSnapshot, CHANNEL_COUNT, SNAPSHOT_MAGIC};
 
 // Re-export the exact `ChaCha8Rng` the core threads, so dependents (e.g. the harness env) draw the
 // species-edit action from the SAME seeded stream type without pinning a second `rand_chacha` (inv. #3).
@@ -289,6 +291,81 @@ impl Simulation {
             population_size,
             allele_freq,
             phenotype,
+        }
+    }
+
+    /// Produce a read-only, derived per-cell [`GridSnapshot`] for the renderer (SPEC §5, §W10; S4.2).
+    ///
+    /// Like [`observe`](Self::observe), this is **pure** w.r.t. the run: it iterates the [`World`] but
+    /// **never** draws from [`SimRng`] and **never** mutates state, so calling it cannot change the
+    /// determinism hash (invariant #3). Each organism is placed into a cell by a deterministic function of
+    /// its [`OrgId`] only (`x = derive_seed(id, 1) % width`, `y = derive_seed(id, 2) % height`), so the
+    /// layout is reproducible and independent of the RNG stream. Aggregation walks organisms in stable
+    /// `OrgId` order (no `HashMap` iteration affecting output — invariant #3).
+    ///
+    /// Channels (each `width * height`, row-major, in `[0, 1]`): `density` = per-cell count / busiest-cell
+    /// count; `allele_freq` = mean [`Genotype`] in the cell; `fitness` = mean [`Energy`] in the cell.
+    /// Empty cells are `0` on every channel.
+    ///
+    /// PoC note: this is a **derived spatial layout** for visualization — the core has no real spatial
+    /// dynamics yet (future work). See [`crate::snapshot`] for the placement model and binary format.
+    ///
+    /// # Panics
+    /// Panics if `width` or `height` is `0` (a degenerate grid has no cells to place organisms in).
+    #[must_use]
+    pub fn snapshot(&mut self, width: u32, height: u32) -> GridSnapshot {
+        assert!(width > 0 && height > 0, "snapshot grid must be non-empty");
+        let generation = self.world.resource::<Tick>().0;
+
+        // Collect organisms in STABLE OrgId order (decouples from ECS archetype iteration — inv. #3).
+        let mut rows: Vec<(u32, f64, f64)> = self
+            .world
+            .query::<(&OrgId, &Genotype, &Energy)>()
+            .iter(&self.world)
+            .map(|(id, g, e)| (id.0, g.0, e.0))
+            .collect();
+        rows.sort_unstable_by_key(|r| r.0);
+        let population = rows.len() as u32;
+
+        let cells = (width as usize) * (height as usize);
+        let mut count = vec![0u32; cells];
+        let mut genotype_sum = vec![0.0f64; cells];
+        let mut energy_sum = vec![0.0f64; cells];
+
+        for (id, g, e) in &rows {
+            // Deterministic placement from OrgId ONLY (splitmix in det.rs) — independent of the RNG stream.
+            let x = (derive_seed(u64::from(*id), 1) % u64::from(width)) as usize;
+            let y = (derive_seed(u64::from(*id), 2) % u64::from(height)) as usize;
+            let cell = y * (width as usize) + x;
+            count[cell] += 1;
+            genotype_sum[cell] += *g;
+            energy_sum[cell] += *e;
+        }
+
+        let max_count = count.iter().copied().max().unwrap_or(0);
+        let mut density = vec![0.0f32; cells];
+        let mut allele_freq = vec![0.0f32; cells];
+        let mut fitness = vec![0.0f32; cells];
+        for c in 0..cells {
+            let n = count[c];
+            if n == 0 {
+                continue; // empty cells stay 0 on every channel.
+            }
+            if max_count > 0 {
+                density[c] = (f64::from(n) / f64::from(max_count)) as f32;
+            }
+            allele_freq[c] = (genotype_sum[c] / f64::from(n)) as f32;
+            fitness[c] = (energy_sum[c] / f64::from(n)) as f32;
+        }
+
+        GridSnapshot {
+            width,
+            height,
+            generation,
+            population,
+            density,
+            allele_freq,
+            fitness,
         }
     }
 
@@ -563,6 +640,144 @@ mod tests {
             "expected directional selection to raise mean genotype above 0.7, got {}",
             r.allele_freq
         );
+    }
+
+    #[test]
+    fn snapshot_dims_and_channel_lengths() {
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 5,
+            entity_count: 200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(5);
+        let snap = sim.snapshot(16, 12);
+        assert_eq!(snap.width, 16);
+        assert_eq!(snap.height, 12);
+        assert_eq!(snap.generation, 5);
+        assert_eq!(snap.population, 200);
+        let cells = 16 * 12;
+        assert_eq!(snap.density.len(), cells);
+        assert_eq!(snap.allele_freq.len(), cells);
+        assert_eq!(snap.fitness.len(), cells);
+    }
+
+    #[test]
+    fn snapshot_channels_in_unit_range() {
+        let cfg = SimConfig {
+            seed: 42,
+            generations: 50,
+            entity_count: 1000,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(50);
+        let snap = sim.snapshot(32, 32);
+        for (name, ch) in [
+            ("density", &snap.density),
+            ("allele_freq", &snap.allele_freq),
+            ("fitness", &snap.fitness),
+        ] {
+            for &v in ch {
+                assert!((0.0..=1.0).contains(&v), "{name} value {v} out of [0,1]");
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_empty_cells_are_zero() {
+        // A tiny population on a large grid leaves most cells empty; those must be 0 on allele_freq/fitness.
+        let cfg = SimConfig {
+            seed: 3,
+            generations: 0,
+            entity_count: 4,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let snap = sim.snapshot(64, 64);
+        // Recompute occupancy via the same OrgId-derived placement to find empty cells.
+        let mut occupied = vec![false; 64 * 64];
+        for id in 0..4u32 {
+            let x = (derive_seed(u64::from(id), 1) % 64) as usize;
+            let y = (derive_seed(u64::from(id), 2) % 64) as usize;
+            occupied[y * 64 + x] = true;
+        }
+        let mut empty_seen = false;
+        for (c, &occ) in occupied.iter().enumerate() {
+            if !occ {
+                empty_seen = true;
+                assert_eq!(snap.density[c], 0.0, "empty cell {c} density != 0");
+                assert_eq!(snap.allele_freq[c], 0.0, "empty cell {c} allele_freq != 0");
+                assert_eq!(snap.fitness[c], 0.0, "empty cell {c} fitness != 0");
+            }
+        }
+        assert!(empty_seen, "test grid should have empty cells");
+    }
+
+    #[test]
+    fn snapshot_empty_population_is_all_zero() {
+        let cfg = SimConfig {
+            seed: 1,
+            generations: 10,
+            entity_count: 0,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(10);
+        let snap = sim.snapshot(8, 8);
+        assert_eq!(snap.population, 0);
+        assert!(snap.density.iter().all(|&v| v == 0.0));
+        assert!(snap.allele_freq.iter().all(|&v| v == 0.0));
+        assert!(snap.fitness.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn snapshot_is_read_only_does_not_change_hash() {
+        // Taking snapshots must not advance the RNG or mutate state: the run_stats hash is identical with
+        // and without intervening snapshot() calls (invariant #3).
+        let cfg = SimConfig {
+            seed: 1234,
+            generations: 100,
+            entity_count: 300,
+        };
+        let baseline = run_headless(&cfg).hash;
+
+        let mut sim = Simulation::reset(&cfg);
+        for _ in 0..cfg.generations {
+            sim.step(1);
+            let _ = sim.snapshot(32, 32); // read-only between steps
+        }
+        assert_eq!(sim.run_stats().hash, baseline);
+    }
+
+    #[test]
+    fn snapshot_is_byte_identical_for_same_seed_gen_grid() {
+        // Two snapshots of the same (seed, generation, grid) must be byte-for-byte identical.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 30,
+            entity_count: 500,
+        };
+        let mut a = Simulation::reset(&cfg);
+        a.step(30);
+        let mut b = Simulation::reset(&cfg);
+        b.step(30);
+        let bytes_a = a.snapshot(32, 32).write_snapshot_bytes();
+        let bytes_b = b.snapshot(32, 32).write_snapshot_bytes();
+        assert_eq!(bytes_a, bytes_b);
+        // And repeated snapshots from the SAME sim are identical (no hidden state).
+        assert_eq!(a.snapshot(32, 32), a.snapshot(32, 32));
+    }
+
+    #[test]
+    fn snapshot_density_normalizes_to_one() {
+        // The busiest cell must hit density 1.0 (per-cell count / max-cell count) for a non-empty run.
+        let cfg = SimConfig {
+            seed: 5,
+            generations: 0,
+            entity_count: 500,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let snap = sim.snapshot(8, 8);
+        let max = snap.density.iter().copied().fold(0.0f32, f32::max);
+        assert_eq!(max, 1.0, "busiest cell should have density 1.0");
     }
 
     #[cfg(feature = "proptest")]
