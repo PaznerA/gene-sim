@@ -1243,6 +1243,7 @@ func _set_view_mode(m: int) -> void:
 	if _specimen_panel != null:
 		_specimen_panel.visible = (m == 1)
 	if m == 1:
+		_refresh_live_specimens()  # in --live there is no specimens.json — build one from the live genome
 		_render_specimens()  # also repopulates the picker
 		_update_trait_readout()
 		_emphasise_focus()
@@ -1254,6 +1255,31 @@ func _set_view_mode(m: int) -> void:
 
 
 ## Flat list of specimens to draw: baseline first, then each edited genome.
+## In --live mode there is no specimens.json, so synthesise the specimen list from the LIVE species genome's
+## expressed phenotype (LiveSim.observe()). The plant's shape then reflects the current genome and updates as
+## the player edits it. Read-only (inv #2): observe() exports the traits; the renderer only maps them to shape.
+## Maps the core's Debug-cased trait keys (GrowthRate…) to the snake_case TRAIT_KEYS the specimen view uses.
+func _refresh_live_specimens() -> void:
+	if _live == null:
+		return
+	const KEY_MAP := {
+		"GrowthRate": "growth_rate", "Reflectance": "reflectance",
+		"DroughtTolerance": "drought_tolerance", "Fecundity": "fecundity",
+		"KillSwitchLinkage": "kill_switch_linkage",
+	}
+	var obs: Dictionary = _live.observe()
+	var pheno: Dictionary = obs.get("phenotype", {})
+	var traits := {}
+	for k in pheno:
+		if KEY_MAP.has(k):
+			traits[KEY_MAP[k]] = float(pheno[k])
+	_specimens = {
+		"baseline": {"label": "live species — gen %d" % int(obs.get("generation", 0)), "traits": traits},
+		"edits": [],
+	}
+	_focus = 0
+
+
 func _specimen_list() -> Array:
 	var out: Array = []
 	if _specimens.has("baseline"):
