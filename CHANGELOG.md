@@ -4,6 +4,12 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+## [0.1.0-beta] — 2026-06-20
+First public beta — a coherent playable build. Released via `release.yml`: installable **Linux `.deb`** +
+**Windows `.zip`** (`gene-sim.exe` + `godot_sim.dll`) attached to the GitHub Release, plus per-OS dev bundles
+(harness CLI + LiveSim cdylib). macOS `.dmg` deferred (needs Apple signing/notarization). Everything below is
+in this release.
+
 ### ADR-012 — climate environment + pre-run main menu (feat, Phase E, E1…E4)
 The player now sets a **real world** instead of a bare seed; climate shapes selection deterministically.
 Built off-stream-first (like the soil substrate) as four gated slices, one deliberate re-pin:

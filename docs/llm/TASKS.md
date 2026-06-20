@@ -34,8 +34,11 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   deliberate RE-PIN in E3 → pinned hash `0x9fad_2c9f_d298_f73a`. Menu is renderer-only (inv #2): its preview row
   is core-computed via `LiveSim.preview_climate`. Designed + adversarially reviewed via workflows; gate green.
 
-- [ ] **🏷️ BETA RELEASE** — tag `v0.1.0-beta` → `release.yml` builds the executables (harness + cdylib for
-  linux/mac/win + Godot Linux export). Do this AFTER Phase S/E land a coherent playable build; the CI is green.
+- [x] **🏷️ BETA RELEASE — DONE** (`v0.1.0-beta`, 2026-06-20). `release.yml` builds + publishes installable
+  artifacts: **Linux `.deb`** (game + `libgodot_sim.so` + launcher + `.desktop`) and **Windows `.zip`**
+  (`gene-sim.exe` + `godot_sim.dll`), plus per-OS dev bundles (harness CLI + cdylib). macOS `.dmg` deferred
+  (needs Apple signing/notarization). Verified green via `workflow_dispatch` dry-run before tagging; the tag
+  push ran the `publish` job → https://github.com/PaznerA/gene-sim/releases/tag/v0.1.0-beta
 
 - [ ] **Phase R3 — multi-species** 🛑 (core, own ADR + human sign-off — like ADR-011). Multiple species competing
   across regions: rewrites `selection` (per-species sub-populations), the snapshot (per-species channels), the
