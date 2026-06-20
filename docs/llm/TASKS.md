@@ -7,6 +7,44 @@
 
 ---
 
+## 🗺️ SESSION ROADMAP — multi-agent (workflow-orchestrated)
+
+The current session's arc + how each phase is driven by Workflow orchestration (design → implement → review).
+Everything below rides on the completed ADR-011 spatial epic + save/load + sandbox-default + CI-green base.
+
+- [x] **Phase 0 — fix: specimen view in --live** ✅ DONE (`4091eaa`). The L-system plant view was empty in
+  live mode (no specimens.json); now synthesised from the LIVE genome's `observe()` phenotype.
+
+- [ ] **Phase U — UI overhaul: a draggable/minimizable panel framework** (renderer-only, inv #2). The headline.
+  - *Workflow:* (1) DESIGN workflow → a reusable `Panel` wrapper API (title bar with drag handle + minimize
+    icon), default docking layout, and the minimize→**pill above the timeline** animation (tween there + back).
+    (2) Implement (serial GDScript: `panel.gd` wrapper + migrate vitals/intervention/mission/inspect/controls/
+    legend/specimen into it). (3) REVIEW workflow (adversarial: drag math, z-order, headless-build, no biology).
+  - *Concrete asks:* nicer **controls-panel graphics**; panels **draggable**; **controls** default-docked
+    bottom-left **above the timeline**; **cell-click detail (Inspect)** default bottom-left; every panel gets a
+    top-left **title bar** with **drag + minimize** icons; minimize → a labelled **pill above the timeline**
+    with a smooth animation both ways on toggle.
+  - *Acceptance:* `godot --check` green (ortho+iso); windowed `--shot` shows the new docked layout; manual drag/
+    minimize verified; `tools/gate.sh` green. Pure presentation — no core change, no re-pin.
+
+- [ ] **Phase R3 — multi-species** 🛑 (core, own ADR + human sign-off — like ADR-011). Multiple species competing
+  across regions: rewrites `selection` (per-species sub-populations), the snapshot (per-species channels), the
+  genome wiring (per-species genomes), and routes region/species edits to a chosen species (inv #6 still
+  species/region-granular). Determinism RE-PIN.
+  - *Workflow:* understand (current single-species selection/snapshot/genome) → design (species model + ADR)
+    → implement slices (each gate-green, re-pin where flagged) → adversarial review.
+
+- [ ] **Phase T — more traits under selection** (core, smaller). Today only `Genotype` + `DroughtTol` are
+  selected; add further environment↔phenotype couplings (e.g. reflectance vs a light/temperature soil channel)
+  behind the `EnvironmentModifier` seam (inv #5). Determinism RE-PIN if the pinned config ships them.
+  - *Workflow:* design (which traits ↔ which env signal) → implement → review.
+
+Sequencing rationale: Phase U first (it's renderer-only, unblocks visual judgement of everything after, and
+the user asked for it next); then R3 (the biggest sim leap, gated on a human ADR sign-off); then T (rides on
+R3's reworked selection). Each core phase re-pins the determinism hash deliberately, ledgered in the pinned test.
+
+---
+
 ## ▶ CURRENT SLICE
 
 ### [x] S0 — Stage 0: Headless deterministic core skeleton  ✅ DONE (gate green; ADR-001, ADR-002)
