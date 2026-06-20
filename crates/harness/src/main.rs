@@ -341,6 +341,39 @@ fn demo_edits() -> Vec<(&'static str, EditAction)> {
     out
 }
 
+/// JSON of the baseline **species genome**: each locus' name, ontology tags (Sequence Ontology / Gene
+/// Ontology term ids, formatted `SO:0000704` / `GO:0008150`), and unit-scaled parameter values. The renderer
+/// surfaces these in its detail panel — track-B (Stage 5 ontology) prep. Read-only; no biology in the export
+/// beyond what the core already defines (`genome::sample_genome` is the species baseline used at reset).
+fn genome_json() -> String {
+    let g = genome::sample_genome();
+    let mut loci = String::new();
+    for (i, locus) in g.loci.iter().enumerate() {
+        let go = locus
+            .tags
+            .go_refs
+            .iter()
+            .map(|r| format!("\"GO:{:07}\"", r.0))
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = locus
+            .parameters
+            .iter()
+            .map(|p| format!("{:.4}", p.value.as_unit_scalar()))
+            .collect::<Vec<_>>()
+            .join(",");
+        if i > 0 {
+            loci.push_str(",\n");
+        }
+        let _ = write!(
+            loci,
+            "      {{\"name\":\"{}\",\"so_term\":\"SO:{:07}\",\"go_refs\":[{}],\"params\":[{}]}}",
+            locus.name, locus.tags.so_term.0, go, params
+        );
+    }
+    format!("{{\"loci\": [\n{loci}\n    ]}}")
+}
+
 /// JSON object of the 5 trait values (canonical [`Trait::ALL`] order) carried by an [`Observation`].
 fn traits_json(o: &Observation) -> String {
     let p = &o.phenotype;
@@ -399,8 +432,9 @@ fn write_specimens(
     }
 
     let json = format!(
-        "{{\n  \"baseline\": {{\"label\":\"baseline\",\"traits\":{}}},\n  \"edits\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"baseline\": {{\"label\":\"baseline\",\"traits\":{}}},\n  \"genome\": {},\n  \"edits\": [\n{}\n  ]\n}}\n",
         traits_json(&baseline),
+        genome_json(),
         edits_json
     );
     std::fs::write(dir.join("specimens.json"), json)

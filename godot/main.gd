@@ -19,6 +19,8 @@ extends Node2D
 ##
 ## Keys (windowed): Space pause · V toggle ecosystem/specimen · Tab cycle specimen · D cycle layer ·
 ##   ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
+## Mouse (windowed): drag = pan · hover = cell/plant tooltip · click = pin detail (cell stats + genome
+##   ontology in ecosystem; focus + detail a plant in specimen).
 
 ## Load the reader by path, not via a `class_name` global: that registry is only populated by an editor
 ## import pass, so a bare identifier is unresolved under a fresh `--headless` run. `preload` needs no cache.
@@ -75,6 +77,12 @@ var _gen_slider: HSlider
 var _gen_label: Label
 var _frame_seconds: float = FRAME_SECONDS  # runtime playback interval (the speed slider mutates this)
 var _syncing: bool = false  # re-entrancy guard so programmatic widget updates don't recurse via signals
+var _tooltip: PanelContainer
+var _tooltip_label: Label
+var _detail_panel: PanelContainer
+var _detail_box: VBoxContainer
+var _dragging: bool = false  # left-button drag-pan in progress
+var _drag_moved: float = 0.0  # accumulated drag distance (to tell a click from a drag)
 
 
 func _ready() -> void:
@@ -139,10 +147,26 @@ func _ready() -> void:
 			if _specimen_picker != null:
 				_specimen_picker.select(_focus)
 			_on_specimen_selected(_focus)  # re-run readout/emphasis/frame for the chosen specimen
+	var inspect_arg := _arg_value("--inspect")  # "x,y": pin the cell detail panel for --shot
+	if inspect_arg != "" and _view_mode == 0 and not _snaps.is_empty():
+		var parts := inspect_arg.split(",")
+		if parts.size() == 2:
+			var cx := int(parts[0])
+			var cy := int(parts[1])
+			var snap = _snaps[_idx]
+			if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
+				var i: int = cy * snap.width + cx
+				_fill_detail("Cell (%d, %d)" % [cx, cy], [
+					"density       %.3f" % snap.density[i],
+					"allele_freq   %.3f" % snap.allele_freq[i],
+					"fitness       %.3f" % snap.fitness[i],
+				])
 
-	# Headless render smoke (gate): build the scene + specimen plants, prove it constructs without a GPU, quit.
+	# Headless render smoke (gate): build the scene + specimen plants + the detail panel, prove it all
+	# constructs without a GPU, quit.
 	if _has_flag("--check"):
 		_render_specimens()  # exercise the L-system build path headlessly (catches GDScript errors)
+		_fill_detail("(check)", ["density 0.0"])  # exercise the detail/ontology rendering path
 		print("render scene OK — %d snapshots, %d specimens, cell=%d, grid %dx%d" % [
 			_snaps.size(), _specimen_list().size(), int(_cell), _snaps[0].width, _snaps[0].height])
 		get_tree().quit()
@@ -211,6 +235,7 @@ func _build_scene() -> void:
 	_build_hud(ui, _field_px)
 	_build_controls(ui, _field_px)
 	_build_specimen_ui(ui, _field_px)
+	_build_interaction_ui(ui)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
@@ -554,6 +579,10 @@ func _set_view_mode(m: int) -> void:
 	_specimen_root.visible = (m == 1)
 	if _vignette != null:
 		_vignette.visible = (m == 0)
+	if _detail_panel != null:
+		_detail_panel.visible = false  # clear stale inspection on view switch
+	if _tooltip != null:
+		_tooltip.visible = false
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
@@ -828,6 +857,137 @@ func _frame_focused_specimen() -> void:
 	_cam.position = wb.position + wb.size * 0.5
 
 
+# ──────────────────────────── mouse interaction: hover tooltip + click detail ────────────────────────────
+
+## Build the hover tooltip (follows the cursor) and the pinned detail panel (set on click). Both READ-ONLY:
+## they surface per-cell snapshot data + the species genome's ontology tags the core exported (invariant #2).
+func _build_interaction_ui(ui: CanvasLayer) -> void:
+	_tooltip = _dark_panel(0.62)
+	_tooltip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_tooltip.visible = false
+	_tooltip_label = Label.new()
+	_tooltip_label.add_theme_font_size_override("font_size", 12)
+	_tooltip_label.add_theme_color_override("font_color", Color(0.95, 0.98, 0.95))
+	_tooltip.add_child(_tooltip_label)
+	ui.add_child(_tooltip)
+
+	_detail_panel = _dark_panel(0.55)
+	_detail_panel.position = Vector2(12, 112)
+	_detail_panel.custom_minimum_size = Vector2(250, 0)
+	_detail_panel.visible = false
+	_detail_box = VBoxContainer.new()
+	_detail_box.add_theme_constant_override("separation", 3)
+	_detail_panel.add_child(_detail_box)
+	ui.add_child(_detail_panel)
+
+
+## A reusable translucent rounded panel (used by the tooltip + detail panel).
+func _dark_panel(alpha: float) -> PanelContainer:
+	var p := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.0, 0.0, 0.0, alpha)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(8)
+	p.add_theme_stylebox_override("panel", sb)
+	return p
+
+
+## Per-cell / per-plant summary that tracks the cursor. Hidden when the cursor is over nothing relevant.
+func _update_tooltip() -> void:
+	if _tooltip == null:
+		return
+	var world := get_global_mouse_position()
+	var text := ""
+	if _view_mode == 0 and not _snaps.is_empty():
+		var cx := int(floor(world.x / _cell))
+		var cy := int(floor(world.y / _cell))
+		var snap = _snaps[_idx]
+		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
+			var i: int = cy * snap.width + cx
+			text = "(%d,%d)  d %.2f  a %.2f  f %.2f" % [cx, cy, snap.density[i], snap.allele_freq[i], snap.fitness[i]]
+	elif _view_mode == 1:
+		var hit := _specimen_at(world)
+		if hit >= 0:
+			text = str((_specimen_list()[hit] as Dictionary).get("label", ""))
+	if text == "":
+		_tooltip.visible = false
+		return
+	_tooltip_label.text = text
+	_tooltip.visible = true
+	_tooltip.position = get_viewport().get_mouse_position() + Vector2(16, 14)
+
+
+## Index of the specimen whose plant bounds contain `world`, else -1.
+func _specimen_at(world: Vector2) -> int:
+	if _specimen_root == null:
+		return -1
+	var kids := _specimen_root.get_children()
+	for i in kids.size():
+		var holder := kids[i] as Node2D
+		var plant := holder.get_child(0) as Node2D
+		if plant != null and plant.has_method("bounds"):
+			var pb: Rect2 = plant.bounds()
+			if Rect2(holder.position + pb.position, pb.size).grow(40.0).has_point(world):
+				return i
+	return -1
+
+
+## Left-click (not a drag): pin the detail panel for the clicked cell (ecosystem) or focus + detail the
+## clicked plant (specimen).
+func _on_click() -> void:
+	var world := get_global_mouse_position()
+	if _view_mode == 0:
+		if _snaps.is_empty():
+			return
+		var snap = _snaps[_idx]
+		var cx := int(floor(world.x / _cell))
+		var cy := int(floor(world.y / _cell))
+		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
+			var i: int = cy * snap.width + cx
+			_fill_detail("Cell (%d, %d)" % [cx, cy], [
+				"density       %.3f" % snap.density[i],
+				"allele_freq   %.3f" % snap.allele_freq[i],
+				"fitness       %.3f" % snap.fitness[i],
+			])
+		else:
+			_detail_panel.visible = false
+	else:
+		var hit := _specimen_at(world)
+		if hit >= 0:
+			_focus = hit
+			if _specimen_picker != null:
+				_specimen_picker.select(_focus)
+			_on_specimen_selected(_focus)
+			_fill_detail(str((_specimen_list()[hit] as Dictionary).get("label", "specimen")), [])
+
+
+## Rewrite the detail panel: a title, optional stat lines, then the species-genome ontology (track-B prep).
+func _fill_detail(title: String, stat_lines: Array) -> void:
+	for c in _detail_box.get_children():
+		c.queue_free()
+	_detail_box.add_child(_detail_label(title, 15, Color(0.96, 0.99, 0.96)))
+	for s in stat_lines:
+		_detail_box.add_child(_detail_label(str(s), 12, Color(0.9, 0.94, 0.9)))
+	var loci: Array = (_specimens.get("genome", {}) as Dictionary).get("loci", [])
+	if not loci.is_empty():
+		_detail_box.add_child(_detail_label("Genome (species) · ontology", 12, Color(0.7, 0.78, 0.7)))
+		for l in loci:
+			var ld: Dictionary = l
+			var go: Array = ld.get("go_refs", [])
+			_detail_box.add_child(_detail_label(
+				"• %s   %s   %s" % [ld.get("name", ""), ld.get("so_term", ""), ", ".join(go)],
+				11, Color(0.86, 0.9, 0.86)))
+	_detail_panel.visible = true
+
+
+func _detail_label(text: String, size: int, color: Color) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", color)
+	return l
+
+
 # ──────────────────────────── per-snapshot update ────────────────────────────
 
 func _show(i: int) -> void:
@@ -918,12 +1078,30 @@ func _advance() -> void:
 # ──────────────────────────── input (windowed) ────────────────────────────
 
 func _unhandled_input(event: InputEvent) -> void:
-	# Mouse wheel = continuous zoom (viewport scope).
-	if event is InputEventMouseButton and event.pressed:
-		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+	if event is InputEventMouseButton:
+		# Wheel = continuous zoom; left button = drag-pan / click-to-inspect.
+		if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
 			_set_zoom(_cam.zoom.x * 1.15)
-		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
 			_set_zoom(_cam.zoom.x / 1.15)
+		elif event.button_index == MOUSE_BUTTON_LEFT:
+			if event.pressed:
+				_dragging = true
+				_drag_moved = 0.0
+			else:
+				if _dragging and _drag_moved < 6.0:  # a click, not a drag → inspect
+					_on_click()
+				_dragging = false
+		return
+
+	if event is InputEventMouseMotion:
+		if _dragging and (event.button_mask & MOUSE_BUTTON_MASK_LEFT):
+			_cam.position -= event.relative / _cam.zoom.x  # drag the map under the cursor
+			_drag_moved += event.relative.length()
+			if _tooltip != null:
+				_tooltip.visible = false
+		else:
+			_update_tooltip()
 		return
 
 	if not (event is InputEventKey and event.pressed and not event.echo):
