@@ -113,6 +113,39 @@ struct Genotype(f64);
 #[derive(Component, Clone, Copy)]
 struct DroughtTol(f64);
 
+/// Per-individual cell position on the canonical [`WORLD_DIMS`] world grid (ADR-011, real spatial biology —
+/// no longer a render-only OrgId hash). Seeded at spawn from a DISJOINT off-`SimRng` derive_seed family
+/// ([`PLACEMENT_STREAM_BASE`]) so initial placement adds ZERO `SimRng` draws (the spawn stream is unchanged;
+/// only `Position` entering `hash_world` re-pins the hash). Inherited + dispersed by [`selection`] (S-B) so
+/// lineages cluster into emergent regions. Lives ONLY in the core (invariant #2).
+#[derive(Component, Clone, Copy)]
+struct Position {
+    x: u32,
+    y: u32,
+}
+
+/// Canonical world grid for per-organism positions (ADR-011). Equal to `soil::SOIL_DIMS` so an organism's
+/// cell maps 1:1 onto a soil cell (no resample for future local-soil coupling). The render snapshot resamples
+/// this world grid onto its own `(width, height)`.
+const WORLD_DIMS: (u32, u32) = soil::SOIL_DIMS;
+
+/// Disjoint `derive_seed` stream base for initial organism PLACEMENT (ASCII "PLAC"), kept far from the soil
+/// family ([`soil::SOIL_STREAM_BASE`]) and the legacy snapshot placement streams `1`/`2` (DECISIONS.md stream
+/// registry). Off the `SimRng` stream (inv #3): placement draws zero `next_u64`, so the spawn draw order is
+/// unchanged — only `Position` entering `hash_world` re-pins the determinism hash.
+const PLACEMENT_STREAM_BASE: u64 = 0x0050_4C41_4300_0000;
+
+/// Deterministic off-stream initial cell for organism `i`: `x`/`y` from two disjoint `derive_seed` streams,
+/// modulo the world grid. No `SimRng` draw (inv #3); reproducible from the master seed alone.
+fn placement(seed: u64, i: u32) -> Position {
+    let w = WORLD_DIMS.0 as u64;
+    let h = WORLD_DIMS.1 as u64;
+    Position {
+        x: (crate::det::derive_seed(seed, PLACEMENT_STREAM_BASE + 2 * i as u64) % w) as u32,
+        y: (crate::det::derive_seed(seed, PLACEMENT_STREAM_BASE + 2 * i as u64 + 1) % h) as u32,
+    }
+}
+
 // --- systems (fixed order via .chain()) -----------------------------------------------------------
 
 fn advance_tick(mut tick: ResMut<Tick>) {
@@ -281,7 +314,15 @@ impl Simulation {
             let g0 = unit_f64(rng.next_u64());
             let init = base_growth * unit_f64(rng.next_u64());
             let drought = unit_f64(rng.next_u64());
-            world.spawn((OrgId(i), Energy(init), Genotype(g0), DroughtTol(drought)));
+            // Initial cell from a DISJOINT off-SimRng stream (ADR-011): no next_u64 draw here, so the spawn
+            // stream order (g0, energy, drought) stays byte-identical to pre-S-A.
+            world.spawn((
+                OrgId(i),
+                Energy(init),
+                Genotype(g0),
+                DroughtTol(drought),
+                placement(config.seed, i),
+            ));
         }
 
         world.insert_resource(SimRng(rng));
@@ -496,10 +537,11 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
 
     // Collect (id, energy, genotype, drought) bits and sort by id so the hash never depends on iteration
     // order. Drought tolerance is per-individual heritable state (R1.0a) so it MUST enter the hash.
-    let mut rows: Vec<(u32, u64, u64, u64)> = world
-        .query::<(&OrgId, &Energy, &Genotype, &DroughtTol)>()
+    // (ADR-011) Position is per-individual heritable spatial state, so it MUST enter the hash.
+    let mut rows: Vec<(u32, u64, u64, u64, u32, u32)> = world
+        .query::<(&OrgId, &Energy, &Genotype, &DroughtTol, &Position)>()
         .iter(world)
-        .map(|(id, e, g, d)| (id.0, e.0.to_bits(), g.0.to_bits(), d.0.to_bits()))
+        .map(|(id, e, g, d, p)| (id.0, e.0.to_bits(), g.0.to_bits(), d.0.to_bits(), p.x, p.y))
         .collect();
     rows.sort_unstable_by_key(|r| r.0);
 
@@ -514,11 +556,13 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
     config.entity_count.hash(&mut h);
     tick.hash(&mut h);
     genome_params.hash(&mut h);
-    for (id, e_bits, g_bits, d_bits) in &rows {
+    for (id, e_bits, g_bits, d_bits, px, py) in &rows {
         id.hash(&mut h);
         e_bits.hash(&mut h);
         g_bits.hash(&mut h);
         d_bits.hash(&mut h);
+        px.hash(&mut h);
+        py.hash(&mut h);
     }
     allele_freq.to_bits().hash(&mut h);
     final_word.hash(&mut h);
@@ -544,14 +588,45 @@ mod tests {
         // Pin the EXACT hash literal. `check_determinism.sh` only compares run==run, so it would NOT catch a
         // reproducible-but-CHANGED hash — this guards that. The literal MUST change deliberately (in the same
         // commit) whenever real sim LOGIC changes; history: `c530…7ab1` pre-soil and through R1.0 (proving
-        // soil was hash-neutral), now `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
-        // soil-coupled selection legitimately shift the trajectory).
+        // soil was hash-neutral); `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
+        // soil-coupled selection); now `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded into the
+        // hash — placement is off-SimRng so the spawn stream is unchanged; only the new spatial bits re-pin).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x8722_544a_fd8f_44aa);
+        assert_eq!(run_headless(&cfg).hash, 0x3ba0_e351_9e02_82ba);
+    }
+
+    #[test]
+    fn placement_is_deterministic_and_in_bounds() {
+        // ADR-011 S-A: every organism gets a real cell, reproducibly from the seed, within the world grid.
+        let cfg = SimConfig {
+            seed: 777,
+            generations: 0,
+            entity_count: 200,
+        };
+        let positions = |s: &mut Simulation| -> Vec<(u32, u32, u32)> {
+            let mut v: Vec<(u32, u32, u32)> = s
+                .world
+                .query::<(&OrgId, &Position)>()
+                .iter(&s.world)
+                .map(|(id, p)| (id.0, p.x, p.y))
+                .collect();
+            v.sort_unstable_by_key(|r| r.0);
+            v
+        };
+        let a = positions(&mut Simulation::reset(&cfg));
+        let b = positions(&mut Simulation::reset(&cfg));
+        assert_eq!(a, b, "placement must be deterministic for a fixed seed");
+        assert_eq!(a.len(), 200);
+        for (_, x, y) in &a {
+            assert!(
+                *x < WORLD_DIMS.0 && *y < WORLD_DIMS.1,
+                "position ({x},{y}) out of world bounds {WORLD_DIMS:?}"
+            );
+        }
     }
 
     fn mean_drought(world: &mut World) -> f64 {

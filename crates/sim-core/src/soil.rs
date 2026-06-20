@@ -11,9 +11,11 @@
 //! LLM-generated modifiers will wire into selection — but in R1.0 it is **present and unwired**.
 //!
 //! ## derive_seed stream registry (keep disjoint — see DECISIONS.md)
-//! * streams `1`, `2` — snapshot organism placement (`x`/`y`), used by [`Simulation::snapshot`].
+//! * streams `1`, `2` — legacy render-only snapshot placement (superseded by real `Position`, ADR-011).
 //! * streams `[SOIL_STREAM_BASE, SOIL_STREAM_BASE + SOIL_CHANNELS*LATTICE*LATTICE)` — soil control points.
 //!   `SOIL_STREAM_BASE` is a large disjoint constant so the soil family can never collide with placement.
+//! * streams `[PLACEMENT_STREAM_BASE, PLACEMENT_STREAM_BASE + 2*entity_count)` — real per-organism initial
+//!   `Position` (`x`/`y`), used by `Simulation::reset` (ADR-011). Off `SimRng`, disjoint from the above.
 
 use crate::det::derive_seed;
 use crate::unit_f64;

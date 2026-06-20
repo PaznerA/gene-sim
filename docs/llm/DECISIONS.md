@@ -407,6 +407,63 @@ we pinned **4.7** — a stop-the-line pin conflict.
 
 ---
 
+## ADR-011 — Real spatial dynamics: per-organism Position, inherited dispersal, region-scoped CRISPR edit, gamification (roadmap R1.2/R1.3 + R5)
+
+### Context
+The grid was **visualization only**: `Simulation::snapshot` placed each organism into a cell by a pure function
+of its `OrgId` (`derive_seed(id,1/2) % dims`) — "not biology" (ADR-006/008). Organisms had **no position**, so a
+*selective* intervention ("a brush of adjustable size — modify only part of the population in a region, not the
+whole species") had no spatial substrate to act on, and `apply_edit` only shifts the SPECIES fitness landscape
+(via `BaseGrowthRate`), so the population evolves toward an edit over generations — there is no per-region hook.
+The human asked for real spatial work + a selective brush + deeper gamification. Designed via a multi-agent
+design workflow (understand → design → ADR/plan).
+
+### Decision
+Promote the visualization layout into **real per-organism spatial biology** in `sim-core`, sliced so each
+determinism re-pin is isolated, and carve the sub-species region edit behind an explicit invariant-#6 ruling.
+- **S-A (done):** add a `Position{x,y}` component on a canonical `WORLD_DIMS` grid (= `soil::SOIL_DIMS` 32×32,
+  1:1 with soil). Initial placement is **off the `SimRng` stream** via a new disjoint `derive_seed` family
+  `PLACEMENT_STREAM_BASE = 0x0050_4C41_4300_0000` ("PLAC"), so the spawn draw order is byte-identical and the
+  ONLY hash delta is `Position` entering `hash_world`. **RE-PIN #1:** `8722…44aa` → `3ba0…82ba`.
+- **S-B:** Wright-Fisher offspring INHERIT the sampled parent's position + one bounded deterministic dispersal
+  step (exactly one `next_u64`/offspring) → lineages cluster into emergent regions/clines. **RE-PIN #2.**
+- **S-C:** `snapshot` aggregates by REAL `Position` (resampled onto the render grid), retiring the OrgId-hash
+  layout. Hash-neutral (snapshot draws no RNG).
+- **S-D:** region-scoped edit — `Region::Disc{cx,cy,radius}` + `organisms_in_region` (OrgId-sorted, no HashMap);
+  run the SAME crispr PAM/score gate against the species locus but return a **signed Genotype delta** applied to
+  every in-region organism (per-individual perturbation, NOT a region-local genome). The gate RNG is drawn
+  **once** per brush (region-size-independent), via the `with_genome_and_rng` replace/restore dance. New
+  `Action::ApplyEditRegion(EditAction, Region)` carries **no organism handle** (Region is a cell descriptor).
+  Hash-neutral on the no-edit pinned run.
+- **S-E/S-F:** gdext `apply_edit_region` binding + renderer **brush UI** (adjustable radius, paint on the
+  ortho/iso map; renderer requests, core computes membership + biology — inv #2).
+- **S-G:** optional local-cell soil coupling (behind the inv-#5 `EnvironmentModifier` seam, `sample_at(x,y)`)
+  + first gamification: an **objective mission + edit budget** (e.g. "establish a drought-tolerant population in
+  the arid region within N generations"), score = efficiency. Conditional **RE-PIN #3** if the pinned config
+  ships local coupling on.
+
+### Invariant #6 ruling (human-adjudicated)
+A region-scoped edit is **sub-species** granular. The human ruled it **allowed, AND accessible to AI policies**
+(not human-operator-only). Guard rails preserved so #6's core ("organisms are ECS entities, not RL agents; no
+per-organism targeting") still holds: the `Region` descriptor targets **cells, not entities** (no organism
+handle — `action_space_is_species_granular` is updated to assert `Region` carries none), the gate yields **one
+outcome per brush regardless of contained count**, and a **minimum radius** prevents a 1-cell brush from being
+de-facto per-organism. This is a deliberate broadening of #6 from "species-only" to "species-or-cell-region".
+
+### Consequences
+- **+** Emergent spatial structure becomes real + visible; the snapshot flips from derived-viz to a read-only
+  projection of real biology; a brush has a real `Position` to scope to; local-soil coupling + spatial
+  gamification become expressible. Every slice is headless-testable (inv #4) and deterministic (inv #3).
+- **−** Multi-part core change (component + spawn + selection + snapshot + harness/binding/UI) → **three
+  isolated determinism re-pins** (S-A substrate, S-B dispersal, S-G optional coupling), each in its own commit
+  with a ledger line; forgetting to fold `Position` into `hash_world` would be a silent determinism hole.
+- **Re-pin procedure (each):** implement → `cargo test -p sim-core determinism_hash_is_pinned -- --nocapture`
+  prints the new actual → replace the literal + append a dated ledger note in the test comment → `tools/gate.sh`
+  green. Defaults adopted: off-stream placement; 9-cell single-draw dispersal, clamp at edges; `WORLD_DIMS` =
+  `SOIL_DIMS`; uniform single delta; failed region edit = no-op + reason.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).
