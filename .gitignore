@@ -25,3 +25,8 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Godot 4.x per-script UID cache (we resolve scripts by preload path, not UID)
+*.uid
+# Detached godot-sim cdylib build output
+/crates/godot-sim/target/

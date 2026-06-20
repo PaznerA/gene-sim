@@ -156,9 +156,15 @@ hash-neutral and ride the normal loop *while* the live-sim crate is built.
 - [x] **P1a (R6.0, pure-Rust)** `harness --record-episode` / `--replay`: the live-session replay-equality
   contract on the CLI (record a journaled reset+Advance+ApplyEdit episode → replay → bit-identical hash),
   with a binary-driven integration test. ✅ DONE (the gate-blocking proof; no Godot needed).
-- [ ] 🛑 **P1b (R6.0, gdext)** `crates/godot-sim` gdext cdylib: `LiveSim` reset/step/observe/snapshot + the
-  in-memory action journal calling the P1a contract; `gene_sim.gdextension`; headless Godot load smoke
-  (skip-if-absent / skip-if-dylib-unbuilt). *Needs Godot 4.6 installed.*
+- [x] **P1b (R6.0, gdext)** `crates/godot-sim` gdext cdylib (godot 0.5.3 / api-4-6 / edition 2024): `LiveSim`
+  reset/step/observe/snapshot. ✅ DONE — **forward-compat confirmed: the api-4-6 cdylib LOADS + runs under the
+  installed Godot 4.7** (no 4.6 install needed for dev). Workspace-detached (main gate unaffected); MPL-2.0,
+  no GPL. `tools/check_livesim.sh` (gate 10/10, skip-if-absent) builds it + smokes `LiveSim` in an isolated
+  temp project. ADR-010.
+- [x] **P2** Injection markers data source: `harness --record-episode --snapshots` writes aligned snapshots +
+  gen-stamped `injections.json`. ✅ DONE (renderer-side markers on the timeline = a small follow-up).
+- [x] **P3 (renderer)** Isometric ecosystem map behind `--iso` (`iso.gd` transform + `iso_ground.gd` CPU
+  diamonds + organisms/picking/camera via iso). ✅ DONE (orthographic stays default; gate runs both).
 - [ ] **P2 (R5-viz, renderer)** Injection markers on the existing `timeline.gd` + a harness path that writes
   `actions.ndjson` + injection generations to a real run dir (today only replay temp dirs).
 - [ ] **P3 (R8-iso, renderer)** Isometric transform (`iso.gd`: CPU diamonds, depth `cx+cy`) + iso ground/soil

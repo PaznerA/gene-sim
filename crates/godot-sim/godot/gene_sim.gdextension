@@ -1,0 +1,23 @@
+; gene-sim live-sim GDExtension (ADR-010, gameplay batch P1b).
+;
+; Registers the Rust `LiveSim` node (crate: crates/godot-sim, a gdext cdylib). All biology runs in the
+; embedded sim-core/harness — GDScript only CALLS LiveSim.reset/step/observe/snapshot (invariant #2).
+;
+; FORWARD-COMPAT (invariant #7 / ADR-010): the cdylib is built against gdext api-4-6, and gdext's rule is
+; "runtime version >= API version", so this LOADS and runs under the installed Godot 4.7 as well as 4.6.
+; (Verified headless: the gdext init line reads `API v4.6.stable, runtime v4.7.stable`.)
+;
+; DYLIB PATH: once the human wires crates/godot-sim into the root workspace, `cargo build -p godot-sim`
+; emits the dylib at the WORKSPACE target — res://../target/debug/libgodot_sim.dylib. While the crate is
+; workspace-DETACHED (its own [workspace] table), the standalone build emits it under
+; crates/godot-sim/target/debug/ instead; copy/symlink it to target/debug/ (or adjust this path) to run
+; the smoke before integration. See crates/godot-sim/Cargo.toml.
+
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.6
+reloadable = true
+
+[libraries]
+macos.debug = "res://../target/debug/libgodot_sim.dylib"
+macos.release = "res://../target/release/libgodot_sim.dylib"

@@ -1,0 +1,42 @@
+# gene-sim live-sim GDExtension (ADR-010, gameplay batch P1b).
+#
+# A THIN godot-rust (gdext) cdylib binding: it registers one Godot node `LiveSim` that wraps the
+# headless `harness::GeneSimEnv` (over `sim_core::Simulation`). All biology stays in sim-core/genome/
+# crispr — this crate only CALLS it (invariant #2 safe: the violation would be biology written in
+# GDScript; a Rust binding GDScript calls is fine). It adds NO new RNG: the single seeded ChaCha8Rng
+# is threaded exactly as `GeneSimEnv` does (invariant #3).
+#
+# DETACHED from the parent workspace (the empty `[workspace]` table below) so the main gate is
+# unaffected until the human wires it into the root Cargo.toml members list. Build standalone with:
+#   cargo build --manifest-path crates/godot-sim/Cargo.toml
+#
+# gdext is MPL-2.0 (no GPL — invariant #1 untouched; the cdylib is a separate link unit anyway).
+# Pinned (invariant #7): godot 0.5.3 targeting api-4-6 (ADR-010). Forward-compat: an api-4-6 cdylib
+# loads under the installed Godot 4.7 (runtime >= API; verified by the headless smoke).
+
+[package]
+name = "godot-sim"
+version = "0.1.0"
+edition = "2024"          # gdext 0.5 (rust-version 1.94) supports edition 2024; rest of the workspace stays 2021.
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+description = "Thin gdext (godot-rust) cdylib: registers the LiveSim node over harness::GeneSimEnv / sim_core (ADR-010)."
+
+# Detach from the parent workspace so `cargo build`/`gate.sh` at the repo root never picks this up
+# until the human integrates it (the brief: do NOT add to root members yet).
+[workspace]
+
+[lib]
+name = "godot_sim"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Path deps (NOT workspace deps — this crate is workspace-detached). Mirror how `harness` deps them.
+sim-core = { path = "../sim-core" }
+harness = { path = "../harness" }
+crispr = { path = "../crispr" }
+genome = { path = "../genome" }
+
+# gdext, pinned exactly to api-4-6 (ADR-010). default-features=false drops __codegen-full (lazy
+# codegen) and pins the api level explicitly rather than auto-detecting the installed Godot.
+godot = { version = "=0.5.3", default-features = false, features = ["api-4-6"] }

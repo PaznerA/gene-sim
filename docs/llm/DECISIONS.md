@@ -23,7 +23,8 @@
 | `tskit` / `pyslim` / `numpy` | **1.0.3 / 1.1.1 / 2.4.6** | installed (Stage 2, S2.3) | `.trees` read-back + stats. MIT / MIT / BSD. |
 | `msprime` | **1.4.2** | installed, optional | **GPL-3** — used ONLY by standalone analysis scripts (separate process, never linked); same pattern as the SLiM subprocess, so invariant #1 is unaffected. Optional (neutral-mutation overlay, S2.4). |
 | `pyarrow` | **24.0.0** | installed (Stage 3, S3.3) | Apache-2.0 — columnar Parquet for batch analytics (SPEC §5). Analysis-only (separate process), never linked. |
-| Godot | **4.6** (repinned from 4.7 — ADR-010, for stable gdext api-4-6) | repin pending 4.6 install (dev still on 4.7) | Thin 2D UI, built LAST (inv. #4); `tools/install_godot.sh` (GODOT_PIN 4.6). Repinned so the `godot-sim` gdext cdylib targets a *released* gdext api level (inv #7). Renderer uses no 4.7-only API → runs on 4.6/4.7. |
+| Godot | **4.6** pin (ADR-010); **dev on 4.7 via gdext forward-compat** | confirmed working on 4.7 | Thin 2D UI, built LAST (inv. #4); `tools/install_godot.sh` (GODOT_PIN 4.6). The `godot-sim` cdylib targets gdext api-4-6 and **loads under the installed 4.7** (runtime ≥ API) — verified by `tools/check_livesim.sh` (init line `API v4.6, runtime v4.7`). No separate 4.6 install needed. |
+| godot-rust (gdext) | **0.5.3** (locked), `api-4-6`, edition 2024 | installed (P1b) | `crates/godot-sim` cdylib `LiveSim` binding over `harness`/`sim-core` (ADR-010). MPL-2.0 (no GPL — separate link unit, inv #1). Workspace-detached; built via `tools/check_livesim.sh`. |
 
 > Rows marked "NOT yet …" record the **intended** pin; the exact tag/minor is confirmed and the Status
 > flipped in the slice that installs the tool (S2.1 for SLiM, S4.1 for Godot). Bevy/RNG/Rust rows below

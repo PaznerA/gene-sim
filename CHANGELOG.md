@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### P1b — LiveSim gdext GDExtension: the renderer can drive the sim live (feat, roadmap R6/P1)
+The Rust live-sim binding (ADR-010), built by a parallel agent + integrated here:
+- `crates/godot-sim` — a **godot-rust (gdext) cdylib** (godot `=0.5.3`, `api-4-6`, edition 2024) embedding
+  `harness::GeneSimEnv`/`sim_core`, registering a `LiveSim` node with `reset(seed)`, `step(n)`, `observe()`,
+  `snapshot(w,h)->PackedByteArray` (GSS2 bytes the existing `snapshot.gd` reads). GDScript only **calls** it
+  → all biology stays in Rust (inv #2); no new RNG (inv #3); fixed-integer cadence.
+- **Forward-compat confirmed:** the api-4-6 cdylib **loads + runs under the installed Godot 4.7** (gdext rule
+  runtime ≥ API; init line `API v4.6.stable, runtime v4.7.stable`) — so dev needs no separate 4.6 install. The
+  crate is workspace-**detached** (own `Cargo.lock`) so the main gate is unaffected; gdext is MPL-2.0, no GPL
+  (inv #1 intact — separate link unit).
+- `tools/check_livesim.sh` (gate **10/10**, skip-if-absent): builds the cdylib + loads `LiveSim` in an
+  ISOLATED temp project + drives reset→step→observe→snapshot, asserting `LIVESIM_SMOKE_OK`. The renderer
+  project `godot/` stays extension-free so the other gates never touch the dylib. `apply_edit`/`save_session`
+  + the renderer `--live` mode are the next phases (P4/P5).
+
 ### P1a — replay CLI: the live-session determinism contract, headless (feat, roadmap R6/P1)
 The pure-Rust, no-Godot foundation of the live-sim epic (ADR-010) — the replay-equality that the gdext
 `LiveSim` node will satisfy, exposed on the CLI:

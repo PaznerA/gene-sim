@@ -25,22 +25,22 @@ record() { # record <STATUS> <label>
 }
 step() { printf '\n\033[1m── %s\033[0m\n' "$1"; }
 
-step "1/9  cargo fmt --check"
+step "1/10  cargo fmt --check"
 if cargo fmt --check; then record PASS "fmt"; else record FAIL "fmt"; fi
 
-step "2/9  cargo clippy --workspace --all-targets -- -D warnings"
+step "2/10  cargo clippy --workspace --all-targets -- -D warnings"
 if cargo clippy --workspace --all-targets -- -D warnings; then record PASS "clippy"; else record FAIL "clippy"; fi
 
-step "3/9  cargo test --workspace"
+step "3/10  cargo test --workspace"
 if cargo test --workspace; then record PASS "test"; else record FAIL "test"; fi
 
-step "4/9  ./tools/check_determinism.sh   (HARD — inv. #3)"
+step "4/10  ./tools/check_determinism.sh   (HARD — inv. #3)"
 if ./tools/check_determinism.sh; then record PASS "determinism"; else record FAIL "determinism [HARD]"; fi
 
-step "5/9  cargo test --workspace --features proptest"
+step "5/10  cargo test --workspace --features proptest"
 if cargo test --workspace --features proptest; then record PASS "proptest"; else record FAIL "proptest"; fi
 
-step "6/9  cargo bench -p sim-core   (perf §11)"
+step "6/10  cargo bench -p sim-core   (perf §11)"
 if [ "${GATE_BENCH:-0}" = "1" ]; then
   if cargo bench -p sim-core; then record PASS "bench"; else record FAIL "bench"; fi
 else
@@ -48,7 +48,7 @@ else
   record SKIP "bench (GATE_BENCH=1 to run)"
 fi
 
-step "7/9  ./tools/check_slim_oracle.sh   (oracle golden §10.6; skips if slim/.venv absent)"
+step "7/10  ./tools/check_slim_oracle.sh   (oracle golden §10.6; skips if slim/.venv absent)"
 if [ -x ./tools/check_slim_oracle.sh ]; then
   ORACLE_OUT="$(./tools/check_slim_oracle.sh 2>&1)"; ORACLE_RC=$?
   printf '%s\n' "$ORACLE_OUT"
@@ -64,7 +64,7 @@ else
   record "N/A" "oracle"
 fi
 
-step "8/9  ./scripts/check_license.sh   (HARD — inv. #1)"
+step "8/10  ./scripts/check_license.sh   (HARD — inv. #1)"
 if [ -x ./scripts/check_license.sh ]; then
   if ./scripts/check_license.sh; then record PASS "license"; else record FAIL "license [HARD]"; fi
 else
@@ -72,7 +72,7 @@ else
   record "N/A" "license"
 fi
 
-step "9/9  ./tools/check_godot_snapshot.sh   (UI headless reader §S4.2; skips if godot absent)"
+step "9/10  ./tools/check_godot_snapshot.sh   (UI headless reader §S4.2; skips if godot absent)"
 if [ -x ./tools/check_godot_snapshot.sh ]; then
   GODOT_OUT="$(./tools/check_godot_snapshot.sh 2>&1)"; GODOT_RC=$?
   printf '%s\n' "$GODOT_OUT"
@@ -86,6 +86,22 @@ if [ -x ./tools/check_godot_snapshot.sh ]; then
 else
   echo "N/A — tools/check_godot_snapshot.sh not present."
   record "N/A" "godot-reader"
+fi
+
+step "10/10  ./tools/check_livesim.sh   (live-sim GDExtension smoke §R6/P1b; skips if godot/cdylib absent)"
+if [ -x ./tools/check_livesim.sh ]; then
+  LIVE_OUT="$(./tools/check_livesim.sh 2>&1)"; LIVE_RC=$?
+  printf '%s\n' "$LIVE_OUT"
+  if [ "$LIVE_RC" != "0" ]; then
+    record FAIL "livesim"
+  elif printf '%s' "$LIVE_OUT" | grep -q "SKIP"; then
+    record SKIP "livesim (godot/cdylib absent)"
+  else
+    record PASS "livesim"
+  fi
+else
+  echo "N/A — tools/check_livesim.sh not present."
+  record "N/A" "livesim"
 fi
 
 printf '\n\033[1m==== GATE SUMMARY ====\033[0m\n'
