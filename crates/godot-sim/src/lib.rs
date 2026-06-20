@@ -20,11 +20,11 @@
 //! gdext is MPL-2.0; this is a cdylib (a separate link unit), so the GPL process-boundary (invariant
 //! #1) is untouched. Pinned to `godot` 0.5.3 / api-4-6 (invariant #7; ADR-010).
 
-use crispr::{CasVariantId, EditOutcome, GuideSequence};
+use crispr::{CasVariantId, EditOutcome, GuideSequence, RegionEditOutcome};
 use genome::LocusId;
 use godot::builtin::VarDictionary;
 use godot::prelude::*;
-use harness::{Action, EditAction, Env, GeneSimEnv};
+use harness::{Action, EditAction, Env, GeneSimEnv, RegionSpec};
 use sim_core::{Observation, Simulation};
 
 /// gdext entry point. Registers every `#[derive(GodotClass)]` in this crate (here: [`LiveSim`]).
@@ -193,6 +193,67 @@ impl LiveSim {
         }
     }
 
+    /// Apply a REGION-scoped CRISPR edit — the selective brush (ADR-011 S-D). Same args as [`apply_edit`] plus
+    /// a CELL disc `(cx, cy, radius)` on the world grid; the edit's gate-derived allele shift is applied to
+    /// only the organisms inside that disc. Returns `{applied, detail, generation, covered}` (`covered` = how
+    /// many organisms the brush touched). Cell-scoped, no organism handle (invariant #6); biology in the core
+    /// (invariant #2) — GDScript only passes ids + a guide + a disc and reads the verdict.
+    #[func]
+    #[allow(clippy::too_many_arguments)]
+    fn apply_edit_region(
+        &mut self,
+        cas: i64,
+        target: i64,
+        guide: GString,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+    ) -> VarDictionary {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::apply_edit_region called before reset()");
+            return region_dict(false, "not reset", 0, 0);
+        };
+        let g = match GuideSequence::new(guide.to_string().into_bytes()) {
+            Ok(g) => g,
+            Err(pos) => {
+                return region_dict(false, &format!("invalid guide (bad base at {pos})"), env_gen(env), 0)
+            }
+        };
+        let edit = EditAction {
+            cas: CasVariantId(cas.clamp(0, i64::from(u16::MAX)) as u16),
+            target: LocusId(target.max(0) as u32),
+            guide: g,
+        };
+        let region = RegionSpec {
+            cx: cx.max(0) as u32,
+            cy: cy.max(0) as u32,
+            radius: radius.max(0) as u32,
+        };
+        env.step(Action::ApplyEditRegion(edit, region));
+        let cur_gen = env_gen(env);
+        match env.last_region_edit() {
+            Some((
+                RegionEditOutcome::Applied {
+                    on_efficiency,
+                    off_target_hits,
+                    genotype_delta,
+                },
+                covered,
+            )) => region_dict(
+                true,
+                &format!(
+                    "region applied → {covered} organisms · on-eff {on_efficiency:.2} · Δallele {genotype_delta:+.2} · off-target {off_target_hits}"
+                ),
+                cur_gen,
+                *covered,
+            ),
+            Some((RegionEditOutcome::Failed { reason }, _)) => {
+                region_dict(false, &format!("failed: {reason:?}"), cur_gen, 0)
+            }
+            None => region_dict(false, "no outcome", cur_gen, 0),
+        }
+    }
+
     /// The Cas-variant table as `[{id, name}, ...]` so the intervention UI can offer real choices (ids +
     /// names only — no biology in GDScript; the table is data, SPEC §4). From `crispr::default_cas_variants`.
     #[func]
@@ -239,6 +300,13 @@ fn edit_dict(applied: bool, detail: &str, generation: i64) -> VarDictionary {
     d.set("applied", applied);
     d.set("detail", detail);
     d.set("generation", generation);
+    d
+}
+
+/// Build the GDScript-facing region-edit `Dictionary` — `edit_dict` plus a `covered` organism count.
+fn region_dict(applied: bool, detail: &str, generation: i64, covered: u32) -> VarDictionary {
+    let mut d = edit_dict(applied, detail, generation);
+    d.set("covered", i64::from(covered));
     d
 }
 
