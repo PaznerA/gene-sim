@@ -464,11 +464,15 @@ func _plant_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
 		"len_falloff": 0.80 + drought * 0.12,  # drought tolerance → sturdier taper
 		"thickness": 3.0 + growth * 3.5,
 		"leaf_size": 2.0 + fec * 6.5,  # fecundity → bigger/more prominent leaves
+		"leaf_aspect": 0.5 + drought * 0.2,  # drought → narrower/sturdier leaves
 		"jitter_deg": 3.0 + ksl * 9.0,  # kill-switch linkage → unruliness
 		"seed": seed_val,
+		"flower_count": int(round(fec * 4.0)),  # fecundity → more flowers (0..4)
+		"petal_count": 5,
 		"branch_base": Color(0.36, 0.24, 0.12),
 		"branch_tip": Color(0.30, 0.55, 0.20).lerp(Color(0.66, 0.62, 0.20), drought),
 		"leaf_color": Color(0.85, 0.55, 0.20).lerp(Color(0.35, 0.78, 0.30), refl),
+		"flower_color": Color(0.95, 0.45, 0.55).lerp(Color(0.98, 0.85, 0.35), refl),
 	}
 
 
