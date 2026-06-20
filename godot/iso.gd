@@ -42,6 +42,30 @@ extends RefCounted
 
 var origin: Vector2 = Vector2.ZERO  # screen-space offset added to every projected point (field framing)
 
+const HILL_SCALE := 6.0  # cells per terrain-height lattice step (gentle rolling hills)
+
+
+## Deterministic terrain height in [0, 1] for cell (cx, cy) — smooth bilinear value-noise giving gentle
+## rolling hills, so the iso ground reads as 3D relief, not a flat rhombus. PRESENTATION ONLY (inv #2): a
+## visual backdrop height, NOT biology / data. Multiply/add only (deterministic, no trig).
+func terrain_height(cx: int, cy: int) -> float:
+	var fx := float(cx) / HILL_SCALE
+	var fy := float(cy) / HILL_SCALE
+	var x0 := int(floor(fx))
+	var y0 := int(floor(fy))
+	var tx := fx - float(x0)
+	var ty := fy - float(y0)
+	var top := lerpf(_h(x0, y0), _h(x0 + 1, y0), tx)
+	var bot := lerpf(_h(x0, y0 + 1), _h(x0 + 1, y0 + 1), tx)
+	return clampf(lerpf(top, bot, ty), 0.0, 1.0)
+
+
+func _h(a: int, b: int) -> float:
+	var h := (a * 73856093) ^ ((b + 1) * 19349663) ^ 83492791
+	h = (h ^ (h >> 13)) * 1274126177
+	h = h ^ (h >> 16)
+	return float(h & 0xffff) / 65535.0
+
 
 ## cell (cx, cy) → screen pixel of the cell's CENTRE-TOP anchor in the iso projection. Standard 2:1 diamond.
 ## Multiply/add only. cx/cy are floats so callers can project fractional positions (e.g. organism jitter).
@@ -106,8 +130,10 @@ func field_bounds(w: int, h: int, cell: float) -> Rect2:
 		hi.x = maxf(hi.x, p.x)
 		hi.y = maxf(hi.y, p.y)
 	# cell_to_screen returns each cell's TOP anchor; the diamond extends half a tile-height below the (w,h)
-	# anchor, so pad the bottom by cell*0.5 to enclose the lowest tiles' bottom tips.
-	hi.y += cell * 0.5
+	# anchor, so pad the bottom by cell*0.5 to enclose the lowest tiles' bottom tips. Pad the TOP by the max
+	# terrain lift (HEIGHT_MAX≈0.7) so raised hills are not clipped, and the bottom by the block depth.
+	lo.y -= cell * 0.7
+	hi.y += cell * (0.5 + 0.22)
 	return Rect2(lo, hi - lo)
 
 

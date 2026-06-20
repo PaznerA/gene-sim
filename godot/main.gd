@@ -203,6 +203,7 @@ func _build_scene() -> void:
 		_iso = Iso.new()
 		var b: Rect2 = _iso.field_bounds(w, h, _cell)
 		_iso.origin = -b.position + Vector2(20, 20)  # shift the negative-x left edge fully on-screen
+	print("ecosystem mode: %s" % ("ISOMETRIC (--iso)" if _iso != null else "orthographic"))
 
 	# Ecosystem layers live under _world so the whole view can be toggled off for the specimen view.
 	_world = Node2D.new()
@@ -268,9 +269,9 @@ func _build_scene() -> void:
 ## This is the "2D TileMap ecosystem view of one scope" (a field) — pure backdrop, no biology.
 func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 	var shades := [
-		Color(0.16, 0.30, 0.15), Color(0.19, 0.34, 0.17),
-		Color(0.14, 0.27, 0.14), Color(0.21, 0.37, 0.19),
-		Color(0.17, 0.31, 0.16), Color(0.11, 0.22, 0.12),  # last = darker soil patch
+		Color(0.18, 0.33, 0.17), Color(0.21, 0.37, 0.19),
+		Color(0.16, 0.30, 0.16), Color(0.24, 0.41, 0.22),
+		Color(0.19, 0.34, 0.18), Color(0.15, 0.27, 0.15),  # last = slightly darker soil patch (not black)
 	]
 	var n := shades.size()
 	var atlas := Image.create(cell * n, cell, false, Image.FORMAT_RGBA8)

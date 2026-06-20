@@ -6,9 +6,11 @@ extends Node2D
 ## tint only VISUALISES a per-cell channel the Rust core already exported. No biology here.
 
 const SHADES := [
-	Color(0.16, 0.30, 0.15), Color(0.19, 0.34, 0.17),
-	Color(0.14, 0.27, 0.14), Color(0.21, 0.37, 0.19),
+	Color(0.20, 0.36, 0.18), Color(0.24, 0.42, 0.21),
+	Color(0.18, 0.32, 0.17), Color(0.27, 0.46, 0.24),
 ]
+const TILE_H := 0.22  # min block depth as a fraction of cell
+const HEIGHT_MAX := 0.7  # max terrain lift as a fraction of cell (the rolling-hills relief)
 
 var _w: int = 0
 var _h: int = 0
@@ -52,7 +54,20 @@ func _draw() -> void:
 			# Soil channels (>=4) are a full field → always tint; population channels only where populated.
 			if _overlay_mode >= 4 or v > 0.0:
 				col = col.lerp(_inferno(v), 0.62)
-		draw_colored_polygon(_iso.diamond_points(x, y, _cell), col)
+		# 3D heightfield tile: the top diamond is RAISED by the cell's terrain height; the two darker side
+		# faces (left/right) drop from the raised top to a common base, so neighbouring heights show relief.
+		# Back-to-front (cx+cy) order makes nearer/taller tiles overdraw farther ones.
+		var lift: float = _cell * HEIGHT_MAX * _iso.terrain_height(x, y)
+		var up := Vector2(0.0, -lift)
+		var skirt := Vector2(0.0, lift + _cell * TILE_H)  # raised top → common base (+ a min block depth)
+		var d: PackedVector2Array = _iso.diamond_points(x, y, _cell)  # [top, right, bottom, left]
+		var tb := d[2] + up  # raised bottom vertex
+		var tl := d[3] + up  # raised left
+		var tr := d[1] + up  # raised right
+		draw_colored_polygon(PackedVector2Array([tl, tb, tb + skirt, tl + skirt]), col.darkened(0.42))
+		draw_colored_polygon(PackedVector2Array([tb, tr, tr + skirt, tb + skirt]), col.darkened(0.60))
+		draw_colored_polygon(
+			PackedVector2Array([d[0] + up, tr, tb, tl]), col)  # raised top diamond
 
 
 func _channel(x: int, y: int) -> float:

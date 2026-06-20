@@ -63,8 +63,9 @@ func _draw() -> void:
 			var off := Vector2(_hash01(x, y, k * 2), _hash01(x, y, k * 2 + 1))
 			var p: Vector2
 			if _iso != null:
-				# Scatter around the diamond centre (anchor + a quarter-cell down).
-				var ctr: Vector2 = _iso.cell_to_screen(float(x), float(y), _cell) + Vector2(0.0, _cell * 0.25)
+				# Scatter around the diamond centre, lifted onto the tile's terrain height (sits on the relief).
+				var lift: float = _cell * 0.7 * _iso.terrain_height(x, y)  # match iso_ground HEIGHT_MAX
+				var ctr: Vector2 = _iso.cell_to_screen(float(x), float(y), _cell) + Vector2(0.0, _cell * 0.25 - lift)
 				p = ctr + Vector2((off.x - 0.5) * _cell * 0.7, (off.y - 0.5) * _cell * 0.35)
 			else:
 				p = Vector2(float(x) * _cell, float(y) * _cell) + (Vector2.ONE * 0.15 + off * 0.7) * _cell
