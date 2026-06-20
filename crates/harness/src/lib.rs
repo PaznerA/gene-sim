@@ -152,6 +152,21 @@ impl GeneSimEnv {
             .observe()
     }
 
+    /// A read-only, derived per-cell [`sim_core::GridSnapshot`] of the current state (delegates to
+    /// [`sim_core::Simulation::snapshot`]; panics if called before `reset`).
+    ///
+    /// Read-only & ADDITIVE (invariant #3): `snapshot` draws no RNG and mutates nothing, so taking one
+    /// mid-episode cannot change the determinism hash. The renderer reads these to draw the ecosystem;
+    /// stepping the env through the same action sequence keeps a snapshot's `generation` aligned with the
+    /// journaled `Advance` cumulative (so injection markers land on the right frame).
+    #[must_use]
+    pub fn snapshot(&mut self, width: u32, height: u32) -> sim_core::GridSnapshot {
+        self.sim
+            .as_mut()
+            .expect("GeneSimEnv::snapshot called before reset")
+            .snapshot(width, height)
+    }
+
     /// The deterministic [`sim_core::RunStats`] of the episode so far — its `hash` is the bit-identical
     /// replay artifact (SPEC §6). Folds in the same final RNG word as the one-shot path, so it must be
     /// called once at the **end** of an episode (panics if called before `reset`).

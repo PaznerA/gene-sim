@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crispr::{default_cas_variants, GuideSequence};
+use crispr::{default_cas_variants, EditOutcome, GuideSequence};
 use genome::LocusId;
 use harness::{Action, EditAction, Env, GeneSimEnv};
 use sim_core::{derive_seed, run_headless, Observation, RunStats, SimConfig, Simulation, Trait};
@@ -35,7 +35,9 @@ OPTIONS:
                           renderer's L-system plant view (SPEC §W10, S4.5). Read-only; no hash impact.
     --hash-only           Print only the combined determinism hash (no files written)
     --record-episode <DIR>  Record a journaled reset+Advance+ApplyEdit episode to <DIR>/<run_id>/ (seed.json +
-                          actions.ndjson) and print its hash — the live-session replay contract (R6/P1, ADR-010)
+                          actions.ndjson) and print its hash — the live-session replay contract (R6/P1, ADR-010).
+                          With --snapshots (and optional --grid) it ALSO writes per-cell snap_<gen>.bin +
+                          injections.json (stamped injection generations) for the renderer timeline (P2)
     --replay <DIR>        Replay a recorded episode dir (seed.json + actions.ndjson) and print its stats hash;
                           equals the recorded hash bit-for-bit on the same build (SPEC §6, inv #3)
     -h, --help            Show this help
@@ -45,6 +47,7 @@ Examples:
     harness --seed 1234 --generations 300 --hash-only
     harness --master-seed 42 --run-index 3 --generations 500 --per-gen-stats
     harness --seed 7 --generations 50 --snapshots data/runs/snaptest --grid 32x32
+    harness --record-episode data/runs --seed 7 --entities 300 --snapshots . --grid 48x48
 ";
 
 /// How often (in generations) a snapshot is written when `--snapshots` is set; the final generation is
@@ -264,17 +267,24 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         let entities = val("--entities")
             .and_then(|s| s.parse().ok())
             .unwrap_or(500);
-        return Some(record_demo_episode(&dir, seed, entities));
+        // P2: when --snapshots/--grid accompany --record-episode, ALSO drive the same journaled episode
+        // stepwise to emit per-cell snapshots + stamped injection generations into the run dir (the marker
+        // source the renderer reads). Read-only w.r.t. the determinism hash (inv #3).
+        let snapshot_grid = val("--snapshots").is_some().then(|| {
+            val("--grid")
+                .and_then(|g| parse_grid(&g).ok())
+                .unwrap_or((64, 64))
+        });
+        return Some(record_demo_episode(&dir, seed, entities, snapshot_grid));
     }
 
     None
 }
 
-/// Record a representative journaled episode (reset + Advance/ApplyEdit mix) to `<dir>/<run_id>/` — the same
-/// shape a live `LiveSim` session produces — so `--replay` can reproduce its hash bit-identically.
-fn record_demo_episode(dir: &str, seed: u64, entities: u32) -> ExitCode {
-    use harness::replay::{record_episode, EnvConfig};
-
+/// The representative demo action sequence (reset + Advance/ApplyEdit mix) — the SINGLE source for both the
+/// journaled `actions.ndjson` and the stepwise snapshot/injection drive, so the two always line up in
+/// generation. `Advance(20)` blocks separate the two edits, so the edits are stamped at gen 20 and gen 40.
+fn demo_episode_actions() -> Vec<Action> {
     let cas = |name: &str| default_cas_variants().into_iter().find(|v| v.name == name);
     let mut actions = vec![Action::Advance(20)];
     if let (Some(sp), Ok(g)) = (cas("SpCas9"), GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG")) {
@@ -296,6 +306,27 @@ fn record_demo_episode(dir: &str, seed: u64, entities: u32) -> ExitCode {
         }));
     }
     actions.push(Action::Advance(20));
+    actions
+}
+
+/// Record a representative journaled episode (reset + Advance/ApplyEdit mix) to `<dir>/<run_id>/` — the same
+/// shape a live `LiveSim` session produces — so `--replay` can reproduce its hash bit-identically.
+///
+/// When `snapshot_grid` is `Some((w, h))` (i.e. `--snapshots`/`--grid` accompanied `--record-episode`), the
+/// SAME journaled episode is then driven stepwise through a separate [`GeneSimEnv`] to ALSO write per-cell
+/// `snap_<gen>.bin` snapshots and a stamped `injections.json` into the run dir, so a renderer can draw
+/// injection markers without re-deriving the generations from the log. That export is read-only w.r.t. the
+/// determinism hash (inv #3): the hash comes from `record_episode`'s own `run_stats` fold; snapshots draw no
+/// RNG and the injection stamps are plain generation counters off the SAME single seeded stream.
+fn record_demo_episode(
+    dir: &str,
+    seed: u64,
+    entities: u32,
+    snapshot_grid: Option<(u32, u32)>,
+) -> ExitCode {
+    use harness::replay::{record_episode, EnvConfig};
+
+    let actions = demo_episode_actions();
 
     let env = EnvConfig {
         entity_count: entities,
@@ -303,6 +334,20 @@ fn record_demo_episode(dir: &str, seed: u64, entities: u32) -> ExitCode {
     match record_episode(&env, seed, &actions, dir) {
         Ok(r) => {
             println!("recorded {} (hash {:016x})", r.dir.display(), r.hash);
+            if let Some(grid) = snapshot_grid {
+                if let Err(e) =
+                    write_episode_snapshots_and_injections(&r.dir, seed, entities, &actions, grid)
+                {
+                    eprintln!("warning: could not write episode snapshots/injections: {e}");
+                    return ExitCode::from(1);
+                }
+                println!(
+                    "wrote snapshots + injections.json to {} ({}x{} grid)",
+                    r.dir.display(),
+                    grid.0,
+                    grid.1
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -310,6 +355,117 @@ fn record_demo_episode(dir: &str, seed: u64, entities: u32) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Drive the journaled demo episode stepwise through a fresh [`GeneSimEnv`], writing per-cell render
+/// snapshots (`snap_<gen>.bin`) at the post-`Advance` generations and a stamped `injections.json` (one entry
+/// per [`Action::ApplyEdit`]) into `run_dir` — the data a renderer timeline needs to draw injection markers
+/// aligned to the snapshots (P2; ADR-010, SPEC §5/§W10).
+///
+/// The drive replays the *same* `(seed, actions)` the recorded episode used, so snapshots/injections line up
+/// in generation with `actions.ndjson` by construction. It is **read-only & ADDITIVE** w.r.t. the
+/// determinism hash (invariant #3): `snapshot()` draws no RNG, and an injection entry is just the running
+/// `Advance` cumulative plus the edit's Applied/Failed outcome (from [`GeneSimEnv::last_edit`]) — both off
+/// the hash path (the recorded hash already came from `record_episode`'s own `run_stats` fold).
+///
+/// `injections.json` schema — a JSON array of objects:
+/// `[{ "generation": <u64>, "label": <string>, "applied": <bool> }, ...]`, one per ApplyEdit, in order.
+fn write_episode_snapshots_and_injections(
+    run_dir: &std::path::Path,
+    seed: u64,
+    entities: u32,
+    actions: &[Action],
+    grid: (u32, u32),
+) -> std::io::Result<()> {
+    use harness::{Env, GeneSimEnv};
+
+    std::fs::create_dir_all(run_dir)?;
+    let (w, h) = grid;
+
+    let mut env = GeneSimEnv::new(entities);
+    env.reset(seed);
+
+    // Generation 0 (the initial state, before any action) — so the timeline has a starting frame.
+    env.snapshot(w, h).write_to(run_dir.join("snap_0.bin"))?;
+
+    // Running cumulative of advanced generations (the single seeded stream's generation counter), kept in
+    // lock-step with the recorded episode's `Advance` actions so every stamp/snapshot lines up.
+    let mut generation: u64 = 0;
+    let mut injections: Vec<(u64, String, bool)> = Vec::new();
+    for action in actions {
+        match action {
+            Action::Advance(n) => {
+                env.step(Action::Advance(*n));
+                generation += *n;
+                // A post-Advance snapshot so the snapshot's `generation` matches the journaled cumulative.
+                env.snapshot(w, h)
+                    .write_to(run_dir.join(format!("snap_{generation}.bin")))?;
+            }
+            Action::ApplyEdit(edit) => {
+                env.step(Action::ApplyEdit(edit.clone()));
+                // Stamp the injection at the CURRENT cumulative generation (the edit is applied "now", in
+                // between Advance blocks — the renderer marks it on that frame). `applied` reflects whether
+                // crispr cleared the gate (Applied) vs an explicit failure (Failed) — never a silent no-op.
+                let applied = matches!(env.last_edit(), Some(EditOutcome::Applied { .. }));
+                injections.push((generation, edit_label(edit), applied));
+            }
+        }
+    }
+
+    write_injections_json(&run_dir.join("injections.json"), &injections)
+}
+
+/// A short human-readable label for an injection entry: the Cas variant name (resolved against the seed
+/// table) plus the targeted species `LocusId` (e.g. `"SpCas9 → locus 0"`). Resolution is for display only —
+/// no biology is computed here (the genotype→phenotype map stays in the core, inv #2).
+fn edit_label(edit: &EditAction) -> String {
+    let cas_name = default_cas_variants()
+        .into_iter()
+        .find(|v| v.id == edit.cas)
+        .map_or_else(|| format!("cas#{}", edit.cas.0), |v| v.name.to_string());
+    format!("{cas_name} → locus {}", edit.target.0)
+}
+
+/// Serialize the stamped injections to a pretty JSON array — the renderer's injection-marker source.
+/// Schema: `[{ "generation": <u64>, "label": <string>, "applied": <bool> }, ...]` (additive; off the hash
+/// path — inv #3). Labels are JSON-escaped so an arbitrary Cas name cannot corrupt the file.
+fn write_injections_json(
+    path: &std::path::Path,
+    injections: &[(u64, String, bool)],
+) -> std::io::Result<()> {
+    let mut json = String::from("[\n");
+    for (idx, (generation, label, applied)) in injections.iter().enumerate() {
+        if idx > 0 {
+            json.push_str(",\n");
+        }
+        let _ = write!(
+            json,
+            "  {{\"generation\": {generation}, \"label\": \"{}\", \"applied\": {applied}}}",
+            json_escape(label),
+        );
+    }
+    json.push_str("\n]\n");
+    std::fs::write(path, json)
+}
+
+/// Minimal JSON string escaping (quotes / backslashes / control chars) so a label can never break the
+/// `injections.json` array. std-only (no serde dependency added here).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn combine_hashes(hashes: impl Iterator<Item = u64>) -> u64 {
