@@ -15,33 +15,47 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
 - [x] **Phase 0 — fix: specimen view in --live** ✅ DONE (`4091eaa`). The L-system plant view was empty in
   live mode (no specimens.json); now synthesised from the LIVE genome's `observe()` phenotype.
 
-- [ ] **Phase U — UI overhaul: a draggable/minimizable panel framework** (renderer-only, inv #2). The headline.
-  - *Workflow:* (1) DESIGN workflow → a reusable `Panel` wrapper API (title bar with drag handle + minimize
-    icon), default docking layout, and the minimize→**pill above the timeline** animation (tween there + back).
-    (2) Implement (serial GDScript: `panel.gd` wrapper + migrate vitals/intervention/mission/inspect/controls/
-    legend/specimen into it). (3) REVIEW workflow (adversarial: drag math, z-order, headless-build, no biology).
-  - *Concrete asks:* nicer **controls-panel graphics**; panels **draggable**; **controls** default-docked
-    bottom-left **above the timeline**; **cell-click detail (Inspect)** default bottom-left; every panel gets a
-    top-left **title bar** with **drag + minimize** icons; minimize → a labelled **pill above the timeline**
-    with a smooth animation both ways on toggle.
-  - *Acceptance:* `godot --check` green (ortho+iso); windowed `--shot` shows the new docked layout; manual drag/
-    minimize verified; `tools/gate.sh` green. Pure presentation — no core change, no re-pin.
+- [x] **Phase U — UI overhaul: draggable/minimizable panel framework** ✅ DONE (`0d6ef49`, `21fa3e8`). `panel.gd`
+  (PanelChrome: title bar = per-panel icon + name, grab-anywhere drag, minimize→pill tween) + `pill_rail.gd`;
+  all panels wrapped (Vitals/CRISPR/Mission/Specimen/Inspect/Legend/Controls). Reviewed (multi-agent) → fixed
+  the minimize/visibility desync (set_active), rapid-toggle restore, controls/rail/timeline stacking, raised the
+  pill rail. *Deferred (low): window-resize re-dock + INSPECT scroll cap.*
+
+- [x] **Phase S — incremental specimen log** ✅ DONE (`a1ff7cd`). The --live specimen view now logs distinct
+  genome states (baseline + one per whole-species edit), rendered side by side. Diagnosed the "map reddens by
+  ~gen 20" = directional selection on per-individual alleles (genotype→~0.98), NOT a bug/auto-injection; the
+  species genome is constant without edits.
+
+- [ ] **Phase E — environment parametrization + main menu** (core + UI). Add a real environment the player can
+  set instead of a bare seed: **GPS latitude/longitude → sun trajectory** (day length / insolation by season),
+  **average temperature**, season. A **MAIN MENU** to choose these (or "random seed"). Couple them into the
+  `EnvironmentModifier` seam (inv #5) so they shape selection (e.g. temperature ↔ a trait), deterministically
+  (re-pin if the pinned config ships them). *Workflow:* design (which env params ↔ which signals; menu UX) →
+  implement core (off-stream env fields like soil) + the menu → review.
+
+- [ ] **🏷️ BETA RELEASE** — tag `v0.1.0-beta` → `release.yml` builds the executables (harness + cdylib for
+  linux/mac/win + Godot Linux export). Do this AFTER Phase S/E land a coherent playable build; the CI is green.
 
 - [ ] **Phase R3 — multi-species** 🛑 (core, own ADR + human sign-off — like ADR-011). Multiple species competing
   across regions: rewrites `selection` (per-species sub-populations), the snapshot (per-species channels), the
-  genome wiring (per-species genomes), and routes region/species edits to a chosen species (inv #6 still
-  species/region-granular). Determinism RE-PIN.
+  genome wiring (per-species genomes), region/species edits routed to a chosen species (inv #6 still species/
+  region-granular). Determinism RE-PIN. **UI: each species gets its own PAGE in the specimen view with a TABLE
+  of its trees** (the incremental specimen log from Phase S, per species).
   - *Workflow:* understand (current single-species selection/snapshot/genome) → design (species model + ADR)
     → implement slices (each gate-green, re-pin where flagged) → adversarial review.
 
-- [ ] **Phase T — more traits under selection** (core, smaller). Today only `Genotype` + `DroughtTol` are
-  selected; add further environment↔phenotype couplings (e.g. reflectance vs a light/temperature soil channel)
-  behind the `EnvironmentModifier` seam (inv #5). Determinism RE-PIN if the pinned config ships them.
-  - *Workflow:* design (which traits ↔ which env signal) → implement → review.
+- [ ] **Phase Rel — relations view (synergy / parasites / predators), vector-DB backed** (core + UI). A NEW view
+  for inter-species/inter-lineage RELATIONS — mutualism, parasitism, predation — with a **vector DB** to index
+  genome/phenotype embeddings (similarity, lineage neighbourhoods). Likely a process-boundary service (inv #1:
+  any GPL/external DB stays a subprocess, never linked). *Workflow:* research (vector-DB options at the process
+  boundary) → design (relation model + ADR) → implement → review.
 
-Sequencing rationale: Phase U first (it's renderer-only, unblocks visual judgement of everything after, and
-the user asked for it next); then R3 (the biggest sim leap, gated on a human ADR sign-off); then T (rides on
-R3's reworked selection). Each core phase re-pins the determinism hash deliberately, ledgered in the pinned test.
+- [ ] **Phase T — more traits under selection** (folds into E/R3). Beyond `Genotype` + `DroughtTol`: more
+  environment↔phenotype couplings behind the `EnvironmentModifier` seam (inv #5). Determinism RE-PIN if shipped.
+
+Sequencing: U + S done. Next E (environment + main menu — makes runs meaningful beyond a seed) → **BETA tag** →
+R3 (biggest sim leap, ADR sign-off) → Rel (relations + vector DB, ADR). Each core phase re-pins the determinism
+hash deliberately, ledgered in the pinned test; each large/invariant phase gets its own design workflow + ADR.
 
 ---
 
