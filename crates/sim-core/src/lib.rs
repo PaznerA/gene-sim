@@ -386,17 +386,15 @@ impl Simulation {
     ///
     /// Like [`observe`](Self::observe), this is **pure** w.r.t. the run: it iterates the [`World`] but
     /// **never** draws from [`SimRng`] and **never** mutates state, so calling it cannot change the
-    /// determinism hash (invariant #3). Each organism is placed into a cell by a deterministic function of
-    /// its [`OrgId`] only (`x = derive_seed(id, 1) % width`, `y = derive_seed(id, 2) % height`), so the
-    /// layout is reproducible and independent of the RNG stream. Aggregation walks organisms in stable
-    /// `OrgId` order (no `HashMap` iteration affecting output — invariant #3).
+    /// determinism hash (invariant #3) — purely a READ-ONLY projection (inv #2). Each organism's REAL world
+    /// [`Position`] (on [`WORLD_DIMS`]) is resampled onto the render `(width, height)` grid (ADR-011 S-C);
+    /// the OrgId-hash visualization layout is retired. Aggregation walks organisms in stable `OrgId` order
+    /// (no `HashMap` iteration affecting output — invariant #3).
     ///
     /// Channels (each `width * height`, row-major, in `[0, 1]`): `density` = per-cell count / busiest-cell
     /// count; `allele_freq` = mean [`Genotype`] in the cell; `fitness` = mean [`Energy`] in the cell.
-    /// Empty cells are `0` on every channel.
-    ///
-    /// PoC note: this is a **derived spatial layout** for visualization — the core has no real spatial
-    /// dynamics yet (future work). See [`crate::snapshot`] for the placement model and binary format.
+    /// Empty cells are `0` on every channel. Now reflects REAL spatial structure (clusters/clines from
+    /// inherited dispersal), not a derived layout.
     ///
     /// # Panics
     /// Panics if `width` or `height` is `0` (a degenerate grid has no cells to place organisms in).
@@ -405,12 +403,13 @@ impl Simulation {
         assert!(width > 0 && height > 0, "snapshot grid must be non-empty");
         let generation = self.world.resource::<Tick>().0;
 
-        // Collect organisms in STABLE OrgId order (decouples from ECS archetype iteration — inv. #3).
-        let mut rows: Vec<(u32, f64, f64)> = self
+        // Collect organisms in STABLE OrgId order (decouples from ECS archetype iteration — inv. #3),
+        // carrying each one's REAL world Position (ADR-011 S-C — no longer the OrgId-hash layout).
+        let mut rows: Vec<(u32, f64, f64, u32, u32)> = self
             .world
-            .query::<(&OrgId, &Genotype, &Energy)>()
+            .query::<(&OrgId, &Genotype, &Energy, &Position)>()
             .iter(&self.world)
-            .map(|(id, g, e)| (id.0, g.0, e.0))
+            .map(|(id, g, e, p)| (id.0, g.0, e.0, p.x, p.y))
             .collect();
         rows.sort_unstable_by_key(|r| r.0);
         let population = rows.len() as u32;
@@ -420,10 +419,13 @@ impl Simulation {
         let mut genotype_sum = vec![0.0f64; cells];
         let mut energy_sum = vec![0.0f64; cells];
 
-        for (id, g, e) in &rows {
-            // Deterministic placement from OrgId ONLY (splitmix in det.rs) — independent of the RNG stream.
-            let x = (derive_seed(u64::from(*id), 1) % u64::from(width)) as usize;
-            let y = (derive_seed(u64::from(*id), 2) % u64::from(height)) as usize;
+        for (_id, g, e, px, py) in &rows {
+            // Resample the organism's REAL world cell (px,py on WORLD_DIMS) onto the render grid — no RNG,
+            // no OrgId hash. Clamp guards the top edge when render dims exceed the world grid.
+            let x = ((u64::from(*px) * u64::from(width)) / u64::from(WORLD_DIMS.0))
+                .min(u64::from(width) - 1) as usize;
+            let y = ((u64::from(*py) * u64::from(height)) / u64::from(WORLD_DIMS.1))
+                .min(u64::from(height) - 1) as usize;
             let cell = y * (width as usize) + x;
             count[cell] += 1;
             genotype_sum[cell] += *g;
@@ -905,14 +907,24 @@ mod tests {
             entity_count: 4,
         };
         let mut sim = Simulation::reset(&cfg);
-        let snap = sim.snapshot(64, 64);
-        // Recompute occupancy via the same OrgId-derived placement to find empty cells.
-        let mut occupied = vec![false; 64 * 64];
-        for id in 0..4u32 {
-            let x = (derive_seed(u64::from(id), 1) % 64) as usize;
-            let y = (derive_seed(u64::from(id), 2) % 64) as usize;
-            occupied[y * 64 + x] = true;
+        // Recompute occupancy from the organisms' REAL positions, resampled to the render grid exactly as
+        // Simulation::snapshot does (ADR-011 S-C — no longer the OrgId hash).
+        let (w, h) = (64u32, 64u32);
+        let mut occupied = vec![false; (w * h) as usize];
+        let positions: Vec<(u32, u32)> = sim
+            .world
+            .query::<&Position>()
+            .iter(&sim.world)
+            .map(|p| (p.x, p.y))
+            .collect();
+        for (px, py) in &positions {
+            let x = ((u64::from(*px) * u64::from(w)) / u64::from(WORLD_DIMS.0))
+                .min(u64::from(w) - 1) as usize;
+            let y = ((u64::from(*py) * u64::from(h)) / u64::from(WORLD_DIMS.1))
+                .min(u64::from(h) - 1) as usize;
+            occupied[y * w as usize + x] = true;
         }
+        let snap = sim.snapshot(w, h);
         let mut empty_seen = false;
         for (c, &occ) in occupied.iter().enumerate() {
             if !occ {
@@ -923,6 +935,31 @@ mod tests {
             }
         }
         assert!(empty_seen, "test grid should have empty cells");
+    }
+
+    #[test]
+    fn snapshot_aggregates_by_real_position() {
+        // ADR-011 S-C: at a 1:1 render grid, every nonzero-density cell is exactly a cell holding an
+        // organism's REAL Position — proving the snapshot reads Position, not the retired OrgId hash.
+        let cfg = SimConfig {
+            seed: 9,
+            generations: 6,
+            entity_count: 400,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let mut real = vec![0u32; (WORLD_DIMS.0 * WORLD_DIMS.1) as usize];
+        for p in sim.world.query::<&Position>().iter(&sim.world) {
+            real[(p.y * WORLD_DIMS.0 + p.x) as usize] += 1;
+        }
+        let snap = sim.snapshot(WORLD_DIMS.0, WORLD_DIMS.1);
+        for (c, (&r, &d)) in real.iter().zip(&snap.density).enumerate() {
+            assert_eq!(
+                r > 0,
+                d > 0.0,
+                "cell {c}: snapshot density must match real Position occupancy"
+            );
+        }
     }
 
     #[test]

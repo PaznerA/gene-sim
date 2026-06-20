@@ -8,13 +8,13 @@
 //! determinism hash (invariant #3). All genotype→phenotype biology stays in the core (invariant #2);
 //! GDScript only reads the bytes this module emits.
 //!
-//! ## Placement model (PoC: derived spatial layout)
-//! The core has **no spatial dynamics yet** — organisms are not positioned in 2D. To give the renderer
-//! something to draw, each organism is placed into a grid cell by a **deterministic function of its
-//! [`OrgId`](crate::OrgId) only** (via the splitmix in [`derive_seed`](crate::derive_seed)):
-//! `x = derive_seed(orgid, 1) % width`, `y = derive_seed(orgid, 2) % height`. This is reproducible and
-//! independent of the RNG stream, so a given `(seed, generation, grid)` always yields byte-identical
-//! snapshots. Real spatial dynamics are future work; this is a layout for visualization, not biology.
+//! ## Placement model (ADR-011: real spatial biology)
+//! Organisms now carry a real per-individual `Position` on the canonical world grid (`WORLD_DIMS`), seeded
+//! off-`SimRng` at spawn and inherited + dispersed by selection so lineages cluster into emergent regions.
+//! `Simulation::snapshot` RESAMPLES each organism's real world cell onto the render `(width, height)` grid —
+//! it no longer derives a cell from `OrgId`. Still pure w.r.t. the run (no `SimRng` draw, no mutation), so a
+//! given `(seed, generation, grid)` yields byte-identical snapshots and producing them never changes the
+//! determinism hash (inv #3). This is a READ-ONLY projection of real biology (inv #2), not a viz-only layout.
 //!
 //! ## Binary format ([`GridSnapshot::write_snapshot_bytes`])
 //! Little-endian, `std`-only (no `bincode`/`serde`):
