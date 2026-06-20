@@ -169,14 +169,16 @@ hash-neutral and ride the normal loop *while* the live-sim crate is built.
   `actions.ndjson` + injection generations to a real run dir (today only replay temp dirs).
 - [ ] **P3 (R8-iso, renderer)** Isometric transform (`iso.gd`: CPU diamonds, depth `cx+cy`) + iso ground/soil
   + framing fix + centralize cell↔pixel picking, behind a `--iso` toggle (orthographic stays default).
-- [ ] 🛑 **P4 (R6.1)** `LiveSim.apply_edit` + full journaling + `save_session`; **`run_stats()` clone-fold fix**
-  (the load-bearing determinism tripwire). Manual-intervention path proven reproducible headless.
+- [x] **P4 (R6.1, partial)** `LiveSim.apply_edit(cas,target,guide)` (species-granular EditAction on the single
+  seeded stream, explicit Applied/Failed) + `cas_variants()`/`loci()` for the UI. ✅ DONE. *Still pending:
+  full action journaling + `save_session` + the `run_stats()` clone-fold fix (needed only for mid-run save).*
 - [x] **P5 (R6.2)** Renderer `--live` mode: open-ended play/pause/step pulling `LiveSim.snapshot()` bytes at a
   fixed-integer cadence; runtime `GDExtensionManager.load_extension` (default project stays extension-free);
   `snapshot.gd::parse_bytes`; rolling history timeline; composes with `--iso`. ✅ DONE (verified windowed +
   `--shot`; falls back to file replay if cdylib unbuilt). *Manual edits (apply_edit) = P4/P6.*
-- [ ] **P6 (R5)** Manual CRISPR intervention UI (`intervention.gd`: Cas/locus/guide/when pickers) → `LiveSim.
-  apply_edit`; Applied/Failed markers + per-gen sparkline on the timeline. Renderer requests, core applies (#2/#6).
+- [x] **P6 (R5)** Live-mode CRISPR intervention panel (Cas/locus dropdowns from the core + guide field + Inject)
+  → `LiveSim.apply_edit`; Applied/Failed markers on the timeline at the injection generation. Renderer
+  requests, core applies (#2/#6). ✅ DONE. *Per-gen effect sparkline = a small follow-up.*
 - [ ] 🛑 **P7 (R3)** Multi-species KEYSTONE — own design workflow + ADR. M0 `SpeciesId` plumbing K=1
   hash-neutral; M1 K>1 (new hash literal, perf re-baseline, ordered-by-`SpeciesId` parents, specimen-view GRID,
   GSS2→GSS3). Resolve the R1.2/R1.3-vs-R3 `selection()` rewrite collision first.

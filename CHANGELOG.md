@@ -4,6 +4,22 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### P4 + P6 — live CRISPR interventions: apply edits to a running sim (feat, roadmap R6/R5)
+The live sim becomes interactive — apply a CRISPR edit while it runs and watch the effect:
+- **P4 (`crates/godot-sim`):** `LiveSim.apply_edit(cas, target, guide) -> {applied, detail, generation}` —
+  builds a species-granular `harness::EditAction` (no organism handle, inv #6) and steps it through the env's
+  single seeded stream (inv #3, exactly as the gym env). Never a silent no-op (explicit Applied/Failed). Plus
+  `cas_variants()` / `loci()` returning `[{id,name}]` so the UI offers real choices. Authoritative PAM/score/
+  gate logic stays in `crispr` (inv #2) — GDScript only assembles ids + a guide and reads the verdict.
+- **P6 (`main.gd`, `timeline.gd`):** a live-mode **CRISPR Intervention** panel (Cas / locus dropdowns
+  populated from the core, a guide field, an Inject button) → `LiveSim.apply_edit` → the outcome is shown and
+  a green/red marker is placed on the timeline at the injection generation. Renderer **requests**, core
+  **applies**. A `--inject` CLI hook fires one demo injection for `--shot` verification.
+
+Verified: the panel populates from the core (Cas: SpCas9, Locus: growth_locus), `apply_edit` applies
+(SpCas9→growth, gen 21) and rejects a malformed guide. godot-sim clippy clean; full gate green (10/10);
+determinism untouched.
+
 ### P5 — `--live` mode: the renderer drives an open-ended live sim (feat, roadmap R6)
 The renderer can now run the simulation LIVE via the LiveSim gdext node, instead of replaying pre-baked
 snapshot files (read-only presentation — biology stays in Rust, inv #2):

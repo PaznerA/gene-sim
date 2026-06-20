@@ -97,6 +97,14 @@ var _detail_box: VBoxContainer
 var _dragging: bool = false  # left-button drag-pan in progress
 var _drag_moved: float = 0.0  # accumulated drag distance (to tell a click from a drag)
 var _live = null  # LiveSim gdext node when --live is active (drives an open-ended run); null = file replay
+var _intervention_panel: Control  # live-mode CRISPR injection UI
+var _cas_picker: OptionButton
+var _locus_picker: OptionButton
+var _guide_edit: LineEdit
+var _inject_status: Label
+var _cas_ids: Array = []  # cas variant id per _cas_picker item
+var _locus_ids: Array = []  # locus id per _locus_picker item
+var _injections: Array = []  # [{generation, applied}] for the timeline markers
 
 
 func _ready() -> void:
@@ -156,6 +164,10 @@ func _ready() -> void:
 	var zoom_arg := _arg_value("--zoom")  # optional: preset zoom scope for --shot
 	if zoom_arg != "":
 		_set_zoom(float(zoom_arg))
+	if _live != null and _has_flag("--inject"):  # optional: fire one demo injection for --shot verification
+		_live.step(20)
+		_live_advance()
+		_on_inject_pressed()
 	if _arg_value("--view") == "specimen":  # optional: open the L-system specimen view for --shot
 		_set_view_mode(1)
 		var focus_arg := _arg_value("--focus")  # optional: focus a specific specimen (0=baseline, 1..=edits)
@@ -253,7 +265,89 @@ func _live_advance() -> void:
 		for s in _snaps:
 			gens.append(s.generation)
 		_timeline.setup(gens)
+		_timeline.set_markers(_injections)
 	_show(_snaps.size() - 1)
+
+
+## Live-mode CRISPR intervention UI (P6): pick a Cas variant / locus / guide and Inject. The renderer only
+## REQUESTS the edit (LiveSim.apply_edit) — the core applies it (authoritative PAM/score/gate stay in crispr,
+## inv #2); the species-granular EditAction carries no organism handle (inv #6). Hidden unless --live.
+func _build_intervention_ui(ui: CanvasLayer) -> void:
+	_intervention_panel = _dark_panel(0.55)
+	var fs := _field_screen_size()
+	_intervention_panel.position = Vector2(maxf(240.0, fs.x - 274.0), 70.0)
+	_intervention_panel.custom_minimum_size = Vector2(262, 0)
+	_intervention_panel.visible = (_live != null)
+	ui.add_child(_intervention_panel)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 5)
+	_intervention_panel.add_child(col)
+
+	var hdr := Label.new()
+	hdr.text = "⌖ CRISPR Intervention"
+	hdr.add_theme_font_size_override("font_size", 15)
+	hdr.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
+	col.add_child(hdr)
+
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Cas:"))
+	_cas_picker = OptionButton.new()
+	r1.add_child(_cas_picker)
+	col.add_child(r1)
+
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Locus:"))
+	_locus_picker = OptionButton.new()
+	r2.add_child(_locus_picker)
+	col.add_child(r2)
+
+	var r3 := HBoxContainer.new()
+	r3.add_child(_dim_label("Guide:"))
+	_guide_edit = LineEdit.new()
+	_guide_edit.text = "ACGTGGACGTTTTAGGCCGG"
+	_guide_edit.custom_minimum_size = Vector2(160, 0)
+	_guide_edit.text_submitted.connect(_on_guide_submitted)
+	r3.add_child(_guide_edit)
+	col.add_child(r3)
+
+	var inject := Button.new()
+	inject.text = "Inject edit"
+	inject.pressed.connect(_on_inject_pressed)
+	col.add_child(inject)
+
+	_inject_status = _dim_label("")
+	_inject_status.custom_minimum_size = Vector2(250, 0)
+	_inject_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	col.add_child(_inject_status)
+
+	if _live != null:
+		for v in _live.cas_variants():
+			_cas_picker.add_item(str((v as Dictionary).get("name", "cas")))
+			_cas_ids.append(int((v as Dictionary).get("id", 0)))
+		for l in _live.loci():
+			_locus_picker.add_item(str((l as Dictionary).get("name", "locus")))
+			_locus_ids.append(int((l as Dictionary).get("id", 0)))
+
+
+func _on_guide_submitted(_text: String) -> void:
+	_on_inject_pressed()
+
+
+## Request a CRISPR edit from the running LiveSim, show the outcome, and mark it on the timeline.
+func _on_inject_pressed() -> void:
+	if _live == null or _cas_picker.selected < 0 or _locus_picker.selected < 0:
+		return
+	var cas_id := int(_cas_ids[_cas_picker.selected])
+	var locus_id := int(_locus_ids[_locus_picker.selected])
+	var outcome: Dictionary = _live.apply_edit(cas_id, locus_id, _guide_edit.text)
+	var applied := bool(outcome.get("applied", false))
+	_inject_status.text = ("✓ " if applied else "✗ ") + str(outcome.get("detail", ""))
+	_inject_status.add_theme_color_override(
+		"font_color", Color(0.5, 0.92, 0.52) if applied else Color(0.96, 0.55, 0.5))
+	_injections.append({"generation": int(outcome.get("generation", 0)), "applied": applied})
+	if _timeline != null:
+		_timeline.set_markers(_injections)
 
 
 # ──────────────────────────── scene construction (read-only presentation) ────────────────────────────
@@ -324,6 +418,7 @@ func _build_scene() -> void:
 	_build_specimen_ui(ui, field_screen)
 	_build_interaction_ui(ui)
 	_build_timeline(ui)
+	_build_intervention_ui(ui)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
@@ -675,6 +770,8 @@ func _set_view_mode(m: int) -> void:
 		_tooltip.visible = false
 	if _timeline != null:
 		_timeline.visible = (m == 0)  # the timeline indexes snapshots, irrelevant in specimen view
+	if _intervention_panel != null:
+		_intervention_panel.visible = (_live != null and m == 0)
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:

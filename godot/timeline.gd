@@ -10,6 +10,12 @@ const PAD := 12.0
 var _count: int = 0
 var _idx: int = 0
 var _gens: Array = []  # generation number per snapshot index, for labels
+var _markers: Array = []  # [{generation:int, applied:bool}] CRISPR injections to mark on the gen axis
+
+
+func set_markers(markers: Array) -> void:
+	_markers = markers
+	queue_redraw()
 
 
 func setup(gens: Array) -> void:
@@ -44,6 +50,21 @@ func _draw() -> void:
 			var g: int = _gens[i] if i < _gens.size() else i
 			draw_string(font, Vector2(x - 8.0, mid + 20.0), str(g), HORIZONTAL_ALIGNMENT_LEFT, -1, 11,
 				Color(0.7, 0.76, 0.7))
+
+	# CRISPR injection markers (green = applied, red = failed), placed on the generation axis.
+	var g0: int = _gens[0]
+	var g1: int = _gens[_count - 1]
+	if g1 > g0:
+		for m in _markers:
+			var g: int = int(m.get("generation", 0))
+			if g < g0 or g > g1:
+				continue  # outside the visible (rolling) window
+			var mx := PAD + tw * float(g - g0) / float(g1 - g0)
+			var mc: Color = Color(0.42, 0.9, 0.46) if bool(m.get("applied", false)) else Color(0.95, 0.42, 0.42)
+			draw_line(Vector2(mx, 6.0), Vector2(mx, h - 16.0), mc, 2.0)
+			draw_polygon(
+				PackedVector2Array([Vector2(mx - 4.0, 4.0), Vector2(mx + 4.0, 4.0), Vector2(mx, 11.0)]),
+				PackedColorArray([mc, mc, mc]))  # downward marker tab
 
 	# Play-head.
 	var px := PAD + tw * float(_idx) / float(_count - 1)

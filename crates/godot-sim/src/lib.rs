@@ -20,9 +20,11 @@
 //! gdext is MPL-2.0; this is a cdylib (a separate link unit), so the GPL process-boundary (invariant
 //! #1) is untouched. Pinned to `godot` 0.5.3 / api-4-6 (invariant #7; ADR-010).
 
+use crispr::{CasVariantId, EditOutcome, GuideSequence};
+use genome::LocusId;
 use godot::builtin::VarDictionary;
 use godot::prelude::*;
-use harness::{Action, Env, GeneSimEnv};
+use harness::{Action, EditAction, Env, GeneSimEnv};
 use sim_core::{Observation, Simulation};
 
 /// gdext entry point. Registers every `#[derive(GodotClass)]` in this crate (here: [`LiveSim`]).
@@ -145,11 +147,99 @@ impl LiveSim {
         PackedByteArray::from(bytes.as_slice())
     }
 
+    /// Apply a CRISPR edit to the **species** genome live (P4 / R6.1) and return its outcome.
+    ///
+    /// `cas` = Cas-variant id, `target` = species-genome locus id, `guide` = the ACGT guide string. Builds a
+    /// species-granular [`harness::EditAction`] (invariant #6 — no organism handle) and steps it through the
+    /// env's single seeded stream (invariant #3 — the edit draws only from that stream, exactly as the gym
+    /// env does). Returns `{applied: bool, detail: String, generation: int}` — never a silent no-op (the core
+    /// always yields an explicit Applied/Failed outcome). Authoritative PAM/score/gate logic stays in
+    /// `crispr` (invariant #2): GDScript only assembles ids + a guide string and reads the verdict.
+    #[func]
+    fn apply_edit(&mut self, cas: i64, target: i64, guide: GString) -> VarDictionary {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::apply_edit called before reset()");
+            return edit_dict(false, "not reset", 0);
+        };
+        let g = match GuideSequence::new(guide.to_string().into_bytes()) {
+            Ok(g) => g,
+            Err(pos) => return edit_dict(false, &format!("invalid guide (bad base at {pos})"), env_gen(env)),
+        };
+        let edit = EditAction {
+            cas: CasVariantId(cas.clamp(0, i64::from(u16::MAX)) as u16),
+            target: LocusId(target.max(0) as u32),
+            guide: g,
+        };
+        env.step(Action::ApplyEdit(edit));
+        let cur_gen = env_gen(env);
+        match env.last_edit() {
+            Some(EditOutcome::Applied {
+                locus,
+                param,
+                on_efficiency,
+                off_target_hits,
+            }) => edit_dict(
+                true,
+                &format!(
+                    "applied → locus {} param {} · on-eff {on_efficiency:.2} · off-target {off_target_hits}",
+                    locus.0, param.0
+                ),
+                cur_gen,
+            ),
+            Some(EditOutcome::Failed { reason, .. }) => {
+                edit_dict(false, &format!("failed: {reason:?}"), cur_gen)
+            }
+            None => edit_dict(false, "no outcome", cur_gen),
+        }
+    }
+
+    /// The Cas-variant table as `[{id, name}, ...]` so the intervention UI can offer real choices (ids +
+    /// names only — no biology in GDScript; the table is data, SPEC §4). From `crispr::default_cas_variants`.
+    #[func]
+    fn cas_variants(&self) -> VarArray {
+        let mut arr = VarArray::new();
+        for v in crispr::default_cas_variants() {
+            let mut d = VarDictionary::new();
+            d.set("id", i64::from(v.id.0));
+            d.set("name", v.name.as_str());
+            arr.push(&d.to_variant());
+        }
+        arr
+    }
+
+    /// The species-genome loci as `[{id, name}, ...]` for the intervention UI's target picker (ids + names
+    /// only). From `genome::sample_genome` (the species baseline).
+    #[func]
+    fn loci(&self) -> VarArray {
+        let mut arr = VarArray::new();
+        for l in genome::sample_genome().loci {
+            let mut d = VarDictionary::new();
+            d.set("id", i64::from(l.id.0));
+            d.set("name", l.name.as_str());
+            arr.push(&d.to_variant());
+        }
+        arr
+    }
+
     /// Convenience: whether `reset` has been called (an episode is live).
     #[func]
     fn is_ready(&self) -> bool {
         self.env.is_some()
     }
+}
+
+/// The current generation of a live env (for stamping an edit's outcome).
+fn env_gen(env: &mut GeneSimEnv) -> i64 {
+    env.observe().generation as i64
+}
+
+/// Build the GDScript-facing edit-outcome `Dictionary` (display only — the authoritative outcome is the core's).
+fn edit_dict(applied: bool, detail: &str, generation: i64) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    d.set("applied", applied);
+    d.set("detail", detail);
+    d.set("generation", generation);
+    d
 }
 
 /// Build the GSS2 snapshot bytes from the env's live `Simulation` (read-only — invariant #3).
