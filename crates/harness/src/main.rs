@@ -10,7 +10,10 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sim_core::{derive_seed, run_headless, RunStats, SimConfig, Simulation, Trait};
+use crispr::{default_cas_variants, GuideSequence};
+use genome::LocusId;
+use harness::{Action, EditAction, Env, GeneSimEnv};
+use sim_core::{derive_seed, run_headless, Observation, RunStats, SimConfig, Simulation, Trait};
 
 const USAGE: &str = "\
 gene-sim harness — headless deterministic sim runner
@@ -28,6 +31,8 @@ OPTIONS:
     --per-gen-stats       Also write per-generation columnar stats to data/runs/<id>/per_gen.csv
     --snapshots <DIR>     Write per-cell render snapshots (snap_<gen>.bin) to <DIR> every epoch (SPEC §W10)
     --grid <W>x<H>        Snapshot grid size for --snapshots. Default: 64x64
+    --specimens <DIR>     Write specimens.json (baseline + edited species-genome trait vectors) for the
+                          renderer's L-system plant view (SPEC §W10, S4.5). Read-only; no hash impact.
     --hash-only           Print only the combined determinism hash (no files written)
     -h, --help            Show this help
 
@@ -52,6 +57,7 @@ struct Args {
     per_gen_stats: bool,
     snapshots: Option<PathBuf>,
     grid: (u32, u32),
+    specimens: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -65,6 +71,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut per_gen_stats = false;
     let mut snapshots: Option<PathBuf> = None;
     let mut grid: (u32, u32) = (64, 64);
+    let mut specimens: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -85,6 +92,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--entities" => entities = parse_num(&take("--entities")?, "--entities")?,
             "--snapshots" => snapshots = Some(PathBuf::from(take("--snapshots")?)),
             "--grid" => grid = parse_grid(&take("--grid")?)?,
+            "--specimens" => specimens = Some(PathBuf::from(take("--specimens")?)),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -100,6 +108,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         per_gen_stats,
         snapshots,
         grid,
+        specimens,
     }))
 }
 
@@ -144,6 +153,7 @@ fn main() -> ExitCode {
 
     let want_per_gen = args.per_gen_stats && !args.hash_only;
     let want_snapshots = args.snapshots.is_some() && !args.hash_only;
+    let want_specimens = args.specimens.is_some() && !args.hash_only;
 
     let mut results: Vec<RunStats> = Vec::with_capacity(indices.len());
     // Per-run, per-generation CSV rows (only populated when --per-gen-stats and not --hash-only).
@@ -167,6 +177,15 @@ fn main() -> ExitCode {
             if let Some(dir) = &args.snapshots {
                 if let Err(e) = write_snapshots(dir, i, multi_run, &cfg, args.grid) {
                     eprintln!("warning: could not write snapshots for run {i}: {e}");
+                }
+            }
+        }
+        if want_specimens {
+            // ADDITIVE & read-only: specimens come from a SEPARATE GeneSimEnv instance (its own RNG), never
+            // the hashed run — so exporting them cannot change the determinism hash (invariant #3).
+            if let Some(dir) = &args.specimens {
+                if let Err(e) = write_specimens(dir, i, multi_run, &cfg) {
+                    eprintln!("warning: could not write specimens for run {i}: {e}");
                 }
             }
         }
@@ -287,6 +306,104 @@ fn write_snapshots(
         }
     }
     Ok(())
+}
+
+/// Demo CRISPR edits exported as named specimens (a Cas + the species-genome locus + a guide that targets
+/// it). These are deliberately fixed presets that exercise the on-target path on the sample genome's two
+/// loci; any outcome (Applied **or** Failed) mutates the genome, so each specimen's phenotype differs from
+/// the baseline — that is exactly the "an edit visibly changes morphology" demo the renderer draws (S4.5).
+fn demo_edits() -> Vec<(&'static str, EditAction)> {
+    let cas = |name: &str| default_cas_variants().into_iter().find(|v| v.name == name);
+    let mut out = Vec::new();
+    if let (Some(sp), Ok(g)) = (cas("SpCas9"), GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG")) {
+        out.push((
+            "SpCas9 → growth_locus",
+            EditAction {
+                cas: sp.id,
+                target: LocusId(0),
+                guide: g,
+            },
+        ));
+    }
+    if let (Some(asc), Ok(g)) = (
+        cas("AsCas12a"),
+        GuideSequence::new(*b"TTTACCGGTTTAGGGCAAAC"),
+    ) {
+        out.push((
+            "AsCas12a → killswitch_locus",
+            EditAction {
+                cas: asc.id,
+                target: LocusId(1),
+                guide: g,
+            },
+        ));
+    }
+    out
+}
+
+/// JSON object of the 5 trait values (canonical [`Trait::ALL`] order) carried by an [`Observation`].
+fn traits_json(o: &Observation) -> String {
+    let p = &o.phenotype;
+    format!(
+        concat!(
+            "{{\"growth_rate\":{:.6},\"reflectance\":{:.6},\"drought_tolerance\":{:.6},",
+            "\"fecundity\":{:.6},\"kill_switch_linkage\":{:.6}}}"
+        ),
+        p.get(Trait::GrowthRate).unwrap_or(0.0),
+        p.get(Trait::Reflectance).unwrap_or(0.0),
+        p.get(Trait::DroughtTolerance).unwrap_or(0.0),
+        p.get(Trait::Fecundity).unwrap_or(0.0),
+        p.get(Trait::KillSwitchLinkage).unwrap_or(0.0),
+    )
+}
+
+/// Write `specimens.json`: the baseline species-genome phenotype plus one phenotype per demo edit, for the
+/// renderer's L-system plant view (S4.5). The genotype→phenotype map (invariant #2) runs in the core via a
+/// [`GeneSimEnv`]; the renderer only reads these trait vectors and maps them to plant visuals.
+///
+/// Read-only & ADDITIVE: the env is a SEPARATE instance with its own seeded RNG (it never touches the hashed
+/// `run_headless` stream), so this cannot change the determinism hash (invariant #3). For a fixed
+/// `(seed, entity_count)` the bytes are reproducible.
+fn write_specimens(
+    base: &std::path::Path,
+    i: u32,
+    multi_run: bool,
+    cfg: &SimConfig,
+) -> std::io::Result<()> {
+    let dir = if multi_run {
+        base.join(format!("run{i}"))
+    } else {
+        base.to_path_buf()
+    };
+    std::fs::create_dir_all(&dir)?;
+
+    // Baseline: the unedited species-genome phenotype (env.reset returns the gen-0 observation).
+    let mut env = GeneSimEnv::new(cfg.entity_count);
+    let baseline = env.reset(cfg.seed);
+
+    let mut edits_json = String::new();
+    for (idx, (label, edit)) in demo_edits().into_iter().enumerate() {
+        // Fresh env per edit so each is applied to the BASELINE genome (independent, not cumulative).
+        let mut e = GeneSimEnv::new(cfg.entity_count);
+        e.reset(cfg.seed);
+        let after = e.step(Action::ApplyEdit(edit)).obs;
+        let applied = matches!(e.last_edit(), Some(crispr::EditOutcome::Applied { .. }));
+        if idx > 0 {
+            edits_json.push_str(",\n");
+        }
+        let _ = write!(
+            edits_json,
+            "    {{\"label\":\"{label}\",\"applied\":{applied},\"traits\":{}}}",
+            traits_json(&after)
+        );
+    }
+
+    let json = format!(
+        "{{\n  \"baseline\": {{\"label\":\"baseline\",\"traits\":{}}},\n  \"edits\": [\n{}\n  ]\n}}\n",
+        traits_json(&baseline),
+        edits_json
+    );
+    std::fs::write(dir.join("specimens.json"), json)
 }
 
 /// Write `data/runs/<run_id>/{seed.json,stats.ndjson}` (human-readable; replay contract seed, SPEC §5).

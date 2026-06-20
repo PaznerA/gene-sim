@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S4.5 — L-system plant morphology + UI controls (feat, Stage 4) — **Stage 4 COMPLETE**
+- **Core export** (`harness --specimens <DIR>` → `specimens.json`): the species-genome **trait vector**
+  (baseline) plus one per demo CRISPR edit, each expressed by the core's `WeightedSumMap` GP map via a
+  separate `GeneSimEnv` (its own seeded RNG — never the hashed run, so **no determinism-hash impact**,
+  inv. #3). Any edit outcome (Applied *or* Failed) mutates the genome, so every specimen's traits differ
+  from baseline — genotype→phenotype stays in the core (inv. #2).
+- **L-system renderer** (`godot/lsystem.gd`): a parametric bracketed turtle-graphics plant (ABOP grammar)
+  drawn from **numeric params only** — pure presentation, zero biology. `main.gd::_plant_params_from_traits`
+  maps each trait → a visual param (growth→size/reach, reflectance→spread+leaf hue, drought→taper+tip colour,
+  fecundity→leaf size, kill-switch→jitter). The genome→trait math is the core's; trait→appearance is the
+  renderer's job (SPEC "L-system rule params").
+- **Specimen view** (key `V` / the View button): renders baseline + edited plants side by side with captions
+  — an edit **visibly** stunts (growth knockdown) or greens-and-grows (kill-switch/reflectance) the plant.
+- **UI control bar:** view toggle (Ecosystem ⇄ Specimen), play/pause, step ◀/▶, and a data-layer dropdown —
+  all change *view* state only (no biology). Keyboard shortcuts still work and stay in sync.
+- The gate's headless `--check` now also builds the L-system specimens (catches GDScript errors in CI); the
+  gate generates `specimens.json` for the check. Full gate green; determinism hash unchanged. ADR-007.
+
 ### S4.3/S4.4 visual polish (refinement, Stage 4)
 - **Heatmap palette:** the data-layer shader now uses an *inferno* ramp (indigo→purple→red→orange→yellow)
   that contrasts with the green field instead of the muddy blue→cyan over grass.

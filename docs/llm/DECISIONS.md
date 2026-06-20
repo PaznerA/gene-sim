@@ -230,6 +230,46 @@ GPU. The first windowed run also surfaced a Godot headless trap.
 
 ---
 
+## ADR-007 — L-system specimen morphology: trait export + renderer mapping (Stage 4, S4.5)
+
+- **Date:** 2026-06-20
+- **Status:** Accepted
+- **Stage:** 4 (slice S4.5)
+
+### Context
+S4.5 must make a genome **edit visibly change plant morphology** while keeping **all biology in the core**
+(inv. #2): the renderer may not compute genotype→phenotype. The species genome (and thus its phenotype) is
+constant across a run — only an **edit** changes it — so the demo is baseline-vs-edited, not per-generation.
+
+### Decision
+- **Trait export, not genome export.** `harness --specimens <DIR>` writes `specimens.json`: the baseline
+  species-genome **trait vector** plus one per fixed demo CRISPR edit. Each is expressed by the core's
+  `WeightedSumMap` GP map through a **separate `GeneSimEnv`** (its own seeded RNG), so it never touches the
+  hashed `run_headless` stream — exporting specimens cannot change the determinism hash (inv. #3). The
+  renderer reads trait scalars; it never sees genome internals or runs the GP map.
+- **Any edit outcome qualifies.** `apply_edit` mutates the genome on **both** Applied and Failed paths (a
+  failed edit perturbs other loci), so every specimen's phenotype differs from baseline — the "an edit
+  changes morphology" demo holds regardless of gate pass/fail.
+- **trait→visual mapping is presentation.** `godot/lsystem.gd` is a parametric bracketed turtle L-system that
+  draws from numeric params only. `main.gd::_plant_params_from_traits` maps each `[0,1]` trait to a visual
+  param (growth→size/reach, reflectance→spread+leaf hue, drought→taper+tip colour, fecundity→leaf size,
+  kill-switch→jitter). This is the renderer's job per SPEC ("L-system rule params"); the biology (genome→
+  trait) already ran in the core. The intra-branch jitter is a deterministic hash, not a model.
+- **UI controls change view state only.** The control bar (view toggle, play/pause, step, layer dropdown)
+  and keys never synthesise a genome or compute traits — they pick *which exported data* to show.
+
+### Consequences
+- **+** The CRISPR mechanic's effect is visible end-to-end (edit → trait delta → plant shape) with biology
+  confined to the core; the renderer stays a thin reader (inv. #2 holds for the richest UI feature).
+- **+** Reproducible, hash-neutral export; gated headless via `--check` (builds the L-system) — inv. #3/#4.
+- **−** Specimens are a fixed preset list (two demo edits), not interactive editing — applying an edit live
+  would require the renderer to call the core. Deferred: a future harness/IPC hook could stream specimens on
+  demand. For the PoC, pre-exported baseline-vs-edited is enough to demonstrate the mechanic.
+- **−** Plant morphology is constant within a run (species genome is static); per-generation morphing would
+  need per-organism genomes in the core (not modelled). Intentional for the PoC.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

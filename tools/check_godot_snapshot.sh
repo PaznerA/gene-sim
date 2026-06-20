@@ -2,9 +2,10 @@
 # tools/check_godot_snapshot.sh — Godot UI gate (invariant #4: every feature tested with no renderer state).
 # Two headless checks against snapshots written by the Rust core:
 #   1. S4.2 reader  — `--snap <file>` parses one snapshot and reports "snapshot OK".
-#   2. S4.3 render  — `--run <dir> --check` builds the full ecosystem scene (terrain TileMap, data overlay,
-#                     organism layer, HUD) and reports "render scene OK" — proving the render path compiles
-#                     and constructs without a GPU (catches GDScript parse/logic errors in CI).
+#   2. S4.3/S4.5    — `--run <dir> --check` builds the full ecosystem scene (terrain TileMap, data overlay,
+#                     organism layer, HUD) AND the S4.5 L-system specimen plants (from specimens.json) and
+#                     reports "render scene OK" — proving both render paths compile and construct without a
+#                     GPU (catches GDScript parse/logic errors in CI).
 # Both guard the headless `class_name`/global-cache trap (a bare global is unresolved without an editor
 # import pass; the scripts `preload` instead). SKIPs cleanly when godot is absent — like the slim oracle gate.
 #
@@ -21,9 +22,10 @@ command -v godot >/dev/null 2>&1 || { echo "SKIP — godot not installed (pin: s
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# Write a small, deterministic snapshot via the headless core. snapshot() draws no RNG and the per-cell
-# grid is a pure function of (seed, generation, grid) — so this is reproducible and read-only (inv. #3).
-if ! cargo run -q -p harness -- --seed 7 --generations 10 --snapshots "$TMP" --grid 16x16 >/dev/null 2>&1; then
+# Write a small, deterministic snapshot + specimen trait vectors via the headless core. snapshot() draws no
+# RNG and the per-cell grid / specimens are pure functions of (seed, generation, grid) — reproducible &
+# read-only (inv. #3). The specimens drive the S4.5 L-system view exercised by the render check below.
+if ! cargo run -q -p harness -- --seed 7 --generations 10 --snapshots "$TMP" --grid 16x16 --specimens "$TMP" >/dev/null 2>&1; then
   echo "FAIL — harness could not write a snapshot"
   exit 1
 fi
