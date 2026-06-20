@@ -92,12 +92,15 @@
     parse-only Godot) + unwired `EnvironmentModifier` seam + **pinned-hash test proving hash-neutrality**.
     ✅ DONE (`crates/sim-core/src/soil.rs`; zero `SimRng` draws, off `hash_world`; perf within noise; click-
     detail panel shows per-cell soil; full gate green; ADR-008 + derive_seed stream registry).
-  - [ ] 🛑 **R1.0a** Make `DroughtTolerance` a live **per-individual heritable** parameter (decolide from the
-    killswitch Bool slot; resampled like `Genotype`). Prerequisite for any coupling. Changes the hash once
-    (update the pinned literal in-slice); own ADR. *Invariants:* #2/#3.
-  - [ ] 🛑 **R1.1** Wire `EnvironmentModifier` into `selection()` — **global** soil-modulated fitness
-    (constant-N preserved; ADR extends ADR-005). First real coupling; static dispatch; re-baseline perf;
-    fold soil digest into `hash_world` at a fixed position.
+  - [x] **R1.0a** Per-individual **heritable** `DroughtTol` component — standing variation seeded at spawn,
+    inherited (not resampled) from the sampled parent, folded into `hash_world`. ✅ DONE (independent of the
+    species GP map; new pinned hash; ADR-009).
+  - [x] **R1.1** Wire `EnvironmentModifier` into `selection()` — **global** soil-modulated fitness via the
+    field-wide mean (`MeanSoil`); `LinearTraitMatchModifier` (drought-tolerant favoured on drier soil);
+    constant-N / no-extinction preserved; static dispatch; perf re-baselined (+~6 % @1k, noise @10k). ✅ DONE
+    (test proves mean drought → terrain target; ADR-009). **← terrain now shapes evolution.**
+  - [x] **soil-viz** (renderer) Soil data-layer overlays (moisture/nutrients/pH) — 7 toggleable layers via a
+    second `soil_tex` in the shader; click-detail shows per-cell soil. ✅ DONE (read-only; gate green).
   - [ ] 🛑 **R1.2** Passive `Cell(u32)` component (placement via `derive_seed`, zero new draws) + **per-cell**
     soil_factor; offspring inherit the **sampled parent's** cell. Spatial selection on a global pool. ADR-005 change.
   - [ ] 🛑 **R1.3** **Local** per-cell Wright-Fisher + dispersal (define empty-cell / deme-size rules; pick

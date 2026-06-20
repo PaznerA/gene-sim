@@ -16,7 +16,6 @@
 //!   `SOIL_STREAM_BASE` is a large disjoint constant so the soil family can never collide with placement.
 
 use crate::det::derive_seed;
-use crate::gp::{Phenotype, Trait};
 use crate::unit_f64;
 
 /// Number of soil channels: `moisture`, `nutrients`, `pH` (each `[0, 1]`).
@@ -71,6 +70,24 @@ impl SoilField {
             0 => &self.moisture,
             1 => &self.nutrients,
             _ => &self.ph,
+        }
+    }
+
+    /// The field-wide mean of each channel as a [`SoilSample`] — the per-run scalar the **global** soil
+    /// coupling (R1.1) feeds to the [`EnvironmentModifier`]. Deterministic (ordered sum).
+    #[must_use]
+    pub fn mean_sample(&self) -> SoilSample {
+        let mean = |v: &[f32]| -> f64 {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len() as f64
+            }
+        };
+        SoilSample {
+            moisture: mean(&self.moisture),
+            nutrients: mean(&self.nutrients),
+            ph: mean(&self.ph),
         }
     }
 
@@ -134,26 +151,26 @@ pub struct SoilSample {
     pub ph: f64,
 }
 
-/// **Pluggable science seam (invariant #5).** How local soil modulates an organism's fitness given the
-/// species phenotype. Present in R1.0 but **NOT wired into selection** — coupling lands in R1.1+, and
-/// Stage-5 admits schema-validated LLM-generated impls behind this same trait without touching sim-core.
+/// **Pluggable science seam (invariant #5).** How local soil modulates an organism's fitness given its
+/// **per-individual** drought tolerance. Wired into [`selection`](crate::Simulation) from R1.1; Stage-5
+/// admits schema-validated LLM-generated impls behind this same trait without touching sim-core.
 pub trait EnvironmentModifier {
-    /// A strictly-positive multiplicative fitness factor for an organism in the given soil. Strictly
-    /// positive so it can never zero a selection weight (preserves ADR-005's no-extinction guarantee).
-    fn fitness_factor(&self, soil: SoilSample, phenotype: &Phenotype) -> f64;
+    /// A strictly-positive multiplicative fitness factor for an organism with the given heritable
+    /// `drought_tolerance` (`[0, 1]`) in the given soil. Strictly positive so it can never zero a selection
+    /// weight (preserves ADR-005's no-extinction guarantee).
+    fn fitness_factor(&self, soil: SoilSample, drought_tolerance: f64) -> f64;
 }
 
-/// In-core default modifier: a drought-tolerant species is favoured on **drier** soil. Linear, bounded,
-/// strictly positive. (Unwired in R1.0; the demo of intent + the seam's test live here.)
+/// In-core default modifier: a drought-tolerant individual is favoured on **drier** soil. Linear, bounded,
+/// strictly positive.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinearTraitMatchModifier;
 
 impl EnvironmentModifier for LinearTraitMatchModifier {
-    fn fitness_factor(&self, soil: SoilSample, phenotype: &Phenotype) -> f64 {
-        let drought = phenotype.get(Trait::DroughtTolerance).unwrap_or(0.0);
+    fn fitness_factor(&self, soil: SoilSample, drought_tolerance: f64) -> f64 {
         // Want: high drought tolerance ↔ low moisture. Match = 1 - |drought - (1 - moisture)|.
         let target = 1.0 - soil.moisture;
-        let match_ = 1.0 - (drought - target).abs();
+        let match_ = 1.0 - (drought_tolerance - target).abs();
         // Map a [0,1] match to a strictly-positive band [0.5, 1.5].
         0.5 + match_.clamp(0.0, 1.0)
     }
@@ -228,11 +245,19 @@ mod tests {
             nutrients: 0.5,
             ph: 0.5,
         };
-        let tolerant = Phenotype {
-            values: vec![(Trait::DroughtTolerance, 0.9)],
-        };
-        // A drought-tolerant species scores higher on dry soil than on wet soil, and always strictly positive.
-        assert!(m.fitness_factor(dry, &tolerant) > m.fitness_factor(wet, &tolerant));
-        assert!(m.fitness_factor(wet, &tolerant) > 0.0);
+        // A drought-tolerant individual scores higher on dry soil than wet, always strictly positive.
+        assert!(m.fitness_factor(dry, 0.9) > m.fitness_factor(wet, 0.9));
+        assert!(m.fitness_factor(wet, 0.9) > 0.0);
+        // ...and a drought-intolerant individual is favoured on wet soil instead.
+        assert!(m.fitness_factor(wet, 0.1) > m.fitness_factor(dry, 0.1));
+    }
+
+    #[test]
+    fn mean_sample_in_range() {
+        let s = SoilField::generate(5, 20, 20);
+        let m = s.mean_sample();
+        assert!((0.0..=1.0).contains(&m.moisture));
+        assert!((0.0..=1.0).contains(&m.nutrients));
+        assert!((0.0..=1.0).contains(&m.ph));
     }
 }

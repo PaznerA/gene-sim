@@ -86,6 +86,12 @@ struct GenomeRes(Genome);
 #[derive(Resource)]
 struct BaseGrowthRate(f64);
 
+/// The field-wide mean soil sample (R1.1 **global** coupling): the per-run scalar the
+/// [`EnvironmentModifier`](soil::EnvironmentModifier) feeds each individual's heritable drought tolerance.
+/// Held as a resource so [`selection`] reads it without owning the whole [`SoilField`](soil::SoilField).
+#[derive(Resource)]
+struct MeanSoil(soil::SoilSample);
+
 /// Stable per-organism id (0..entity_count), assigned at spawn. Gives a deterministic hash order
 /// independent of ECS query/archetype iteration order.
 #[derive(Component, Clone, Copy)]
@@ -100,6 +106,12 @@ struct Energy(f64);
 /// [`SimRng`] so individuals vary; resampled each generation by [`selection`]. Higher fitness ⇒ more copies.
 #[derive(Component, Clone, Copy)]
 struct Genotype(f64);
+
+/// Per-individual **heritable** drought tolerance in `[0, 1]` (roadmap R1.0a). Seeded at spawn as standing
+/// variation; inherited (NOT resampled) from the fitness-sampled parent each generation by [`selection`], so
+/// soil-coupled selection (R1.1) can shift the population's drought distribution to match the terrain.
+#[derive(Component, Clone, Copy)]
+struct DroughtTol(f64);
 
 // --- systems (fixed order via .chain()) -----------------------------------------------------------
 
@@ -133,41 +145,49 @@ fn fitness(base: f64, genotype: f64) -> f64 {
 fn selection(
     mut rng: ResMut<SimRng>,
     base: Res<BaseGrowthRate>,
-    mut q: Query<(&OrgId, &mut Genotype)>,
+    mean_soil: Res<MeanSoil>,
+    mut q: Query<(&OrgId, &mut Genotype, &mut DroughtTol)>,
 ) {
-    // Snapshot parents in stable id order (decouples sampling from ECS archetype order).
-    let mut parents: Vec<(u32, f64)> = q.iter().map(|(id, g)| (id.0, g.0)).collect();
+    use soil::EnvironmentModifier as _;
+    let modifier = soil::LinearTraitMatchModifier;
+
+    // Snapshot parents (id, genotype, drought) in stable id order (decouples sampling from archetype order).
+    let mut parents: Vec<(u32, f64, f64)> = q.iter().map(|(id, g, d)| (id.0, g.0, d.0)).collect();
     if parents.len() < 2 {
         return; // nothing to select between (also the empty-population fast path).
     }
     parents.sort_unstable_by_key(|p| p.0);
 
-    // Cumulative fitness weights over the id-sorted parents.
+    // Cumulative weights = base fitness × the soil-coupled environment factor (R1.1). The factor is
+    // strictly positive, so weights stay positive (ADR-005 no-extinction). Deterministic: mean_soil is a
+    // per-run constant and drought is per-parent; no RNG and no HashMap here.
     let mut cumulative: Vec<f64> = Vec::with_capacity(parents.len());
     let mut total = 0.0;
-    for &(_, g) in &parents {
-        total += fitness(base.0, g);
+    for &(_, g, d) in &parents {
+        total += fitness(base.0, g) * modifier.fitness_factor(mean_soil.0, d);
         cumulative.push(total);
     }
 
-    // Draw N offspring genotypes, each from a fitness-proportional parent (ordered binary search).
+    // Draw N offspring, each INHERITING a fitness-proportional parent's (genotype, drought). The RNG draw
+    // count is exactly N — identical to before R1.1 — so the only stream shift came from drought-seeding
+    // at spawn, keeping this loop's reproducibility intact.
     let n = parents.len();
-    let mut offspring: Vec<f64> = Vec::with_capacity(n);
+    let mut offspring: Vec<(f64, f64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let target = unit_f64(rng.0.next_u64()) * total;
         // First cumulative weight strictly greater than target; partition_point is deterministic.
         let idx = cumulative.partition_point(|&c| c <= target).min(n - 1);
-        offspring.push(parents[idx].1);
+        offspring.push((parents[idx].1, parents[idx].2));
     }
 
-    // Map each id (in stable order) to its new genotype, then write back. `BTreeMap` is ordered (not a
-    // `HashMap`), so the build is deterministic; the write-back order over the query is irrelevant since
-    // each entity is keyed by its own stable id.
-    let by_id: std::collections::BTreeMap<u32, f64> =
+    // Map each id (in stable order) to its inherited (genotype, drought), then write back. `BTreeMap` is
+    // ordered (not a `HashMap`) so the build is deterministic; per-id write-back order is irrelevant.
+    let by_id: std::collections::BTreeMap<u32, (f64, f64)> =
         parents.iter().map(|p| p.0).zip(offspring).collect();
-    for (id, mut g) in &mut q {
-        if let Some(&new_g) = by_id.get(&id.0) {
+    for (id, mut g, mut d) in &mut q {
+        if let Some(&(new_g, new_d)) = by_id.get(&id.0) {
             g.0 = new_g;
+            d.0 = new_d;
         }
     }
 }
@@ -249,18 +269,26 @@ impl Simulation {
         let phenotype = WeightedSumMap.express(&genome);
         let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
 
+        // Static soil substrate, generated purely from the seed via derive_seed — ZERO SimRng draws (R1.0).
+        let soil = soil::SoilField::generate(config.seed, soil::SOIL_DIMS.0, soil::SOIL_DIMS.1);
+        let mean_soil = soil.mean_sample();
+
         for i in 0..config.entity_count {
             // Per-individual genotype in [0,1] seeded from the single RNG so individuals VARY (the standing
-            // variation selection acts on); energy keeps the Stage-0 metabolism behaviour.
+            // variation selection acts on); energy keeps the Stage-0 metabolism behaviour; drought tolerance
+            // is the new heritable standing variation soil-coupled selection acts on (R1.0a). Draw order is
+            // fixed (genotype, energy, drought) so the stream is reproducible.
             let g0 = unit_f64(rng.next_u64());
             let init = base_growth * unit_f64(rng.next_u64());
-            world.spawn((OrgId(i), Energy(init), Genotype(g0)));
+            let drought = unit_f64(rng.next_u64());
+            world.spawn((OrgId(i), Energy(init), Genotype(g0), DroughtTol(drought)));
         }
 
         world.insert_resource(SimRng(rng));
         world.insert_resource(Tick::default());
         world.insert_resource(GenomeRes(genome));
         world.insert_resource(BaseGrowthRate(base_growth));
+        world.insert_resource(MeanSoil(mean_soil));
 
         let mut schedule = Schedule::default();
         // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
@@ -271,9 +299,8 @@ impl Simulation {
             world,
             schedule,
             config: config.clone(),
-            // Generated purely from the seed via derive_seed — draws ZERO from SimRng, so it cannot move
-            // the determinism hash (invariant #3). Static for the run.
-            soil: soil::SoilField::generate(config.seed, soil::SOIL_DIMS.0, soil::SOIL_DIMS.1),
+            // Static for the run; read-only w.r.t. the hash beyond its coupling effect on per-org state.
+            soil,
         }
     }
 
@@ -467,11 +494,12 @@ pub fn run_headless(config: &SimConfig) -> RunStats {
 fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    // Collect (id, energy-bits, genotype-bits) and sort by id so the hash never depends on iteration order.
-    let mut rows: Vec<(u32, u64, u64)> = world
-        .query::<(&OrgId, &Energy, &Genotype)>()
+    // Collect (id, energy, genotype, drought) bits and sort by id so the hash never depends on iteration
+    // order. Drought tolerance is per-individual heritable state (R1.0a) so it MUST enter the hash.
+    let mut rows: Vec<(u32, u64, u64, u64)> = world
+        .query::<(&OrgId, &Energy, &Genotype, &DroughtTol)>()
         .iter(world)
-        .map(|(id, e, g)| (id.0, e.0.to_bits(), g.0.to_bits()))
+        .map(|(id, e, g, d)| (id.0, e.0.to_bits(), g.0.to_bits(), d.0.to_bits()))
         .collect();
     rows.sort_unstable_by_key(|r| r.0);
 
@@ -486,10 +514,11 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
     config.entity_count.hash(&mut h);
     tick.hash(&mut h);
     genome_params.hash(&mut h);
-    for (id, e_bits, g_bits) in &rows {
+    for (id, e_bits, g_bits, d_bits) in &rows {
         id.hash(&mut h);
         e_bits.hash(&mut h);
         g_bits.hash(&mut h);
+        d_bits.hash(&mut h);
     }
     allele_freq.to_bits().hash(&mut h);
     final_word.hash(&mut h);
@@ -511,23 +540,52 @@ mod tests {
     }
 
     #[test]
-    fn determinism_hash_is_pinned_and_soil_is_hash_neutral() {
-        // Pin the EXACT hash literal captured BEFORE the soil layer existed (the harness's run-0 derived
-        // seed for seed=42, gens=50, entities=1000). `check_determinism.sh` only compares run==run, so it
-        // would NOT catch a reproducible-but-CHANGED hash — this guards that, AND because the literal was
-        // measured pre-soil, matching it on the with-soil build PROVES soil is hash-neutral (it is generated
-        // from `derive_seed` with zero `SimRng` draws and never folded into `hash_world`). If this literal
-        // ever needs to change, it means real sim LOGIC changed (e.g. R1.1 soil→selection coupling) — update
-        // it deliberately in that same commit.
+    fn determinism_hash_is_pinned() {
+        // Pin the EXACT hash literal. `check_determinism.sh` only compares run==run, so it would NOT catch a
+        // reproducible-but-CHANGED hash — this guards that. The literal MUST change deliberately (in the same
+        // commit) whenever real sim LOGIC changes; history: `c530…7ab1` pre-soil and through R1.0 (proving
+        // soil was hash-neutral), now `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
+        // soil-coupled selection legitimately shift the trajectory).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(
-            run_headless(&cfg).hash,
-            0xc530_7d86_dba9_7ab1,
-            "soil must be hash-neutral in R1.0 (this literal was measured pre-soil)"
+        assert_eq!(run_headless(&cfg).hash, 0x8722_544a_fd8f_44aa);
+    }
+
+    fn mean_drought(world: &mut World) -> f64 {
+        let mut sum = 0.0;
+        let mut n = 0u32;
+        for d in world.query::<&DroughtTol>().iter(world) {
+            sum += d.0;
+            n += 1;
+        }
+        if n == 0 {
+            0.0
+        } else {
+            sum / f64::from(n)
+        }
+    }
+
+    #[test]
+    fn soil_coupling_drives_drought_toward_terrain() {
+        // The mean soil moisture sets the selective target (1 - moisture). From a neutral ~0.5 start, after
+        // enough generations the population's mean drought tolerance moves TOWARD that target — proving soil
+        // now drives selection (R1.1). Deterministic.
+        let cfg = SimConfig {
+            seed: 12345,
+            generations: 400,
+            entity_count: 1500,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let target = 1.0 - sim.soil.mean_sample().moisture;
+        let start = mean_drought(&mut sim.world);
+        sim.step(cfg.generations);
+        let end = mean_drought(&mut sim.world);
+        assert!(
+            (end - target).abs() < (start - target).abs(),
+            "mean drought should move toward terrain target {target}: start {start}, end {end}"
         );
     }
 

@@ -316,6 +316,44 @@ R1.0 ships the **substrate only, provably hash-neutral, no coupling**:
 
 ---
 
+## ADR-009 — Per-individual heritable drought tolerance + global soil-coupled selection (R1.0a + R1.1)
+
+- **Date:** 2026-06-20
+- **Status:** Accepted
+- **Stage:** Roadmap R1 (slices R1.0a + R1.1). Extends ADR-005.
+
+### Context
+R1.0 shipped the soil substrate but it was inert. To make terrain **shape evolution** (and unblock the dead
+DroughtTolerance trait — gp.rs maps it to the killswitch `Bool(false)`), the human chose (b) **per-individual
+heritable** drought tolerance. R1.1 then wires the soil into selection. The crux is doing this without breaking
+ADR-005's constant-N Wright-Fisher or determinism (#3).
+
+### Decision
+- **R1.0a:** a per-organism `DroughtTol(f64)` ECS component — heritable standing variation in `[0,1]`, seeded
+  once at spawn from the single `SimRng` (one extra draw per organism, in a fixed `genotype, energy, drought`
+  order) and **inherited** (not resampled) from the fitness-sampled parent each generation. Folded into
+  `hash_world` (it is per-individual state). It deliberately does **not** touch the species GP map — the
+  species-level DroughtTolerance trait (used by the specimen view) is independent and stays as-is.
+- **R1.1:** `selection()` weight becomes `fitness(base, genotype) × EnvironmentModifier::fitness_factor(soil,
+  drought)`, using the in-core `LinearTraitMatchModifier` (a drought-tolerant individual is favoured on drier
+  soil) fed the **field-wide mean** soil sample (a `MeanSoil` resource computed once per run — "global"
+  coupling, the smallest real step on the spatiality spectrum). The factor is strictly positive (band
+  `[0.5,1.5]`), so weights never zero → ADR-005's **constant-N, no-extinction** structure is preserved. The
+  selection loop draws **exactly N** RNG words as before (offspring *inherit*, never resample drought), so the
+  only stream shift came from R1.0a's spawn draw — determinism stays reproducible (new pinned hash literal).
+
+### Consequences
+- **+** Terrain now drives selection: a test proves the population's mean drought tolerance moves toward the
+  terrain target `(1 − mean_moisture)`. The `EnvironmentModifier` seam (inv #5) is live and static-dispatched.
+- **+** ADR-005 intact (constant-N, no extinction); determinism intact (pinned literal `8722…44aa`).
+- **−** Perf: a per-parent modifier call in the hot loop → ~+6 % at 1 k entities (within noise at 10 k);
+  re-baselined in-slice (see below).
+- **−** Coupling is **global/non-spatial** (mean soil) — "weak-but-real". Spatial selection (a per-cell
+  `soil_factor` via a `Cell` component, offspring inheriting the sampled parent's cell) is R1.2; full local
+  Wright-Fisher + dispersal is R1.3 (the target), each a further ADR-005 change.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).
@@ -323,19 +361,19 @@ Source: `cargo bench -p sim-core` (`crates/sim-core/benches/tick.rs`), run via `
 The perf gate (§10.7) fails on a regression **below the CURRENT baseline**. Re-baseline at each stage that
 changes the hot path, in the same slice (this is anticipated — see the Stage 0 row note).
 
-### Current baseline — Stage 1 exit (slice S1.5): empty loop + Wright-Fisher selection
+### Current baseline — R1.1 exit: Wright-Fisher selection + soil-coupled `EnvironmentModifier`
 | Workload (entities × generations) | Median wall time | Throughput |
 |---|---|---|
-| 1 000 × 50  | **1.645 ms** | ~30 M organism-updates/s |
-| 5 000 × 50  | **10.48 ms** | ~24 M organism-updates/s |
-| 10 000 × 50 | **25.97 ms** | ~19 M organism-updates/s |
+| 1 000 × 50  | **1.737 ms** | ~29 M organism-updates/s |
+| 5 000 × 50  | **10.88 ms** | ~23 M organism-updates/s |
+| 10 000 × 50 | **25.79 ms** | ~19 M organism-updates/s |
 
-**Headline (current):** ~**19 M organism-updates/s** at 10 k entities (10 k advance 50 generations of
-*real selection* in ~26 ms ⇒ ~1.9 k generations/s). The ~9× drop vs the Stage 0 row is **expected**: S1.5
-added the per-generation Wright-Fisher selection step (cumulative-fitness sampling + write-back) where Stage 0
-had an empty loop. Still far from the SPEC §11 trigger to move to GPU / cohorts. Known cheap win (tracked in
-TASKS follow-ups): the selection write-back uses a `BTreeMap` (O(N log N) + allocation); a `Vec` indexed by the
-contiguous `OrgId` would be O(N) — would lift this baseline materially when done.
+**Headline (current):** ~**19 M organism-updates/s** at 10 k entities — unchanged from the Stage 1 baseline.
+R1.1 wired a per-parent `EnvironmentModifier::fitness_factor` call into the selection hot loop (soil → drought
+coupling), which adds a few f64 ops per parent: a **fixed-ish overhead** that shows as ~+6 % on the smallest
+workload (1 k) but is within noise at 10 k (the headline). Re-baselined in-slice per ADR-005's hot-path rule;
+the prior Stage-1 row (1.645 / 10.48 / 25.97 ms) is superseded. Same cheap win still tracked (F1: `BTreeMap`
+→ `Vec` write-back); the `EnvironmentModifier` is static-dispatched (a unit struct), so it already inlines.
 
 ### Historical — Stage 0 (slice S0): empty deterministic loop (no selection)
 | 1 000 × 50 → **302.6 µs** · 5 000 × 50 → **1.438 ms** · 10 000 × 50 → **2.856 ms** (~175 M updates/s). |

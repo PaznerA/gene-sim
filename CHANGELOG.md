@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### R1.0a + R1.1 — soil-coupled selection: terrain shapes evolution (feat, roadmap R1)
+The terrain stops being inert — it now drives selection (extends ADR-005):
+- **R1.0a:** a per-organism heritable `DroughtTol(f64)` ECS component — standing variation seeded once at
+  spawn from `SimRng` (fixed draw order), **inherited** (not resampled) from the fitness-sampled parent, and
+  folded into `hash_world`. Independent of the species GP map (the dead DroughtTolerance trait is bypassed).
+- **R1.1:** `selection()` weight = `fitness(base, genotype) × EnvironmentModifier::fitness_factor(soil,
+  drought)` using the in-core `LinearTraitMatchModifier` (drought-tolerant favoured on drier soil) fed the
+  field-wide **mean** soil (`MeanSoil` resource — "global" coupling). The factor is strictly positive, so
+  ADR-005's constant-N / no-extinction holds; the loop draws exactly N words (offspring inherit, never
+  resample), so determinism stays reproducible.
+- **Proven:** a test shows the population's mean drought tolerance moves toward the terrain target
+  `(1 − mean_moisture)`. New pinned hash literal `8722…44aa` (was `c530…7ab1`). Perf re-baselined in-slice
+  (~+6 % at 1 k entities from the per-parent modifier call; within noise at the 10 k headline ~19 M
+  updates/s). ADR-009.
+
 ### R1.0 — terrain/soil substrate: hash-neutral static SoilField (feat, roadmap R1; multi-agent designed)
 Multi-agent designed (3 scoping lenses → adversarial vetting against determinism/ADR-005/perf/snapshot →
 synthesis) + human sign-off. First slice of the terrain epic — **substrate only, provably hash-neutral**:
