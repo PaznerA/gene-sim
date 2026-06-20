@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S4.4 — data-layer shaders + zoom scopes (feat, Stage 4)
+- `godot/data_layer.gdshader` (canvas_item): samples the per-cell data texture the core produced
+  (R=density, G=allele_freq, B=fitness via `snapshot.gd::to_data_image`) and maps the channel chosen by a
+  `layer` uniform through a heat colormap on the GPU — replacing the S4.3 CPU `_heat` loop. INVARIANT #2
+  intact: the shader only **visualises** values the core already computed.
+- **≥2 toggleable data layers:** `D` cycles off → density → allele_freq → fitness (the shader `layer`
+  uniform); the overlay `Sprite2D` uses NEAREST filtering so each texel is one crisp cell.
+- **Viewport zoom scopes:** mouse-wheel = continuous zoom; keys `1`/`2`/`3` jump to scope presets
+  (field ×1 / patch ×2.6 / cells ×6); arrows pan. HUD shows the live layer + scope + magnification. The
+  zoomed "cells" scope makes individual organism dots and per-cell data legible.
+- `--shot` gains `--layer <0..3>` and `--zoom <f>` so each layer/scope can be captured for visual review.
+  Verified by windowed screenshots of the allele_freq, fitness and zoomed-density views; the headless
+  `--check` render smoke (gate 9/9) now also builds the `ShaderMaterial` path. Cargo gates + determinism
+  hash unaffected. (Renderer architecture: ADR-006.)
+
 ### S4.3 — 2D ecosystem view: live run render from snapshots (feat, Stage 4)
 - `godot/main.gd` now builds a **2D ecosystem view of one scope** in code (all read-only — invariant #2):
   a tiled **grass field** (`TileMapLayer` from a procedurally-generated shade atlas), a per-cell **data

@@ -59,7 +59,7 @@
 - [x] 🛑 **S4.1** `tools/install_godot.sh`: pin Godot minor (SPEC §W3), `godot/` project skeleton, `godot --headless --quit` smoke. *Build order gate — only after the core is headless + deterministic (invariant #4).* AC: pinned version recorded; headless smoke passes. ✅ DONE (human signed off; Godot **4.7** pinned; `godot/` project + read-only `main.gd` (inv #2); headless smoke "UI booted … OK"). Build-order precondition met (Stages 0–3 headless+deterministic).
 - [x] **S4.2** Snapshot reader in `godot/`: read `data/runs/<id>/snapshots/*.bin` (SPEC §5). **GDScript reads only — no biology (invariant #2).** AC: loads a snapshot and reports entity count. ✅ DONE (`sim-core::GridSnapshot` derived read-only grid + `std`-only `"GSS1"` format off the hash path (inv #3); `harness --snapshots`; `godot/snapshot.gd` read-only parser + `to_data_image()`; `main.gd --snap` reports `WxH/gen/pop/cells/channels` headless. Fixed the `class_name`/global-cache headless trap via `preload`. New gate 9/9 `check_godot_snapshot.sh` (skip-if-absent) locks it in; full gate green.)
 - [x] **S4.3** 2D TileMap ecosystem view of one scope (field/forest/pond). AC: renders a live run from snapshots. ✅ DONE (`main.gd` builds, all read-only (inv #2): grass `TileMapLayer` + per-cell data-overlay `Sprite2D` + organism dot layer (`organisms.gd`) + `Camera2D` + HUD. `--run <dir>` plays `snap_*.bin` ordered by gen on a timer (auto-discovers newest run); gen0→gen60 visibly tracks selection. Verified by windowed `--shot` PNG capture; headless `--check` render smoke wired into gate 9/9 alongside the reader. ADR-006.)
-- [ ] **S4.4** ≥2 toggleable data-layer shaders (per-cell data texture: density, allele freq, fitness, edit penetrance) + viewport zoom scopes (SPEC §W10). AC: layers toggle; zoom switches scope.
+- [x] **S4.4** ≥2 toggleable data-layer shaders (per-cell data texture: density, allele freq, fitness, edit penetrance) + viewport zoom scopes (SPEC §W10). AC: layers toggle; zoom switches scope. ✅ DONE (`data_layer.gdshader` samples the RGBF data texture; `D` cycles 3 GPU layers density/allele_freq/fitness; wheel + keys 1/2/3 zoom scopes field/patch/cells + arrow pan; HUD shows layer+scope. Verified via windowed `--shot --layer/--zoom`; headless `--check` builds the ShaderMaterial path (gate 9/9). *Note: edit-penetrance layer deferred — needs a 4th snapshot channel from the core (follow-up F3).* ADR-006.)
 - [ ] **S4.5** L-system morphology driven by genome trait params → visible plant change. AC: an edit visibly changes branching/leaf structure; **zero biology math in GDScript**.
 
 ### Stage 5 — Ontology + LLM modifiers — SPEC §8
@@ -76,6 +76,9 @@
 - [ ] **F2** sim-core `metabolism`: it draws from `SimRng` *inside* `Query<&mut Energy>` iteration — safe today
   (single archetype, no structural changes) but harden (snapshot to ordered Vec, or draw outside the query) if
   any system later adds/removes components per-organism. (Reviewer note, S1.5.)
+- [ ] **F3** Render the **edit-penetrance** data layer (SPEC §W10 lists it as a 4th channel). Needs sim-core to
+  add an `edit_penetrance` channel to `GridSnapshot` (derived, read-only, off the hash path like the others)
+  and bump `CHANNEL_COUNT`/the `"GSS1"` layout; the shader already supports selecting by `layer` index. (S4.4.)
 
 ## DONE
 - **S0** — Stage 0 headless deterministic core skeleton. DoD met: `cargo run -p harness -- --seed 42

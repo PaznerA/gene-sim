@@ -4,25 +4,32 @@ extends Node2D
 ## INVARIANT #2 (STOP THE LINE if violated): this renderer READS sim snapshots only. It must NEVER compute
 ## genotype→phenotype or any biology — all of that lives in the Rust core (crates/genome, crates/sim-core).
 ## GDScript here only loads/plays snapshot data and draws it: a tiled field backdrop, organism dot markers,
-## and a toggleable per-cell data overlay. Data-layer SHADERS + zoom scopes land in S4.4.
+## and toggleable per-cell data-layer SHADERS (density/allele_freq/fitness) over a zoomable viewport (S4.4).
 ##
 ## CLI (args after `--`):
 ##   --snap <file.bin>     Headless: parse one snapshot and report its header (S4.2 gate path).
 ##   --run  <dir>          Play snap_*.bin in <dir> as a live run (windowed; auto-advances, loops).
 ##   --shot <out.png>      Render one frame to a PNG then quit (needs a display; for verification).
 ##   --gen  <n>            With --run/--shot: pick the snapshot whose generation == n (else the last).
+##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
+##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
 ##
-## Keys (windowed): Space pause/resume · D cycle data overlay (off/density/allele/fitness) · ./, step.
+## Keys (windowed): Space pause · D cycle layer · ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
 
 ## Load the reader by path, not via a `class_name` global: that registry is only populated by an editor
 ## import pass, so a bare identifier is unresolved under a fresh `--headless` run. `preload` needs no cache.
 const SnapshotReader := preload("res://snapshot.gd")
 const Organisms := preload("res://organisms.gd")
+const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness"]
 const FRAME_SECONDS := 0.45  # seconds per snapshot when playing a run
 const TARGET_FIELD_PX := 880.0  # the field is scaled to about this many pixels on its long side
+# Zoom "scopes": magnification presets the viewport switches between (keys 1/2/3; SPEC §W10).
+const SCOPES := [{"name": "field", "zoom": 1.0}, {"name": "patch", "zoom": 2.6}, {"name": "cells", "zoom": 6.0}]
+const ZOOM_MIN := 0.6
+const ZOOM_MAX := 12.0
 
 var _snaps: Array = []  # parsed snapshot.gd instances, ordered by generation
 var _idx: int = 0
@@ -33,6 +40,7 @@ var _paused: bool = false
 var _terrain: TileMapLayer
 var _overlay: Sprite2D
 var _organisms: Node2D
+var _cam: Camera2D
 var _hud: Label
 var _timer: Timer
 
@@ -79,8 +87,14 @@ func _ready() -> void:
 		return
 
 	_build_scene()
+	var layer_arg := _arg_value("--layer")  # optional: preselect a data layer (0 off … 3 fitness) for --shot
+	if layer_arg != "":
+		_overlay_mode = clampi(int(layer_arg), 0, OVERLAY_NAMES.size() - 1)
 	_idx = _pick_index(int(_arg_value("--gen", "-1")))
 	_show(_idx)
+	var zoom_arg := _arg_value("--zoom")  # optional: preset zoom scope for --shot
+	if zoom_arg != "":
+		_set_zoom(float(zoom_arg))
 
 	# Headless render smoke (gate): build the scene from a run, prove it constructs without a GPU, quit.
 	if _has_flag("--check"):
@@ -116,18 +130,20 @@ func _build_scene() -> void:
 
 	_overlay = Sprite2D.new()
 	_overlay.centered = false
-	_overlay.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
-	_overlay.modulate = Color(1, 1, 1, 0.55)
+	_overlay.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST  # one data texel = one crisp cell block
+	var mat := ShaderMaterial.new()
+	mat.shader = DataLayerShader
+	_overlay.material = mat
 	add_child(_overlay)
 
 	_organisms = Organisms.new()
 	add_child(_organisms)
 
 	# A camera framing the whole field; S4.4 adds zoom scopes on top of this.
-	var cam := Camera2D.new()
-	cam.position = field_px * 0.5
-	add_child(cam)
-	cam.make_current()  # must be in-tree first
+	_cam = Camera2D.new()
+	_cam.position = field_px * 0.5
+	add_child(_cam)
+	_cam.make_current()  # must be in-tree first
 
 	# HUD on its own CanvasLayer so it ignores the world camera.
 	var ui := CanvasLayer.new()
@@ -188,44 +204,62 @@ func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 func _show(i: int) -> void:
 	if i < 0 or i >= _snaps.size():
 		return
+	_idx = i
 	var snap = _snaps[i]
 	_organisms.set_snapshot(snap, _cell)
 	_update_overlay(snap)
-	_hud.text = "gen %d   pop %d   grid %dx%d   layer: %s%s   [%d/%d]" % [
-		snap.generation, snap.population, snap.width, snap.height,
-		OVERLAY_NAMES[_overlay_mode], ("  (paused)" if _paused else ""),
-		i + 1, _snaps.size()]
+	_refresh_hud()
 
 
+## Feed the per-cell data texture (R=density, G=allele_freq, B=fitness) to the data-layer shader and select
+## the active channel via the `layer` uniform. The colormap + alpha live in data_layer.gdshader (GPU).
 func _update_overlay(snap) -> void:
 	if _overlay_mode == 0:
 		_overlay.visible = false
 		return
 	_overlay.visible = true
-	var channel: PackedFloat32Array
-	match _overlay_mode:
-		2: channel = snap.allele_freq
-		3: channel = snap.fitness
-		_: channel = snap.density
-	var img := Image.create(snap.width, snap.height, false, Image.FORMAT_RGBA8)
-	for y in snap.height:
-		for x in snap.width:
-			img.set_pixel(x, y, _heat(channel[y * snap.width + x]))
-	_overlay.texture = ImageTexture.create_from_image(img)
+	_overlay.texture = ImageTexture.create_from_image(snap.to_data_image())
 	_overlay.scale = Vector2(_cell, _cell)
+	var mat := _overlay.material as ShaderMaterial
+	if mat != null:
+		mat.set_shader_parameter("layer", _overlay_mode - 1)  # 0 density / 1 allele_freq / 2 fitness
 
 
-## Transparent→blue→cyan→yellow→red ramp; alpha rises with intensity so empty cells stay clear.
-func _heat(t: float) -> Color:
-	if t <= 0.0:
-		return Color(0, 0, 0, 0)
-	var c: Color
-	if t < 0.5:
-		c = Color(0.1, 0.3, 0.9).lerp(Color(0.1, 0.9, 0.7), t / 0.5)
-	else:
-		c = Color(0.95, 0.85, 0.1).lerp(Color(0.95, 0.15, 0.1), (t - 0.5) / 0.5)
-	c.a = 0.15 + 0.7 * clampf(t, 0.0, 1.0)
-	return c
+func _refresh_hud() -> void:
+	if _hud == null or _snaps.is_empty():
+		return
+	var snap = _snaps[_idx]
+	_hud.text = "gen %d   pop %d   grid %dx%d   layer: %s%s   scope: %s (×%.1f)   [%d/%d]" % [
+		snap.generation, snap.population, snap.width, snap.height,
+		OVERLAY_NAMES[_overlay_mode], ("  (paused)" if _paused else ""),
+		_scope_label(), _cam.zoom.x, _idx + 1, _snaps.size()]
+
+
+## Name the current zoom scope from the magnification (HUD only).
+func _scope_label() -> String:
+	var z := _cam.zoom.x
+	if z < 1.8:
+		return "field"
+	elif z < 4.2:
+		return "patch"
+	return "cells"
+
+
+func _set_zoom(z: float) -> void:
+	var zc := clampf(z, ZOOM_MIN, ZOOM_MAX)
+	_cam.zoom = Vector2(zc, zc)
+	_refresh_hud()
+
+
+## Jump to a named zoom scope preset (keys 1/2/3).
+func _set_scope(i: int) -> void:
+	_set_zoom(float(SCOPES[i]["zoom"]))
+
+
+## Pan the camera; step is in world pixels, scaled inversely with zoom so it feels constant on screen.
+func _pan(dir: Vector2) -> void:
+	_cam.position += dir * (90.0 / _cam.zoom.x)
+	_refresh_hud()
 
 
 func _advance() -> void:
@@ -238,23 +272,43 @@ func _advance() -> void:
 # ──────────────────────────── input (windowed) ────────────────────────────
 
 func _unhandled_input(event: InputEvent) -> void:
+	# Mouse wheel = continuous zoom (viewport scope).
+	if event is InputEventMouseButton and event.pressed:
+		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+			_set_zoom(_cam.zoom.x * 1.15)
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			_set_zoom(_cam.zoom.x / 1.15)
+		return
+
 	if not (event is InputEventKey and event.pressed and not event.echo):
 		return
 	match event.keycode:
 		KEY_SPACE:
 			_paused = not _paused
-			_show(_idx)
+			_refresh_hud()
 		KEY_D:
 			_overlay_mode = (_overlay_mode + 1) % OVERLAY_NAMES.size()
 			_show(_idx)
 		KEY_PERIOD:
 			_paused = true
-			_idx = (_idx + 1) % _snaps.size()
-			_show(_idx)
+			_show((_idx + 1) % _snaps.size())
 		KEY_COMMA:
 			_paused = true
-			_idx = (_idx - 1 + _snaps.size()) % _snaps.size()
-			_show(_idx)
+			_show((_idx - 1 + _snaps.size()) % _snaps.size())
+		KEY_1:
+			_set_scope(0)
+		KEY_2:
+			_set_scope(1)
+		KEY_3:
+			_set_scope(2)
+		KEY_LEFT:
+			_pan(Vector2.LEFT)
+		KEY_RIGHT:
+			_pan(Vector2.RIGHT)
+		KEY_UP:
+			_pan(Vector2.UP)
+		KEY_DOWN:
+			_pan(Vector2.DOWN)
 		KEY_ESCAPE:
 			get_tree().quit()
 
