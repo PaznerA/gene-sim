@@ -66,6 +66,14 @@ var _focus: int = 0  # which specimen (index into _specimen_list()) is focused i
 var _specimen_panel: Control
 var _specimen_picker: OptionButton
 var _trait_rows: Array = []  # [{bar:ProgressBar, value:Label, delta:Label}] one per TRAIT_KEYS entry
+var _prev_button: Button
+var _next_button: Button
+var _speed_slider: HSlider
+var _scope_buttons: Array = []  # 3 Buttons, one per SCOPES preset (field/patch/cells)
+var _gen_slider: HSlider
+var _gen_label: Label
+var _frame_seconds: float = FRAME_SECONDS  # runtime playback interval (the speed slider mutates this)
+var _syncing: bool = false  # re-entrancy guard so programmatic widget updates don't recurse via signals
 
 
 func _ready() -> void:
@@ -145,7 +153,7 @@ func _ready() -> void:
 
 	# Live playback (windowed): advance through the run on a timer.
 	_timer = Timer.new()
-	_timer.wait_time = FRAME_SECONDS
+	_timer.wait_time = _frame_seconds
 	_timer.timeout.connect(_advance)
 	add_child(_timer)
 	if _snaps.size() > 1:
@@ -199,7 +207,8 @@ func _build_scene() -> void:
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
-		var win := (_field_px + Vector2(40, 96)).max(Vector2(720, 540))
+		# Extra bottom margin so the two-row control bar (S3) is fully on-screen, not clipped.
+		var win := (_field_px + Vector2(40, 150)).max(Vector2(760, 600))
 		DisplayServer.window_set_size(Vector2i(int(win.x), int(win.y)))
 	RenderingServer.set_default_clear_color(Color(0.06, 0.08, 0.07))
 
@@ -314,8 +323,9 @@ func _inferno(t: float) -> Color:
 
 # ──────────────────────────── controls bar ────────────────────────────
 
-## A bottom control bar: view toggle, play/pause, step, data-layer picker. All change VIEW state only —
-## no biology (invariant #2). Mirrors the keyboard shortcuts so the UI is discoverable.
+## A bottom control bar (two rows): row 1 = view toggle / play-pause / step / data-layer picker; row 2 =
+## playback-speed slider / zoom-scope buttons / generation scrubber. All change VIEW state only — no biology
+## (invariant #2). Mirrors the keyboard shortcuts so the UI is discoverable.
 func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	var bar := PanelContainer.new()
 	var sb := StyleBoxFlat.new()
@@ -326,9 +336,14 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	bar.position = Vector2(12, field_px.y + 16)
 	ui.add_child(bar)
 
+	var rows := VBoxContainer.new()
+	rows.add_theme_constant_override("separation", 6)
+	bar.add_child(rows)
+
+	# Row 1 — view / playback / step / layer.
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 8)
-	bar.add_child(row)
+	rows.add_child(row)
 
 	_view_button = Button.new()
 	_view_button.text = "View: Ecosystem"
@@ -340,15 +355,15 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	_play_button.pressed.connect(_on_play_pressed)
 	row.add_child(_play_button)
 
-	var prev := Button.new()
-	prev.text = "◀"
-	prev.pressed.connect(_step_rel.bind(-1))
-	row.add_child(prev)
+	_prev_button = Button.new()
+	_prev_button.text = "◀"
+	_prev_button.pressed.connect(_step_rel.bind(-1))
+	row.add_child(_prev_button)
 
-	var nxt := Button.new()
-	nxt.text = "▶"
-	nxt.pressed.connect(_step_rel.bind(1))
-	row.add_child(nxt)
+	_next_button = Button.new()
+	_next_button.text = "▶"
+	_next_button.pressed.connect(_step_rel.bind(1))
+	row.add_child(_next_button)
 
 	var lbl := Label.new()
 	lbl.text = "  Layer:"
@@ -361,6 +376,104 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	_layer_picker.selected = _overlay_mode
 	_layer_picker.item_selected.connect(_on_layer_selected)
 	row.add_child(_layer_picker)
+
+	# Row 2 — speed / scope / generation scrubber.
+	var row2 := HBoxContainer.new()
+	row2.add_theme_constant_override("separation", 8)
+	rows.add_child(row2)
+
+	row2.add_child(_dim_label("Speed:"))
+	_speed_slider = HSlider.new()
+	_speed_slider.min_value = 0.5  # 0.5× … 4× playback speed
+	_speed_slider.max_value = 4.0
+	_speed_slider.step = 0.1
+	_speed_slider.value = 1.0
+	_speed_slider.custom_minimum_size = Vector2(90, 0)
+	_speed_slider.value_changed.connect(_on_speed_changed)
+	row2.add_child(_speed_slider)
+
+	row2.add_child(_dim_label("  Scope:"))
+	var group := ButtonGroup.new()
+	group.allow_unpress = true  # _scope_label() buckets continuous zoom; no preset may be active
+	for i in SCOPES.size():
+		var b := Button.new()
+		b.text = str(SCOPES[i]["name"]).capitalize()
+		b.toggle_mode = true
+		b.button_group = group
+		b.pressed.connect(_set_scope.bind(i))
+		row2.add_child(b)
+		_scope_buttons.append(b)
+
+	row2.add_child(_dim_label("  Gen:"))
+	_gen_slider = HSlider.new()
+	_gen_slider.min_value = 0
+	_gen_slider.max_value = maxi(1, _snaps.size() - 1)
+	_gen_slider.step = 1
+	_gen_slider.value = _idx
+	_gen_slider.custom_minimum_size = Vector2(150, 0)
+	_gen_slider.editable = _snaps.size() > 1
+	_gen_slider.value_changed.connect(_on_gen_slider)
+	row2.add_child(_gen_slider)
+
+	_gen_label = _dim_label("")
+	row2.add_child(_gen_label)
+
+	_sync_controls()
+
+
+## A small dimmed label used as an inline caption in the control bar.
+func _dim_label(text: String) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.add_theme_color_override("font_color", Color(0.82, 0.86, 0.82))
+	return l
+
+
+func _on_speed_changed(v: float) -> void:
+	# Higher slider = faster playback = shorter interval.
+	_frame_seconds = FRAME_SECONDS / maxf(0.1, v)
+	if _timer != null:
+		_timer.wait_time = _frame_seconds
+	_sync_controls()
+
+
+func _on_gen_slider(v: float) -> void:
+	if _syncing or _view_mode != 0 or _snaps.size() < 2:
+		return
+	_paused = true
+	_update_play_button()
+	_show(int(round(v)))
+
+
+## Push current state INTO the row-2 widgets without re-triggering their signals (re-entrancy guarded).
+func _sync_controls() -> void:
+	_syncing = true
+	var eco := _view_mode == 0
+	if _gen_slider != null:
+		_gen_slider.editable = eco and _snaps.size() > 1
+		_gen_slider.set_value_no_signal(_idx)
+	if _gen_label != null:
+		if eco and not _snaps.is_empty():
+			_gen_label.text = "gen %d  [%d/%d]" % [_snaps[_idx].generation, _idx + 1, _snaps.size()]
+		else:
+			_gen_label.text = ""
+	if _prev_button != null:
+		_prev_button.disabled = not eco
+	if _next_button != null:
+		_next_button.disabled = not eco
+	if _speed_slider != null:
+		_speed_slider.editable = eco
+	_sync_scope_buttons()
+	_syncing = false
+
+
+## Reflect the current zoom scope in the toggle buttons (one pressed, or none at in-between zooms).
+func _sync_scope_buttons() -> void:
+	if _scope_buttons.is_empty():
+		return
+	var active := _scope_label()  # 'field' / 'patch' / 'cells'
+	for i in _scope_buttons.size():
+		(_scope_buttons[i] as Button).set_pressed_no_signal(str(SCOPES[i]["name"]) == active)
 
 
 func _on_view_pressed() -> void:
@@ -412,6 +525,7 @@ func _set_view_mode(m: int) -> void:
 		_frame_focused_specimen()
 	else:
 		_frame_world()
+	_sync_controls()  # enable/disable scrubber + step for the new mode
 	_refresh_hud()
 
 
@@ -682,6 +796,7 @@ func _show(i: int) -> void:
 	_organisms.set_snapshot(snap, _cell)
 	_update_overlay(snap)
 	_refresh_hud()
+	_sync_controls()
 
 
 ## Feed the per-cell data texture (R=density, G=allele_freq, B=fitness) to the data-layer shader and select
@@ -737,6 +852,7 @@ func _set_zoom(z: float) -> void:
 	var zc := clampf(z, ZOOM_MIN, ZOOM_MAX)
 	_cam.zoom = Vector2(zc, zc)
 	_refresh_hud()
+	_sync_scope_buttons()
 
 
 ## Jump to a named zoom scope preset (keys 1/2/3).
