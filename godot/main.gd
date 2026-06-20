@@ -40,6 +40,7 @@ const Sparkline := preload("res://sparkline.gd")
 const Brush := preload("res://brush.gd")
 const PanelChrome := preload("res://panel.gd")
 const PillRail := preload("res://pill_rail.gd")
+const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
@@ -107,6 +108,7 @@ var _detail_box: VBoxContainer
 var _dragging: bool = false  # left-button drag-pan in progress
 var _drag_moved: float = 0.0  # accumulated drag distance (to tell a click from a drag)
 var _live = null  # LiveSim gdext node when --live is active (drives an open-ended run); null = file replay
+var _menu = null  # the pre-run main-menu overlay while it is open (ADR-012 E4); null once dismissed
 var _intervention_panel: Control  # live-mode CRISPR injection UI
 var _cas_picker: OptionButton
 var _locus_picker: OptionButton
@@ -255,6 +257,8 @@ func _ready() -> void:
 		return
 
 	if shot_path != "":
+		if _live != null and _has_flag("--menu"):
+			_show_main_menu()  # capture the main-menu overlay for visual verification
 		await _take_shot(shot_path)
 		return
 
@@ -264,6 +268,74 @@ func _ready() -> void:
 	_timer.timeout.connect(_live_advance if _live != null else _advance)
 	add_child(_timer)
 	if _live != null or _snaps.size() > 1:
+		_timer.start()
+
+	# Main menu (ADR-012 E4): a plain windowed --live launch lets the player set the world before it runs.
+	if _live != null and _should_show_menu():
+		_show_main_menu()
+
+
+# ──────────────────────────── environment + main menu (ADR-012 Phase E) ───────────────────────────────────
+
+## Apply the climate / population CLI flags to the LiveSim BEFORE its first reset, so a headless or scripted
+## run (`--lat/--lon/--temp/--season/--entities`) is byte-identical to driving the same values through the menu
+## (inv #2: the renderer only forwards numbers; the core builds the world). Absent flags = the neutral world.
+func _apply_cli_environment() -> void:
+	if _live == null:
+		return
+	var ent := _arg_value("--entities")
+	if ent != "":
+		_live.set_entity_count(int(ent))
+	_live.set_environment(
+		float(_arg_value("--lat", "0")),
+		float(_arg_value("--lon", "0")),
+		float(_arg_value("--temp", "0.5")),
+		int(_arg_value("--season", "0")),
+	)
+
+
+## Show the menu only for a plain interactive launch — never for the headless/gate paths (--shot/--check) or an
+## explicit --no-menu (the CLI-flag parity path), so scripted runs stay deterministic + menu-free.
+func _should_show_menu() -> bool:
+	return (
+		DisplayServer.get_name() != "headless"
+		and _arg_value("--shot") == ""
+		and not _has_flag("--no-menu")
+		and not _has_flag("--check")
+		and not _has_flag("--inject")
+		and not _has_flag("--brush")
+	)
+
+
+## Instantiate the main-menu overlay, pause the sim behind it, and wire Start → reconfigure + reseed in place.
+func _show_main_menu() -> void:
+	var menu := MainMenu.new()
+	menu.setup(_live, _seed)
+	menu.start_run.connect(_on_menu_start)
+	add_child(menu)
+	_menu = menu  # mark the modal open so _unhandled_input swallows sim hotkeys until Start
+	_paused = true
+	if _timer != null:
+		_timer.stop()
+
+
+## The menu's Start: apply seed/entity/climate to the LiveSim, reseed the world in place (no relaunch — the same
+## proven _do_reset path), and resume. The menu frees itself after emitting.
+func _on_menu_start(cfg: Dictionary) -> void:
+	_menu = null  # the modal is dismissed (the menu frees itself after emitting) → hotkeys live again
+	if _live == null:
+		return
+	_seed = int(cfg.get("seed", _seed))
+	_live.set_entity_count(int(cfg.get("entities", 1000)))
+	_live.set_environment(
+		float(cfg.get("lat", 0.0)),
+		float(cfg.get("lon", 0.0)),
+		float(cfg.get("temp", 0.5)),
+		int(cfg.get("season", 0)),
+	)
+	_do_reset(_seed)
+	_paused = false
+	if _timer != null:
 		_timer.start()
 
 
@@ -298,6 +370,7 @@ func _setup_live() -> bool:
 			printerr("--live: failed to load LiveSim extension (status %d)" % st)
 			return false
 	_live = ClassDB.instantiate("LiveSim")
+	_apply_cli_environment()  # CLI env/entity flags (headless + scripted parity); the menu overrides on Start
 	_live.reset(_seed)
 	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
 	if snap == null:
@@ -1841,6 +1914,11 @@ func _advance() -> void:
 # ──────────────────────────── input (windowed) ────────────────────────────
 
 func _unhandled_input(event: InputEvent) -> void:
+	# While the pre-run menu is up it is a modal gate (ADR-012 E4): swallow every sim hotkey — its dim backdrop
+	# already blocks the mouse, but keyboard would otherwise leak through (ESC=quit, SPACE/V/D/B/S mutate the
+	# hidden sim). The menu's own controls handle the keys they need.
+	if _menu != null:
+		return
 	if event is InputEventMouseButton:
 		# Brush mode: wheel = brush radius, left-click = paint a region edit. Else wheel = zoom, click = inspect.
 		if _brush_on:

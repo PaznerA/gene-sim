@@ -103,6 +103,25 @@ impl LiveSim {
         };
     }
 
+    /// CORE-computed climate preview for the main menu (ADR-012 E4): the `{day_length, insolation, temperature}`
+    /// the given params would produce (all `[0,1]`). The menu DISPLAYS these — it never computes climate itself
+    /// (inv #2: biology stays in the core). Pure: builds a `ClimateField` off the params, touches no run state.
+    #[func]
+    fn preview_climate(&self, lat: f64, lon: f64, avg_temp: f64, season: i64) -> VarDictionary {
+        let sample = sim_core::climate::ClimateField::from_params(&EnvParams {
+            lat,
+            lon,
+            avg_temp: avg_temp.clamp(0.0, 1.0),
+            season: season.clamp(0, 3),
+        })
+        .sample();
+        let mut d = VarDictionary::new();
+        d.set("day_length", sample.day_length);
+        d.set("insolation", sample.insolation);
+        d.set("temperature", sample.temperature);
+        d
+    }
+
     /// Start a fresh episode from `seed` and return the initial observation as a `Dictionary`.
     ///
     /// Builds a new [`harness::GeneSimEnv`] (which seeds the single `ChaCha8Rng` once — invariant #3)

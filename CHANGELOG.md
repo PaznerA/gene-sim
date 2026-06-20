@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### ADR-012 — climate environment + pre-run main menu (feat, Phase E, E1…E4)
+The player now sets a **real world** instead of a bare seed; climate shapes selection deterministically.
+Built off-stream-first (like the soil substrate) as four gated slices, one deliberate re-pin:
+- **E1** `crates/sim-core/src/climate.rs`: `EnvParams { lat, lon, avg_temp, season }` → `ClimateField`
+  (`insolation` / `temperature` / `day_length`), pure +,-,*,clamp,abs,match — **no transcendentals** (inv #3
+  cross-platform bit-identity). Off the sim RNG stream → **hash-neutral**.
+- **E2** threaded env through `harness::GeneSimEnv` + the replay journal (`SeedJson` gains lat/lon/avg_temp/
+  season with `#[serde(default)]` → old saves load as the neutral world) + `LiveSim.set_environment`; saved
+  sessions replay under their climate. Still **hash-neutral**.
+- **E3** coupling: heritable `ThermalTol` (4th spawn draw) ↔ `TemperatureMatchModifier` behind the
+  `ClimateModifier` seam (inv #5); pressure scales with climate **extremity** so a temperate default is
+  selection-neutral (soil signal undisturbed). **Single RE-PIN** → `0x9fad_2c9f_d298_f73a` (ledgered).
+- **E4** pre-run **MAIN MENU** (`godot/main_menu.gd`, CanvasLayer overlay): seed (or random), lat/lon/temp/
+  season/population, **core-computed preview** via `LiveSim.preview_climate` (inv #2 — the renderer never
+  computes climate). Start reseeds in place via the proven `_do_reset` path; CLI `--lat/--lon/--temp/--season/
+  --entities` is byte-identical to the menu path (shared 1000 default). Menu-free for headless/gate runs.
+- **Review fixes** (adversarial workflow): the menu is now a true modal — `_unhandled_input` swallows sim
+  hotkeys while it is open (ESC no longer quits the app behind it); the seed field writes back the actually-used
+  value on invalid input (no silent fallback surprise).
+
 ### Save/load progress + sandbox-default live mode (feat, roadmap R6 follow-up)
 The live session is now persistable, and free-play is the default:
 - **Save/load via the replay contract** (deterministic, no new hash literal): `harness::replay::save_journal`

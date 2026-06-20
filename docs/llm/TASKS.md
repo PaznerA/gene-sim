@@ -26,12 +26,13 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   ~gen 20" = directional selection on per-individual alleles (genotype→~0.98), NOT a bug/auto-injection; the
   species genome is constant without edits.
 
-- [ ] **Phase E — environment parametrization + main menu** (core + UI). Add a real environment the player can
-  set instead of a bare seed: **GPS latitude/longitude → sun trajectory** (day length / insolation by season),
-  **average temperature**, season. A **MAIN MENU** to choose these (or "random seed"). Couple them into the
-  `EnvironmentModifier` seam (inv #5) so they shape selection (e.g. temperature ↔ a trait), deterministically
-  (re-pin if the pinned config ships them). *Workflow:* design (which env params ↔ which signals; menu UX) →
-  implement core (off-stream env fields like soil) + the menu → review.
+- [x] **Phase E — environment parametrization + main menu** (core + UI) — DONE (ADR-012, E1→E4). The player
+  sets a real world instead of a bare seed: **GPS latitude/longitude → sun trajectory** (day length / insolation
+  by season), **average temperature**, season — via a **MAIN MENU** (or "random seed"). Coupled into selection
+  through the `ClimateModifier` seam (inv #5): heritable `ThermalTol` ↔ a `TemperatureMatchModifier`, climate-
+  neutral at a temperate default so the pinned config stays meaningful. Off-stream env fields (like soil), single
+  deliberate RE-PIN in E3 → pinned hash `0x9fad_2c9f_d298_f73a`. Menu is renderer-only (inv #2): its preview row
+  is core-computed via `LiveSim.preview_climate`. Designed + adversarially reviewed via workflows; gate green.
 
 - [ ] **🏷️ BETA RELEASE** — tag `v0.1.0-beta` → `release.yml` builds the executables (harness + cdylib for
   linux/mac/win + Godot Linux export). Do this AFTER Phase S/E land a coherent playable build; the CI is green.
@@ -53,7 +54,8 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
 - [ ] **Phase T — more traits under selection** (folds into E/R3). Beyond `Genotype` + `DroughtTol`: more
   environment↔phenotype couplings behind the `EnvironmentModifier` seam (inv #5). Determinism RE-PIN if shipped.
 
-Sequencing: U + S done. Next E (environment + main menu — makes runs meaningful beyond a seed) → **BETA tag** →
+Sequencing: U + S + E done. Next **BETA tag** (v0.1.0-beta; extend `release.yml` to ship installable .exe/.dmg/
+.deb per the review's release-readiness findings) →
 R3 (biggest sim leap, ADR sign-off) → Rel (relations + vector DB, ADR). Each core phase re-pins the determinism
 hash deliberately, ledgered in the pinned test; each large/invariant phase gets its own design workflow + ADR.
 
