@@ -54,6 +54,9 @@ static func load_from(path: String) -> SnapshotData:
 	s.soil_moisture = f.get_buffer(n * 4).to_float32_array()
 	s.soil_nutrients = f.get_buffer(n * 4).to_float32_array()
 	s.soil_ph = f.get_buffer(n * 4).to_float32_array()
+	if not _channels_complete(s):
+		push_error("snapshot: %s has truncated/short channels (expected %d floats each)" % [path, n])
+		return null
 	return s
 
 
@@ -79,7 +82,22 @@ static func parse_bytes(buf: PackedByteArray) -> SnapshotData:
 	s.soil_moisture = read.call(off); off += n * 4
 	s.soil_nutrients = read.call(off); off += n * 4
 	s.soil_ph = read.call(off)
+	if not _channels_complete(s):
+		push_error("snapshot: byte buffer has truncated/short channels (expected %d floats each)" % n)
+		return null
 	return s
+
+
+## True iff every channel array has exactly width*height floats (a short/truncated buffer fails this, so the
+## caller returns null instead of letting a later _draw index out of range). Read-only validation.
+static func _channels_complete(s: SnapshotData) -> bool:
+	var n := s.width * s.height
+	if s.width < 0 or s.height < 0:
+		return false
+	for arr in [s.density, s.allele_freq, s.fitness, s.soil_moisture, s.soil_nutrients, s.soil_ph]:
+		if arr.size() != n:
+			return false
+	return true
 
 
 func cell_count() -> int:

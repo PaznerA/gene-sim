@@ -58,6 +58,8 @@ func set_snapshot(snap, cell: float) -> void:
 func _draw() -> void:
 	if _w == 0 or _h == 0:
 		return
+	if _density.size() != _w * _h or _allele.size() != _w * _h or _fitness.size() != _w * _h:
+		return  # short/truncated channels (snapshot.gd should have rejected them) — degrade gracefully, no crash
 	var base_r := maxf(1.5, _cell * 0.16)
 	var rim := Color(0.03, 0.05, 0.04, 0.92)
 	var lod_dots_only := _cell < LOD_MIN_CELL

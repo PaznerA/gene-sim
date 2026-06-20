@@ -234,13 +234,17 @@ func _ready() -> void:
 ## it, reset, and seed _snaps with the gen-0 snapshot. Returns false (→ fall back to file replay) if the
 ## cdylib is not built or the extension fails to load. The renderer only CALLS LiveSim (inv #2: biology in Rust).
 func _setup_live() -> bool:
-	var dylib := ProjectSettings.globalize_path("res://../crates/godot-sim/target/debug/libgodot_sim.dylib")
-	if not FileAccess.file_exists(dylib):
-		dylib = ProjectSettings.globalize_path("res://../crates/godot-sim/target/debug/libgodot_sim.so")
-	if not FileAccess.file_exists(dylib):
-		printerr("--live needs the LiveSim cdylib. Build it:  cargo build --manifest-path crates/godot-sim/Cargo.toml")
-		return false
+	# An EXPORTED build auto-registers LiveSim at startup from the bundled res://gene_sim.gdextension — use it
+	# directly. Only the dev/editor run (extension not yet loaded) needs to locate + load the source-tree
+	# cdylib at runtime. Probing the source tree FIRST would wrongly fail the exported game (no crates/ in the
+	# PCK), so the class check gates the dev-only probe.
 	if not ClassDB.class_exists("LiveSim"):
+		var dylib := ProjectSettings.globalize_path("res://../crates/godot-sim/target/debug/libgodot_sim.dylib")
+		if not FileAccess.file_exists(dylib):
+			dylib = ProjectSettings.globalize_path("res://../crates/godot-sim/target/debug/libgodot_sim.so")
+		if not FileAccess.file_exists(dylib):
+			printerr("--live needs the LiveSim cdylib. Build it:  cargo build --manifest-path crates/godot-sim/Cargo.toml")
+			return false
 		var ext := "user://gene_sim_live.gdextension"
 		var f := FileAccess.open(ext, FileAccess.WRITE)
 		if f == null:
@@ -1014,8 +1018,12 @@ func _specimen_list() -> Array:
 ## Build one L-system plant per specimen, laid out in a row with a caption. The plant geometry comes from
 ## the core-exported trait vector via _plant_params_from_traits (presentation mapping — no biology, inv #2).
 func _render_specimens() -> void:
+	# Synchronous teardown: queue_free() is DEFERRED, so the stale holders would linger in get_children()
+	# this same frame and _emphasise_focus/_frame_focused_specimen (run right after on a view re-entry) would
+	# index the wrong (old) holder and dim the real focused plant. remove_child + free drops them at once.
 	for c in _specimen_root.get_children():
-		c.queue_free()
+		_specimen_root.remove_child(c)
+		c.free()
 	var list := _specimen_list()
 	_specimen_bounds = Rect2()
 	if list.is_empty():
