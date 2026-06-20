@@ -409,6 +409,12 @@ we pinned **4.7** — a stop-the-line pin conflict.
 
 ## ADR-011 — Real spatial dynamics: per-organism Position, inherited dispersal, region-scoped CRISPR edit, gamification (roadmap R1.2/R1.3 + R5)
 
+**Status: COMPLETE.** All slices landed gate-green: S-A (Position + off-stream placement, RE-PIN #1
+`3ba0…82ba`), S-B (inherited dispersal, RE-PIN #2 `0413…ce77`), S-C (snapshot by real position, hash-neutral),
+S-D (region edit in core/crispr/harness), S-E (gdext binding), S-F (brush UI), S-G (local soil coupling
+RE-PIN #3 `c01e…e40e` + the mission/edit-budget game loop). Three deliberate re-pins, all ledgered in the
+`determinism_hash_is_pinned` comment.
+
 ### Context
 The grid was **visualization only**: `Simulation::snapshot` placed each organism into a cell by a pure function
 of its `OrgId` (`derive_seed(id,1/2) % dims`) — "not biology" (ADR-006/008). Organisms had **no position**, so a

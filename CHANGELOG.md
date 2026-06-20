@@ -23,8 +23,14 @@ The grid stops being a visualization and becomes real biology, on which a *selec
 
 Invariant #6 was human-adjudicated (ADR-011): a region edit is sub-species but cell-scoped (no organism
 handle, min radius) and allowed in an AI policy's action space. All deterministic (inv #3), headless-tested
-(inv #4), biology in the core (inv #2). Local-soil-coupled selection + gamification (objective + edit budget)
-remain as S-G. Full gate green at every slice.
+(inv #4), biology in the core (inv #2). Full gate green at every slice.
+- **S-G1** LOCAL soil-coupled selection: each parent reads its OWN cell's soil (`SoilField::sample_at`) instead
+  of the field mean, so drought-tolerant lineages win in arid cells — real spatial adaptation (tested:
+  driest-quartile drought > wettest; per-cell mismatch shrinks). Behind the `EnvironmentModifier` seam (inv #5).
+  **RE-PIN #3** (`0413…` → `c01e…`).
+- **S-G2** the game loop: a SUPPRESS-THE-ZONE mission (drive the cyan target zone's mean allele below a
+  threshold within a deadline, on a limited edit budget — the brush lowers allele, selection raises it),
+  win/lose banner + score. Renderer-side game rules over the core-exported snapshot (inv #2), not in the hash.
 
 ### CI — GitHub Actions: the gate on every push + release executables (ci, roadmap §7)
 - `.github/workflows/ci.yml`: runs the single quality gate (`tools/gate.sh`) on every push to main + PR —
