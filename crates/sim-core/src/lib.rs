@@ -179,13 +179,17 @@ fn selection(
     mut rng: ResMut<SimRng>,
     base: Res<BaseGrowthRate>,
     mean_soil: Res<MeanSoil>,
-    mut q: Query<(&OrgId, &mut Genotype, &mut DroughtTol)>,
+    mut q: Query<(&OrgId, &mut Genotype, &mut DroughtTol, &mut Position)>,
 ) {
     use soil::EnvironmentModifier as _;
     let modifier = soil::LinearTraitMatchModifier;
 
-    // Snapshot parents (id, genotype, drought) in stable id order (decouples sampling from archetype order).
-    let mut parents: Vec<(u32, f64, f64)> = q.iter().map(|(id, g, d)| (id.0, g.0, d.0)).collect();
+    // Snapshot parents (id, genotype, drought, x, y) in stable id order (decouples sampling from archetype
+    // order). Position rides along so offspring can INHERIT the sampled parent's cell (+ disperse) — ADR-011.
+    let mut parents: Vec<(u32, f64, f64, u32, u32)> = q
+        .iter()
+        .map(|(id, g, d, p)| (id.0, g.0, d.0, p.x, p.y))
+        .collect();
     if parents.len() < 2 {
         return; // nothing to select between (also the empty-population fast path).
     }
@@ -196,31 +200,39 @@ fn selection(
     // per-run constant and drought is per-parent; no RNG and no HashMap here.
     let mut cumulative: Vec<f64> = Vec::with_capacity(parents.len());
     let mut total = 0.0;
-    for &(_, g, d) in &parents {
+    for &(_, g, d, _, _) in &parents {
         total += fitness(base.0, g) * modifier.fitness_factor(mean_soil.0, d);
         cumulative.push(total);
     }
 
-    // Draw N offspring, each INHERITING a fitness-proportional parent's (genotype, drought). The RNG draw
-    // count is exactly N — identical to before R1.1 — so the only stream shift came from drought-seeding
-    // at spawn, keeping this loop's reproducibility intact.
+    // Draw N offspring, each INHERITING a fitness-proportional parent's (genotype, drought, position) and then
+    // dispersing one bounded step. EXACTLY two draws/offspring in a fixed order (select, then disperse) so the
+    // stream is reproducible (ADR-011 RE-PIN #2; was N draws pre-S-B, now 2N). Lineages of fit parents stay
+    // spatially near each other → emergent regions/clines.
     let n = parents.len();
-    let mut offspring: Vec<(f64, f64)> = Vec::with_capacity(n);
+    let mut offspring: Vec<(f64, f64, u32, u32)> = Vec::with_capacity(n);
     for _ in 0..n {
         let target = unit_f64(rng.0.next_u64()) * total;
         // First cumulative weight strictly greater than target; partition_point is deterministic.
         let idx = cumulative.partition_point(|&c| c <= target).min(n - 1);
-        offspring.push((parents[idx].1, parents[idx].2));
+        let (_, pg, pd, px, py) = parents[idx];
+        // One dispersal draw → a 9-cell Moore step (dx, dy ∈ {-1, 0, 1}), clamped to the world grid edges.
+        let k = (unit_f64(rng.0.next_u64()) * 9.0) as i64; // 0..=8 (unit_f64 < 1, so *9 < 9)
+        let nx = (px as i64 + (k % 3 - 1)).clamp(0, WORLD_DIMS.0 as i64 - 1) as u32;
+        let ny = (py as i64 + (k / 3 - 1)).clamp(0, WORLD_DIMS.1 as i64 - 1) as u32;
+        offspring.push((pg, pd, nx, ny));
     }
 
-    // Map each id (in stable order) to its inherited (genotype, drought), then write back. `BTreeMap` is
-    // ordered (not a `HashMap`) so the build is deterministic; per-id write-back order is irrelevant.
-    let by_id: std::collections::BTreeMap<u32, (f64, f64)> =
+    // Map each id (in stable order) to its inherited (genotype, drought, position), then write back. `BTreeMap`
+    // is ordered (not a `HashMap`) so the build is deterministic; per-id write-back order is irrelevant.
+    let by_id: std::collections::BTreeMap<u32, (f64, f64, u32, u32)> =
         parents.iter().map(|p| p.0).zip(offspring).collect();
-    for (id, mut g, mut d) in &mut q {
-        if let Some(&(new_g, new_d)) = by_id.get(&id.0) {
+    for (id, mut g, mut d, mut p) in &mut q {
+        if let Some(&(new_g, new_d, new_x, new_y)) = by_id.get(&id.0) {
             g.0 = new_g;
             d.0 = new_d;
+            p.x = new_x;
+            p.y = new_y;
         }
     }
 }
@@ -589,14 +601,15 @@ mod tests {
         // reproducible-but-CHANGED hash — this guards that. The literal MUST change deliberately (in the same
         // commit) whenever real sim LOGIC changes; history: `c530…7ab1` pre-soil and through R1.0 (proving
         // soil was hash-neutral); `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
-        // soil-coupled selection); now `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded into the
-        // hash — placement is off-SimRng so the spawn stream is unchanged; only the new spatial bits re-pin).
+        // soil-coupled selection); `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded into the
+        // hash); now `0413…ce77` after ADR-011 S-B (inherited dispersal adds one `next_u64`/offspring, so the
+        // selection loop draws 2N/gen instead of N — a legitimate stream reshape).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x3ba0_e351_9e02_82ba);
+        assert_eq!(run_headless(&cfg).hash, 0x0413_3877_4dd7_ce77);
     }
 
     #[test]
@@ -627,6 +640,28 @@ mod tests {
                 "position ({x},{y}) out of world bounds {WORLD_DIMS:?}"
             );
         }
+    }
+
+    #[test]
+    fn dispersal_keeps_positions_in_bounds() {
+        // ADR-011 S-B: inherited dispersal steps one Moore cell/generation, clamped — never leaves the grid.
+        let cfg = SimConfig {
+            seed: 4242,
+            generations: 30,
+            entity_count: 300,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let out_of_bounds = sim
+            .world
+            .query::<&Position>()
+            .iter(&sim.world)
+            .filter(|p| p.x >= WORLD_DIMS.0 || p.y >= WORLD_DIMS.1)
+            .count();
+        assert_eq!(
+            out_of_bounds, 0,
+            "dispersal must clamp positions to the world grid"
+        );
     }
 
     fn mean_drought(world: &mut World) -> f64 {
