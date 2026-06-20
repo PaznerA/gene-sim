@@ -1,8 +1,11 @@
 extends RefCounted
-## Reads a gene-sim binary snapshot (.bin, format "GSS1") written by the Rust core
+## Reads a gene-sim binary snapshot (.bin, format "GSS2") written by the Rust core
 ## (sim-core `GridSnapshot::write_snapshot_bytes`). Little-endian layout:
-##   "GSS1" | u32 width | u32 height | u32 channel_count(=3) | u64 generation | u32 population
-##   | f32[w*h] density | f32[w*h] allele_freq | f32[w*h] fitness   (each channel row-major)
+##   "GSS2" | u32 width | u32 height | u32 channel_count(=6) | u64 generation | u32 population
+##   | f32[w*h] density | f32[w*h] allele_freq | f32[w*h] fitness
+##   | f32[w*h] soil_moisture | f32[w*h] soil_nutrients | f32[w*h] soil_ph   (each channel row-major)
+## The soil_* channels (roadmap R1.0) are PARSED here for inspection; the data-layer shader still samples
+## only density/allele_freq/fitness — a visible soil overlay is later UI work (Godot is built last).
 ##
 ## INVARIANT #2 (STOP THE LINE if violated): this ONLY parses snapshot bytes and exposes them for rendering.
 ## It computes NO biology / genotype→phenotype — all of that lives in the Rust core. The renderer is read-only.
@@ -12,7 +15,7 @@ extends RefCounted
 ## Consumers `preload("res://snapshot.gd")`; the static factory self-references via `SnapshotData` below.
 ## Both are resolved at parse time and need no `.godot/` cache.
 
-const MAGIC := "GSS1"
+const MAGIC := "GSS2"
 const SnapshotData := preload("res://snapshot.gd")
 
 var width: int = 0
@@ -23,6 +26,9 @@ var population: int = 0
 var density: PackedFloat32Array
 var allele_freq: PackedFloat32Array
 var fitness: PackedFloat32Array
+var soil_moisture: PackedFloat32Array
+var soil_nutrients: PackedFloat32Array
+var soil_ph: PackedFloat32Array
 
 
 static func load_from(path: String) -> SnapshotData:
@@ -45,6 +51,9 @@ static func load_from(path: String) -> SnapshotData:
 	s.density = f.get_buffer(n * 4).to_float32_array()
 	s.allele_freq = f.get_buffer(n * 4).to_float32_array()
 	s.fitness = f.get_buffer(n * 4).to_float32_array()
+	s.soil_moisture = f.get_buffer(n * 4).to_float32_array()
+	s.soil_nutrients = f.get_buffer(n * 4).to_float32_array()
+	s.soil_ph = f.get_buffer(n * 4).to_float32_array()
 	return s
 
 

@@ -4,6 +4,20 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### R1.0 — terrain/soil substrate: hash-neutral static SoilField (feat, roadmap R1; multi-agent designed)
+Multi-agent designed (3 scoping lenses → adversarial vetting against determinism/ADR-005/perf/snapshot →
+synthesis) + human sign-off. First slice of the terrain epic — **substrate only, provably hash-neutral**:
+- `crates/sim-core/src/soil.rs`: a static `SoilField` (moisture / nutrients / pH, each `[0,1]`) generated
+  once in `Simulation::reset` from `derive_seed` (value-noise over a 5×5 lattice, multiply-add only) — **zero
+  `SimRng` draws**, never folded into `hash_world`. Plus an `EnvironmentModifier` trait (invariant-#5 seam) +
+  `LinearTraitMatchModifier` default, present but **unwired** (coupling is R1.1+).
+- Snapshot gains **3 read-only soil channels**: `CHANNEL_COUNT` 3→6, magic **GSS1→GSS2** (loud bad-magic on a
+  stale reader). `godot/snapshot.gd` is **parse-only**; the click-detail panel now shows per-cell soil values
+  (no shader/overlay — "Godot LAST" respected).
+- **Determinism proven:** a new test pins the exact pre-soil hash literal (`0xc530…7ab1`); matching it on the
+  with-soil build proves soil is hash-neutral (guards the `check_determinism.sh` silent-change gap). Perf
+  within criterion noise (no re-baseline; soil gen is off the hot loop). ADR-008 + a `derive_seed` stream registry.
+
 ### UI/controls + visual polish round (A+C; feat/refinement, Stage 4) — multi-agent designed
 Designed + adversarially vetted by a multi-agent **workflow** (parallel design → invariant-#2/Godot-4.7-API
 review → synthesized gated plan), then implemented serially (one slice → headless `--check` → `tools/gate.sh`

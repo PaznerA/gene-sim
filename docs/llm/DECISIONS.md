@@ -270,6 +270,52 @@ constant across a run — only an **edit** changes it — so the demo is baselin
 
 ---
 
+## ADR-008 — Terrain/soil substrate: hash-neutral static SoilField (roadmap R1.0)
+
+- **Date:** 2026-06-20
+- **Status:** Accepted
+- **Stage:** Roadmap R1 (slice R1.0), multi-agent designed + adversarially vetted; human signed off.
+
+### Context
+The roadmap (TASKS §ROADMAP) wants a terrain/soil substrate that eventually drives **spatial** selection
+(target: R1.3 local per-cell Wright-Fisher + dispersal) and is the substrate for Stage-5 LLM env-modifiers.
+The design workflow surfaced three traps that force the **first** slice to be substrate-only: (1) the advertised
+soil→DroughtTolerance coupling is currently **impossible** — `DroughtTolerance = 1.0·p2` maps to the killswitch
+`Bool(false)` = 0.0 and collides with `KillSwitchLinkage` (gp.rs); (2) `check_determinism.sh` only compares
+`run==run`, so a reproducible-but-*changed* hash passes silently; (3) a 4th+ snapshot channel can't ride the
+current renderer (RGBF / `.rgb` / `--layer 0..3`) without real Stage-4 shader work, violating "Godot LAST".
+
+### Decision
+R1.0 ships the **substrate only, provably hash-neutral, no coupling**:
+- `crates/sim-core/src/soil.rs`: a static `SoilField` (3 channels — moisture / nutrients / pH, each `[0,1]`),
+  generated once in `Simulation::reset` from `derive_seed(seed, SOIL_STREAM_BASE + …)` — the stateless
+  splitmix64 — drawing **zero** from the threaded `SimRng` and **never** folded into `hash_world`. Value-noise
+  from a 5×5 control lattice, bilinearly interpolated (multiply-add only, no transcendentals → cross-platform).
+- Exported as **3 new read-only snapshot channels**; `CHANNEL_COUNT` 3→6 and magic **GSS1→GSS2** (a bumped
+  magic makes a stale 3-channel reader fail loudly, not silently). `godot/snapshot.gd` change is **parse-only**
+  (reads + exposes the soil planes; the detail panel shows them) — **no** shader / overlay / `--layer` work.
+- An `EnvironmentModifier` trait (invariant #5 seam) + in-core `LinearTraitMatchModifier` default are present
+  but **UNWIRED** — selection coupling lands in R1.1+, Stage-5 admits validated LLM impls behind the same trait.
+- A Rust test **pins the exact pre-soil hash literal** (`0xc530…7ab1`, seed = the harness run-0 derived seed)
+  — since the literal was measured *before* soil existed, matching it on the with-soil build **proves** soil is
+  hash-neutral (and guards the silent-change gap in `check_determinism.sh`).
+
+### Consequences
+- **+** Determinism intact (proven by the pinned literal); perf within criterion noise (no re-baseline — soil
+  gen is O(cells) once per `reset`, off the hot selection loop); ADR-005 untouched; "Godot LAST" respected.
+- **+** Clean substrate + invariant-#5 seam for the phased coupling (R1.1 global → R1.2 per-cell → R1.3 local)
+  and Stage-5; the renderer already surfaces per-cell soil in the click-detail panel.
+- **−** Soil does **nothing** to the sim yet (by design). The DroughtTolerance dead-trait must be fixed
+  (R1.0a — chosen: **per-individual heritable**) before any coupling; spatial selection (R1.2+) is the real
+  ADR-005 change, separately ADR'd.
+
+### `derive_seed` stream registry (keep disjoint — inv #3)
+- `1`, `2` — snapshot organism placement (`x`, `y`) — `Simulation::snapshot`.
+- `[SOIL_STREAM_BASE, SOIL_STREAM_BASE + SOIL_CHANNELS·LATTICE²)` (base `0x0050_4F49_4C00_0000`) — soil control points.
+- Future spatial phases (R1.2 Cell, R1.3 dispersal) must reserve new disjoint ranges here before use.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

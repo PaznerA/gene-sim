@@ -85,11 +85,25 @@
 > Keep the gene-sim differentiators vs. Bibites: **real CRISPR mechanic, real SO/GO ontology, deterministic
 > reproducibility, daisy-chain biosafety.**
 
-- [ ] 🛑 **R1 — Terrain + soil/environment substrate (core)** *(design IN FLIGHT — workflow running)*. Per-cell
-  deterministic soil (e.g. moisture / nutrients / pH) coupling to selection so traits (esp. DroughtTolerance)
-  matter **spatially**; new read-only `GridSnapshot` channels for the renderer. Foundation for spatial
-  emergence + the env-modifier boundary. *Depends:* extends Stage 1 selection + the snapshot. *Invariants:*
-  #3 determinism (the crux — local selection vs. ADR-005 constant-N Wright-Fisher), #2, #5, perf. ADR + sign-off pending.
+- **R1 — Terrain + soil/environment substrate (core)** — designed (workflow) + signed off. Decisions: 3 soil
+  channels (moisture/nutrients/pH) from the start; DroughtTolerance becomes **per-individual heritable**
+  (R1.0a); target = **full local model (R1.3)**, reached via phases. Sub-slices:
+  - [x] **R1.0** Static seed-derived `SoilField` (3 channels) + 3 read-only snapshot channels (GSS1→GSS2,
+    parse-only Godot) + unwired `EnvironmentModifier` seam + **pinned-hash test proving hash-neutrality**.
+    ✅ DONE (`crates/sim-core/src/soil.rs`; zero `SimRng` draws, off `hash_world`; perf within noise; click-
+    detail panel shows per-cell soil; full gate green; ADR-008 + derive_seed stream registry).
+  - [ ] 🛑 **R1.0a** Make `DroughtTolerance` a live **per-individual heritable** parameter (decolide from the
+    killswitch Bool slot; resampled like `Genotype`). Prerequisite for any coupling. Changes the hash once
+    (update the pinned literal in-slice); own ADR. *Invariants:* #2/#3.
+  - [ ] 🛑 **R1.1** Wire `EnvironmentModifier` into `selection()` — **global** soil-modulated fitness
+    (constant-N preserved; ADR extends ADR-005). First real coupling; static dispatch; re-baseline perf;
+    fold soil digest into `hash_world` at a fixed position.
+  - [ ] 🛑 **R1.2** Passive `Cell(u32)` component (placement via `derive_seed`, zero new draws) + **per-cell**
+    soil_factor; offspring inherit the **sampled parent's** cell. Spatial selection on a global pool. ADR-005 change.
+  - [ ] 🛑 **R1.3** **Local** per-cell Wright-Fisher + dispersal (define empty-cell / deme-size rules; pick
+    grid/N so patterns are signal not drift). Largest ADR-005 rewrite — the target model.
+  - [ ] 🛑 **R1.4** Dynamic soil (pH/nutrient dynamics; zero-RNG or after-selection in the schedule) +
+    Stage-5 LLM `EnvironmentModifier` admission behind the trait — the Track-B payoff.
 - [ ] 🛑 **R2 — Environment parameters / climate (core).** Global + time-varying knobs (seasonal moisture,
   temperature…) layered on R1's static soil via deterministic schedules; makes runs dynamic over time.
   *Depends:* R1.

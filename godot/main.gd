@@ -156,11 +156,7 @@ func _ready() -> void:
 			var snap = _snaps[_idx]
 			if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
 				var i: int = cy * snap.width + cx
-				_fill_detail("Cell (%d, %d)" % [cx, cy], [
-					"density       %.3f" % snap.density[i],
-					"allele_freq   %.3f" % snap.allele_freq[i],
-					"fitness       %.3f" % snap.fitness[i],
-				])
+				_fill_detail("Cell (%d, %d)" % [cx, cy], _cell_lines(snap, i))
 
 	# Headless render smoke (gate): build the scene + specimen plants + the detail panel, prove it all
 	# constructs without a GPU, quit.
@@ -904,7 +900,7 @@ func _update_tooltip() -> void:
 		var snap = _snaps[_idx]
 		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
 			var i: int = cy * snap.width + cx
-			text = "(%d,%d)  d %.2f  a %.2f  f %.2f" % [cx, cy, snap.density[i], snap.allele_freq[i], snap.fitness[i]]
+			text = "(%d,%d)  d %.2f  a %.2f  f %.2f  moist %.2f" % [cx, cy, snap.density[i], snap.allele_freq[i], snap.fitness[i], snap.soil_moisture[i]]
 	elif _view_mode == 1:
 		var hit := _specimen_at(world)
 		if hit >= 0:
@@ -944,11 +940,7 @@ func _on_click() -> void:
 		var cy := int(floor(world.y / _cell))
 		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
 			var i: int = cy * snap.width + cx
-			_fill_detail("Cell (%d, %d)" % [cx, cy], [
-				"density       %.3f" % snap.density[i],
-				"allele_freq   %.3f" % snap.allele_freq[i],
-				"fitness       %.3f" % snap.fitness[i],
-			])
+			_fill_detail("Cell (%d, %d)" % [cx, cy], _cell_lines(snap, i))
 		else:
 			_detail_panel.visible = false
 	else:
@@ -959,6 +951,18 @@ func _on_click() -> void:
 				_specimen_picker.select(_focus)
 			_on_specimen_selected(_focus)
 			_fill_detail(str((_specimen_list()[hit] as Dictionary).get("label", "specimen")), [])
+
+
+## The per-cell stat lines (population channels + R1.0 soil channels) for the detail panel.
+func _cell_lines(snap, i: int) -> Array:
+	return [
+		"density        %.3f" % snap.density[i],
+		"allele_freq    %.3f" % snap.allele_freq[i],
+		"fitness        %.3f" % snap.fitness[i],
+		"soil moisture  %.3f" % snap.soil_moisture[i],
+		"soil nutrients %.3f" % snap.soil_nutrients[i],
+		"soil pH        %.3f" % snap.soil_ph[i],
+	]
 
 
 ## Rewrite the detail panel: a title, optional stat lines, then the species-genome ontology (track-B prep).

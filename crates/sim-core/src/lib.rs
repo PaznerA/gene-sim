@@ -22,6 +22,7 @@ use rand_chacha::rand_core::{Rng, SeedableRng};
 pub mod det;
 pub mod gp;
 pub mod snapshot;
+pub mod soil;
 
 pub use det::derive_seed;
 pub use gp::{GenotypePhenotypeMap, Phenotype, Trait, WeightedSumMap};
@@ -172,7 +173,7 @@ fn selection(
 }
 
 /// Map a u64 to a `[0, 1)` f64 using the top 53 bits (deterministic, no rand-API churn).
-fn unit_f64(x: u64) -> f64 {
+pub(crate) fn unit_f64(x: u64) -> f64 {
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -227,6 +228,10 @@ pub struct Simulation {
     world: World,
     schedule: Schedule,
     config: SimConfig,
+    /// Static per-cell environment substrate (terrain/soil), generated once from the seed and read-only
+    /// w.r.t. the run (off the determinism-hash path — roadmap R1.0). Exported into snapshots; not yet
+    /// coupled to selection.
+    soil: soil::SoilField,
 }
 
 impl Simulation {
@@ -266,6 +271,9 @@ impl Simulation {
             world,
             schedule,
             config: config.clone(),
+            // Generated purely from the seed via derive_seed — draws ZERO from SimRng, so it cannot move
+            // the determinism hash (invariant #3). Static for the run.
+            soil: soil::SoilField::generate(config.seed, soil::SOIL_DIMS.0, soil::SOIL_DIMS.1),
         }
     }
 
@@ -358,6 +366,19 @@ impl Simulation {
             fitness[c] = (energy_sum[c] / f64::from(n)) as f32;
         }
 
+        // Resample the static soil field onto the snapshot grid (read-only, no RNG → off the hash path).
+        let mut soil_moisture = vec![0.0f32; cells];
+        let mut soil_nutrients = vec![0.0f32; cells];
+        let mut soil_ph = vec![0.0f32; cells];
+        for y in 0..height {
+            for x in 0..width {
+                let c = (y as usize) * (width as usize) + (x as usize);
+                soil_moisture[c] = self.soil.sample_to(0, x, y, width, height);
+                soil_nutrients[c] = self.soil.sample_to(1, x, y, width, height);
+                soil_ph[c] = self.soil.sample_to(2, x, y, width, height);
+            }
+        }
+
         GridSnapshot {
             width,
             height,
@@ -366,6 +387,9 @@ impl Simulation {
             density,
             allele_freq,
             fitness,
+            soil_moisture,
+            soil_nutrients,
+            soil_ph,
         }
     }
 
@@ -484,6 +508,27 @@ mod tests {
             entity_count: 500,
         };
         assert_eq!(run_headless(&cfg).hash, run_headless(&cfg).hash);
+    }
+
+    #[test]
+    fn determinism_hash_is_pinned_and_soil_is_hash_neutral() {
+        // Pin the EXACT hash literal captured BEFORE the soil layer existed (the harness's run-0 derived
+        // seed for seed=42, gens=50, entities=1000). `check_determinism.sh` only compares run==run, so it
+        // would NOT catch a reproducible-but-CHANGED hash — this guards that, AND because the literal was
+        // measured pre-soil, matching it on the with-soil build PROVES soil is hash-neutral (it is generated
+        // from `derive_seed` with zero `SimRng` draws and never folded into `hash_world`). If this literal
+        // ever needs to change, it means real sim LOGIC changed (e.g. R1.1 soil→selection coupling) — update
+        // it deliberately in that same commit.
+        let cfg = SimConfig {
+            seed: 13_679_457_532_755_275_413,
+            generations: 50,
+            entity_count: 1000,
+        };
+        assert_eq!(
+            run_headless(&cfg).hash,
+            0xc530_7d86_dba9_7ab1,
+            "soil must be hash-neutral in R1.0 (this literal was measured pre-soil)"
+        );
     }
 
     #[test]

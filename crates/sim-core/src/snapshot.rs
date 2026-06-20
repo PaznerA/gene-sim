@@ -19,24 +19,26 @@
 //! ## Binary format ([`GridSnapshot::write_snapshot_bytes`])
 //! Little-endian, `std`-only (no `bincode`/`serde`):
 //! ```text
-//!   bytes 0..4 : ASCII magic "GSS1"
+//!   bytes 0..4 : ASCII magic "GSS2"
 //!   u32 LE     : width
 //!   u32 LE     : height
-//!   u32 LE     : channel_count (= 3)
+//!   u32 LE     : channel_count (= 6)
 //!   u64 LE     : generation
 //!   u32 LE     : population
 //!   then channel-major, each channel's width*height f32 LE values in row-major order,
-//!   channels in order: density, allele_freq, fitness.
+//!   channels in order: density, allele_freq, fitness, soil_moisture, soil_nutrients, soil_ph.
 //! ```
 
 use std::io;
 use std::path::Path;
 
-/// ASCII magic header identifying the snapshot binary format (`"GSS1"` = Gene-Sim Snapshot v1).
-pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS1";
+/// ASCII magic header identifying the snapshot binary format (`"GSS2"` = Gene-Sim Snapshot v2; v2 added the
+/// 3 soil channels — a bumped magic turns a stale 3-channel reader into a loud bad-magic error, not silence).
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS2";
 
-/// The number of per-cell channels a [`GridSnapshot`] carries: `density`, `allele_freq`, `fitness`.
-pub const CHANNEL_COUNT: u32 = 3;
+/// The number of per-cell channels a [`GridSnapshot`] carries: `density`, `allele_freq`, `fitness`,
+/// `soil_moisture`, `soil_nutrients`, `soil_ph`.
+pub const CHANNEL_COUNT: u32 = 6;
 
 /// A read-only, derived per-cell grid view of the simulation for the renderer (SPEC §W10).
 ///
@@ -64,6 +66,12 @@ pub struct GridSnapshot {
     pub allele_freq: Vec<f32>,
     /// Per-cell mean `Energy` in `[0, 1]`, row-major (`width * height`); `0` for empty cells.
     pub fitness: Vec<f32>,
+    /// Per-cell soil moisture in `[0, 1]`, row-major; resampled from the run's static `SoilField` (R1.0).
+    pub soil_moisture: Vec<f32>,
+    /// Per-cell soil nutrient level in `[0, 1]`, row-major (resampled from the `SoilField`).
+    pub soil_nutrients: Vec<f32>,
+    /// Per-cell soil pH (normalized `[0, 1]`), row-major (resampled from the `SoilField`).
+    pub soil_ph: Vec<f32>,
 }
 
 impl GridSnapshot {
@@ -85,7 +93,14 @@ impl GridSnapshot {
         buf.extend_from_slice(&self.generation.to_le_bytes());
         buf.extend_from_slice(&self.population.to_le_bytes());
 
-        for channel in [&self.density, &self.allele_freq, &self.fitness] {
+        for channel in [
+            &self.density,
+            &self.allele_freq,
+            &self.fitness,
+            &self.soil_moisture,
+            &self.soil_nutrients,
+            &self.soil_ph,
+        ] {
             for &v in channel {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -131,6 +146,9 @@ mod tests {
         let density = read_channel();
         let allele_freq = read_channel();
         let fitness = read_channel();
+        let soil_moisture = read_channel();
+        let soil_nutrients = read_channel();
+        let soil_ph = read_channel();
         assert_eq!(off, bytes.len(), "trailing bytes");
 
         GridSnapshot {
@@ -141,6 +159,9 @@ mod tests {
             density,
             allele_freq,
             fitness,
+            soil_moisture,
+            soil_nutrients,
+            soil_ph,
         }
     }
 
@@ -154,6 +175,9 @@ mod tests {
             density: vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.125],
             allele_freq: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             fitness: vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.4],
+            soil_moisture: vec![0.11, 0.22, 0.33, 0.44, 0.55, 0.66],
+            soil_nutrients: vec![0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+            soil_ph: vec![0.05, 0.15, 0.25, 0.35, 0.45, 0.55],
         };
         let back = parse(&snap.write_snapshot_bytes());
 
@@ -162,10 +186,13 @@ mod tests {
         assert_eq!(back.height, 2);
         assert_eq!(back.generation, 17);
         assert_eq!(back.population, 5);
-        // Sample cells across all three channels (exact f32 bit equality).
+        // Sample cells across all six channels (exact f32 bit equality).
         assert_eq!(back.density, snap.density);
         assert_eq!(back.allele_freq, snap.allele_freq);
         assert_eq!(back.fitness, snap.fitness);
+        assert_eq!(back.soil_moisture, snap.soil_moisture);
+        assert_eq!(back.soil_nutrients, snap.soil_nutrients);
+        assert_eq!(back.soil_ph, snap.soil_ph);
         // Full struct equality.
         assert_eq!(back, snap);
     }
@@ -180,10 +207,13 @@ mod tests {
             density: vec![0.0; 16],
             allele_freq: vec![0.0; 16],
             fitness: vec![0.0; 16],
+            soil_moisture: vec![0.0; 16],
+            soil_nutrients: vec![0.0; 16],
+            soil_ph: vec![0.0; 16],
         };
         let bytes = snap.write_snapshot_bytes();
-        // 28-byte header + 3 channels * 16 cells * 4 bytes.
-        assert_eq!(bytes.len(), 28 + 3 * 16 * 4);
-        assert_eq!(&bytes[0..4], b"GSS1");
+        // 28-byte header + 6 channels * 16 cells * 4 bytes.
+        assert_eq!(bytes.len(), 28 + 6 * 16 * 4);
+        assert_eq!(&bytes[0..4], b"GSS2");
     }
 }
