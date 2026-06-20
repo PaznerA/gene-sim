@@ -62,8 +62,22 @@ Verify with `cargo tree -p oracle-slim` (no GPL crate) — the license gate (`sc
 enforces this. Same pattern for Crisflash (off-target oracle, Stage 2+).
 
 ## Genome-in-core (invariant #2)
-Genotype→phenotype lives in `crates/genome` / `crates/sim-core` only. `godot/` reads bincode snapshots and
-computes no biology. If a GDScript file needs a trait value, the value must already be in the snapshot.
+Genotype→phenotype lives in `crates/genome` / `crates/sim-core` only. `godot/` reads `GridSnapshot` bytes
+(std-only `"GSS1"` format, `crates/sim-core/src/snapshot.rs`) and computes no biology. If a GDScript file
+needs a trait value, the value must already be a channel in the snapshot.
+
+## Renderer (Stage 4, Godot — invariants #2 & #4)
+- **No `class_name` globals in renderer scripts.** Godot only registers them during an editor *import* pass,
+  so a fresh `godot --headless` run (CI / the gate) leaves a bare `Snapshot` identifier unresolved. Load via
+  `preload("res://foo.gd")`; for a script's own static factory use a self-preload const. (Cost us S4.2.)
+- **Snapshots are read-only & hash-neutral.** `Simulation::snapshot()` draws no RNG and mutates nothing, so
+  emitting snapshots can't change the determinism hash (inv. #3). Keep new channels on that derived path.
+- **Verifying the renderer:** headless can't render pixels (dummy GPU). Two-pronged:
+  `godot --headless --path godot -- --run <dir> --check` builds the scene and prints `render scene OK`
+  (gated — catches GDScript parse/logic errors); `godot --path godot -- --run <dir> --shot out.png` opens a
+  real window and captures the viewport to PNG for eyeballing (`--layer`/`--zoom`/`--gen` to pick the frame).
+- **`:=` needs an inferable type:** indexing an untyped `Array` yields `Variant`, so `var c := arr[i]` fails to
+  parse — write `var c: Color = arr[i]`. Data-layer colormaps belong in a `.gdshader`, not a per-pixel GDScript loop.
 
 ## Pluggable science (invariant #5)
 On/off-target scores are traits (`OnTargetScore`/`OffTargetScore`). sim-core depends on the trait, never a
