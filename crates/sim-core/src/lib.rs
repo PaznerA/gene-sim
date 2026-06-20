@@ -98,7 +98,6 @@ struct SoilFieldRes(soil::SoilField);
 /// The world climate as a resource (ADR-012 Phase E): derived from the player's `EnvParams`, off the `SimRng`
 /// stream. Inserted at reset; CONSUMED by selection only once E3 couples it (until then it's hash-neutral).
 #[derive(Resource)]
-#[allow(dead_code)] // E1: inserted but not yet read — E3's TemperatureMatchModifier consumes it (then drop this).
 struct ClimateFieldRes(climate::ClimateField);
 
 /// Stable per-organism id (0..entity_count), assigned at spawn. Gives a deterministic hash order
@@ -121,6 +120,12 @@ struct Genotype(f64);
 /// soil-coupled selection (R1.1) can shift the population's drought distribution to match the terrain.
 #[derive(Component, Clone, Copy)]
 struct DroughtTol(f64);
+
+/// Per-individual **heritable** thermal tolerance in `[0, 1]` (ADR-012 Phase E E3). Standing variation seeded
+/// at spawn (after drought, fixed draw order); inherited (NOT resampled) from the fitness-sampled parent; the
+/// climate's `TemperatureMatchModifier` favours warm-adapted individuals in warm climates. Folded into the hash.
+#[derive(Component, Clone, Copy)]
+struct ThermalTol(f64);
 
 /// Per-individual cell position on the canonical [`WORLD_DIMS`] world grid (ADR-011, real spatial biology —
 /// no longer a render-only OrgId hash). Seeded at spawn from a DISJOINT off-`SimRng` derive_seed family
@@ -214,59 +219,68 @@ fn selection(
     mut rng: ResMut<SimRng>,
     base: Res<BaseGrowthRate>,
     soil_field: Res<SoilFieldRes>,
-    mut q: Query<(&OrgId, &mut Genotype, &mut DroughtTol, &mut Position)>,
+    climate_field: Res<ClimateFieldRes>,
+    mut q: Query<(
+        &OrgId,
+        &mut Genotype,
+        &mut DroughtTol,
+        &mut ThermalTol,
+        &mut Position,
+    )>,
 ) {
+    use climate::ClimateModifier as _;
     use soil::EnvironmentModifier as _;
-    let modifier = soil::LinearTraitMatchModifier;
+    let soil_mod = soil::LinearTraitMatchModifier;
+    let clim_mod = climate::TemperatureMatchModifier;
+    let clim_sample = climate_field.0.sample(); // GLOBAL climate coupling (ADR-012 E3); per-cell is a follow-up.
 
-    // Snapshot parents (id, genotype, drought, x, y) in stable id order (decouples sampling from archetype
-    // order). Position rides along so offspring can INHERIT the sampled parent's cell (+ disperse) — ADR-011.
-    let mut parents: Vec<(u32, f64, f64, u32, u32)> = q
+    // Snapshot parents (id, genotype, drought, thermal, x, y) in stable id order. Position rides along so
+    // offspring INHERIT the sampled parent's cell (+ disperse) — ADR-011; thermal rides for the climate factor.
+    let mut parents: Vec<(u32, f64, f64, f64, u32, u32)> = q
         .iter()
-        .map(|(id, g, d, p)| (id.0, g.0, d.0, p.x, p.y))
+        .map(|(id, g, d, t, p)| (id.0, g.0, d.0, t.0, p.x, p.y))
         .collect();
     if parents.len() < 2 {
         return; // nothing to select between (also the empty-population fast path).
     }
     parents.sort_unstable_by_key(|p| p.0);
 
-    // Weights = base fitness × the environment factor of the parent's OWN cell soil (ADR-011 S-G local
-    // coupling): an arid cell penalises drought-intolerant parents, so lineages adapt to their region. The
-    // factor stays strictly positive (ADR-005 no-extinction). Deterministic: sample_at is RNG-free, no HashMap.
+    // Weights = base fitness × the parent's OWN-cell SOIL factor (ADR-011 S-G) × the CLIMATE factor (ADR-012 E3:
+    // warm-adapted individuals win in warm climates). Both factors strictly positive (ADR-005 no-extinction);
+    // both RNG-free, no HashMap → deterministic.
     let mut cumulative: Vec<f64> = Vec::with_capacity(parents.len());
     let mut total = 0.0;
-    for &(_, g, d, x, y) in &parents {
+    for &(_, g, d, t, x, y) in &parents {
         let local_soil = soil_field.0.sample_at(x, y);
-        total += fitness(base.0, g) * modifier.fitness_factor(local_soil, d);
+        let w = fitness(base.0, g)
+            * soil_mod.fitness_factor(local_soil, d)
+            * clim_mod.fitness_factor(clim_sample, t);
+        total += w;
         cumulative.push(total);
     }
 
-    // Draw N offspring, each INHERITING a fitness-proportional parent's (genotype, drought, position) and then
-    // dispersing one bounded step. EXACTLY two draws/offspring in a fixed order (select, then disperse) so the
-    // stream is reproducible (ADR-011 RE-PIN #2; was N draws pre-S-B, now 2N). Lineages of fit parents stay
-    // spatially near each other → emergent regions/clines.
+    // Draw N offspring, each INHERITING a fitness-proportional parent's (genotype, drought, thermal, position)
+    // then dispersing one bounded step. EXACTLY two draws/offspring in a fixed order (select, then disperse).
     let n = parents.len();
-    let mut offspring: Vec<(f64, f64, u32, u32)> = Vec::with_capacity(n);
+    let mut offspring: Vec<(f64, f64, f64, u32, u32)> = Vec::with_capacity(n);
     for _ in 0..n {
         let target = unit_f64(rng.0.next_u64()) * total;
-        // First cumulative weight strictly greater than target; partition_point is deterministic.
         let idx = cumulative.partition_point(|&c| c <= target).min(n - 1);
-        let (_, pg, pd, px, py) = parents[idx];
-        // One dispersal draw → a 9-cell Moore step (dx, dy ∈ {-1, 0, 1}), clamped to the world grid edges.
-        let k = (unit_f64(rng.0.next_u64()) * 9.0) as i64; // 0..=8 (unit_f64 < 1, so *9 < 9)
+        let (_, pg, pd, pt, px, py) = parents[idx];
+        let k = (unit_f64(rng.0.next_u64()) * 9.0) as i64; // 0..=8 → a 9-cell Moore step
         let nx = (px as i64 + (k % 3 - 1)).clamp(0, WORLD_DIMS.0 as i64 - 1) as u32;
         let ny = (py as i64 + (k / 3 - 1)).clamp(0, WORLD_DIMS.1 as i64 - 1) as u32;
-        offspring.push((pg, pd, nx, ny));
+        offspring.push((pg, pd, pt, nx, ny));
     }
 
-    // Map each id (in stable order) to its inherited (genotype, drought, position), then write back. `BTreeMap`
-    // is ordered (not a `HashMap`) so the build is deterministic; per-id write-back order is irrelevant.
-    let by_id: std::collections::BTreeMap<u32, (f64, f64, u32, u32)> =
+    // Map each id to its inherited (genotype, drought, thermal, position), then write back (ordered BTreeMap).
+    let by_id: std::collections::BTreeMap<u32, (f64, f64, f64, u32, u32)> =
         parents.iter().map(|p| p.0).zip(offspring).collect();
-    for (id, mut g, mut d, mut p) in &mut q {
-        if let Some(&(new_g, new_d, new_x, new_y)) = by_id.get(&id.0) {
+    for (id, mut g, mut d, mut t, mut p) in &mut q {
+        if let Some(&(new_g, new_d, new_t, new_x, new_y)) = by_id.get(&id.0) {
             g.0 = new_g;
             d.0 = new_d;
+            t.0 = new_t;
             p.x = new_x;
             p.y = new_y;
         }
@@ -370,13 +384,14 @@ impl Simulation {
             let g0 = unit_f64(rng.next_u64());
             let init = base_growth * unit_f64(rng.next_u64());
             let drought = unit_f64(rng.next_u64());
-            // Initial cell from a DISJOINT off-SimRng stream (ADR-011): no next_u64 draw here, so the spawn
-            // stream order (g0, energy, drought) stays byte-identical to pre-S-A.
+            let thermal = unit_f64(rng.next_u64()); // ADR-012 E3: fixed draw order (g0, energy, drought, thermal)
+                                                    // Initial cell from a DISJOINT off-SimRng stream (ADR-011): no next_u64 draw here.
             world.spawn((
                 OrgId(i),
                 Energy(init),
                 Genotype(g0),
                 DroughtTol(drought),
+                ThermalTol(thermal),
                 placement(config.seed, i),
             ));
         }
@@ -640,10 +655,28 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
     // Collect (id, energy, genotype, drought) bits and sort by id so the hash never depends on iteration
     // order. Drought tolerance is per-individual heritable state (R1.0a) so it MUST enter the hash.
     // (ADR-011) Position is per-individual heritable spatial state, so it MUST enter the hash.
-    let mut rows: Vec<(u32, u64, u64, u64, u32, u32)> = world
-        .query::<(&OrgId, &Energy, &Genotype, &DroughtTol, &Position)>()
+    // (ADR-012 E3) ThermalTol is per-individual heritable state, so it MUST enter the hash too.
+    let mut rows: Vec<(u32, u64, u64, u64, u64, u32, u32)> = world
+        .query::<(
+            &OrgId,
+            &Energy,
+            &Genotype,
+            &DroughtTol,
+            &ThermalTol,
+            &Position,
+        )>()
         .iter(world)
-        .map(|(id, e, g, d, p)| (id.0, e.0.to_bits(), g.0.to_bits(), d.0.to_bits(), p.x, p.y))
+        .map(|(id, e, g, d, t, p)| {
+            (
+                id.0,
+                e.0.to_bits(),
+                g.0.to_bits(),
+                d.0.to_bits(),
+                t.0.to_bits(),
+                p.x,
+                p.y,
+            )
+        })
         .collect();
     rows.sort_unstable_by_key(|r| r.0);
 
@@ -658,11 +691,12 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
     config.entity_count.hash(&mut h);
     tick.hash(&mut h);
     genome_params.hash(&mut h);
-    for (id, e_bits, g_bits, d_bits, px, py) in &rows {
+    for (id, e_bits, g_bits, d_bits, t_bits, px, py) in &rows {
         id.hash(&mut h);
         e_bits.hash(&mut h);
         g_bits.hash(&mut h);
         d_bits.hash(&mut h);
+        t_bits.hash(&mut h);
         px.hash(&mut h);
         py.hash(&mut h);
     }
@@ -693,14 +727,16 @@ mod tests {
         // soil was hash-neutral); `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
         // soil-coupled selection); `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded in);
         // `0413…ce77` after ADR-011 S-B (inherited dispersal adds one `next_u64`/offspring → 2N draws/gen);
-        // now `c01e…e40e` after ADR-011 S-G (LOCAL soil coupling — each parent's OWN cell soil, not the
-        // field mean, weights selection: same draw count, shifted trajectory).
+        // `c01e…e40e` after ADR-011 S-G (LOCAL soil coupling); now `9fad…f73a` after ADR-012 E3 (climate:
+        // heritable ThermalTol — a 4th spawn draw, folded into the hash — and TemperatureMatchModifier weights
+        // selection by the world climate. At the default TEMPERATE env the modifier is selection-neutral, so the
+        // re-pin captures only the structural change: the extra spawn draw + ThermalTol in the hash).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0xc01e_1069_087c_e40e);
+        assert_eq!(run_headless(&cfg).hash, 0x9fad_2c9f_d298_f73a);
     }
 
     #[test]
@@ -828,6 +864,66 @@ mod tests {
         assert!(
             end < start,
             "local coupling should shrink the per-cell drought mismatch: start {start:.3}, end {end:.3}"
+        );
+    }
+
+    #[test]
+    fn climate_coupling_adapts_thermal_tolerance_to_temperature() {
+        // ADR-012 E3: in a WARM climate the population's mean ThermalTol rises toward 1 (warm-adapted wins); in
+        // a COLD climate it falls toward 0. From the same neutral ~0.5 standing variation, the
+        // TemperatureMatchModifier shifts the distribution — the proof the climate shapes selection. Deterministic.
+        let cfg = SimConfig {
+            seed: 909,
+            generations: 120,
+            entity_count: 1200,
+        };
+        let warm = climate::EnvParams {
+            lat: 0.0,
+            lon: 0.0,
+            avg_temp: 1.0,
+            season: 1,
+        }; // temperature → 1.0
+        let cold = climate::EnvParams {
+            lat: 0.0,
+            lon: 0.0,
+            avg_temp: 0.0,
+            season: 3,
+        }; // temperature → 0.0
+
+        let mean_thermal = |sim: &mut Simulation| -> f64 {
+            let ts: Vec<f64> = sim
+                .world
+                .query::<&ThermalTol>()
+                .iter(&sim.world)
+                .map(|t| t.0)
+                .collect();
+            if ts.is_empty() {
+                0.0
+            } else {
+                ts.iter().sum::<f64>() / ts.len() as f64
+            }
+        };
+
+        let mut hot = Simulation::reset_with_env(&cfg, &warm);
+        let start = mean_thermal(&mut hot); // same spawn draws as cold ⇒ identical neutral start
+        hot.step(cfg.generations);
+        let hot_end = mean_thermal(&mut hot);
+
+        let mut chill = Simulation::reset_with_env(&cfg, &cold);
+        chill.step(cfg.generations);
+        let cold_end = mean_thermal(&mut chill);
+
+        assert!(
+            hot_end > start,
+            "warm climate raises thermal tolerance: {start:.3} → {hot_end:.3}"
+        );
+        assert!(
+            cold_end < start,
+            "cold climate lowers thermal tolerance: {start:.3} → {cold_end:.3}"
+        );
+        assert!(
+            hot_end > cold_end,
+            "warm- vs cold-adapted populations diverge: {hot_end:.3} vs {cold_end:.3}"
         );
     }
 

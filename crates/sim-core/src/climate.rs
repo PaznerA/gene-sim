@@ -92,6 +92,35 @@ impl ClimateField {
     }
 }
 
+/// **Pluggable climate science (invariant #5)** — how the world climate modulates an organism's fitness given
+/// its **per-individual** heritable thermal tolerance. Mirrors [`soil::EnvironmentModifier`](crate::soil::
+/// EnvironmentModifier); a Stage-5 schema-validated LLM impl can swap in behind this seam without touching
+/// `sim-core`'s selection arithmetic (we extend the SAMPLE source, not the math).
+pub trait ClimateModifier {
+    /// A strictly-positive multiplicative fitness factor for an organism with `thermal_tol` in `[0, 1]` under
+    /// the given climate. Strictly positive so it can never zero a selection weight (ADR-005 no-extinction).
+    fn fitness_factor(&self, climate: ClimateSample, thermal_tol: f64) -> f64;
+}
+
+/// In-core default climate modifier: an individual's heritable thermal tolerance should match the climate
+/// temperature — but the pressure SCALES WITH HOW EXTREME the climate is, so a TEMPERATE world (temperature
+/// ≈ 0.5, the neutral default) imposes NO thermal selection and only hot/cold extremes adapt the trait. This
+/// keeps the default/pinned world selection-neutral on `ThermalTol` (the soil signal is undisturbed) while a
+/// player-set extreme climate drives real adaptation. Strictly positive (ADR-005 no-extinction).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TemperatureMatchModifier;
+
+impl ClimateModifier for TemperatureMatchModifier {
+    fn fitness_factor(&self, climate: ClimateSample, thermal_tol: f64) -> f64 {
+        // Trait↔climate alignment: +1 perfect match, −1 opposite.
+        let align = 1.0 - 2.0 * (thermal_tol - climate.temperature).abs();
+        // Climate extremity: 0 at a temperate 0.5 → no pressure; 1 at a 0/1 extreme → full pressure.
+        let extremity = 2.0 * (climate.temperature - 0.5).abs();
+        // Strictly-positive band [0.5, 1.5] centred at 1.0; pressure scales with extremity.
+        1.0 + 0.5 * extremity * align
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

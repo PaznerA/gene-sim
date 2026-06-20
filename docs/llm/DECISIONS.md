@@ -484,11 +484,14 @@ only invariant-touching step (climate→selection coupling) is a single ledgered
   `CLIM_STREAM_BASE = 0x0043_4C49_4D00_0000` reserved for future per-cell variation.
 - **E2:** thin gdext `LiveSim.set_environment(lat,lon,temp,season)` + `harness::GeneSimEnv` threading +
   `replay::EnvConfig`/`SeedJson` persistence (so save/load + replay reproduce the env). Hash-neutral.
-- **E3 (🛑 RE-PIN):** new heritable per-individual `ThermalTol` (template = `DroughtTol`; spawn draw order
-  genotype,energy,drought,thermal; inherited; folded into `hash_world`) + a `TemperatureMatchModifier` behind the
-  inv-#5 `EnvironmentModifier` seam, multiplying a strictly-positive factor (band like soil's) into the selection
-  weight (GLOBAL coupling first, per ADR-011's mean→local progression). The pinned config ships coupling ON →
-  ONE deliberate re-pin, ledgered (…c01e…e40e → NEW).
+- **E3 (🛑 RE-PIN, done):** new heritable per-individual `ThermalTol` (template = `DroughtTol`; spawn draw order
+  genotype,energy,drought,thermal; inherited; folded into `hash_world`) + a `ClimateModifier`/`TemperatureMatch
+  Modifier` (own inv-#5 seam alongside soil's `EnvironmentModifier`), multiplying a strictly-positive factor
+  (band [0.5,1.5]) into the selection weight (GLOBAL coupling first). **Refinement:** the thermal pressure scales
+  with climate EXTREMITY — a TEMPERATE world (temperature ≈ 0.5, the neutral default) is selection-neutral on
+  `ThermalTol`, so the default/pinned config's re-pin captures ONLY the structural change (the 4th spawn draw +
+  `ThermalTol` in the hash), the soil signal stays undisturbed, and only player-set hot/cold extremes adapt the
+  trait. ONE deliberate re-pin: `…c01e…e40e → 0x9fad_2c9f_d298_f73a`, ledgered in `determinism_hash_is_pinned`.
 - **E4:** a main-menu Godot overlay (`main_menu.gd`, preload, no class_name) shown before `_setup_live` in the
   windowed `--live` path: seed (random|fixed), lat/lon/temp/season, entity count, a PREVIEW row computed by the
   CORE (`observe()`, not GDScript — inv #2), Start → `set_environment` + reset via the existing `_do_reset`
