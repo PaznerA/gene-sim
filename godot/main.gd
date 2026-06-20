@@ -38,6 +38,8 @@ const Iso := preload("res://iso.gd")
 const IsoGround := preload("res://iso_ground.gd")
 const Sparkline := preload("res://sparkline.gd")
 const Brush := preload("res://brush.gd")
+const PanelChrome := preload("res://panel.gd")
+const PillRail := preload("res://pill_rail.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
@@ -72,6 +74,8 @@ var _specimen_root: Node2D  # holds the L-system plant specimens
 var _iso = null  # iso.gd transform instance when --iso is active; null = orthographic (default)
 var _iso_ground: Node2D  # CPU-diamond ground + data overlay (iso mode only)
 var _vignette: CanvasLayer  # screen-space edge darkening (ecosystem view only)
+var _pill_rail: Control  # rail of minimized-panel pills above the timeline (Phase U panel framework)
+var _controls_panel: Control  # the wrapped control deck (Phase U)
 var _terrain: TileMapLayer
 var _overlay: Sprite2D
 var _organisms: Node2D
@@ -341,22 +345,11 @@ func _live_advance() -> void:
 ## REQUESTS the edit (LiveSim.apply_edit) — the core applies it (authoritative PAM/score/gate stay in crispr,
 ## inv #2); the species-granular EditAction carries no organism handle (inv #6). Hidden unless --live.
 func _build_intervention_ui(ui: CanvasLayer) -> void:
-	_intervention_panel = _dark_panel(0.55)
-	var fs := _field_screen_size()
-	_intervention_panel.position = Vector2(maxf(240.0, fs.x - 274.0), 70.0)
-	_intervention_panel.custom_minimum_size = Vector2(262, 0)
-	_intervention_panel.visible = (_live != null)
-	ui.add_child(_intervention_panel)
-
+	var body := _dark_panel(0.55)
+	body.custom_minimum_size = Vector2(262, 0)
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 5)
-	_intervention_panel.add_child(col)
-
-	var hdr := Label.new()
-	hdr.text = "⌖ CRISPR Intervention"
-	hdr.add_theme_font_size_override("font_size", 15)
-	hdr.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
-	col.add_child(hdr)
+	body.add_child(col)
 
 	var r1 := HBoxContainer.new()
 	r1.add_child(_dim_label("Cas:"))
@@ -405,6 +398,11 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 		for l in _live.loci():
 			_locus_picker.add_item(str((l as Dictionary).get("name", "locus")))
 			_locus_ids.append(int((l as Dictionary).get("id", 0)))
+
+	var fs := _field_screen_size()
+	_intervention_panel = PanelChrome.new()
+	_intervention_panel.setup("⌖ CRISPR", body, ui, Vector2(maxf(240.0, fs.x - 274.0), 70.0), _pill_rail)
+	_intervention_panel.visible = (_live != null)
 
 
 func _on_guide_submitted(_text: String) -> void:
@@ -482,25 +480,20 @@ func _set_brush_radius(r: int) -> void:
 ## A left-rail Mission panel + a centred win/lose banner. The goal, current zone reading, edit budget, and
 ## deadline are all game RULES over the core-exported snapshot — no biology is computed here (inv #2). Live only.
 func _build_mission_ui(ui: CanvasLayer) -> void:
-	_mission_panel = _dark_panel(0.8)
-	_mission_panel.position = Vector2(12, 286)
-	_mission_panel.custom_minimum_size = Vector2(246, 0)
-	_mission_panel.visible = _mission_on
-	ui.add_child(_mission_panel)
+	var body := _dark_panel(0.8)
+	body.custom_minimum_size = Vector2(246, 0)
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 3)
-	_mission_panel.add_child(col)
-	var hdr := Label.new()
-	hdr.text = "◎ MISSION"
-	hdr.add_theme_font_size_override("font_size", 13)
-	hdr.add_theme_color_override("font_color", Color(0.4, 0.85, 0.95))
-	col.add_child(hdr)
+	body.add_child(col)
 	_mission_label = Label.new()
 	_mission_label.add_theme_font_size_override("font_size", 13)
 	_mission_label.add_theme_color_override("font_color", Color(0.9, 0.95, 0.95))
 	_mission_label.custom_minimum_size = Vector2(232, 0)
 	_mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_mission_label)
+	_mission_panel = PanelChrome.new()
+	_mission_panel.setup("◎ MISSION", body, ui, Vector2(12, 286), _pill_rail)
+	_mission_panel.visible = _mission_on
 	if _mission_marker != null and _mission_on:
 		_mission_marker.set_brush(_mission_zone, _mission_radius)  # paint the static cyan goal zone (mission only)
 
@@ -641,6 +634,10 @@ func _build_scene() -> void:
 	add_child(ui)
 	# UI positions key off the on-screen field size (the iso diamond bbox under --iso, else the ortho rect).
 	var field_screen := _field_screen_size()
+	# The pill rail (minimized-panel dock above the timeline) must exist before the panel builders so they can
+	# be handed it (Phase U). It anchors by preset, so tree order vs the timeline doesn't matter.
+	_pill_rail = PillRail.new()
+	_pill_rail.setup(ui)
 	_build_titlebar(ui)
 	_build_hud(ui, field_screen)
 	_build_vitals_ui(ui)
@@ -786,18 +783,11 @@ func _build_titlebar(ui: CanvasLayer) -> void:
 ## single game scoreboard. Read-only (inv #2): the core exports these numbers; the sparkline plots recorded
 ## data (inv #3, no RNG).
 func _build_vitals_ui(ui: CanvasLayer) -> void:
-	_vitals_panel = _dark_panel(0.74)
-	_vitals_panel.position = Vector2(12, 46)
-	_vitals_panel.custom_minimum_size = Vector2(214, 0)
-	ui.add_child(_vitals_panel)
+	var body := _dark_panel(0.74)
+	body.custom_minimum_size = Vector2(214, 0)
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 4)
-	_vitals_panel.add_child(col)
-	var hdr := Label.new()
-	hdr.text = "VITALS"
-	hdr.add_theme_font_size_override("font_size", 13)
-	hdr.add_theme_color_override("font_color", Color(0.6, 0.7, 0.62))
-	col.add_child(hdr)
+	body.add_child(col)
 	_vitals_pop = _vital_label()
 	_vitals_fit = _vital_label()
 	_vitals_allele = _vital_label()
@@ -812,6 +802,10 @@ func _build_vitals_ui(ui: CanvasLayer) -> void:
 	cap.add_theme_font_size_override("font_size", 11)
 	cap.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
 	col.add_child(cap)
+	# Wrap in the draggable/minimizable panel chrome (Phase U). The wrapper becomes _vitals_panel, so the
+	# existing `_vitals_panel.visible = (m==0)` toggle still hides chrome + body together.
+	_vitals_panel = PanelChrome.new()
+	_vitals_panel.setup("VITALS", body, ui, Vector2(12, 46), _pill_rail)
 
 
 func _vital_label() -> Label:
@@ -895,17 +889,15 @@ func _refresh_vitals() -> void:
 func _build_hud(ui: CanvasLayer, field_px: Vector2) -> void:
 	# The dense status line lives in the title bar + Vitals panel now (S3); _build_hud only owns the legend.
 	# Colormap legend: the active layer's name + the inferno gradient bar (low → high).
-	_legend = PanelContainer.new()
-	_legend.position = Vector2(12, maxf(120.0, field_px.y - 52.0))
+	var body := PanelContainer.new()
 	var lsb := StyleBoxFlat.new()
 	lsb.bg_color = Color(0.0, 0.0, 0.0, 0.42)
 	lsb.set_corner_radius_all(6)
 	lsb.set_content_margin_all(8)
-	_legend.add_theme_stylebox_override("panel", lsb)
-	ui.add_child(_legend)
+	body.add_theme_stylebox_override("panel", lsb)
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 3)
-	_legend.add_child(col)
+	body.add_child(col)
 	_legend_label = Label.new()
 	_legend_label.add_theme_font_size_override("font_size", 14)
 	_legend_label.add_theme_color_override("font_color", Color(0.9, 0.94, 0.9))
@@ -915,6 +907,8 @@ func _build_hud(ui: CanvasLayer, field_px: Vector2) -> void:
 	bar.custom_minimum_size = Vector2(208, 12)
 	bar.stretch_mode = TextureRect.STRETCH_SCALE
 	col.add_child(bar)
+	_legend = PanelChrome.new()
+	_legend.setup("LEGEND", body, ui, Vector2(12, maxf(120.0, field_px.y - 52.0)), _pill_rail)
 
 
 ## 1-D inferno gradient texture matching data_layer.gdshader (low → high).
@@ -950,18 +944,22 @@ func _inferno(t: float) -> Color:
 ## playback-speed slider / zoom-scope buttons / generation scrubber. All change VIEW state only — no biology
 ## (invariant #2). Mirrors the keyboard shortcuts so the UI is discoverable.
 func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
-	var bar := PanelContainer.new()
+	# Polished control deck (Phase U): a raised rounded card with a border + soft shadow, not a flat black slab.
+	var body := PanelContainer.new()
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.0, 0.0, 0.0, 0.5)
-	sb.set_corner_radius_all(6)
-	sb.set_content_margin_all(6)
-	bar.add_theme_stylebox_override("panel", sb)
-	bar.position = Vector2(12, field_px.y + 16)
-	ui.add_child(bar)
+	sb.bg_color = Color(0.06, 0.09, 0.08, 0.86)
+	sb.set_corner_radius_all(8)
+	sb.set_border_width_all(1)
+	sb.border_color = Color(0.18, 0.4, 0.28, 0.55)
+	sb.shadow_size = 6
+	sb.shadow_color = Color(0.0, 0.0, 0.0, 0.35)
+	sb.shadow_offset = Vector2(0.0, 2.0)
+	sb.set_content_margin_all(10)
+	body.add_theme_stylebox_override("panel", sb)
 
 	var rows := VBoxContainer.new()
-	rows.add_theme_constant_override("separation", 6)
-	bar.add_child(rows)
+	rows.add_theme_constant_override("separation", 8)
+	body.add_child(rows)
 
 	# Row 1 — view / playback / step / layer.
 	var row := HBoxContainer.new()
@@ -1068,6 +1066,9 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	if not live:
 		row3.add_child(_dim_label("  — launch with --live to restart / save / load"))
 
+	# Wrap the deck in the panel chrome (drag handle + minimize), docked bottom-left above the timeline.
+	_controls_panel = PanelChrome.new()
+	_controls_panel.setup("CONTROLS", body, ui, Vector2(12, field_px.y + 16), _pill_rail)
 	_sync_controls()
 
 
@@ -1410,26 +1411,17 @@ func _frame_specimens() -> void:
 ## A top-right panel for the specimen view: a picker to focus one specimen + a readout of its 5 trait values
 ## as bars with a delta-vs-baseline arrow. Reads only the core-exported trait vectors (presentation, inv #2).
 func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
-	_specimen_panel = PanelContainer.new()
+	var body := PanelContainer.new()
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = Color(0.0, 0.0, 0.0, 0.5)
 	sb.set_corner_radius_all(6)
 	sb.set_content_margin_all(10)
-	_specimen_panel.add_theme_stylebox_override("panel", sb)
-	_specimen_panel.position = Vector2(maxf(240.0, field_px.x - 304.0), 70.0)
-	_specimen_panel.custom_minimum_size = Vector2(288, 0)
-	_specimen_panel.visible = false
-	ui.add_child(_specimen_panel)
+	body.add_theme_stylebox_override("panel", sb)
+	body.custom_minimum_size = Vector2(288, 0)
 
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 6)
-	_specimen_panel.add_child(col)
-
-	var header := Label.new()
-	header.text = "Specimen"
-	header.add_theme_font_size_override("font_size", 16)
-	header.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
-	col.add_child(header)
+	body.add_child(col)
 
 	_specimen_picker = OptionButton.new()
 	_specimen_picker.item_selected.connect(_on_specimen_selected)
@@ -1481,6 +1473,10 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 		row.add_child(delta_lbl)
 
 		_trait_rows.append({"bar": bar, "value": val_lbl, "delta": delta_lbl})
+
+	_specimen_panel = PanelChrome.new()
+	_specimen_panel.setup("SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 70.0), _pill_rail)
+	_specimen_panel.visible = false
 
 
 ## Refill the picker from the current specimen list (baseline first). Clamps _focus into range.
@@ -1577,14 +1573,15 @@ func _build_interaction_ui(ui: CanvasLayer) -> void:
 	_tooltip.add_child(_tooltip_label)
 	ui.add_child(_tooltip)
 
-	_detail_panel = _dark_panel(0.55)
-	_detail_panel.position = Vector2(12, 112)
-	_detail_panel.custom_minimum_size = Vector2(250, 0)
-	_detail_panel.visible = false
+	var body := _dark_panel(0.55)
+	body.custom_minimum_size = Vector2(250, 0)
 	_detail_box = VBoxContainer.new()
 	_detail_box.add_theme_constant_override("separation", 3)
-	_detail_panel.add_child(_detail_box)
-	ui.add_child(_detail_panel)
+	body.add_child(_detail_box)
+	# Inspect (cell-click detail) docks BOTTOM-LEFT now (Phase U), above the control deck.
+	_detail_panel = PanelChrome.new()
+	_detail_panel.setup("INSPECT", body, ui, Vector2(12, maxf(120.0, _field_screen_size().y - 220.0)), _pill_rail)
+	_detail_panel.visible = false
 
 
 ## Full-width bottom timeline: generation axis + play-head + click-to-seek (timeline.gd).
