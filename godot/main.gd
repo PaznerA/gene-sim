@@ -66,6 +66,7 @@ var _overlay_mode: int = 1  # index into OVERLAY_NAMES; 1 = density
 var _paused: bool = false
 var _view_mode: int = 0  # 0 = ecosystem, 1 = specimen (L-system plants)
 var _specimens: Dictionary = {}  # parsed specimens.json: {baseline:{...}, edits:[...]}
+var _live_specimen_log: Array = []  # --live: incremental log of distinct genome states (baseline + per edit)
 var _run_dir: String = ""
 var _field_px := Vector2.ZERO
 
@@ -304,6 +305,8 @@ func _setup_live() -> bool:
 		_live = null
 		return false
 	_snaps = [snap]
+	_live_specimen_log = []
+	_log_live_genome("baseline — gen 0")  # seed the specimen history before any edit (incremental log)
 	# Default = SANDBOX (free play, unlimited edits). The suppress-the-zone mission is opt-in behind --mission
 	# until deeper tasks exist (S-G2 stays available but off by default).
 	_mission_on = _has_flag("--mission")
@@ -415,7 +418,11 @@ func _on_inject_pressed() -> void:
 		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
-	_record_edit_outcome(_live.apply_edit(cas_id, locus_id, _guide_edit.text))
+	var outcome: Dictionary = _live.apply_edit(cas_id, locus_id, _guide_edit.text)
+	_record_edit_outcome(outcome)
+	if bool(outcome.get("applied", false)):
+		# A whole-species edit changed the genome → log the new genome state as a specimen (incremental history).
+		_log_live_genome("edit %d — gen %d" % [_live_specimen_log.size(), int(outcome.get("generation", 0))])
 	if _mission_on:
 		_edits_used += 1
 
@@ -1124,6 +1131,8 @@ func _resync_to_live() -> void:
 	_injections = []
 	_fit_history = []
 	_allele_history = []
+	_live_specimen_log = []  # fresh run → fresh specimen history
+	_log_live_genome("baseline — gen 0")
 	_prev_obs = {}
 	_paused = false
 	if _timeline != null:
@@ -1261,25 +1270,41 @@ func _set_view_mode(m: int) -> void:
 ## expressed phenotype (LiveSim.observe()). The plant's shape then reflects the current genome and updates as
 ## the player edits it. Read-only (inv #2): observe() exports the traits; the renderer only maps them to shape.
 ## Maps the core's Debug-cased trait keys (GrowthRate…) to the snake_case TRAIT_KEYS the specimen view uses.
-func _refresh_live_specimens() -> void:
-	if _live == null:
-		return
+## Map the live genome's expressed phenotype (LiveSim.observe, Debug-cased keys) to the snake_case TRAIT_KEYS.
+func _capture_live_traits() -> Dictionary:
 	const KEY_MAP := {
 		"GrowthRate": "growth_rate", "Reflectance": "reflectance",
 		"DroughtTolerance": "drought_tolerance", "Fecundity": "fecundity",
 		"KillSwitchLinkage": "kill_switch_linkage",
 	}
-	var obs: Dictionary = _live.observe()
-	var pheno: Dictionary = obs.get("phenotype", {})
+	var pheno: Dictionary = _live.observe().get("phenotype", {})
 	var traits := {}
 	for k in pheno:
 		if KEY_MAP.has(k):
 			traits[KEY_MAP[k]] = float(pheno[k])
-	_specimens = {
-		"baseline": {"label": "live species — gen %d" % int(obs.get("generation", 0)), "traits": traits},
-		"edits": [],
-	}
-	_focus = 0
+	return traits
+
+
+## Append the current live genome's phenotype to the specimen log — but ONLY if it differs from the last entry.
+## The species genome changes only on a WHOLE-species CRISPR edit (selection drives per-individual alleles, not
+## the genome), so without edits there is exactly one entry; each successful edit logs a new static record (the
+## user's "log each unique genome state"). Brush/region edits shift alleles, not the genome → no new entry.
+func _log_live_genome(label: String) -> void:
+	if _live == null:
+		return
+	var traits := _capture_live_traits()
+	if not _live_specimen_log.is_empty() and _live_specimen_log.back().get("traits", {}) == traits:
+		return  # unchanged genome — don't log a duplicate
+	_live_specimen_log.append({"label": label, "traits": traits})
+
+
+func _refresh_live_specimens() -> void:
+	if _live == null:
+		return
+	if _live_specimen_log.is_empty():
+		_log_live_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
+	_specimens = {"baseline": _live_specimen_log[0], "edits": _live_specimen_log.slice(1)}
+	_focus = clampi(_focus, 0, _live_specimen_log.size() - 1)
 
 
 func _specimen_list() -> Array:
