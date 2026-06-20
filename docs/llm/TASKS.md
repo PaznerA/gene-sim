@@ -171,8 +171,10 @@ hash-neutral and ride the normal loop *while* the live-sim crate is built.
   + framing fix + centralize cell↔pixel picking, behind a `--iso` toggle (orthographic stays default).
 - [ ] 🛑 **P4 (R6.1)** `LiveSim.apply_edit` + full journaling + `save_session`; **`run_stats()` clone-fold fix**
   (the load-bearing determinism tripwire). Manual-intervention path proven reproducible headless.
-- [ ] 🛑 **P5 (R6.2)** Renderer `--live` mode: open-ended play/pause/step pulling snapshots from `LiveSim` at a
-  deterministic integer cadence; auto-extending timeline.
+- [x] **P5 (R6.2)** Renderer `--live` mode: open-ended play/pause/step pulling `LiveSim.snapshot()` bytes at a
+  fixed-integer cadence; runtime `GDExtensionManager.load_extension` (default project stays extension-free);
+  `snapshot.gd::parse_bytes`; rolling history timeline; composes with `--iso`. ✅ DONE (verified windowed +
+  `--shot`; falls back to file replay if cdylib unbuilt). *Manual edits (apply_edit) = P4/P6.*
 - [ ] **P6 (R5)** Manual CRISPR intervention UI (`intervention.gd`: Cas/locus/guide/when pickers) → `LiveSim.
   apply_edit`; Applied/Failed markers + per-gen sparkline on the timeline. Renderer requests, core applies (#2/#6).
 - [ ] 🛑 **P7 (R3)** Multi-species KEYSTONE — own design workflow + ADR. M0 `SpeciesId` plumbing K=1

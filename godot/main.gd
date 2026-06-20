@@ -14,6 +14,8 @@ extends Node2D
 ##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
 ##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
 ##   --iso                 Render the ecosystem isometrically (CPU diamonds); orthographic is the default.
+##   --live [--seed N]     Drive an OPEN-ENDED run live via the LiveSim gdext node (build the cdylib first:
+##                         cargo build --manifest-path crates/godot-sim/Cargo.toml). Space pauses, ▶ steps.
 ##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
 ##   --focus <i>           With --view specimen: focus specimen i (0 baseline, 1.. edits) for --shot.
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
@@ -43,6 +45,10 @@ const TARGET_FIELD_PX := 880.0  # the field is scaled to about this many pixels 
 const SCOPES := [{"name": "field", "zoom": 1.0}, {"name": "patch", "zoom": 2.6}, {"name": "cells", "zoom": 6.0}]
 const ZOOM_MIN := 0.6
 const ZOOM_MAX := 12.0
+# --live (P5): drive the sim live via the LiveSim gdext node instead of replaying snapshot files.
+const LIVE_GRID := Vector2i(48, 48)  # snapshot grid pulled from LiveSim each tick
+const LIVE_STEP := 1  # generations advanced per tick (a FIXED integer — deterministic cadence, inv #3)
+const LIVE_HISTORY := 150  # rolling snapshot buffer kept for the timeline / scrubbing
 
 var _snaps: Array = []  # parsed snapshot.gd instances, ordered by generation
 var _idx: int = 0
@@ -90,6 +96,7 @@ var _detail_panel: PanelContainer
 var _detail_box: VBoxContainer
 var _dragging: bool = false  # left-button drag-pan in progress
 var _drag_moved: float = 0.0  # accumulated drag distance (to tell a click from a drag)
+var _live = null  # LiveSim gdext node when --live is active (drives an open-ended run); null = file replay
 
 
 func _ready() -> void:
@@ -110,23 +117,26 @@ func _ready() -> void:
 		get_tree().quit()
 		return
 
-	# ---- Resolve the snapshots to show: explicit --run dir, a single --snap (for --shot), or auto-discover.
-	var run_dir := _arg_value("--run")
-	if run_dir != "":
-		_run_dir = run_dir
-		_snaps = _load_run(run_dir)
-	elif snap_path != "":
-		var one := SnapshotReader.load_from(snap_path)
-		if one != null:
-			_snaps = [one]
+	# ---- Resolve the snapshots to show: --live drives the sim via LiveSim; else a --run dir / --snap / auto.
+	if _has_flag("--live") and _setup_live():
+		pass  # _setup_live populated _snaps from a live LiveSim reset
 	else:
-		var newest := _newest_run_dir()
-		if newest != "":
-			print("auto-discovered run: %s" % newest)
-			_run_dir = newest
-			_snaps = _load_run(newest)
-	if _run_dir != "":
-		_specimens = _load_specimens(_run_dir)
+		var run_dir := _arg_value("--run")
+		if run_dir != "":
+			_run_dir = run_dir
+			_snaps = _load_run(run_dir)
+		elif snap_path != "":
+			var one := SnapshotReader.load_from(snap_path)
+			if one != null:
+				_snaps = [one]
+		else:
+			var newest := _newest_run_dir()
+			if newest != "":
+				print("auto-discovered run: %s" % newest)
+				_run_dir = newest
+				_snaps = _load_run(newest)
+		if _run_dir != "":
+			_specimens = _load_specimens(_run_dir)
 
 	if _snaps.is_empty():
 		# Headless smoke (S4.1) with nothing to show, or no run found: boot cleanly and exit.
@@ -179,13 +189,71 @@ func _ready() -> void:
 		await _take_shot(shot_path)
 		return
 
-	# Live playback (windowed): advance through the run on a timer.
+	# Playback timer (windowed): in --live, advance the LiveSim each tick; else play through the file run.
 	_timer = Timer.new()
 	_timer.wait_time = _frame_seconds
-	_timer.timeout.connect(_advance)
+	_timer.timeout.connect(_live_advance if _live != null else _advance)
 	add_child(_timer)
-	if _snaps.size() > 1:
+	if _live != null or _snaps.size() > 1:
 		_timer.start()
+
+
+# ──────────────────────────── live mode (P5): drive the sim via the LiveSim gdext node ────────────────────
+
+## Load the LiveSim GDExtension at RUNTIME (so the default project + gate stay extension-free), instantiate
+## it, reset, and seed _snaps with the gen-0 snapshot. Returns false (→ fall back to file replay) if the
+## cdylib is not built or the extension fails to load. The renderer only CALLS LiveSim (inv #2: biology in Rust).
+func _setup_live() -> bool:
+	var dylib := ProjectSettings.globalize_path("res://../crates/godot-sim/target/debug/libgodot_sim.dylib")
+	if not FileAccess.file_exists(dylib):
+		dylib = ProjectSettings.globalize_path("res://../crates/godot-sim/target/debug/libgodot_sim.so")
+	if not FileAccess.file_exists(dylib):
+		printerr("--live needs the LiveSim cdylib. Build it:  cargo build --manifest-path crates/godot-sim/Cargo.toml")
+		return false
+	if not ClassDB.class_exists("LiveSim"):
+		var ext := "user://gene_sim_live.gdextension"
+		var f := FileAccess.open(ext, FileAccess.WRITE)
+		if f == null:
+			printerr("--live: cannot write the runtime .gdextension")
+			return false
+		f.store_string(("[configuration]\nentry_symbol = \"gdext_rust_init\"\ncompatibility_minimum = 4.6\n"
+			+ "[libraries]\nmacos.debug = \"%s\"\nmacos.release = \"%s\"\nlinux.debug = \"%s\"\nlinux.release = \"%s\"\n")
+			% [dylib, dylib, dylib, dylib])
+		f.close()
+		var st := GDExtensionManager.load_extension(ext)
+		if not ClassDB.class_exists("LiveSim"):
+			printerr("--live: failed to load LiveSim extension (status %d)" % st)
+			return false
+	_live = ClassDB.instantiate("LiveSim")
+	_live.reset(int(_arg_value("--seed", "42")))
+	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
+	if snap == null:
+		printerr("--live: LiveSim.snapshot() returned unparseable bytes")
+		_live = null
+		return false
+	_snaps = [snap]
+	print("LIVE MODE — driving LiveSim (open-ended run, %d gen/tick)" % LIVE_STEP)
+	return true
+
+
+## One live tick: advance the sim a fixed integer number of generations, pull the new snapshot, append it to
+## the rolling history, and display it. Deterministic cadence (inv #3: LIVE_STEP is a fixed integer).
+func _live_advance() -> void:
+	if _paused or _view_mode != 0 or _live == null:
+		return
+	_live.step(LIVE_STEP)
+	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
+	if snap == null:
+		return
+	_snaps.append(snap)
+	if _snaps.size() > LIVE_HISTORY:
+		_snaps.pop_front()
+	if _timeline != null:
+		var gens: Array = []
+		for s in _snaps:
+			gens.append(s.generation)
+		_timeline.setup(gens)
+	_show(_snaps.size() - 1)
 
 
 # ──────────────────────────── scene construction (read-only presentation) ────────────────────────────
@@ -1119,8 +1187,9 @@ func _refresh_hud() -> void:
 	if _snaps.is_empty():
 		return
 	var snap = _snaps[_idx]
-	_hud.text = "gen %d   pop %d   grid %dx%d   layer: %s%s   scope: %s (×%.1f)   [%d/%d]" % [
-		snap.generation, snap.population, snap.width, snap.height,
+	var live_tag := ("● LIVE   " if _live != null else "")
+	_hud.text = "%sgen %d   pop %d   grid %dx%d   layer: %s%s   scope: %s (×%.1f)   [%d/%d]" % [
+		live_tag, snap.generation, snap.population, snap.width, snap.height,
 		OVERLAY_NAMES[_overlay_mode], ("  (paused)" if _paused else ""),
 		_scope_label(), _cam.zoom.x, _idx + 1, _snaps.size()]
 	if _legend != null:

@@ -57,6 +57,31 @@ static func load_from(path: String) -> SnapshotData:
 	return s
 
 
+## Parse a GSS2 snapshot from an in-memory byte buffer (e.g. `LiveSim.snapshot()` in --live mode) rather
+## than a file. Same layout as load_from. Returns null on bad magic / short buffer. Read-only (inv #2).
+static func parse_bytes(buf: PackedByteArray) -> SnapshotData:
+	if buf.size() < 28 or buf.slice(0, 4).get_string_from_ascii() != MAGIC:
+		push_error("snapshot: bad/short byte buffer")
+		return null
+	var s := SnapshotData.new()
+	s.width = buf.decode_u32(4)
+	s.height = buf.decode_u32(8)
+	s.channel_count = buf.decode_u32(12)
+	s.generation = buf.decode_u64(16)
+	s.population = buf.decode_u32(24)
+	var n := s.width * s.height
+	var off := 28
+	var read := func(o: int) -> PackedFloat32Array:
+		return buf.slice(o, o + n * 4).to_float32_array()
+	s.density = read.call(off); off += n * 4
+	s.allele_freq = read.call(off); off += n * 4
+	s.fitness = read.call(off); off += n * 4
+	s.soil_moisture = read.call(off); off += n * 4
+	s.soil_nutrients = read.call(off); off += n * 4
+	s.soil_ph = read.call(off)
+	return s
+
+
 func cell_count() -> int:
 	return width * height
 

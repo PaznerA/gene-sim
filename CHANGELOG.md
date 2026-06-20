@@ -4,6 +4,20 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### P5 — `--live` mode: the renderer drives an open-ended live sim (feat, roadmap R6)
+The renderer can now run the simulation LIVE via the LiveSim gdext node, instead of replaying pre-baked
+snapshot files (read-only presentation — biology stays in Rust, inv #2):
+- `main.gd --live [--seed N]`: loads the LiveSim extension at **runtime** via `GDExtensionManager.load_extension`
+  (a temp `user://` .gdextension pointing at the built cdylib) — so the default project + gate stay
+  extension-free. Instantiates `LiveSim`, `reset(seed)`, then a timer advances a **fixed integer** generations
+  per tick (deterministic cadence, inv #3), pulling `LiveSim.snapshot()` GSS2 bytes each tick.
+- `snapshot.gd::parse_bytes(PackedByteArray)`: parse a GSS2 snapshot from an in-memory buffer (the live path)
+  rather than a file, so the existing render (organisms / data overlay / **isometric**) is reused unchanged.
+- Open-ended run with a rolling snapshot history (timeline + scrubbing over recent generations); play/pause/step
+  drive the live sim; the HUD shows `● LIVE`. Falls back to file replay if the cdylib is not built.
+  Composes with `--iso`/`--layer`. Verified windowed (live loop steps clean) + `--shot`. Manual interventions
+  (apply_edit) + save are P4/P6. Full gate green (10/10); determinism untouched.
+
 ### P1b — LiveSim gdext GDExtension: the renderer can drive the sim live (feat, roadmap R6/P1)
 The Rust live-sim binding (ADR-010), built by a parallel agent + integrated here:
 - `crates/godot-sim` — a **godot-rust (gdext) cdylib** (godot `=0.5.3`, `api-4-6`, edition 2024) embedding
