@@ -14,7 +14,7 @@ extends Node2D
 ##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
 ##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
 ##   --iso                 Render the ecosystem isometrically (CPU diamonds); orthographic is the default.
-##   --live [--seed N]     Drive an OPEN-ENDED run live via the LiveSim gdext node (build the cdylib first:
+##   --live [--seed N]     Drive an OPEN-ENDED SANDBOX run live via the LiveSim gdext node (build the cdylib
 ##                         cargo build --manifest-path crates/godot-sim/Cargo.toml). Space pauses, ▶ steps.
 ##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
 ##   --focus <i>           With --view specimen: focus specimen i (0 baseline, 1.. edits) for --shot.
@@ -55,6 +55,7 @@ const LIVE_GRID := Vector2i(32, 32)  # snapshot grid pulled from LiveSim each ti
 # a render cell maps 1:1 to a world cell — the selective brush picks world cells directly, ADR-011 S-F)
 const LIVE_STEP := 1  # generations advanced per tick (a FIXED integer — deterministic cadence, inv #3)
 const LIVE_HISTORY := 150  # rolling snapshot buffer kept for the timeline / scrubbing
+const SAVE_DIR := "user://saves/slot1"  # default save slot (the journal: seed.json + actions.ndjson)
 
 var _snaps: Array = []  # parsed snapshot.gd instances, ordered by generation
 var _idx: int = 0
@@ -299,8 +300,11 @@ func _setup_live() -> bool:
 		_live = null
 		return false
 	_snaps = [snap]
-	_mission_on = true  # the live run is a game: a suppress-the-zone mission with an edit budget (S-G2)
-	print("LIVE MODE — driving LiveSim (open-ended run, %d gen/tick)" % LIVE_STEP)
+	# Default = SANDBOX (free play, unlimited edits). The suppress-the-zone mission is opt-in behind --mission
+	# until deeper tasks exist (S-G2 stays available but off by default).
+	_mission_on = _has_flag("--mission")
+	print("LIVE MODE — %s (open-ended run, %d gen/tick)" % [
+		"MISSION" if _mission_on else "sandbox", LIVE_STEP])
 	return true
 
 
@@ -497,8 +501,8 @@ func _build_mission_ui(ui: CanvasLayer) -> void:
 	_mission_label.custom_minimum_size = Vector2(232, 0)
 	_mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_mission_label)
-	if _mission_marker != null:
-		_mission_marker.set_brush(_mission_zone, _mission_radius)  # paint the static cyan goal zone
+	if _mission_marker != null and _mission_on:
+		_mission_marker.set_brush(_mission_zone, _mission_radius)  # paint the static cyan goal zone (mission only)
 
 	_mission_banner = Label.new()
 	_mission_banner.position = Vector2(_field_screen_size().x * 0.5 - 170.0, 78.0)
@@ -1049,8 +1053,20 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	_seed_edit.editable = live
 	_seed_edit.text_submitted.connect(func(_t): _on_newrun_pressed())
 	row3.add_child(_seed_edit)
+	var save_btn := Button.new()
+	save_btn.text = "💾 Save"
+	save_btn.tooltip_text = "Save this session's progress (the seeded action journal)"
+	save_btn.pressed.connect(_on_save_pressed)
+	save_btn.disabled = not live
+	row3.add_child(save_btn)
+	var load_btn := Button.new()
+	load_btn.text = "📂 Load"
+	load_btn.tooltip_text = "Restore the saved session (deterministic replay)"
+	load_btn.pressed.connect(_on_load_pressed)
+	load_btn.disabled = not live
+	row3.add_child(load_btn)
 	if not live:
-		row3.add_child(_dim_label("  — launch with --live to restart / reseed"))
+		row3.add_child(_dim_label("  — launch with --live to restart / save / load"))
 
 	_sync_controls()
 
@@ -1092,6 +1108,12 @@ func _do_reset(seed: int) -> void:
 	if _seed_edit != null:
 		_seed_edit.text = str(seed)
 	_live.reset(seed)
+	_resync_to_live()
+
+
+## Rebuild the renderer's rolling state from the live env's CURRENT state (after a reset or a load): one
+## snapshot, cleared history/markers/timeline, unpaused. The mission progress (S-G2) is left intact.
+func _resync_to_live() -> void:
 	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
 	if snap == null:
 		return
@@ -1107,6 +1129,34 @@ func _do_reset(seed: int) -> void:
 		_timeline.set_markers(_injections)
 	_show(0)
 	_update_play_button()
+
+
+## Save the live session (the seeded action journal) to the default slot. Live-only.
+func _on_save_pressed() -> void:
+	if _live == null:
+		return
+	var ok: bool = _live.save_session(ProjectSettings.globalize_path(SAVE_DIR))
+	_flash_status("💾 saved" if ok else "✗ save failed", ok)
+
+
+## Load the saved session: LiveSim restores it by deterministic replay, then resync the renderer. Live-only.
+func _on_load_pressed() -> void:
+	if _live == null:
+		return
+	var r: Dictionary = _live.load_session(ProjectSettings.globalize_path(SAVE_DIR))
+	if not bool(r.get("ok", false)):
+		_flash_status("✗ load failed: " + str(r.get("detail", "no save")), false)
+		return
+	_resync_to_live()
+	_flash_status("📂 loaded — gen %d, %d actions" % [int(r.get("generation", 0)), int(r.get("actions", 0))], true)
+
+
+## Flash a short message in the intervention status line (shared by save/load + edits).
+func _flash_status(text: String, ok: bool) -> void:
+	if _inject_status != null:
+		_inject_status.text = text
+		_inject_status.add_theme_color_override(
+			"font_color", Color(0.5, 0.92, 0.52) if ok else Color(0.96, 0.55, 0.5))
 
 
 ## Push current state INTO the row-2 widgets without re-triggering their signals (re-entrancy guarded).

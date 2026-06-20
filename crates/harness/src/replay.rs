@@ -175,10 +175,23 @@ pub fn record_episode(
 /// whose validation is preserved by [`crispr::GuideSequence`]'s deserialize), or if `actions.ndjson`'s
 /// line count disagrees with `seed.json`'s `action_count`.
 pub fn replay(dir: impl AsRef<Path>) -> io::Result<u64> {
-    let dir = dir.as_ref();
+    let (seed_json, actions) = read_journal(dir)?;
+    let env_config = EnvConfig {
+        entity_count: seed_json.entity_count,
+    };
+    Ok(run_episode(&env_config, seed_json.seed, &actions))
+}
 
-    let seed_str = std::fs::read_to_string(dir.join(SEED_FILE))?;
-    let seed_json: SeedJson = serde_json::from_str(&seed_str).map_err(to_io)?;
+/// Read + parse a recorded journal from `dir` into its [`SeedJson`] + ordered [`Action`]s (the read half of
+/// [`replay`], without re-running it). Used by the live save/load mechanic (ADR-011 S-G follow-up): a renderer
+/// LOAD restores the exact session by `reset(seed)` + replaying these actions deterministically (inv #3).
+///
+/// # Errors
+/// Missing/malformed `seed.json` or `actions.ndjson` (incl. a malformed guide), or an `action_count` mismatch.
+pub fn read_journal(dir: impl AsRef<Path>) -> io::Result<(SeedJson, Vec<Action>)> {
+    let dir = dir.as_ref();
+    let seed_json: SeedJson =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(SEED_FILE))?).map_err(to_io)?;
 
     let actions_str = std::fs::read_to_string(dir.join(ACTIONS_FILE))?;
     let mut actions: Vec<Action> = Vec::new();
@@ -206,11 +219,48 @@ pub fn replay(dir: impl AsRef<Path>) -> io::Result<u64> {
             ),
         ));
     }
+    Ok((seed_json, actions))
+}
 
-    let env_config = EnvConfig {
-        entity_count: seed_json.entity_count,
+/// Write a journal (`seed.json` + `actions.ndjson`) directly into `dir` (no `run_id` subdir, unlike
+/// [`record_episode`]) — for a SAVE SLOT at a player-chosen path. Same on-disk format as `record_episode`, so
+/// [`read_journal`] / [`replay`] restore it. The journal IS the saved progress (seed + the ordered action
+/// sequence the live session drove); replaying it reproduces the exact state (inv #3).
+///
+/// # Errors
+/// Any I/O error creating `dir` or writing the two files.
+pub fn save_journal(
+    dir: impl AsRef<Path>,
+    env_config: &EnvConfig,
+    seed: u64,
+    actions: &[Action],
+) -> io::Result<()> {
+    let dir = dir.as_ref();
+    std::fs::create_dir_all(dir)?;
+
+    let seed_json = SeedJson {
+        seed,
+        generations: 0,
+        entity_count: env_config.entity_count,
+        action_count: actions.len(),
+        toolchain: Toolchain::default(),
+        harness_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    Ok(run_episode(&env_config, seed_json.seed, &actions))
+    std::fs::write(
+        dir.join(SEED_FILE),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&seed_json).map_err(to_io)?
+        ),
+    )?;
+
+    let mut ndjson = String::new();
+    for action in actions {
+        ndjson.push_str(&serde_json::to_string(action).map_err(to_io)?);
+        ndjson.push('\n');
+    }
+    std::fs::write(dir.join(ACTIONS_FILE), ndjson)?;
+    Ok(())
 }
 
 /// Map a `serde_json` error into an [`io::Error`] so the public API surfaces a single error type.
@@ -260,6 +310,41 @@ mod tests {
             }),
             Action::Advance(15),
         ]
+    }
+
+    #[test]
+    fn save_journal_round_trips_and_replays() {
+        // The live save/load mechanic (ADR-011 S-G): save_journal writes a journal that read_journal parses
+        // back identically, and replaying the saved dir reproduces the exact hash of running the actions —
+        // proving a LOAD restores the session deterministically. Includes a region edit (the brush).
+        let dir = temp_dir("saveload");
+        let env = EnvConfig { entity_count: 200 };
+        let mut actions = sample_actions();
+        actions.push(Action::ApplyEditRegion(
+            EditAction {
+                cas: cas_id("SpCas9"),
+                target: LocusId(0),
+                guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+            },
+            crate::RegionSpec {
+                cx: 16,
+                cy: 16,
+                radius: 6,
+            },
+        ));
+        save_journal(&dir, &env, 7, &actions).unwrap();
+        let (sj, read_back) = read_journal(&dir).unwrap();
+        assert_eq!(sj.seed, 7);
+        assert_eq!(
+            read_back, actions,
+            "round-trip must preserve the action sequence"
+        );
+        assert_eq!(
+            replay(&dir).unwrap(),
+            run_episode(&env, 7, &actions),
+            "a loaded journal must replay to the same hash as the direct run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

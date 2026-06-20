@@ -50,6 +50,11 @@ struct LiveSim {
     env: Option<GeneSimEnv>,
     /// Population spawned at the next `reset`. Set via [`set_entity_count`](Self::set_entity_count).
     entity_count: u32,
+    /// Master seed of the current session (for save/load).
+    seed: u64,
+    /// Ordered journal of the session's actions (Advance coalesced) — the SAVED PROGRESS. Replaying
+    /// `reset(seed)` + this journal restores the exact session deterministically (inv #3).
+    journal: Vec<Action>,
     base: Base<RefCounted>,
 }
 
@@ -59,6 +64,8 @@ impl IRefCounted for LiveSim {
         Self {
             env: None,
             entity_count: DEFAULT_ENTITY_COUNT,
+            seed: 0,
+            journal: Vec::new(),
             base,
         }
     }
@@ -92,6 +99,8 @@ impl LiveSim {
         // from GDScript (which has no native u64) without changing the deterministic stream.
         let obs = env.reset(seed as u64);
         self.env = Some(env);
+        self.seed = seed as u64; // a fresh session: remember the seed + start an empty journal (save/load)
+        self.journal.clear();
         observation_to_dict(&obs)
     }
 
@@ -107,6 +116,7 @@ impl LiveSim {
             Some(env) => {
                 // GeneSimEnv::step applies one Action; Advance(n) advances exactly n generations.
                 let _ = env.step(Action::Advance(n));
+                self.journal_advance(n);
             }
             None => godot_error!("LiveSim::step called before reset()"),
         }
@@ -170,7 +180,10 @@ impl LiveSim {
             target: LocusId(target.max(0) as u32),
             guide: g,
         };
-        env.step(Action::ApplyEdit(edit));
+        let action = Action::ApplyEdit(edit);
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load (disjoint field borrow from `env`)
+        let env = self.env.as_mut().expect("env present");
         let cur_gen = env_gen(env);
         match env.last_edit() {
             Some(EditOutcome::Applied {
@@ -229,7 +242,10 @@ impl LiveSim {
             cy: cy.max(0) as u32,
             radius: radius.max(0) as u32,
         };
-        env.step(Action::ApplyEditRegion(edit, region));
+        let action = Action::ApplyEditRegion(edit, region);
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load
+        let env = self.env.as_mut().expect("env present");
         let cur_gen = env_gen(env);
         match env.last_region_edit() {
             Some((
@@ -286,6 +302,76 @@ impl LiveSim {
     #[func]
     fn is_ready(&self) -> bool {
         self.env.is_some()
+    }
+
+    /// SAVE the live session's progress to `dir` (the journal: seed + the ordered action sequence). Restored
+    /// by [`load_session`](Self::load_session). Writes `dir/{seed.json,actions.ndjson}` only — it does NOT fold
+    /// a hash on the LIVE env (that would draw `next_u64` and desync the stream); the determinism proof is that
+    /// `replay(dir)` reproduces the live run. Returns `false` before `reset` or on an I/O error.
+    #[func]
+    fn save_session(&mut self, dir: GString) -> bool {
+        if self.env.is_none() {
+            godot_error!("LiveSim::save_session called before reset()");
+            return false;
+        }
+        let env_config = harness::replay::EnvConfig {
+            entity_count: self.entity_count,
+        };
+        match harness::replay::save_journal(dir.to_string(), &env_config, self.seed, &self.journal) {
+            Ok(()) => true,
+            Err(e) => {
+                godot_error!("LiveSim::save_session failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// LOAD a saved session from `dir`: read the journal and restore the exact state by building a FRESH env
+    /// (never reusing the live one — keeps the single stream clean) and replaying `reset(seed)` + the recorded
+    /// actions deterministically (inv #3). Returns `{ok, generation, population, allele_freq, phenotype,
+    /// actions}` (`ok=false` + `detail` on a read error). The journal is restored so a later save re-extends it.
+    #[func]
+    fn load_session(&mut self, dir: GString) -> VarDictionary {
+        let (seed_json, actions) = match harness::replay::read_journal(dir.to_string()) {
+            Ok(v) => v,
+            Err(e) => {
+                godot_error!("LiveSim::load_session failed: {e}");
+                let mut d = VarDictionary::new();
+                d.set("ok", false);
+                d.set("detail", e.to_string());
+                return d;
+            }
+        };
+        self.entity_count = seed_json.entity_count;
+        let mut env = GeneSimEnv::new(self.entity_count);
+        env.reset(seed_json.seed);
+        for action in &actions {
+            let _ = env.step(action.clone());
+        }
+        self.seed = seed_json.seed;
+        self.journal = actions;
+        let obs = env.observe();
+        self.env = Some(env);
+        let mut d = observation_to_dict(&obs);
+        d.set("ok", true);
+        d.set("actions", self.journal.len() as i64);
+        d
+    }
+}
+
+impl LiveSim {
+    /// Append `n` generations to the journal, COALESCING consecutive Advances — `Advance(a)+Advance(b)` is
+    /// bit-identical to `Advance(a+b)` on the single stream, so the saved file stays O(edits) not O(generations)
+    /// and the replayed hash is unchanged. The live env still steps tick-by-tick (this only records).
+    fn journal_advance(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(Action::Advance(last)) = self.journal.last_mut() {
+            *last += n;
+        } else {
+            self.journal.push(Action::Advance(n));
+        }
     }
 }
 

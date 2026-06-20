@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Save/load progress + sandbox-default live mode (feat, roadmap R6 follow-up)
+The live session is now persistable, and free-play is the default:
+- **Save/load via the replay contract** (deterministic, no new hash literal): `harness::replay::save_journal`
+  / `read_journal` write/read a journal (`seed.json` + `actions.ndjson`) to an exact dir.
+  `LiveSim` now JOURNALS every driven action (reset seed + Advance/ApplyEdit/ApplyEditRegion, with consecutive
+  Advances coalesced — O(edits) not O(generations), hash-neutral). `LiveSim.save_session(dir)` writes the
+  journal (it does NOT fold a hash on the LIVE env — that would draw `next_u64` and desync the stream);
+  `load_session(dir)` restores the exact state by building a FRESH env and replaying `reset(seed)` + the
+  actions. Verified: a saved session reloads byte-identical (same generation + allele_freq).
+- **Renderer**: 💾 Save / 📂 Load buttons in the run-lifecycle row → `LiveSim.save_session/load_session` +
+  resync. Round-trip test in `harness` (save → read → replay reproduces the direct-run hash).
+- **Sandbox is the live default** (free play, unlimited edits); the suppress-the-zone mission (S-G2) is now
+  opt-in behind `--mission` "until deeper tasks exist". Designed via a save/load design workflow.
+
+
 ### ADR-011 S-A…S-F — real spatial dynamics + the selective CRISPR brush (feat, roadmap R1.2/R1.3 + R5)
 Designed via a multi-agent understand→design→ADR workflow; landed as gated, individually-re-pinned slices.
 The grid stops being a visualization and becomes real biology, on which a *selective* brush can act:
