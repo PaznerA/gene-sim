@@ -114,6 +114,21 @@ var _brush_on: bool = false  # brush mode active (paint region edits) vs normal 
 var _brush_radius: int = 4  # brush disc radius in world cells
 var _brush_cell: Vector2i = Vector2i(-1, -1)  # hovered world cell
 var _brush_button: Button
+# Gamification (ADR-011 S-G2): a mission to SUPPRESS allele frequency in a target zone under a budget +
+# deadline (the brush lowers allele, selection raises it → a tug-of-war). Renderer-side game rules over the
+# core-exported snapshot (inv #2 — no biology computed here); not part of the determinism hash.
+var _mission_on: bool = false
+var _mission_zone: Vector2i = Vector2i(8, 8)  # target world cell (disc centre)
+var _mission_radius: int = 6
+var _mission_target: float = 0.40  # win when the zone's mean allele_freq drops to/below this
+var _mission_deadline: int = 140  # lose if the generation passes this with the goal unmet
+var _edit_budget: int = 6  # total edits (inject + brush) the mission allows
+var _edits_used: int = 0
+var _mission_status: int = 0  # 0 active · 1 won · 2 lost
+var _mission_marker: Node2D  # cyan zone marker (a Brush instance reused as a static goal ring)
+var _mission_panel: Control
+var _mission_label: Label
+var _mission_banner: Label
 var _seed: int = 42  # active master seed (from --seed; New-run/Restart rebind it)
 var _restart_button: Button
 var _newrun_button: Button
@@ -284,6 +299,7 @@ func _setup_live() -> bool:
 		_live = null
 		return false
 	_snaps = [snap]
+	_mission_on = true  # the live run is a game: a suppress-the-zone mission with an edit budget (S-G2)
 	print("LIVE MODE — driving LiveSim (open-ended run, %d gen/tick)" % LIVE_STEP)
 	return true
 
@@ -393,11 +409,13 @@ func _on_guide_submitted(_text: String) -> void:
 
 ## Request a CRISPR edit from the running LiveSim, show the outcome, and mark it on the timeline.
 func _on_inject_pressed() -> void:
-	if _live == null or _cas_picker.selected < 0 or _locus_picker.selected < 0:
+	if _live == null or _cas_picker.selected < 0 or _locus_picker.selected < 0 or not _can_spend_edit():
 		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
 	_record_edit_outcome(_live.apply_edit(cas_id, locus_id, _guide_edit.text))
+	if _mission_on:
+		_edits_used += 1
 
 
 ## Show an edit outcome (whole-species or region) in the status line + drop a timeline marker. Shared by the
@@ -430,10 +448,14 @@ func _on_brush_toggled(pressed: bool) -> void:
 func _apply_brush() -> void:
 	if _live == null or _brush_cell.x < 0 or _cas_picker.selected < 0 or _locus_picker.selected < 0:
 		return
+	if not _can_spend_edit():
+		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
 	_record_edit_outcome(_live.apply_edit_region(
 		cas_id, locus_id, _guide_edit.text, _brush_cell.x, _brush_cell.y, _brush_radius))
+	if _mission_on:
+		_edits_used += 1
 
 
 ## Update the hovered brush cell from the mouse (world → cell, clamped to the world/live grid) + refresh preview.
@@ -449,6 +471,96 @@ func _set_brush_radius(r: int) -> void:
 	_brush_radius = clampi(r, 1, 16)
 	if _brush != null and _brush_cell.x >= 0:
 		_brush.set_brush(_brush_cell, _brush_radius)
+
+
+# ──────────────────────────── mission / gamification (S-G2, renderer-side game rules) ────────────────────
+
+## A left-rail Mission panel + a centred win/lose banner. The goal, current zone reading, edit budget, and
+## deadline are all game RULES over the core-exported snapshot — no biology is computed here (inv #2). Live only.
+func _build_mission_ui(ui: CanvasLayer) -> void:
+	_mission_panel = _dark_panel(0.8)
+	_mission_panel.position = Vector2(12, 286)
+	_mission_panel.custom_minimum_size = Vector2(246, 0)
+	_mission_panel.visible = _mission_on
+	ui.add_child(_mission_panel)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 3)
+	_mission_panel.add_child(col)
+	var hdr := Label.new()
+	hdr.text = "◎ MISSION"
+	hdr.add_theme_font_size_override("font_size", 13)
+	hdr.add_theme_color_override("font_color", Color(0.4, 0.85, 0.95))
+	col.add_child(hdr)
+	_mission_label = Label.new()
+	_mission_label.add_theme_font_size_override("font_size", 13)
+	_mission_label.add_theme_color_override("font_color", Color(0.9, 0.95, 0.95))
+	_mission_label.custom_minimum_size = Vector2(232, 0)
+	_mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	col.add_child(_mission_label)
+	if _mission_marker != null:
+		_mission_marker.set_brush(_mission_zone, _mission_radius)  # paint the static cyan goal zone
+
+	_mission_banner = Label.new()
+	_mission_banner.position = Vector2(_field_screen_size().x * 0.5 - 170.0, 78.0)
+	_mission_banner.add_theme_font_size_override("font_size", 28)
+	_mission_banner.visible = false
+	ui.add_child(_mission_banner)
+
+
+## Whether a (mission) edit can be spent; updates the status line when the budget is exhausted.
+func _can_spend_edit() -> bool:
+	if _mission_on and _edits_used >= _edit_budget:
+		if _inject_status != null:
+			_inject_status.text = "✗ out of edits (budget %d)" % _edit_budget
+			_inject_status.add_theme_color_override("font_color", Color(0.96, 0.55, 0.5))
+		return false
+	return true
+
+
+## Evaluate the mission from the current snapshot: the mean allele_freq over the POPULATED cells of the target
+## zone, plus the win (zone ≤ target before the deadline) / lose (deadline passed) check + score. Read-only.
+func _eval_mission() -> void:
+	if not _mission_on or _snaps.is_empty():
+		return
+	var snap = _snaps[_idx]
+	var w: int = snap.width
+	var sum := 0.0
+	var n := 0
+	var r2 := _mission_radius * _mission_radius
+	for dy in range(-_mission_radius, _mission_radius + 1):
+		for dx in range(-_mission_radius, _mission_radius + 1):
+			if dx * dx + dy * dy > r2:
+				continue
+			var cx := _mission_zone.x + dx
+			var cy := _mission_zone.y + dy
+			if cx < 0 or cy < 0 or cx >= w or cy >= snap.height:
+				continue
+			var i: int = cy * w + cx
+			if snap.density[i] > 0.0:
+				sum += snap.allele_freq[i]
+				n += 1
+	var zone_allele := (sum / float(n)) if n > 0 else 0.0
+	var gen: int = snap.generation
+	if _mission_status == 0:
+		if n > 0 and zone_allele <= _mission_target:
+			_mission_status = 1
+			var score := (_edit_budget - _edits_used) * 10 + maxi(0, _mission_deadline - gen)
+			_show_mission_banner("✓ MISSION COMPLETE   ·   score %d" % score, Color(0.45, 0.95, 0.5))
+		elif gen > _mission_deadline:
+			_mission_status = 2
+			_show_mission_banner("✗ MISSION FAILED   ·   deadline passed", Color(0.96, 0.5, 0.45))
+	if _mission_label != null:
+		_mission_label.text = (
+			"Suppress allele in the cyan zone ≤ %.2f.\nzone %.2f   ·   edits %d/%d   ·   gen %d/%d"
+			% [_mission_target, zone_allele, _edits_used, _edit_budget, gen, _mission_deadline])
+
+
+func _show_mission_banner(text: String, color: Color) -> void:
+	if _mission_banner == null:
+		return
+	_mission_banner.text = text
+	_mission_banner.add_theme_color_override("font_color", color)
+	_mission_banner.visible = true
 
 
 # ──────────────────────────── scene construction (read-only presentation) ────────────────────────────
@@ -497,6 +609,12 @@ func _build_scene() -> void:
 	_brush.setup(_iso, _cell, LIVE_GRID)
 	_world.add_child(_brush)
 
+	# Mission target-zone marker (cyan, static) — the gamification goal area (ADR-011 S-G2), live only.
+	_mission_marker = Brush.new()
+	_mission_marker.setup(_iso, _cell, LIVE_GRID)
+	_mission_marker.set_tint(Color(0.3, 0.85, 0.95, 0.22))
+	_world.add_child(_mission_marker)
+
 	# L-system specimen view (S4.5) — hidden until toggled.
 	_specimen_root = Node2D.new()
 	_specimen_root.visible = false
@@ -527,6 +645,7 @@ func _build_scene() -> void:
 	_build_interaction_ui(ui)
 	_build_timeline(ui)
 	_build_intervention_ui(ui)
+	_build_mission_ui(ui)
 	# --live was requested but the LiveSim cdylib failed to load → show why (we fell back to file replay).
 	if _has_flag("--live") and _live == null:
 		var np := _dark_panel(0.82)
@@ -1065,6 +1184,8 @@ func _set_view_mode(m: int) -> void:
 		_vitals_panel.visible = (m == 0)
 		if m != 0:
 			_set_brush_mode(false)  # the brush only makes sense in the ecosystem view
+		if _mission_panel != null:
+			_mission_panel.visible = (_mission_on and m == 0)
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
@@ -1543,6 +1664,7 @@ func _show(i: int) -> void:
 		_iso_ground.set_snapshot(snap, _overlay_mode)  # iso draws ground + data overlay as diamonds
 	_update_overlay(snap)
 	_refresh_hud()
+	_eval_mission()
 	_sync_controls()
 
 

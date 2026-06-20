@@ -9,6 +9,12 @@ var _cell: float = 16.0
 var _wdims: Vector2i = Vector2i(32, 32)  # world grid (== the live snapshot grid, 1:1)
 var _center: Vector2i = Vector2i(-1, -1)  # hovered world cell; (-1,-1) = inactive (nothing drawn)
 var _radius: int = 4
+var _tint: Color = Color(0.97, 0.86, 0.32, 0.30)  # disc fill; the centre cell draws a brighter variant
+
+
+func set_tint(c: Color) -> void:
+	_tint = c
+	queue_redraw()
 
 
 func setup(iso, cell: float, wdims: Vector2i) -> void:
@@ -32,8 +38,8 @@ func clear() -> void:
 func _draw() -> void:
 	if _center.x < 0:
 		return
-	var fill := Color(0.97, 0.86, 0.32, 0.30)
-	var centre_fill := Color(0.99, 0.62, 0.25, 0.45)
+	var fill := _tint
+	var centre_fill := Color(_tint.r, _tint.g, _tint.b, minf(_tint.a + 0.18, 0.7)).lightened(0.15)
 	var r2 := _radius * _radius
 	for dy in range(-_radius, _radius + 1):
 		for dx in range(-_radius, _radius + 1):
