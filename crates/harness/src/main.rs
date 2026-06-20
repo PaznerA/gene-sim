@@ -34,6 +34,10 @@ OPTIONS:
     --specimens <DIR>     Write specimens.json (baseline + edited species-genome trait vectors) for the
                           renderer's L-system plant view (SPEC §W10, S4.5). Read-only; no hash impact.
     --hash-only           Print only the combined determinism hash (no files written)
+    --record-episode <DIR>  Record a journaled reset+Advance+ApplyEdit episode to <DIR>/<run_id>/ (seed.json +
+                          actions.ndjson) and print its hash — the live-session replay contract (R6/P1, ADR-010)
+    --replay <DIR>        Replay a recorded episode dir (seed.json + actions.ndjson) and print its stats hash;
+                          equals the recorded hash bit-for-bit on the same build (SPEC §6, inv #3)
     -h, --help            Show this help
 
 Examples:
@@ -133,6 +137,12 @@ fn parse_num<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, String> {
 }
 
 fn main() -> ExitCode {
+    // Replay subcommands (roadmap R6/P1): the determinism/replay contract that the live-sim `LiveSim` node
+    // (gdext, ADR-010) will satisfy, exposed on the CLI and provable headless without Godot.
+    if let Some(code) = handle_replay_subcommands() {
+        return code;
+    }
+
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -222,6 +232,84 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Handle the replay subcommands (`--replay <dir>` / `--record-episode <dir>`), returning `Some(code)` if
+/// one was present. These expose `harness::replay`'s record/replay contract (SPEC §5/§6) on the CLI — the
+/// determinism foundation the live-sim `LiveSim` node (ADR-010) journals into and replays bit-identically.
+fn handle_replay_subcommands() -> Option<ExitCode> {
+    let argv: Vec<String> = std::env::args().collect();
+    let val = |flag: &str| -> Option<String> {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1).cloned())
+    };
+
+    if let Some(dir) = val("--replay") {
+        return Some(match harness::replay::replay(&dir) {
+            Ok(hash) => {
+                // Single deterministic line — the replayed stats hash (compare against the recorded one).
+                println!("{hash:016x}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("replay error: {e}");
+                ExitCode::from(1)
+            }
+        });
+    }
+
+    if let Some(dir) = val("--record-episode") {
+        let seed = val("--seed").and_then(|s| s.parse().ok()).unwrap_or(42);
+        let entities = val("--entities")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+        return Some(record_demo_episode(&dir, seed, entities));
+    }
+
+    None
+}
+
+/// Record a representative journaled episode (reset + Advance/ApplyEdit mix) to `<dir>/<run_id>/` — the same
+/// shape a live `LiveSim` session produces — so `--replay` can reproduce its hash bit-identically.
+fn record_demo_episode(dir: &str, seed: u64, entities: u32) -> ExitCode {
+    use harness::replay::{record_episode, EnvConfig};
+
+    let cas = |name: &str| default_cas_variants().into_iter().find(|v| v.name == name);
+    let mut actions = vec![Action::Advance(20)];
+    if let (Some(sp), Ok(g)) = (cas("SpCas9"), GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG")) {
+        actions.push(Action::ApplyEdit(EditAction {
+            cas: sp.id,
+            target: LocusId(0),
+            guide: g,
+        }));
+    }
+    actions.push(Action::Advance(20));
+    if let (Some(asc), Ok(g)) = (
+        cas("AsCas12a"),
+        GuideSequence::new(*b"TTTACCGGTTTAGGGCAAAC"),
+    ) {
+        actions.push(Action::ApplyEdit(EditAction {
+            cas: asc.id,
+            target: LocusId(1),
+            guide: g,
+        }));
+    }
+    actions.push(Action::Advance(20));
+
+    let env = EnvConfig {
+        entity_count: entities,
+    };
+    match record_episode(&env, seed, &actions, dir) {
+        Ok(r) => {
+            println!("recorded {} (hash {:016x})", r.dir.display(), r.hash);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("record error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn combine_hashes(hashes: impl Iterator<Item = u64>) -> u64 {

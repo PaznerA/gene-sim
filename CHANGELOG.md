@@ -4,6 +4,17 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### P1a — replay CLI: the live-session determinism contract, headless (feat, roadmap R6/P1)
+The pure-Rust, no-Godot foundation of the live-sim epic (ADR-010) — the replay-equality that the gdext
+`LiveSim` node will satisfy, exposed on the CLI:
+- `harness --record-episode <DIR>` records a journaled `reset + Advance + ApplyEdit` episode (the shape a live
+  `LiveSim` session produces) to `<DIR>/<run_id>/` (`seed.json` + `actions.ndjson`) and prints its hash.
+- `harness --replay <DIR>` replays it and prints the stats hash — **bit-identical** to the recorded one on the
+  same build (SPEC §6, inv #3). Both wrap the existing `harness::replay` contract (S3.2).
+- `crates/harness/tests/replay_cli.rs` drives the binary end-to-end (record → replay → identical hash). This
+  is the **gate-blocking proof of the live architecture** and needs no Godot; the gdext crate + Godot load
+  smoke (P1b) follow once Godot 4.6 is installed. Full gate green; determinism hash unchanged.
+
 ### Gameplay batch P0 — live-sim architecture decision (ADR-010; multi-agent designed, signed off)
 Decision gate (no code) for the live/continuous-sim + interventions + multi-species + isometric batch:
 - **Architecture (signed off):** Option A — a `crates/godot-sim` **gdext GDExtension** embedding the

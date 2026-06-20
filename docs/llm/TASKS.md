@@ -153,9 +153,12 @@ replay contract; **Godot repinned 4.7→4.6** for stable gdext api-4-6 (ADR-010)
 hash-neutral and ride the normal loop *while* the live-sim crate is built.
 - [x] **P0** Decision gate: ADR-010 (Option A + repin 4.6 + replay-equality determinism + `run_stats()`
   clone-fold + integer cadence). ✅ DONE (signed off; pin docs updated).
-- [ ] 🛑 **P1 (R6.0)** `crates/godot-sim` gdext cdylib: `LiveSim` reset/step/observe/snapshot + action journal;
-  `harness --replay <dir>`. Gate-blocking proof = **pure-Rust replay-equality** test (no Godot); gdext smoke
-  skip-if-absent. *Needs Godot 4.6 installed.*
+- [x] **P1a (R6.0, pure-Rust)** `harness --record-episode` / `--replay`: the live-session replay-equality
+  contract on the CLI (record a journaled reset+Advance+ApplyEdit episode → replay → bit-identical hash),
+  with a binary-driven integration test. ✅ DONE (the gate-blocking proof; no Godot needed).
+- [ ] 🛑 **P1b (R6.0, gdext)** `crates/godot-sim` gdext cdylib: `LiveSim` reset/step/observe/snapshot + the
+  in-memory action journal calling the P1a contract; `gene_sim.gdextension`; headless Godot load smoke
+  (skip-if-absent / skip-if-dylib-unbuilt). *Needs Godot 4.6 installed.*
 - [ ] **P2 (R5-viz, renderer)** Injection markers on the existing `timeline.gd` + a harness path that writes
   `actions.ndjson` + injection generations to a real run dir (today only replay temp dirs).
 - [ ] **P3 (R8-iso, renderer)** Isometric transform (`iso.gd`: CPU diamonds, depth `cx+cy`) + iso ground/soil
