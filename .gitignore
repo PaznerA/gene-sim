@@ -30,3 +30,7 @@ __pycache__/
 *.uid
 # Detached godot-sim cdylib build output
 /crates/godot-sim/target/
+# CI-staged Godot export artifacts (release.yml writes these into godot/ transiently)
+/godot/libgodot_sim.*
+/godot/gene_sim.gdextension
+/build/

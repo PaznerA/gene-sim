@@ -1,0 +1,115 @@
+name: Release
+
+# Build distributable executables on a version tag (v*) or manual dispatch:
+#   • binaries: the headless `harness` CLI + the `godot_sim` cdylib (LiveSim), for Linux/macOS/Windows.
+#   • godot-export: the Godot game executable for Linux, with the LiveSim cdylib bundled (best-effort:
+#     needs the committed godot/export_presets.cfg + the 4.6 export templates; allowed to fail so the
+#     reliable cargo binaries always publish).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    name: binaries (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: macos-latest
+            label: macos
+          - os: windows-latest
+            label: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release (workspace + LiveSim cdylib)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --workspace
+          cargo build --release --manifest-path crates/godot-sim/Cargo.toml
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # headless harness CLI (the sim core, no renderer)
+          cp target/release/harness dist/ 2>/dev/null || cp target/release/harness.exe dist/ 2>/dev/null || true
+          # LiveSim gdext cdylib (.so / .dylib / .dll depending on the platform)
+          cp crates/godot-sim/target/release/libgodot_sim.so dist/ 2>/dev/null || true
+          cp crates/godot-sim/target/release/libgodot_sim.dylib dist/ 2>/dev/null || true
+          cp crates/godot-sim/target/release/godot_sim.dll dist/ 2>/dev/null || true
+          cp crates/godot-sim/godot/gene_sim.gdextension dist/ 2>/dev/null || true
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gene-sim-${{ matrix.label }}
+          path: dist/
+          if-no-files-found: error
+
+  godot-export:
+    name: godot game executable (linux, best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # the cargo binaries above are the guaranteed deliverable; this is a bonus
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build LiveSim cdylib (linux release)
+        run: cargo build --release --manifest-path crates/godot-sim/Cargo.toml
+
+      - name: Install Godot 4.6 + export templates
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot/releases/download/4.6-stable"
+          curl -fsSL -o /tmp/godot.zip "$base/Godot_v4.6-stable_linux.x86_64.zip"
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          sudo install -m 755 /tmp/godot/Godot_v4.6-stable_linux.x86_64 /usr/local/bin/godot
+          curl -fsSL -o /tmp/templates.tpz "$base/Godot_v4.6-stable_export_templates.tpz"
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.6.stable"
+          unzip -q /tmp/templates.tpz -d /tmp/templates
+          mv /tmp/templates/templates/* "$HOME/.local/share/godot/export_templates/4.6.stable/"
+
+      - name: Stage the LiveSim GDExtension into the project (export bundles res:// only)
+        run: |
+          set -euo pipefail
+          cp crates/godot-sim/target/release/libgodot_sim.so godot/libgodot_sim.so
+          cat > godot/gene_sim.gdextension <<'EOF'
+          [configuration]
+          entry_symbol = "gdext_rust_init"
+          compatibility_minimum = 4.6
+          [libraries]
+          linux.x86_64.debug = "res://libgodot_sim.so"
+          linux.x86_64.release = "res://libgodot_sim.so"
+          EOF
+
+      - name: Export the Linux executable
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          # Prime the import cache + extension_list (the editor import pass; tolerate its known non-fatal noise).
+          godot --headless --path godot --import 2>/dev/null || true
+          godot --headless --path godot --export-release "Linux" "$GITHUB_WORKSPACE/build/gene-sim.x86_64"
+          chmod +x build/gene-sim.x86_64 || true
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gene-sim-godot-linux
+          path: build/
+          if-no-files-found: warn

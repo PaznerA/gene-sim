@@ -1,0 +1,42 @@
+name: CI
+
+# The one quality gate (tools/gate.sh) on every push to main + every PR: fmt, clippy, the full test suite,
+# the determinism check (inv #3), proptests, the license check (inv #1), the Godot headless reader, and the
+# LiveSim gdext smoke. The SLiM oracle + bench self-skip when their tools are absent (no SLiM/.venv on CI).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate (tools/gate.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins 1.96.0 + rustfmt/clippy; rustup honours it on first cargo call.
+      - name: Show Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Godot 4.6 (pinned, ADR-010) for the headless reader + the LiveSim gdext smoke. The api-4-6 cdylib
+      # built by the gate loads under this 4.6 runtime (and forward-compat under 4.7 — see ADR-010).
+      - name: Install Godot 4.6 (headless)
+        run: |
+          set -euo pipefail
+          url="https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_linux.x86_64.zip"
+          curl -fsSL -o /tmp/godot.zip "$url"
+          unzip -q /tmp/godot.zip -d /tmp/godot
+          sudo install -m 755 /tmp/godot/Godot_v4.6-stable_linux.x86_64 /usr/local/bin/godot
+          godot --version
+
+      - name: Run the gate
+        run: ./tools/gate.sh

@@ -4,6 +4,27 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### CI — GitHub Actions: the gate on every push + release executables (ci, roadmap §7)
+- `.github/workflows/ci.yml`: runs the single quality gate (`tools/gate.sh`) on every push to main + PR —
+  fmt, clippy, full tests, determinism (inv #3), proptests, license (inv #1), the Godot headless reader, and
+  the LiveSim gdext smoke. Installs the pinned Godot 4.6; the SLiM oracle + bench self-skip (no SLiM on CI).
+- `.github/workflows/release.yml` (on `v*` tag / dispatch): builds distributable executables —
+  the headless `harness` CLI + the `godot_sim` cdylib (LiveSim) for Linux/macOS/Windows (matrix, guaranteed),
+  plus a best-effort Godot Linux game-executable export (`continue-on-error`) that bundles the cdylib.
+- `godot/export_presets.cfg`: Linux + Windows export presets (Godot 4.6). The export step stages the LiveSim
+  cdylib into `res://` so the GDExtension ships beside the executable. Verified locally: workflows are valid
+  YAML, the release builds produce harness + cdylib at the expected paths, and Godot recognises the "Linux"
+  preset (fails only on the missing template, which CI installs).
+
+### S1–S8 / P8 — coherent game pass: sprites, game shell, run lifecycle (feat, roadmap UI)
+Designed via a parallel design workflow, landed as gated slices:
+- **S1+S2** trait-driven plant sprites (forb/grass-tuft/shrub by allele/fitness/density/soil; dots demoted to
+  foot pips; 'S' toggle; ortho + iso on the relief). **S3** title bar + Vitals scoreboard from
+  `LiveSim.observe()` (population/fitness/allele + ▲▼ trend + sparkline). **S4+S5** run-lifecycle controls
+  (Restart / New run / Seed; dropped the redundant Gen slider). **S8a** on-screen notice when the live cdylib
+  is missing. *(S6 user-set gen/tick cadence is the one 🛑 invariant slice — deferred for sign-off; S7
+  extinction is unreachable under ADR-005 constant-N.)*
+
 ### P4 + P6 — live CRISPR interventions: apply edits to a running sim (feat, roadmap R6/R5)
 The live sim becomes interactive — apply a CRISPR edit while it runs and watch the effect:
 - **P4 (`crates/godot-sim`):** `LiveSim.apply_edit(cas, target, guide) -> {applied, detail, generation}` —
