@@ -7,6 +7,7 @@ shader_type canvas_item;
 
 uniform int layer = 0;          // 0 = density, 1 = allele_freq, 2 = fitness
 uniform float opacity = 0.78;   // overall overlay strength
+uniform float alpha_gamma = 1.6;  // >1 fades low values further toward transparent (smoother heat read)
 
 vec3 inferno(float t) {
 	vec3 c0 = vec3(0.05, 0.03, 0.15);  // deep indigo
@@ -33,6 +34,8 @@ void fragment() {
 		v = d.b;
 	}
 	v = clamp(v, 0.0, 1.0);
-	float a = v <= 0.0 ? 0.0 : (0.25 + 0.6 * v) * opacity;
+	// Colour uses the raw value (inferno mapping is byte-identical); only ALPHA is shaped by the gamma curve.
+	float shaped = pow(v, alpha_gamma);
+	float a = v <= 0.0 ? 0.0 : (0.16 + 0.64 * shaped) * opacity;
 	COLOR = vec4(inferno(v), a);
 }

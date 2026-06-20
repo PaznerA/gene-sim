@@ -45,10 +45,12 @@ func _draw() -> void:
 			# fitter cells render slightly larger markers (extra read on the data).
 			var radius := base_r * (0.82 + 0.5 * fit)
 			var base := Vector2(float(x) * _cell, float(y) * _cell)
+			var glow := Color(col.r, col.g, col.b, 0.16)
 			for k in dots:
 				var off := Vector2(_hash01(x, y, k * 2), _hash01(x, y, k * 2 + 1))
 				# inset a touch so dots stay inside the cell
 				var p := base + (Vector2.ONE * 0.15 + off * 0.7) * _cell
+				draw_circle(p, radius * 1.7, glow)  # soft halo so markers read less harsh
 				draw_circle(p, radius + 1.2, rim)  # dark rim so dots read on grass
 				draw_circle(p, radius, col)  # body, coloured by genetics
 				draw_circle(p - Vector2(radius, radius) * 0.32, radius * 0.34, Color(1, 1, 1, 0.7))  # specular core

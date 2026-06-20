@@ -50,6 +50,7 @@ var _field_px := Vector2.ZERO
 
 var _world: Node2D  # holds the ecosystem layers (terrain/overlay/organisms)
 var _specimen_root: Node2D  # holds the L-system plant specimens
+var _vignette: CanvasLayer  # screen-space edge darkening (ecosystem view only)
 var _terrain: TileMapLayer
 var _overlay: Sprite2D
 var _organisms: Node2D
@@ -198,8 +199,14 @@ func _build_scene() -> void:
 	add_child(_cam)
 	_cam.make_current()  # must be in-tree first
 
-	# HUD + controls on their own CanvasLayer so they ignore the world camera.
+	# Screen-space edge vignette (S4). It sits ABOVE the world (Node2D, effective layer 0) but BELOW the UI:
+	# there is no integer between 0 and 1, so we set explicit layers — vignette=1, UI=2 — and rely on layer
+	# order, not tree order. Hidden in the specimen view (clean dark backdrop there).
+	_build_vignette()
+
+	# HUD + controls on their own CanvasLayer (layer 2) so they sit above the vignette and ignore the camera.
 	var ui := CanvasLayer.new()
+	ui.layer = 2
 	add_child(ui)
 	_build_hud(ui, _field_px)
 	_build_controls(ui, _field_px)
@@ -226,10 +233,14 @@ func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 	for ti in n:
 		for yy in cell:
 			for xx in cell:
-				# subtle per-pixel jitter so tiles read as grass, not flat blocks.
-				var j := (_hash01(xx, yy, ti) - 0.5) * 0.05
+				# Per-pixel speckle + a per-column green streak so tiles read as grass blades, not flat blocks.
+				var speckle := (_hash01(xx, yy, ti) - 0.5) * 0.04
+				var blade := (_hash01(xx, ti * 7 + 1, 3) - 0.5) * 0.05  # vertical blade streaks (mostly green)
 				var c: Color = shades[ti]
-				atlas.set_pixel(ti * cell + xx, yy, Color(c.r + j, c.g + j, c.b + j))
+				atlas.set_pixel(ti * cell + xx, yy, Color(
+					clampf(c.r + speckle, 0.0, 1.0),
+					clampf(c.g + speckle + blade * 1.4, 0.0, 1.0),
+					clampf(c.b + speckle, 0.0, 1.0)))
 	var tex := ImageTexture.create_from_image(atlas)
 
 	var ts := TileSet.new()
@@ -252,6 +263,35 @@ func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 				ti = int(_hash01(x, y, 13) * float(n))
 			layer.set_cell(Vector2i(x, y), sid, Vector2i(ti % n, 0))
 	return layer
+
+
+## Screen-space edge vignette (layer 1, between world and UI). MOUSE_FILTER_IGNORE so it never eats the
+## wheel-zoom / button clicks that pass to the world or the UI above it.
+func _build_vignette() -> void:
+	_vignette = CanvasLayer.new()
+	_vignette.layer = 1
+	add_child(_vignette)
+	var tr := TextureRect.new()
+	tr.texture = _vignette_texture()
+	tr.set_anchors_preset(Control.PRESET_FULL_RECT)
+	tr.stretch_mode = TextureRect.STRETCH_SCALE
+	tr.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR
+	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_vignette.add_child(tr)
+
+
+## A radial gradient: transparent centre → soft dark frame at the edges/corners (CPU image, headless-safe).
+func _vignette_texture() -> ImageTexture:
+	var n := 256
+	var img := Image.create(n, n, false, Image.FORMAT_RGBA8)
+	var c := Vector2(n - 1, n - 1) * 0.5
+	var maxd := c.length()
+	for y in n:
+		for x in n:
+			var d := (Vector2(x, y) - c).length() / maxd  # 0 centre … 1 corner
+			var a := pow(clampf((d - 0.5) / 0.5, 0.0, 1.0), 1.6) * 0.5
+			img.set_pixel(x, y, Color(0, 0, 0, a))
+	return ImageTexture.create_from_image(img)
 
 
 # ──────────────────────────── HUD + legend ────────────────────────────
@@ -512,6 +552,8 @@ func _set_view_mode(m: int) -> void:
 	_view_mode = m
 	_world.visible = (m == 0)
 	_specimen_root.visible = (m == 1)
+	if _vignette != null:
+		_vignette.visible = (m == 0)
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:

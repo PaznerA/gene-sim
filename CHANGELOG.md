@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### UI/controls + visual polish round (A+C; feat/refinement, Stage 4) — multi-agent designed
+Designed + adversarially vetted by a multi-agent **workflow** (parallel design → invariant-#2/Godot-4.7-API
+review → synthesized gated plan), then implemented serially (one slice → headless `--check` → `tools/gate.sh`
+9/9 → windowed `--shot` visual check → commit). All read-only presentation (invariant #2); the determinism
+hash is unchanged throughout.
+- **S1 / C1 — plant polish** (`lsystem.gd`): leaves render as teardrop polygons oriented along the live tip
+  heading; fecundity-driven flowers (petal ring + centre); ground line + 16-gon shadow under each base. All
+  geometry precomputed in `build()` so the headless gate catches malformed polygons; `bounds()` unchanged.
+- **S2 / A1 — specimen UX** (`main.gd`): a top-right panel — specimen selector (`OptionButton`) + a 5-trait
+  readout (ProgressBar + value + **delta-vs-baseline** arrow ▲/▼/=). Focusing brightens the chosen plant,
+  dims the rest, and frames the camera. Tab cycles; `--focus <i>` for deterministic `--shot`.
+- **S3 / A2 — ecosystem controls** (`main.gd`): a second control-bar row — playback-speed slider (runtime
+  `_frame_seconds`), zoom-scope toggle buttons (Field/Patch/Cells, synced to the camera), and a generation
+  scrubber (bidirectional, `set_value_no_signal` + a re-entrancy guard). Step/scrubber disable in the
+  specimen view; window margin bumped so the two-row bar is fully on-screen.
+- **S4 / C2 — ecosystem polish** (`organisms.gd`, `main.gd`, `data_layer.gdshader`): softer organism markers
+  (halo + core); richer grass (per-pixel blade streaks); a screen-space edge **vignette** (CanvasLayer 1
+  below the UI at layer 2; hidden in the specimen view); and an overlay **alpha-gamma** curve in the shader
+  (smoother heat — the `inferno(v)` colour mapping stays byte-identical, only alpha is shaped).
+
 ### S4.5 — L-system plant morphology + UI controls (feat, Stage 4) — **Stage 4 COMPLETE**
 - **Core export** (`harness --specimens <DIR>` → `specimens.json`): the species-genome **trait vector**
   (baseline) plus one per demo CRISPR edit, each expressed by the core's `WeightedSumMap` GP map via a
