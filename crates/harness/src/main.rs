@@ -330,6 +330,7 @@ fn record_demo_episode(
 
     let env = EnvConfig {
         entity_count: entities,
+        ..Default::default()
     };
     match record_episode(&env, seed, &actions, dir) {
         Ok(r) => {

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{Action, Env, GeneSimEnv};
+use sim_core::EnvParams;
 
 /// Pinned tool versions recorded into [`SeedJson`] (invariant #7). These mirror the strings the CLI
 /// writes (`crates/harness/src/main.rs`) so a logged episode records the same reproducibility metadata.
@@ -54,10 +55,21 @@ impl Default for Toolchain {
 ///
 /// This is exactly what [`GeneSimEnv::new`] needs to rebuild an identical env; the per-episode `seed`
 /// is recorded separately (it is the thing being replayed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EnvConfig {
     /// Organisms spawned at each `reset` (the env's `entity_count`).
     pub entity_count: u32,
+    /// The player-set climate the run was built under (ADR-012 Phase E). Default = the neutral world.
+    pub env: EnvParams,
+}
+
+impl Default for EnvConfig {
+    fn default() -> Self {
+        Self {
+            entity_count: 1000,
+            env: EnvParams::default(),
+        }
+    }
 }
 
 /// The `seed.json` schema (SPEC §5): everything needed to reproduce an episode except the ordered
@@ -66,7 +78,7 @@ pub struct EnvConfig {
 /// `generations` is the [`sim_core::SimConfig::generations`] the env hands the core; the env advances
 /// time via [`Action::Advance`], so this is recorded metadata (the env uses `0`) — kept for parity with
 /// the CLI's `seed.json` and to fully pin the config that produced `hash`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeedJson {
     /// The master/episode seed handed to `reset` (invariant #3 — one seed drives the whole run).
     pub seed: u64,
@@ -76,10 +88,43 @@ pub struct SeedJson {
     pub entity_count: u32,
     /// Number of actions in the companion `actions.ndjson` (sanity-checked on replay).
     pub action_count: usize,
+    /// Climate the run was built under (ADR-012 Phase E). `#[serde(default)]` so pre-Phase-E saves (no env)
+    /// still load as the neutral world.
+    #[serde(default = "default_lat")]
+    pub lat: f64,
+    #[serde(default = "default_lon")]
+    pub lon: f64,
+    #[serde(default = "default_temp")]
+    pub avg_temp: f64,
+    #[serde(default)]
+    pub season: i64,
     /// Pinned tool versions for the reference build (invariant #7).
     pub toolchain: Toolchain,
     /// The harness crate version that produced this log.
     pub harness_version: String,
+}
+
+fn default_lat() -> f64 {
+    EnvParams::default().lat
+}
+fn default_lon() -> f64 {
+    EnvParams::default().lon
+}
+fn default_temp() -> f64 {
+    EnvParams::default().avg_temp
+}
+
+impl SeedJson {
+    /// Reconstruct the [`EnvParams`] from the persisted climate fields.
+    #[must_use]
+    pub fn env_params(&self) -> EnvParams {
+        EnvParams {
+            lat: self.lat,
+            lon: self.lon,
+            avg_temp: self.avg_temp,
+            season: self.season,
+        }
+    }
 }
 
 /// The outcome of recording an episode: the directory written and the final stats hash (SPEC §6).
@@ -107,6 +152,7 @@ fn run_id(env: &EnvConfig, seed: u64, action_count: usize) -> String {
 /// identical deterministic code path (invariant #3 — the hash is bit-identical by construction).
 fn run_episode(env_config: &EnvConfig, seed: u64, actions: &[Action]) -> u64 {
     let mut env = GeneSimEnv::new(env_config.entity_count);
+    env.set_environment(env_config.env); // ADR-012: replay under the recorded climate
     env.reset(seed);
     for action in actions {
         env.step(action.clone());
@@ -144,6 +190,10 @@ pub fn record_episode(
         generations: 0,
         entity_count: env_config.entity_count,
         action_count: actions.len(),
+        lat: env_config.env.lat,
+        lon: env_config.env.lon,
+        avg_temp: env_config.env.avg_temp,
+        season: env_config.env.season,
         toolchain: Toolchain::default(),
         harness_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -178,6 +228,7 @@ pub fn replay(dir: impl AsRef<Path>) -> io::Result<u64> {
     let (seed_json, actions) = read_journal(dir)?;
     let env_config = EnvConfig {
         entity_count: seed_json.entity_count,
+        env: seed_json.env_params(),
     };
     Ok(run_episode(&env_config, seed_json.seed, &actions))
 }
@@ -243,6 +294,10 @@ pub fn save_journal(
         generations: 0,
         entity_count: env_config.entity_count,
         action_count: actions.len(),
+        lat: env_config.env.lat,
+        lon: env_config.env.lon,
+        avg_temp: env_config.env.avg_temp,
+        season: env_config.env.season,
         toolchain: Toolchain::default(),
         harness_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -318,7 +373,10 @@ mod tests {
         // back identically, and replaying the saved dir reproduces the exact hash of running the actions —
         // proving a LOAD restores the session deterministically. Includes a region edit (the brush).
         let dir = temp_dir("saveload");
-        let env = EnvConfig { entity_count: 200 };
+        let env = EnvConfig {
+            entity_count: 200,
+            ..Default::default()
+        };
         let mut actions = sample_actions();
         actions.push(Action::ApplyEditRegion(
             EditAction {
@@ -351,7 +409,10 @@ mod tests {
     fn record_then_replay_is_bit_identical() {
         // THE acceptance criterion (SPEC §10.5/§6): record an episode of mixed Advance + ApplyEdit
         // actions, then replay it, and assert the replayed stats hash == the recorded stats hash.
-        let env_config = EnvConfig { entity_count: 300 };
+        let env_config = EnvConfig {
+            entity_count: 300,
+            ..Default::default()
+        };
         let seed = 2024;
         let actions = sample_actions();
         let root = temp_dir("bit_identical");
@@ -369,7 +430,10 @@ mod tests {
 
     #[test]
     fn record_writes_human_readable_seed_json_and_ndjson() {
-        let env_config = EnvConfig { entity_count: 100 };
+        let env_config = EnvConfig {
+            entity_count: 100,
+            ..Default::default()
+        };
         let actions = sample_actions();
         let root = temp_dir("artifacts");
 
@@ -398,7 +462,10 @@ mod tests {
     #[test]
     fn replay_is_repeatable_and_matches_a_direct_run() {
         // Replaying twice yields the same hash, and it equals a direct in-memory episode run.
-        let env_config = EnvConfig { entity_count: 256 };
+        let env_config = EnvConfig {
+            entity_count: 256,
+            ..Default::default()
+        };
         let seed = 99;
         let actions = sample_actions();
         let root = temp_dir("repeatable");
@@ -418,7 +485,10 @@ mod tests {
     #[test]
     fn malformed_guide_in_actions_ndjson_fails_to_deserialize() {
         // AC: a malformed guide in actions.ndjson fails to replay (GuideSequence validation preserved).
-        let env_config = EnvConfig { entity_count: 50 };
+        let env_config = EnvConfig {
+            entity_count: 50,
+            ..Default::default()
+        };
         let actions = vec![Action::Advance(5)];
         let root = temp_dir("malformed_guide");
 
@@ -432,6 +502,10 @@ mod tests {
             generations: 0,
             entity_count: 50,
             action_count: 1,
+            lat: 0.0,
+            lon: 0.0,
+            avg_temp: 0.5,
+            season: 0,
             toolchain: Toolchain::default(),
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
         };
@@ -453,7 +527,10 @@ mod tests {
 
     #[test]
     fn action_count_mismatch_is_rejected() {
-        let env_config = EnvConfig { entity_count: 50 };
+        let env_config = EnvConfig {
+            entity_count: 50,
+            ..Default::default()
+        };
         let actions = sample_actions();
         let root = temp_dir("count_mismatch");
 

@@ -25,7 +25,7 @@ use genome::LocusId;
 use godot::builtin::VarDictionary;
 use godot::prelude::*;
 use harness::{Action, EditAction, Env, GeneSimEnv, RegionSpec};
-use sim_core::{Observation, Simulation};
+use sim_core::{EnvParams, Observation, Simulation};
 
 /// gdext entry point. Registers every `#[derive(GodotClass)]` in this crate (here: [`LiveSim`]).
 struct GodotSimExtension;
@@ -50,6 +50,8 @@ struct LiveSim {
     env: Option<GeneSimEnv>,
     /// Population spawned at the next `reset`. Set via [`set_entity_count`](Self::set_entity_count).
     entity_count: u32,
+    /// The climate the next `reset` builds the world under (ADR-012 Phase E). Set via `set_environment`.
+    env_params: EnvParams,
     /// Master seed of the current session (for save/load).
     seed: u64,
     /// Ordered journal of the session's actions (Advance coalesced) — the SAVED PROGRESS. Replaying
@@ -64,6 +66,7 @@ impl IRefCounted for LiveSim {
         Self {
             env: None,
             entity_count: DEFAULT_ENTITY_COUNT,
+            env_params: EnvParams::default(),
             seed: 0,
             journal: Vec::new(),
             base,
@@ -87,6 +90,19 @@ impl LiveSim {
         i64::from(self.entity_count)
     }
 
+    /// Set the CLIMATE the **next** `reset` builds the world under (ADR-012 Phase E): latitude / longitude in
+    /// degrees, average temperature (normalized `[0,1]`), season (`0` Spring · `1` Summer · `2` Autumn · `3`
+    /// Winter). The main menu calls this before `reset`. Stores params only — biology stays in the core (inv #2).
+    #[func]
+    fn set_environment(&mut self, lat: f64, lon: f64, avg_temp: f64, season: i64) {
+        self.env_params = EnvParams {
+            lat,
+            lon,
+            avg_temp: avg_temp.clamp(0.0, 1.0),
+            season: season.clamp(0, 3),
+        };
+    }
+
     /// Start a fresh episode from `seed` and return the initial observation as a `Dictionary`.
     ///
     /// Builds a new [`harness::GeneSimEnv`] (which seeds the single `ChaCha8Rng` once — invariant #3)
@@ -95,6 +111,7 @@ impl LiveSim {
     #[func]
     fn reset(&mut self, seed: i64) -> VarDictionary {
         let mut env = GeneSimEnv::new(self.entity_count);
+        env.set_environment(self.env_params); // build the world under the player's climate (ADR-012)
         // `seed` is the master seed; reinterpret the i64 bits as u64 so the full 64-bit space is usable
         // from GDScript (which has no native u64) without changing the deterministic stream.
         let obs = env.reset(seed as u64);
@@ -316,6 +333,7 @@ impl LiveSim {
         }
         let env_config = harness::replay::EnvConfig {
             entity_count: self.entity_count,
+            env: self.env_params, // persist the climate so the saved session replays under it (ADR-012)
         };
         match harness::replay::save_journal(dir.to_string(), &env_config, self.seed, &self.journal) {
             Ok(()) => true,
@@ -343,7 +361,9 @@ impl LiveSim {
             }
         };
         self.entity_count = seed_json.entity_count;
+        self.env_params = seed_json.env_params(); // restore the saved climate (ADR-012)
         let mut env = GeneSimEnv::new(self.entity_count);
+        env.set_environment(self.env_params);
         env.reset(seed_json.seed);
         for action in &actions {
             let _ = env.step(action.clone());

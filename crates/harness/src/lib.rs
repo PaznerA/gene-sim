@@ -30,7 +30,7 @@ use crispr::{
 };
 use genome::LocusId;
 use serde::{Deserialize, Serialize};
-use sim_core::{Observation, SimConfig, Simulation};
+use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod replay;
 
@@ -135,6 +135,8 @@ pub struct GeneSimEnv {
     seed: u64,
     /// Per-run generation budget / spawn count handed to the core (the edit/advance loop runs on top).
     entity_count: u32,
+    /// The player-set climate the next `reset` builds the world under (ADR-012 Phase E). Default = neutral.
+    env: EnvParams,
     /// The live simulation, present once `reset` has been called.
     sim: Option<Simulation>,
     /// Cas-variant table the `ApplyEdit` action resolves against (data, not code — SPEC §4).
@@ -159,6 +161,7 @@ impl GeneSimEnv {
         Self {
             seed: 42,
             entity_count,
+            env: EnvParams::default(),
             sim: None,
             variants: default_cas_variants(),
             on: DefaultOnTargetScore,
@@ -167,6 +170,12 @@ impl GeneSimEnv {
             last_edit: None,
             last_region_edit: None,
         }
+    }
+
+    /// Set the climate the **next** `reset` builds the world under (ADR-012 Phase E). Does not disturb a run in
+    /// progress. The renderer/CLI feeds this from the main menu; default is the neutral world.
+    pub fn set_environment(&mut self, env: EnvParams) {
+        self.env = env;
     }
 
     /// The outcome of the most recent [`Action::ApplyEdit`], if any (for inspection / tests).
@@ -240,7 +249,8 @@ impl Env for GeneSimEnv {
             generations: 0,
             entity_count: self.entity_count,
         };
-        let mut sim = Simulation::reset(&cfg);
+        // Build the world under the player's climate (ADR-012 Phase E; default env = byte-identical to before).
+        let mut sim = Simulation::reset_with_env(&cfg, &self.env);
         let obs = sim.observe();
         self.sim = Some(sim);
         obs
