@@ -70,6 +70,67 @@
 
 ---
 
+## ROADMAP — beyond the PoC: a *Bibites*-like ecosystem sandbox
+
+> **North-star:** grow the single-species deterministic PoC into a **multi-species, editable, open-ended
+> ecosystem sandbox** where a player or LLM agent **combines species**, **shapes terrain + environment**,
+> **intervenes with CRISPR edits** (and watches them on a timeline), and observes emergence — inspired by
+> **[The Bibites](https://thebibites.com/)** (and similar artificial-life sandboxes). The fixed PoC build
+> order (Stages 0–5) is the foundation; these epics extend it.
+>
+> **Gating rule:** every epic that touches the **sim model** is >1 day and risks invariants #2/#3/#6 + the
+> perf gate → **🛑 design (ideally a design workflow) + ADR + human sign-off BEFORE core code** (per LOOP §2).
+> Renderer epics are invariant-safe presentation and run on the normal per-slice loop. Determinism (#3) is the
+> load-bearing constraint for all core work; re-baseline the perf gate in any slice that touches the hot loop.
+> Keep the gene-sim differentiators vs. Bibites: **real CRISPR mechanic, real SO/GO ontology, deterministic
+> reproducibility, daisy-chain biosafety.**
+
+- [ ] 🛑 **R1 — Terrain + soil/environment substrate (core)** *(design IN FLIGHT — workflow running)*. Per-cell
+  deterministic soil (e.g. moisture / nutrients / pH) coupling to selection so traits (esp. DroughtTolerance)
+  matter **spatially**; new read-only `GridSnapshot` channels for the renderer. Foundation for spatial
+  emergence + the env-modifier boundary. *Depends:* extends Stage 1 selection + the snapshot. *Invariants:*
+  #3 determinism (the crux — local selection vs. ADR-005 constant-N Wright-Fisher), #2, #5, perf. ADR + sign-off pending.
+- [ ] 🛑 **R2 — Environment parameters / climate (core).** Global + time-varying knobs (seasonal moisture,
+  temperature…) layered on R1's static soil via deterministic schedules; makes runs dynamic over time.
+  *Depends:* R1.
+- [ ] 🛑 **R3 — Multi-species core (KEYSTONE).** The headline: multiple species, each with its own genome +
+  phenotype, coexisting in one world with **inter-species interaction** (start: competition for shared
+  soil/resources via local fitness; later: trophic/predation). A big change to the single-`GenomeRes` model,
+  selection, the snapshot (per-species channels), and the action space (the operator picks *which species* to
+  edit — inv #6). *Depends:* R1 (shared substrate). *Invariants:* #2/#3/#6, perf. Largest core epic — its own
+  design workflow + sign-off.
+- [ ] 🛑 **R4 — Ecosystem editor + scenario load/save.** Define a scenario (species roster + genomes, terrain,
+  env params, master seed) as a **deterministic, replayable** serialized file (RON/JSON), with a Godot editor
+  UI to compose / save / load / launch runs — the "sandbox" surface. *Depends:* R1–R3 (the things being
+  edited). Reuses the `seed.json` + `actions.ndjson` replay contract (SPEC §5/§6). Core scenario serialization
+  + renderer editor UI (renderer stays read-only re: biology — it edits *scenario config*, not genomes-in-GDScript).
+- [ ] **R5 — Manual intervention + injection timeline.** Interactive CRISPR edits applied at a chosen time
+  (later: place/species) from the UI, driving the core via the existing gym `Action::ApplyEdit`; a **timeline
+  widget** visualizing *when* injections happened + their downstream effect (population / allele_freq / trait
+  deltas), built on `actions.ndjson` + per-gen stats. *Depends:* R6 for real-time (works on replay otherwise).
+  *Invariants:* #2 (renderer **requests** an action; the core applies it — no biology in GDScript), #6.
+- [ ] 🛑 **R6 — Endless / open-ended run (core + harness + renderer).** Replace fixed-N runs with an unbounded,
+  streamable sim: the core runs open-ended, snapshots **stream** to disk (ring buffer / append), and the
+  renderer plays live with pause / resume / scrub; determinism preserved via the seeded stream. Enables R5
+  real-time intervention + a living sandbox. *Invariants:* #3 (determinism over an unbounded run), #4.
+- [ ] **R7 — UI control panel + sandbox UX (renderer).** Incremental renderer UX toward the sandbox: species
+  roster panel, scenario load/save buttons, the R5 injection timeline, environment/terrain inspectors (read
+  R1/R2 channels), richer detail panels (extend the ontology surface). Read-only presentation (inv #2); pairs
+  with R3–R5 on the normal loop.
+- [ ] **R8 — Isometric trait-driven sprites (renderer).** Generate isometric organism/plant sprites in the
+  ecosystem view reflecting the (species) trait vector + local terrain, instead of dots (the "do budoucna"
+  idea). Read-only presentation from exported traits + soil. *Depends:* R1 (terrain) + R3 (per-species traits).
+- [ ] **Stage 5 — Ontology + LLM modifiers (S5.1–S5.4, above)** connects here as the **env-modifier engine**:
+  LLM/ontology-defined functions act on the R1/R2 soil/environment substrate to modify fitness, behind the
+  invariant-#5 trait boundary, validated against the SO/GO graph before admission (SPEC §4). The just-shipped
+  detail-panel ontology surface is the UI hook.
+
+**Suggested sequence:** R1 (in flight) → Stage 5 graph/validation (parallel, renderer-light) → R2 → R6
+(unblocks live intervention) → R5 → R3 (keystone) → R4 (editor) → R7/R8 (UX/visual, ongoing). Re-plan after R1
+sign-off; each core epic gets its own design workflow + ADR before code.
+
+---
+
 ## FOLLOW-UPS / TECH DEBT (non-blocking; pick up when convenient)
 - [ ] **F1** sim-core selection write-back: replace the per-generation `BTreeMap<u32,f64>` with a `Vec` indexed
   by contiguous `OrgId` (O(N) vs O(N log N) + allocation). Would lift the Stage 1 perf baseline (ADR-005).
@@ -98,3 +159,9 @@
   (S4.3), data-layer shaders + zoom scopes (S4.4), L-system plant morphology from core-exported trait vectors
   + UI control bar (S4.5). ADR-006/007. **Zero biology in GDScript** throughout (inv. #2); every UI feature
   gated headless via `--check`/`--snap` (inv. #4); determinism hash unchanged across all of Stage 4.
+- **Post-Stage-4 renderer round** (multi-agent designed + adversarially vetted; A+C + mouse): visual polish
+  (inferno overlay, teardrop leaves + flowers + ground/shadow, grass blades, edge vignette), specimen UX
+  (selector + 5-trait readout with delta-vs-baseline + focus emphasis), ecosystem control bar (speed slider,
+  scope buttons, generation scrubber), and mouse controls (drag-pan, hover tooltip, click detail). Track-B
+  prep: `harness --specimens` now also exports the species genome's **SO/GO ontology tags**, surfaced in the
+  click-detail panel. All read-only (inv. #2); determinism hash unchanged; full gate green per slice.
