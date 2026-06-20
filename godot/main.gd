@@ -86,8 +86,6 @@ var _prev_button: Button
 var _next_button: Button
 var _speed_slider: HSlider
 var _scope_buttons: Array = []  # 3 Buttons, one per SCOPES preset (field/patch/cells)
-var _gen_slider: HSlider
-var _gen_label: Label
 var _frame_seconds: float = FRAME_SECONDS  # runtime playback interval (the speed slider mutates this)
 var _syncing: bool = false  # re-entrancy guard so programmatic widget updates don't recurse via signals
 var _timeline: Control  # full-width bottom generation timeline (timeline.gd)
@@ -106,7 +104,10 @@ var _inject_status: Label
 var _cas_ids: Array = []  # cas variant id per _cas_picker item
 var _locus_ids: Array = []  # locus id per _locus_picker item
 var _injections: Array = []  # [{generation, applied}] for the timeline markers
-var _seed: int = 42  # active master seed (from --seed; New-run/Restart in S5 will rebind it)
+var _seed: int = 42  # active master seed (from --seed; New-run/Restart rebind it)
+var _restart_button: Button
+var _newrun_button: Button
+var _seed_edit: LineEdit
 var _titlebar: Control
 var _title_badge: Label  # ● LIVE / REPLAY
 var _title_status: Label  # seed · gen · pop · fit · allele chip strip
@@ -178,6 +179,9 @@ func _ready() -> void:
 	var zoom_arg := _arg_value("--zoom")  # optional: preset zoom scope for --shot
 	if zoom_arg != "":
 		_set_zoom(float(zoom_arg))
+	var reseed := _arg_value("--reset-seed")  # optional: exercise the lifecycle reset for --shot verification
+	if _live != null and reseed != "":
+		_do_reset(int(reseed))
 	if _live != null and _has_flag("--inject"):  # optional: fire one demo injection for --shot verification
 		_live.step(20)
 		_live_advance()
@@ -810,19 +814,34 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 		row2.add_child(b)
 		_scope_buttons.append(b)
 
-	row2.add_child(_dim_label("  Gen:"))
-	_gen_slider = HSlider.new()
-	_gen_slider.min_value = 0
-	_gen_slider.max_value = maxi(1, _snaps.size() - 1)
-	_gen_slider.step = 1
-	_gen_slider.value = _idx
-	_gen_slider.custom_minimum_size = Vector2(150, 0)
-	_gen_slider.editable = _snaps.size() > 1
-	_gen_slider.value_changed.connect(_on_gen_slider)
-	row2.add_child(_gen_slider)
+	# (The generation scrubber is gone — the bottom timeline owns seek with a play-head + labels.)
 
-	_gen_label = _dim_label("")
-	row2.add_child(_gen_label)
+	# Row 3 — run lifecycle (live only): Restart (same seed) / New run (Seed field) — deterministic re-runs.
+	var row3 := HBoxContainer.new()
+	row3.add_theme_constant_override("separation", 8)
+	rows.add_child(row3)
+	var live := _live != null
+	_restart_button = Button.new()
+	_restart_button.text = "⟳ Restart"
+	_restart_button.tooltip_text = "Re-run from the same seed (deterministic)"
+	_restart_button.pressed.connect(_on_restart_pressed)
+	_restart_button.disabled = not live
+	row3.add_child(_restart_button)
+	_newrun_button = Button.new()
+	_newrun_button.text = "✦ New run"
+	_newrun_button.tooltip_text = "Start a fresh run from the Seed field"
+	_newrun_button.pressed.connect(_on_newrun_pressed)
+	_newrun_button.disabled = not live
+	row3.add_child(_newrun_button)
+	row3.add_child(_dim_label("  Seed:"))
+	_seed_edit = LineEdit.new()
+	_seed_edit.text = str(_seed)
+	_seed_edit.custom_minimum_size = Vector2(110, 0)
+	_seed_edit.editable = live
+	_seed_edit.text_submitted.connect(func(_t): _on_newrun_pressed())
+	row3.add_child(_seed_edit)
+	if not live:
+		row3.add_child(_dim_label("  — launch with --live to restart / reseed"))
 
 	_sync_controls()
 
@@ -843,26 +862,48 @@ func _on_speed_changed(v: float) -> void:
 	_sync_controls()
 
 
-func _on_gen_slider(v: float) -> void:
-	if _syncing or _view_mode != 0 or _snaps.size() < 2:
+## Restart the live run from the SAME seed (deterministic re-run, inv #3). Live-only.
+func _on_restart_pressed() -> void:
+	_do_reset(_seed)
+
+
+## Start a fresh live run from the Seed field (or _seed+1 if blank/invalid). Live-only.
+func _on_newrun_pressed() -> void:
+	var txt := _seed_edit.text.strip_edges() if _seed_edit != null else ""
+	_do_reset(int(txt) if txt.is_valid_int() else _seed + 1)
+
+
+## Re-reset the LiveSim with `seed` and clear all presentation buffers (history, markers, timeline). The core
+## re-seeds its single ChaCha8 stream, so the same seed → identical bytes (inv #3). Renderer requests; core
+## computes (inv #2). No-op without a live sim.
+func _do_reset(seed: int) -> void:
+	if _live == null:
 		return
-	_paused = true
+	_seed = seed
+	if _seed_edit != null:
+		_seed_edit.text = str(seed)
+	_live.reset(seed)
+	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
+	if snap == null:
+		return
+	_snaps = [snap]
+	_idx = 0
+	_injections = []
+	_fit_history = []
+	_allele_history = []
+	_prev_obs = {}
+	_paused = false
+	if _timeline != null:
+		_timeline.setup([snap.generation])
+		_timeline.set_markers(_injections)
+	_show(0)
 	_update_play_button()
-	_show(int(round(v)))
 
 
 ## Push current state INTO the row-2 widgets without re-triggering their signals (re-entrancy guarded).
 func _sync_controls() -> void:
 	_syncing = true
 	var eco := _view_mode == 0
-	if _gen_slider != null:
-		_gen_slider.editable = eco and _snaps.size() > 1
-		_gen_slider.set_value_no_signal(_idx)
-	if _gen_label != null:
-		if eco and not _snaps.is_empty():
-			_gen_label.text = "gen %d  [%d/%d]" % [_snaps[_idx].generation, _idx + 1, _snaps.size()]
-		else:
-			_gen_label.text = ""
 	if _prev_button != null:
 		_prev_button.disabled = not eco
 	if _next_button != null:
