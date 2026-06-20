@@ -135,6 +135,32 @@ const WORLD_DIMS: (u32, u32) = soil::SOIL_DIMS;
 /// unchanged — only `Position` entering `hash_world` re-pins the determinism hash.
 const PLACEMENT_STREAM_BASE: u64 = 0x0050_4C41_4300_0000;
 
+/// Minimum brush radius (ADR-011 invariant-#6 guard): a region edit always covers a disc, never a single
+/// cell, so it stays a CELL-region operator action and can't degenerate into de-facto per-organism targeting.
+pub const MIN_REGION_RADIUS: u32 = 1;
+
+/// A spatial brush region on the world grid for a region-scoped edit (ADR-011 S-D). Targets CELLS, carries NO
+/// organism handle (the invariant-#6 type guard — the edit can never name an individual). Euclidean disc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    /// Disc centre cell x on the world grid.
+    pub cx: u32,
+    /// Disc centre cell y on the world grid.
+    pub cy: u32,
+    /// Disc radius in cells (clamped up to [`MIN_REGION_RADIUS`]).
+    pub radius: u32,
+}
+
+impl Region {
+    /// Whether world cell `(x, y)` falls inside the disc (radius clamped to [`MIN_REGION_RADIUS`]).
+    fn contains(&self, x: u32, y: u32) -> bool {
+        let dx = i64::from(x) - i64::from(self.cx);
+        let dy = i64::from(y) - i64::from(self.cy);
+        let r = i64::from(self.radius.max(MIN_REGION_RADIUS));
+        dx * dx + dy * dy <= r * r
+    }
+}
+
 /// Deterministic off-stream initial cell for organism `i`: `x`/`y` from two disjoint `derive_seed` streams,
 /// modulo the world grid. No `SimRng` draw (inv #3); reproducible from the master seed alone.
 fn placement(seed: u64, i: u32) -> Position {
@@ -512,6 +538,47 @@ impl Simulation {
         let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
         self.world.resource_mut::<BaseGrowthRate>().0 = base_growth;
         out
+    }
+
+    /// Apply a REGION-scoped CRISPR edit (ADR-011 S-D, the selective brush). `f` runs the species-genome gate
+    /// with the run's single seeded RNG and returns `(result, genotype_delta)`; the SIGNED delta is then added
+    /// to every in-`region` organism's `[0, 1]` allele (clamped). Returns `(result, covered_count)`.
+    ///
+    /// **Determinism (inv #3):** the gate draws from the SAME single stream (RNG handed in via the same
+    /// replace/restore dance as [`with_genome_and_rng`]); the delta application draws ZERO RNG, so the stream
+    /// cost is whatever `f` consumed (fixed: ≤1 draw) — INDEPENDENT of how many organisms the brush covers.
+    /// **Granularity (inv #6):** `region` targets CELLS (no organism handle); the per-individual allele shift
+    /// is a regional operator action, not per-organism agency, and never mutates `BaseGrowthRate`/the genome.
+    pub fn apply_edit_region<R>(
+        &mut self,
+        region: Region,
+        f: impl FnOnce(&Genome, &mut ChaCha8Rng) -> (R, f64),
+    ) -> (R, u32) {
+        // Take the RNG out so the gate can borrow it alongside an immutable genome (same dance as above).
+        let mut rng = std::mem::replace(
+            &mut self.world.resource_mut::<SimRng>().0,
+            ChaCha8Rng::seed_from_u64(0),
+        );
+        let (result, delta) = {
+            let genome = &self.world.resource::<GenomeRes>().0;
+            f(genome, &mut rng)
+        };
+        self.world.resource_mut::<SimRng>().0 = rng;
+
+        // Shift every in-region individual's allele by the gate-derived delta. Per-org `g += delta` is
+        // order-independent (and the end-of-run hash sorts by OrgId), so no draw and no HashMap here (inv #3).
+        let mut covered = 0u32;
+        for (_id, p, mut g) in self
+            .world
+            .query::<(&OrgId, &Position, &mut Genotype)>()
+            .iter_mut(&mut self.world)
+        {
+            if region.contains(p.x, p.y) {
+                g.0 = (g.0 + delta).clamp(0.0, 1.0);
+                covered += 1;
+            }
+        }
+        (result, covered)
     }
 
     /// Fold the current state into the deterministic [`RunStats`] artifact (SPEC §6). Mirrors what the

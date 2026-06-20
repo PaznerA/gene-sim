@@ -587,6 +587,74 @@ pub enum EditOutcome {
     },
 }
 
+/// The result of [`evaluate_region_edit`] (ADR-011 S-D, region-scoped brush). Unlike [`EditOutcome`] this
+/// does **not** mutate the species genome and so names no mutated `param`: instead it carries a SIGNED shift
+/// for the caller (`sim-core`) to add to every in-region individual's `[0, 1]` allele. The gate is the SAME
+/// as [`apply_edit`]'s; only the effect differs (per-individual regional perturbation, not a genome param).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegionEditOutcome {
+    /// The edit passed gating; shift each in-region allele by `genotype_delta` (clamped by the caller).
+    Applied {
+        /// On-target efficiency that cleared the gate (in `[0, 1]`).
+        on_efficiency: f64,
+        /// Off-target hit count that cleared the gate.
+        off_target_hits: u32,
+        /// Signed shift to apply to each in-region individual's allele (sign+scale from one RNG draw × `on`).
+        genotype_delta: f64,
+    },
+    /// The edit failed gating — a no-op on the population (the brush draws zero from the stream on failure).
+    Failed {
+        /// Why the edit failed (no PAM / on-target too low / off-target too high / …).
+        reason: EditFailure,
+    },
+}
+
+/// Evaluate a REGION-scoped edit: run the SAME PAM/on-target/off-target gate as [`apply_edit`] against the
+/// **species** genome locus, but **without mutating the genome** — return a signed allele delta for the caller
+/// to apply to the organisms inside a brushed region (ADR-011 S-D).
+///
+/// **Determinism (inv. #3):** the gate itself is RNG-free; on SUCCESS exactly ONE `rng` draw sets the signed
+/// direction/scale, and on FAILURE ZERO draws happen. The RNG cost is therefore FIXED and **independent of how
+/// many organisms are in the region** — a 1-cell brush and a whole-map brush consume the identical stream. The
+/// magnitude is `on_efficiency`, the sign/scale a single `[-1, 1)` draw, so `genotype_delta = signed * on_eff`.
+pub fn evaluate_region_edit<On: OnTargetScore, Off: OffTargetScore>(
+    genome: &genome::Genome,
+    edit: &Edit,
+    variants: &[CasVariant],
+    on: &On,
+    off: &Off,
+    thresholds: &EditThresholds,
+    rng: &mut ChaCha8Rng,
+) -> RegionEditOutcome {
+    let fail = |reason| RegionEditOutcome::Failed { reason };
+    let Some(cas) = variants.iter().find(|v| v.id == edit.cas) else {
+        return fail(EditFailure::UnknownCasVariant);
+    };
+    let Some(target_idx) = genome.loci.iter().position(|l| l.id == edit.target) else {
+        return fail(EditFailure::UnknownTargetLocus);
+    };
+    if find_pam_sites_in(&genome.loci[target_idx].sequence, cas).is_empty() {
+        return fail(EditFailure::NoPamSite);
+    }
+    let on_eff = on
+        .efficiency(&genome.loci[target_idx], &edit.guide, cas)
+        .clamp(0.0, 1.0);
+    let off_hits = off.hit_count(genome, &edit.guide, cas);
+    if on_eff < thresholds.min_on_target {
+        return fail(EditFailure::OnTargetTooLow);
+    }
+    if off_hits > thresholds.max_off_target {
+        return fail(EditFailure::OffTargetTooHigh);
+    }
+    // Gate passed: one RNG draw for the signed direction/scale (region-size-independent — inv #3).
+    let signed = rng_unit(rng) * 2.0 - 1.0;
+    RegionEditOutcome::Applied {
+        on_efficiency: on_eff,
+        off_target_hits: off_hits,
+        genotype_delta: signed * on_eff,
+    }
+}
+
 /// Draw a unit `[0, 1)` f64 from the seeded RNG, matching `sim-core`'s `unit_f64` (top 53 bits).
 ///
 /// Keeping the conversion identical to sim-core means the same RNG stream maps to the same floats

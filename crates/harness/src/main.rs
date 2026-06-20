@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crispr::{default_cas_variants, EditOutcome, GuideSequence};
+use crispr::{default_cas_variants, EditOutcome, GuideSequence, RegionEditOutcome};
 use genome::LocusId;
 use harness::{Action, EditAction, Env, GeneSimEnv};
 use sim_core::{derive_seed, run_headless, Observation, RunStats, SimConfig, Simulation, Trait};
@@ -408,6 +408,14 @@ fn write_episode_snapshots_and_injections(
                 // crispr cleared the gate (Applied) vs an explicit failure (Failed) — never a silent no-op.
                 let applied = matches!(env.last_edit(), Some(EditOutcome::Applied { .. }));
                 injections.push((generation, edit_label(edit), applied));
+            }
+            Action::ApplyEditRegion(edit, region) => {
+                env.step(Action::ApplyEditRegion(edit.clone(), *region));
+                let applied = matches!(
+                    env.last_region_edit(),
+                    Some((RegionEditOutcome::Applied { .. }, _))
+                );
+                injections.push((generation, format!("{} @region", edit_label(edit)), applied));
             }
         }
     }

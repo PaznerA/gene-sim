@@ -6,11 +6,13 @@
 //! flow straight through.
 //!
 //! ## Action granularity (invariant #6 — the load-bearing rule of this slice)
-//! Actions are **species/operator-granular only**: the agent advances generations ([`Action::Advance`])
-//! or applies a CRISPR edit to the **species genome** ([`Action::ApplyEdit`]). There is **no per-organism
-//! action** — individual organisms are ECS entities, never RL agents. The type system enforces this:
-//! [`Action`] carries no organism handle, and an [`EditAction`] targets a [`genome::LocusId`] on the one
-//! shared species genome, never a specific entity.
+//! Actions advance generations ([`Action::Advance`]), edit the **species genome** ([`Action::ApplyEdit`]),
+//! or apply a CRISPR edit to a **cell region** ([`Action::ApplyEditRegion`], ADR-011 S-D — the selective
+//! brush). There is **no per-organism action** — individual organisms are ECS entities, never RL agents. The
+//! type system enforces it: [`Action`] carries no organism handle, an [`EditAction`] targets a
+//! [`genome::LocusId`], and a [`RegionSpec`] targets CELLS (centre + radius), never a specific entity. Per the
+//! ADR-011 human ruling, the region edit is sub-species but cell-scoped (a minimum radius keeps it from being
+//! de-facto per-organism) and is allowed in an AI policy's action space.
 //!
 //! ## Determinism (invariant #3)
 //! One seeded `rand_chacha::ChaCha8Rng` is created once per [`reset`](Env::reset) inside the wrapped
@@ -22,8 +24,9 @@
 #![forbid(unsafe_code)]
 
 use crispr::{
-    apply_edit, default_cas_variants, CasVariant, CasVariantId, DefaultOffTargetScore,
-    DefaultOnTargetScore, Edit, EditOutcome, EditThresholds, GuideSequence,
+    apply_edit, default_cas_variants, evaluate_region_edit, CasVariant, CasVariantId,
+    DefaultOffTargetScore, DefaultOnTargetScore, Edit, EditOutcome, EditThresholds, GuideSequence,
+    RegionEditOutcome,
 };
 use genome::LocusId;
 use serde::{Deserialize, Serialize};
@@ -94,6 +97,32 @@ pub enum Action {
     Advance(u64),
     /// Apply a CRISPR edit to the **species** genome (then re-express phenotype so it changes dynamics).
     ApplyEdit(EditAction),
+    /// Apply a CRISPR edit to only the organisms inside a CELL region (the selective brush, ADR-011 S-D).
+    /// The [`RegionSpec`] names cells, never an organism — the invariant-#6 type guard at the action level.
+    ApplyEditRegion(EditAction, RegionSpec),
+}
+
+/// A spatial brush region for [`Action::ApplyEditRegion`]: a disc of world cells (centre + radius). Serde so
+/// it journals to `actions.ndjson` for bit-identical replay; converts to a `sim_core::Region` at apply time.
+/// Carries NO organism handle (invariant #6 — the edit targets cells, not individuals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionSpec {
+    /// Disc centre cell x on the world grid.
+    pub cx: u32,
+    /// Disc centre cell y on the world grid.
+    pub cy: u32,
+    /// Disc radius in cells.
+    pub radius: u32,
+}
+
+impl RegionSpec {
+    fn to_region(self) -> sim_core::Region {
+        sim_core::Region {
+            cx: self.cx,
+            cy: self.cy,
+            radius: self.radius,
+        }
+    }
 }
 
 /// A gym-like environment over the deterministic headless core (SPEC §2.2; S3.1).
@@ -118,6 +147,8 @@ pub struct GeneSimEnv {
     thresholds: EditThresholds,
     /// Outcome of the most recent `ApplyEdit` (so callers/tests can inspect success vs failure).
     last_edit: Option<EditOutcome>,
+    /// Outcome + covered-organism count of the most recent `ApplyEditRegion` (ADR-011 S-D).
+    last_region_edit: Option<(RegionEditOutcome, u32)>,
 }
 
 impl GeneSimEnv {
@@ -134,6 +165,7 @@ impl GeneSimEnv {
             off: DefaultOffTargetScore::default(),
             thresholds: EditThresholds::default(),
             last_edit: None,
+            last_region_edit: None,
         }
     }
 
@@ -141,6 +173,12 @@ impl GeneSimEnv {
     #[must_use]
     pub fn last_edit(&self) -> Option<&EditOutcome> {
         self.last_edit.as_ref()
+    }
+
+    /// The outcome + covered-organism count of the most recent [`Action::ApplyEditRegion`] (ADR-011 S-D).
+    #[must_use]
+    pub fn last_region_edit(&self) -> Option<&(RegionEditOutcome, u32)> {
+        self.last_region_edit.as_ref()
     }
 
     /// The current observation without taking a step (panics if called before `reset`).
@@ -195,6 +233,7 @@ impl Env for GeneSimEnv {
     fn reset(&mut self, seed: u64) -> Observation {
         self.seed = seed;
         self.last_edit = None;
+        self.last_region_edit = None;
         let cfg = SimConfig {
             seed,
             // `generations` here is only metadata for the stats hash; the env advances via `Advance`.
@@ -234,6 +273,29 @@ impl Env for GeneSimEnv {
                     apply_edit(g, &crispr_edit, variants, on, off, thresholds, rng)
                 });
                 self.last_edit = Some(outcome);
+                self.last_region_edit = None;
+            }
+            Action::ApplyEditRegion(edit, region) => {
+                // Region-scoped edit (ADR-011 S-D): the SAME gate as ApplyEdit, but it does NOT mutate the
+                // genome — it returns a signed allele delta that sim-core adds to every in-region organism.
+                // RNG cost is fixed (≤1 draw), independent of the brushed area (inv #3); region targets cells
+                // only (inv #6).
+                let crispr_edit = Edit {
+                    cas: edit.cas,
+                    target: edit.target,
+                    guide: edit.guide,
+                };
+                let (outcome, covered) = sim.apply_edit_region(region.to_region(), |g, rng| {
+                    let oc =
+                        evaluate_region_edit(g, &crispr_edit, variants, on, off, thresholds, rng);
+                    let delta = match oc {
+                        RegionEditOutcome::Applied { genotype_delta, .. } => genotype_delta,
+                        RegionEditOutcome::Failed { .. } => 0.0,
+                    };
+                    (oc, delta)
+                });
+                self.last_region_edit = Some((outcome, covered));
+                self.last_edit = None;
             }
         }
 
@@ -380,7 +442,55 @@ mod tests {
             Action::Advance(_) => {}
             // EditAction targets a species LocusId — never an organism/entity id (inv. #6).
             Action::ApplyEdit(EditAction { target: _, .. }) => {}
+            // ApplyEditRegion targets a species LocusId + a CELL region (cx/cy/radius) — still no organism
+            // handle, so per-organism targeting stays unrepresentable (ADR-011 invariant-#6 ruling).
+            Action::ApplyEditRegion(EditAction { target: _, .. }, RegionSpec { .. }) => {}
         }
+    }
+
+    #[test]
+    fn region_edit_covers_organisms_and_is_deterministic() {
+        // ADR-011 S-D: a region edit covers a nonzero set of organisms, reproduces bit-for-bit for the same
+        // (seed, edit, region), and (on a passing gate) shifts the population allele_freq vs an un-edited control.
+        let mk = || {
+            let mut e = GeneSimEnv::new(600);
+            e.reset(7);
+            e
+        };
+        let action = || {
+            Action::ApplyEditRegion(
+                EditAction {
+                    cas: cas_id("SpCas9"),
+                    target: LocusId(0),
+                    guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                },
+                RegionSpec {
+                    cx: 16,
+                    cy: 16,
+                    radius: 8,
+                },
+            )
+        };
+        let mut a = mk();
+        a.step(action());
+        let mut b = mk();
+        b.step(action());
+        assert_eq!(
+            a.observe().allele_freq,
+            b.observe().allele_freq,
+            "region edit must be deterministic for a fixed seed/edit/region"
+        );
+        let (_outcome, covered) = a
+            .last_region_edit()
+            .expect("region edit should be recorded");
+        assert!(*covered > 0, "the brush should cover some organisms");
+        // A passing region edit moves the field allele_freq away from the un-edited control.
+        let control = mk().observe().allele_freq;
+        assert_ne!(
+            a.observe().allele_freq,
+            control,
+            "a covered edit should change allele_freq"
+        );
     }
 
     #[test]
