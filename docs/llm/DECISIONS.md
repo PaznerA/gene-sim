@@ -470,6 +470,40 @@ de-facto per-organism. This is a deliberate broadening of #6 from "species-only"
 
 ---
 
+## ADR-012 — Climate environment (lat/lon/season/temperature) + pre-sim main menu (Phase E)
+
+### Decision
+Give a run a player-set **climate** that shapes selection, plus a **main menu** to configure it — sliced so the
+only invariant-touching step (climate→selection coupling) is a single ledgered determinism re-pin.
+- **E1 (done):** `climate::EnvParams { lat, lon, avg_temp, season }` (Default = neutral temperate) + a
+  `ClimateField` derived from them as a PURE multiply/add/clamp/`match` function — **NO sin/cos/acos** (libm
+  differs across platforms → would break inv #3; soil.rs precedent). Built in a new `Simulation::reset_with_env`
+  next to `SoilField`, off the seed (zero `SimRng` draws); `reset(config)` delegates with the default env so all
+  32 `SimConfig` literals + the pinned config stay byte-identical. Inserted as `ClimateFieldRes`, NOT yet read →
+  **hash-neutral** (the unchanged pinned literal `0xc01e…e40e` is the proof, exactly as soil R1.0 proved).
+  `CLIM_STREAM_BASE = 0x0043_4C49_4D00_0000` reserved for future per-cell variation.
+- **E2:** thin gdext `LiveSim.set_environment(lat,lon,temp,season)` + `harness::GeneSimEnv` threading +
+  `replay::EnvConfig`/`SeedJson` persistence (so save/load + replay reproduce the env). Hash-neutral.
+- **E3 (🛑 RE-PIN):** new heritable per-individual `ThermalTol` (template = `DroughtTol`; spawn draw order
+  genotype,energy,drought,thermal; inherited; folded into `hash_world`) + a `TemperatureMatchModifier` behind the
+  inv-#5 `EnvironmentModifier` seam, multiplying a strictly-positive factor (band like soil's) into the selection
+  weight (GLOBAL coupling first, per ADR-011's mean→local progression). The pinned config ships coupling ON →
+  ONE deliberate re-pin, ledgered (…c01e…e40e → NEW).
+- **E4:** a main-menu Godot overlay (`main_menu.gd`, preload, no class_name) shown before `_setup_live` in the
+  windowed `--live` path: seed (random|fixed), lat/lon/temp/season, entity count, a PREVIEW row computed by the
+  CORE (`observe()`, not GDScript — inv #2), Start → `set_environment` + reset via the existing `_do_reset`
+  in-place reseed (no relaunch). Headless/`--check`/`--shot` early-return before the menu and feed the SAME
+  setters from CLI flags (`--lat/--lon/--temp/--season/--entities`) → byte-identical to going through the menu.
+
+### Consequences
++ Runs become meaningful beyond a bare seed; climate becomes a selection lever (and visible variety once it
+  couples). + Off-stream field keeps E1/E2 hash-neutral; E3 is one isolated, ledgered re-pin. + No transcendentals
+  → cross-platform determinism preserved. + Menu is pure config (renderer read-only, inv #2). − One re-pin; the
+  env must be journaled for save/load replay. Defaults (human-approved): global coupling first, climate-ON in the
+  pinned config, season 4-enum, transcendental-free LUT/polynomial, `TemperatureMatchModifier` on the existing seam.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

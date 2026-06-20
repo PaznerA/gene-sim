@@ -19,11 +19,13 @@ use bevy_ecs::prelude::*;
 use genome::Genome;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
+pub mod climate;
 pub mod det;
 pub mod gp;
 pub mod snapshot;
 pub mod soil;
 
+pub use climate::EnvParams;
 pub use det::derive_seed;
 pub use gp::{GenotypePhenotypeMap, Phenotype, Trait, WeightedSumMap};
 pub use snapshot::{GridSnapshot, CHANNEL_COUNT, SNAPSHOT_MAGIC};
@@ -92,6 +94,12 @@ struct BaseGrowthRate(f64);
 /// its coupling effect on per-individual fitness). Supersedes the R1.1 global `MeanSoil` coupling.
 #[derive(Resource)]
 struct SoilFieldRes(soil::SoilField);
+
+/// The world climate as a resource (ADR-012 Phase E): derived from the player's `EnvParams`, off the `SimRng`
+/// stream. Inserted at reset; CONSUMED by selection only once E3 couples it (until then it's hash-neutral).
+#[derive(Resource)]
+#[allow(dead_code)] // E1: inserted but not yet read — E3's TemperatureMatchModifier consumes it (then drop this).
+struct ClimateFieldRes(climate::ClimateField);
 
 /// Stable per-organism id (0..entity_count), assigned at spawn. Gives a deterministic hash order
 /// independent of ECS query/archetype iteration order.
@@ -328,10 +336,19 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    /// Build a fresh simulation: seed the [`ChaCha8Rng`] **once**, express the genome→phenotype once,
-    /// and spawn the population — exactly as the one-shot [`run_headless`] does (invariant #3, #2).
+    /// Build a fresh simulation with the DEFAULT (neutral) climate — the historical behaviour every existing
+    /// caller + the pinned determinism config rely on (so they stay byte-identical). See [`reset_with_env`].
     #[must_use]
     pub fn reset(config: &SimConfig) -> Self {
+        Self::reset_with_env(config, &climate::EnvParams::default())
+    }
+
+    /// Build a fresh simulation under a player-set climate (ADR-012 Phase E): seed the [`ChaCha8Rng`] **once**,
+    /// express the genome→phenotype once, spawn the population, and build the static soil + [`climate`] fields
+    /// off the seed/params (zero `SimRng` draws). The climate is inserted but only SHAPES selection once E3
+    /// couples it; until then this is byte-identical to [`reset`] at default `env` (invariant #3, #2).
+    #[must_use]
+    pub fn reset_with_env(config: &SimConfig, env: &climate::EnvParams) -> Self {
         let mut world = World::new();
         // Seed the single RNG ONCE for the whole episode (inv. #3 — never re-seeded mid-run).
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
@@ -369,6 +386,9 @@ impl Simulation {
         world.insert_resource(GenomeRes(genome));
         world.insert_resource(BaseGrowthRate(base_growth));
         world.insert_resource(SoilFieldRes(soil.clone())); // per-cell source for LOCAL coupling (ADR-011 S-G)
+                                                           // World climate from the player's params — off the SimRng stream; unused by selection until E3 (so
+                                                           // inserting it here is hash-neutral, proven by the unchanged pinned literal). ADR-012 Phase E.
+        world.insert_resource(ClimateFieldRes(climate::ClimateField::from_params(env)));
 
         let mut schedule = Schedule::default();
         // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
