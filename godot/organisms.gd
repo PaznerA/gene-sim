@@ -31,8 +31,8 @@ func set_snapshot(snap, cell: float) -> void:
 func _draw() -> void:
 	if _w == 0 or _h == 0:
 		return
-	var radius := maxf(1.5, _cell * 0.17)
-	var outline := Color(0.04, 0.06, 0.04, 0.9)
+	var base_r := maxf(1.5, _cell * 0.16)
+	var rim := Color(0.03, 0.05, 0.04, 0.92)
 	for y in _h:
 		for x in _w:
 			var i := y * _w + x
@@ -40,21 +40,27 @@ func _draw() -> void:
 			if d <= 0.0:
 				continue
 			var dots := int(ceil(d * float(MAX_DOTS_PER_CELL)))
-			var col := _organism_color(_allele[i], _fitness[i])
+			var fit := clampf(_fitness[i], 0.0, 1.0)
+			var col := _organism_color(_allele[i], fit)
+			# fitter cells render slightly larger markers (extra read on the data).
+			var radius := base_r * (0.82 + 0.5 * fit)
 			var base := Vector2(float(x) * _cell, float(y) * _cell)
 			for k in dots:
 				var off := Vector2(_hash01(x, y, k * 2), _hash01(x, y, k * 2 + 1))
 				# inset a touch so dots stay inside the cell
 				var p := base + (Vector2.ONE * 0.15 + off * 0.7) * _cell
-				draw_circle(p, radius + 1.0, outline)  # dark rim so dots read on grass
-				draw_circle(p, radius, col)
+				draw_circle(p, radius + 1.2, rim)  # dark rim so dots read on grass
+				draw_circle(p, radius, col)  # body, coloured by genetics
+				draw_circle(p - Vector2(radius, radius) * 0.32, radius * 0.34, Color(1, 1, 1, 0.7))  # specular core
 
 
-## allele_freq → hue (green→amber), fitness → brightness. Presentation mapping only (no biology).
+## allele_freq → hue (cyan→blue→magenta→red, off the grass green), fitness → brightness/saturation.
+## Presentation mapping only (no biology).
 func _organism_color(allele: float, fitness: float) -> Color:
-	var hue := 0.33 - 0.30 * clampf(allele, 0.0, 1.0)  # 0.33 green … 0.03 red-orange
-	var val := 0.45 + 0.55 * clampf(fitness, 0.0, 1.0)
-	return Color.from_hsv(hue, 0.7, val, 0.95)
+	var hue := 0.52 - 0.52 * clampf(allele, 0.0, 1.0)  # 0.52 cyan … 0.0 red
+	var sat := 0.6 + 0.3 * fitness
+	var val := 0.6 + 0.4 * fitness
+	return Color.from_hsv(hue, sat, val, 0.97)
 
 
 ## Deterministic [0,1) hash for intra-cell dot jitter (visual scatter only).

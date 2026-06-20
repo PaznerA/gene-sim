@@ -4,6 +4,16 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### S4.3/S4.4 visual polish (refinement, Stage 4)
+- **Heatmap palette:** the data-layer shader now uses an *inferno* ramp (indigo→purple→red→orange→yellow)
+  that contrasts with the green field instead of the muddy blue→cyan over grass.
+- **Organisms** (`organisms.gd`): markers get a white specular core + darker rim and a palette off the grass
+  green (cyan→magenta→red by allele_freq); fitter cells render slightly larger — far more legible.
+- **Grass** (`main.gd`): terrain shade comes from a coarse block (grassy patches, not per-tile checker noise)
+  with an occasional single-cell speckle and a darker soil tone.
+- **HUD:** the status line sits in a translucent panel; a new bottom-left **legend** shows the active layer
+  name + the colormap gradient (low → high). All read-only presentation (invariant #2); gates unaffected.
+
 ### S4.4 — data-layer shaders + zoom scopes (feat, Stage 4)
 - `godot/data_layer.gdshader` (canvas_item): samples the per-cell data texture the core produced
   (R=density, G=allele_freq, B=fitness via `snapshot.gd::to_data_image`) and maps the channel chosen by a

@@ -42,6 +42,8 @@ var _overlay: Sprite2D
 var _organisms: Node2D
 var _cam: Camera2D
 var _hud: Label
+var _legend_label: Label
+var _legend: Control
 var _timer: Timer
 
 
@@ -148,13 +150,7 @@ func _build_scene() -> void:
 	# HUD on its own CanvasLayer so it ignores the world camera.
 	var ui := CanvasLayer.new()
 	add_child(ui)
-	_hud = Label.new()
-	_hud.position = Vector2(14, 10)
-	_hud.add_theme_font_size_override("font_size", 18)
-	_hud.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
-	_hud.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
-	_hud.add_theme_constant_override("outline_size", 8)
-	ui.add_child(_hud)
+	_build_hud(ui, field_px)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
@@ -169,6 +165,7 @@ func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 	var shades := [
 		Color(0.16, 0.30, 0.15), Color(0.19, 0.34, 0.17),
 		Color(0.14, 0.27, 0.14), Color(0.21, 0.37, 0.19),
+		Color(0.17, 0.31, 0.16), Color(0.11, 0.22, 0.12),  # last = darker soil patch
 	]
 	var n := shades.size()
 	var atlas := Image.create(cell * n, cell, false, Image.FORMAT_RGBA8)
@@ -176,7 +173,7 @@ func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 		for yy in cell:
 			for xx in cell:
 				# subtle per-pixel jitter so tiles read as grass, not flat blocks.
-				var j := (_hash01(xx, yy, ti) - 0.5) * 0.06
+				var j := (_hash01(xx, yy, ti) - 0.5) * 0.05
 				var c: Color = shades[ti]
 				atlas.set_pixel(ti * cell + xx, yy, Color(c.r + j, c.g + j, c.b + j))
 	var tex := ImageTexture.create_from_image(atlas)
@@ -194,9 +191,80 @@ func _build_terrain(w: int, h: int, cell: int) -> TileMapLayer:
 	layer.tile_set = ts
 	for y in h:
 		for x in w:
-			var ti := int(_hash01(x, y, 7) * float(n)) % n
-			layer.set_cell(Vector2i(x, y), sid, Vector2i(ti, 0))
+			# Shade from a COARSE block so the field reads as grassy patches, not per-tile checker noise,
+			# with an occasional single-cell speckle for texture.
+			var ti := int(_hash01(int(x / 3.0), int(y / 3.0), 7) * float(n))
+			if _hash01(x, y, 11) > 0.86:
+				ti = int(_hash01(x, y, 13) * float(n))
+			layer.set_cell(Vector2i(x, y), sid, Vector2i(ti % n, 0))
 	return layer
+
+
+# ──────────────────────────── HUD + legend ────────────────────────────
+
+## Build the status line (in a translucent panel) and the colormap legend (bottom-left).
+func _build_hud(ui: CanvasLayer, field_px: Vector2) -> void:
+	var panel := PanelContainer.new()
+	panel.position = Vector2(12, 10)
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.0, 0.0, 0.0, 0.42)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(8)
+	panel.add_theme_stylebox_override("panel", sb)
+	ui.add_child(panel)
+	_hud = Label.new()
+	_hud.add_theme_font_size_override("font_size", 17)
+	_hud.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
+	panel.add_child(_hud)
+
+	# Colormap legend: the active layer's name + the inferno gradient bar (low → high).
+	_legend = PanelContainer.new()
+	_legend.position = Vector2(12, maxf(120.0, field_px.y - 52.0))
+	var lsb := StyleBoxFlat.new()
+	lsb.bg_color = Color(0.0, 0.0, 0.0, 0.42)
+	lsb.set_corner_radius_all(6)
+	lsb.set_content_margin_all(8)
+	_legend.add_theme_stylebox_override("panel", lsb)
+	ui.add_child(_legend)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 3)
+	_legend.add_child(col)
+	_legend_label = Label.new()
+	_legend_label.add_theme_font_size_override("font_size", 14)
+	_legend_label.add_theme_color_override("font_color", Color(0.9, 0.94, 0.9))
+	col.add_child(_legend_label)
+	var bar := TextureRect.new()
+	bar.texture = _legend_texture()
+	bar.custom_minimum_size = Vector2(208, 12)
+	bar.stretch_mode = TextureRect.STRETCH_SCALE
+	col.add_child(bar)
+
+
+## 1-D inferno gradient texture matching data_layer.gdshader (low → high).
+func _legend_texture() -> ImageTexture:
+	var n := 208
+	var img := Image.create(n, 12, false, Image.FORMAT_RGBA8)
+	for x in n:
+		var c := _inferno(float(x) / float(n - 1))
+		for y in 12:
+			img.set_pixel(x, y, c)
+	return ImageTexture.create_from_image(img)
+
+
+## CPU mirror of the shader's inferno ramp (for the legend bar only).
+func _inferno(t: float) -> Color:
+	var c0 := Color(0.05, 0.03, 0.15)
+	var c1 := Color(0.35, 0.07, 0.43)
+	var c2 := Color(0.75, 0.18, 0.33)
+	var c3 := Color(0.96, 0.49, 0.14)
+	var c4 := Color(0.99, 0.92, 0.55)
+	if t < 0.25:
+		return c0.lerp(c1, t / 0.25)
+	elif t < 0.5:
+		return c1.lerp(c2, (t - 0.25) / 0.25)
+	elif t < 0.75:
+		return c2.lerp(c3, (t - 0.5) / 0.25)
+	return c3.lerp(c4, (t - 0.75) / 0.25)
 
 
 # ──────────────────────────── per-snapshot update ────────────────────────────
@@ -233,6 +301,9 @@ func _refresh_hud() -> void:
 		snap.generation, snap.population, snap.width, snap.height,
 		OVERLAY_NAMES[_overlay_mode], ("  (paused)" if _paused else ""),
 		_scope_label(), _cam.zoom.x, _idx + 1, _snaps.size()]
+	if _legend != null:
+		_legend.visible = _overlay_mode != 0
+		_legend_label.text = "%s   low → high" % OVERLAY_NAMES[_overlay_mode]
 
 
 ## Name the current zoom scope from the magnification (HUD only).
