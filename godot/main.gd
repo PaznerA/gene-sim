@@ -33,6 +33,7 @@ const Lsystem := preload("res://lsystem.gd")
 const Timeline := preload("res://timeline.gd")
 const Iso := preload("res://iso.gd")
 const IsoGround := preload("res://iso_ground.gd")
+const Sparkline := preload("res://sparkline.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
@@ -105,11 +106,24 @@ var _inject_status: Label
 var _cas_ids: Array = []  # cas variant id per _cas_picker item
 var _locus_ids: Array = []  # locus id per _locus_picker item
 var _injections: Array = []  # [{generation, applied}] for the timeline markers
+var _seed: int = 42  # active master seed (from --seed; New-run/Restart in S5 will rebind it)
+var _titlebar: Control
+var _title_badge: Label  # ● LIVE / REPLAY
+var _title_status: Label  # seed · gen · pop · fit · allele chip strip
+var _vitals_panel: Control
+var _vitals_pop: Label
+var _vitals_fit: Label
+var _vitals_allele: Label
+var _sparkline: Control
+var _prev_obs: Dictionary = {}  # previous vitals, for the ▲▼ trend glyphs (deterministic last-vs-now)
+var _fit_history: Array = []  # rolling mean-fitness [0,1] for the sparkline (live: per tick; replay: per snap)
+var _allele_history: Array = []  # rolling allele-freq [0,1] for the sparkline
 
 
 func _ready() -> void:
 	var v := Engine.get_version_info()
 	print("gene-sim UI booted — Godot %s (%s)" % [v.string, DisplayServer.get_name()])
+	_seed = int(_arg_value("--seed", "42"))
 
 	# ---- S4.2 headless gate path: parse one snapshot, report header, quit. Keep exact output ("snapshot OK").
 	var snap_path := _arg_value("--snap")
@@ -237,7 +251,7 @@ func _setup_live() -> bool:
 			printerr("--live: failed to load LiveSim extension (status %d)" % st)
 			return false
 	_live = ClassDB.instantiate("LiveSim")
-	_live.reset(int(_arg_value("--seed", "42")))
+	_live.reset(_seed)
 	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
 	if snap == null:
 		printerr("--live: LiveSim.snapshot() returned unparseable bytes")
@@ -260,6 +274,14 @@ func _live_advance() -> void:
 	_snaps.append(snap)
 	if _snaps.size() > LIVE_HISTORY:
 		_snaps.pop_front()
+	# Roll the sparkline histories: mean fitness over populated cells + the run-level allele freq from observe().
+	var obs: Dictionary = _live.observe()
+	_fit_history.append(_mean_pop(snap.fitness, snap.density))
+	_allele_history.append(clampf(float(obs.get("allele_freq", 0.0)), 0.0, 1.0))
+	if _fit_history.size() > LIVE_HISTORY:
+		_fit_history.pop_front()
+	if _allele_history.size() > LIVE_HISTORY:
+		_allele_history.pop_front()
 	if _timeline != null:
 		var gens: Array = []
 		for s in _snaps:
@@ -413,7 +435,9 @@ func _build_scene() -> void:
 	add_child(ui)
 	# UI positions key off the on-screen field size (the iso diamond bbox under --iso, else the ortho rect).
 	var field_screen := _field_screen_size()
+	_build_titlebar(ui)
 	_build_hud(ui, field_screen)
+	_build_vitals_ui(ui)
 	_build_controls(ui, field_screen)
 	_build_specimen_ui(ui, field_screen)
 	_build_interaction_ui(ui)
@@ -505,20 +529,154 @@ func _vignette_texture() -> ImageTexture:
 # ──────────────────────────── HUD + legend ────────────────────────────
 
 ## Build the status line (in a translucent panel) and the colormap legend (bottom-left).
-func _build_hud(ui: CanvasLayer, field_px: Vector2) -> void:
-	var panel := PanelContainer.new()
-	panel.position = Vector2(12, 10)
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.0, 0.0, 0.0, 0.42)
-	sb.set_corner_radius_all(6)
-	sb.set_content_margin_all(8)
-	panel.add_theme_stylebox_override("panel", sb)
-	ui.add_child(panel)
-	_hud = Label.new()
-	_hud.add_theme_font_size_override("font_size", 17)
-	_hud.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
-	panel.add_child(_hud)
+# ──────────────────────────── title bar + vitals scoreboard (S3, read-only) ────────────────────────────
 
+## Full-width top header: game title (left) + a run-state chip strip (right). Replaces the old dense floating
+## HUD string. Read-only presentation (inv #2) — every chip is a number the core exported.
+func _build_titlebar(ui: CanvasLayer) -> void:
+	_titlebar = PanelContainer.new()
+	_titlebar.set_anchors_preset(Control.PRESET_TOP_WIDE)
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.04, 0.06, 0.05, 0.9)
+	sb.set_content_margin_all(7)
+	sb.border_width_bottom = 2
+	sb.border_color = Color(0.2, 0.45, 0.3, 0.7)
+	_titlebar.add_theme_stylebox_override("panel", sb)
+	ui.add_child(_titlebar)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 12)
+	_titlebar.add_child(row)
+	var title := Label.new()
+	title.text = "GENE-SIM   ·   CRISPR Ecosystem"
+	title.add_theme_font_size_override("font_size", 18)
+	title.add_theme_color_override("font_color", Color(0.85, 0.95, 0.8))
+	row.add_child(title)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(spacer)
+	_title_badge = Label.new()
+	_title_badge.add_theme_font_size_override("font_size", 15)
+	row.add_child(_title_badge)
+	_title_status = Label.new()
+	_title_status.add_theme_font_size_override("font_size", 15)
+	_title_status.add_theme_color_override("font_color", Color(0.88, 0.92, 0.88))
+	row.add_child(_title_status)
+
+
+## Top-left Vitals scoreboard: Population / Mean fitness / Allele freq with ▲▼ trend, plus a recent-trend
+## sparkline. Fed from LiveSim.observe() in --live, else from snapshot field-means over populated cells. The
+## single game scoreboard. Read-only (inv #2): the core exports these numbers; the sparkline plots recorded
+## data (inv #3, no RNG).
+func _build_vitals_ui(ui: CanvasLayer) -> void:
+	_vitals_panel = _dark_panel(0.74)
+	_vitals_panel.position = Vector2(12, 46)
+	_vitals_panel.custom_minimum_size = Vector2(214, 0)
+	ui.add_child(_vitals_panel)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	_vitals_panel.add_child(col)
+	var hdr := Label.new()
+	hdr.text = "VITALS"
+	hdr.add_theme_font_size_override("font_size", 13)
+	hdr.add_theme_color_override("font_color", Color(0.6, 0.7, 0.62))
+	col.add_child(hdr)
+	_vitals_pop = _vital_label()
+	_vitals_fit = _vital_label()
+	_vitals_allele = _vital_label()
+	col.add_child(_vitals_pop)
+	col.add_child(_vitals_fit)
+	col.add_child(_vitals_allele)
+	_sparkline = Sparkline.new()
+	_sparkline.custom_minimum_size = Vector2(198, 40)
+	col.add_child(_sparkline)
+	var cap := Label.new()
+	cap.text = "fitness / allele — recent trend"
+	cap.add_theme_font_size_override("font_size", 11)
+	cap.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
+	col.add_child(cap)
+
+
+func _vital_label() -> Label:
+	var l := Label.new()
+	l.add_theme_font_size_override("font_size", 16)
+	l.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
+	return l
+
+
+## Current vitals: {generation, population, fitness, allele}. Live → LiveSim.observe() (+ snapshot fitness
+## mean); replay → snapshot field-means over POPULATED cells. Pure reads of core-exported data (inv #2).
+func _vitals_source() -> Dictionary:
+	if _live != null:
+		var o: Dictionary = _live.observe()
+		return {
+			"generation": int(o.get("generation", 0)), "population": int(o.get("population", 0)),
+			"allele": clampf(float(o.get("allele_freq", 0.0)), 0.0, 1.0), "fitness": _mean_pop_now(true)}
+	if not _snaps.is_empty():
+		var s = _snaps[_idx]
+		return {
+			"generation": s.generation, "population": s.population,
+			"allele": _mean_pop(s.allele_freq, s.density), "fitness": _mean_pop(s.fitness, s.density)}
+	return {}
+
+
+## Mean of `values` over cells where density > 0 (the populated field). Read-only aggregate, no biology.
+func _mean_pop(values: PackedFloat32Array, density: PackedFloat32Array) -> float:
+	var sum := 0.0
+	var n := 0
+	for i in values.size():
+		if i < density.size() and density[i] > 0.0:
+			sum += values[i]
+			n += 1
+	return (sum / float(n)) if n > 0 else 0.0
+
+
+func _mean_pop_now(_want_fitness: bool) -> float:
+	if _snaps.is_empty():
+		return 0.0
+	var s = _snaps[_idx]
+	return _mean_pop(s.fitness, s.density)
+
+
+## ▲ / ▼ / = trend of `now` vs the previous tick's value for `key` (deterministic last-vs-now, no RNG).
+func _trend(now: float, key: String) -> String:
+	if not _prev_obs.has(key):
+		return "·"
+	var prev := float(_prev_obs[key])
+	if absf(now - prev) <= maxf(0.0005, absf(prev) * 0.001):
+		return "="
+	return "▲" if now > prev else "▼"
+
+
+## Refresh the title-bar chips + Vitals scoreboard + sparkline from the current vitals source.
+func _refresh_vitals() -> void:
+	var v := _vitals_source()
+	if v.is_empty():
+		return
+	if _title_badge != null:
+		_title_badge.text = "● LIVE" if _live != null else "REPLAY"
+		_title_badge.add_theme_color_override(
+			"font_color", Color(0.45, 0.92, 0.5) if _live != null else Color(0.7, 0.72, 0.74))
+	if _title_status != null and _view_mode == 0:
+		_title_status.text = "seed %d     gen %d     pop %d     fit %.2f     allele %.2f" % [
+			_seed, int(v.generation), int(v.population), float(v.fitness), float(v.allele)]
+	if _vitals_pop != null:
+		_vitals_pop.text = "%s  Population    %d" % [_trend(float(v.population), "population"), int(v.population)]
+		_vitals_fit.text = "%s  Mean fitness  %.2f" % [_trend(float(v.fitness), "fitness"), float(v.fitness)]
+		_vitals_allele.text = "%s  Allele freq   %.2f" % [_trend(float(v.allele), "allele"), float(v.allele)]
+	if _live == null:  # replay: plot the whole run; live appends per tick in _live_advance
+		_fit_history = []
+		_allele_history = []
+		for s in _snaps:
+			_fit_history.append(_mean_pop(s.fitness, s.density))
+			_allele_history.append(_mean_pop(s.allele_freq, s.density))
+	if _sparkline != null:
+		_sparkline.set_series(_fit_history, _allele_history)
+	_prev_obs = v
+
+
+func _build_hud(ui: CanvasLayer, field_px: Vector2) -> void:
+	# The dense status line lives in the title bar + Vitals panel now (S3); _build_hud only owns the legend.
 	# Colormap legend: the active layer's name + the inferno gradient bar (low → high).
 	_legend = PanelContainer.new()
 	_legend.position = Vector2(12, maxf(120.0, field_px.y - 52.0))
@@ -772,6 +930,8 @@ func _set_view_mode(m: int) -> void:
 		_timeline.visible = (m == 0)  # the timeline indexes snapshots, irrelevant in specimen view
 	if _intervention_panel != null:
 		_intervention_panel.visible = (_live != null and m == 0)
+	if _vitals_panel != null:
+		_vitals_panel.visible = (m == 0)
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
@@ -1269,29 +1429,20 @@ func _update_overlay(snap) -> void:
 
 
 func _refresh_hud() -> void:
-	if _hud == null:
-		return
-	# Specimen view: caption the L-system plants; hide the data legend.
+	_refresh_vitals()  # title-bar chips + Vitals scoreboard + sparkline
 	if _view_mode == 1:
-		var edits := _specimen_list().size() - 1
-		if edits >= 0:
-			_hud.text = "specimen view — baseline + %d edited genome(s); each plant's shape is its trait vector   [V back]" % maxi(0, edits)
-		else:
-			_hud.text = "specimen view — no specimens.json (re-run harness with --specimens)   [V back]"
+		# Specimen view: caption in the title status; hide the data legend.
+		if _title_status != null:
+			var edits := _specimen_list().size() - 1
+			_title_status.text = ("specimen view — baseline + %d edited genome(s)   [V back]" % maxi(0, edits)
+				if edits >= 0 else "specimen view — no specimens.json   [V back]")
 		if _legend != null:
 			_legend.visible = false
 		return
-	if _snaps.is_empty():
-		return
-	var snap = _snaps[_idx]
-	var live_tag := ("● LIVE   " if _live != null else "")
-	_hud.text = "%sgen %d   pop %d   grid %dx%d   layer: %s%s   scope: %s (×%.1f)   [%d/%d]" % [
-		live_tag, snap.generation, snap.population, snap.width, snap.height,
-		OVERLAY_NAMES[_overlay_mode], ("  (paused)" if _paused else ""),
-		_scope_label(), _cam.zoom.x, _idx + 1, _snaps.size()]
 	if _legend != null:
 		_legend.visible = _overlay_mode != 0
-		_legend_label.text = "%s   low → high" % OVERLAY_NAMES[_overlay_mode]
+		if _overlay_mode != 0 and _legend_label != null:
+			_legend_label.text = "%s   low → high" % OVERLAY_NAMES[_overlay_mode]
 
 
 ## Name the current zoom scope from the magnification (HUD only).
