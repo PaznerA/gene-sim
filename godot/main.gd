@@ -13,6 +13,7 @@ extends Node2D
 ##   --gen  <n>            With --run/--shot: pick the snapshot whose generation == n (else the last).
 ##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
 ##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
+##   --iso                 Render the ecosystem isometrically (CPU diamonds); orthographic is the default.
 ##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
 ##   --focus <i>           With --view specimen: focus specimen i (0 baseline, 1.. edits) for --shot.
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
@@ -28,6 +29,8 @@ const SnapshotReader := preload("res://snapshot.gd")
 const Organisms := preload("res://organisms.gd")
 const Lsystem := preload("res://lsystem.gd")
 const Timeline := preload("res://timeline.gd")
+const Iso := preload("res://iso.gd")
+const IsoGround := preload("res://iso_ground.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
@@ -53,6 +56,8 @@ var _field_px := Vector2.ZERO
 
 var _world: Node2D  # holds the ecosystem layers (terrain/overlay/organisms)
 var _specimen_root: Node2D  # holds the L-system plant specimens
+var _iso = null  # iso.gd transform instance when --iso is active; null = orthographic (default)
+var _iso_ground: Node2D  # CPU-diamond ground + data overlay (iso mode only)
 var _vignette: CanvasLayer  # screen-space edge darkening (ecosystem view only)
 var _terrain: TileMapLayer
 var _overlay: Sprite2D
@@ -192,22 +197,35 @@ func _build_scene() -> void:
 	_cell = maxf(3.0, floorf(TARGET_FIELD_PX / float(max(w, h))))
 	_field_px = Vector2(float(w) * _cell, float(h) * _cell)
 
+	# Isometric mode (P3): a CPU-diamond ground + iso-projected organisms, instead of the ortho TileMap +
+	# axis-aligned shader overlay. Behind --iso; orthographic stays the default. Read-only presentation (#2).
+	if _has_flag("--iso"):
+		_iso = Iso.new()
+		var b: Rect2 = _iso.field_bounds(w, h, _cell)
+		_iso.origin = -b.position + Vector2(20, 20)  # shift the negative-x left edge fully on-screen
+
 	# Ecosystem layers live under _world so the whole view can be toggled off for the specimen view.
 	_world = Node2D.new()
 	add_child(_world)
 
-	_terrain = _build_terrain(w, h, int(_cell))
-	_world.add_child(_terrain)
+	if _iso != null:
+		_iso_ground = IsoGround.new()
+		_iso_ground.setup(w, h, _cell, _iso)
+		_world.add_child(_iso_ground)
+	else:
+		_terrain = _build_terrain(w, h, int(_cell))
+		_world.add_child(_terrain)
 
 	_overlay = Sprite2D.new()
 	_overlay.centered = false
 	_overlay.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST  # one data texel = one crisp cell block
 	var mat := ShaderMaterial.new()
 	mat.shader = DataLayerShader
-	_overlay.material = mat
+	_overlay.visible = (_iso == null)  # iso draws the data overlay into the diamonds instead
 	_world.add_child(_overlay)
 
 	_organisms = Organisms.new()
+	_organisms.set_iso(_iso)
 	_world.add_child(_organisms)
 
 	# L-system specimen view (S4.5) — hidden until toggled.
@@ -217,7 +235,7 @@ func _build_scene() -> void:
 
 	# A camera framing the whole field; S4.4 adds zoom scopes on top of this.
 	_cam = Camera2D.new()
-	_cam.position = _field_px * 0.5
+	_cam.position = _field_center()
 	add_child(_cam)
 	_cam.make_current()  # must be in-tree first
 
@@ -230,16 +248,18 @@ func _build_scene() -> void:
 	var ui := CanvasLayer.new()
 	ui.layer = 2
 	add_child(ui)
-	_build_hud(ui, _field_px)
-	_build_controls(ui, _field_px)
-	_build_specimen_ui(ui, _field_px)
+	# UI positions key off the on-screen field size (the iso diamond bbox under --iso, else the ortho rect).
+	var field_screen := _field_screen_size()
+	_build_hud(ui, field_screen)
+	_build_controls(ui, field_screen)
+	_build_specimen_ui(ui, field_screen)
 	_build_interaction_ui(ui)
 	_build_timeline(ui)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
 		# Extra bottom margin so the two-row control bar (S3) is fully on-screen, not clipped.
-		var win := (_field_px + Vector2(40, 150)).max(Vector2(760, 600))
+		var win := (_field_screen_size() + Vector2(40, 150)).max(Vector2(760, 600))
 		DisplayServer.window_set_size(Vector2i(int(win.x), int(win.y)))
 	RenderingServer.set_default_clear_color(Color(0.06, 0.08, 0.07))
 
@@ -686,8 +706,31 @@ func _plant_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
 	}
 
 
+## On-screen size of the ecosystem field — the iso diamond bbox under --iso, else the ortho rectangle.
+func _field_screen_size() -> Vector2:
+	if _iso != null and not _snaps.is_empty():
+		return _iso.field_bounds(_snaps[0].width, _snaps[0].height, _cell).size
+	return _field_px
+
+
+## On-screen centre of the field (camera target).
+func _field_center() -> Vector2:
+	if _iso != null and not _snaps.is_empty():
+		var b: Rect2 = _iso.field_bounds(_snaps[0].width, _snaps[0].height, _cell)
+		return b.position + b.size * 0.5
+	return _field_px * 0.5
+
+
+## Grid cell under a world point — inverse iso transform under --iso, else the ortho division.
+func _cell_at(world: Vector2) -> Vector2i:
+	if _iso != null:
+		var c: Vector2 = _iso.screen_to_cell(world, _cell)
+		return Vector2i(int(floor(c.x)), int(floor(c.y)))
+	return Vector2i(int(floor(world.x / _cell)), int(floor(world.y / _cell)))
+
+
 func _frame_world() -> void:
-	_cam.position = _field_px * 0.5
+	_cam.position = _field_center()
 	_cam.zoom = Vector2.ONE
 
 
@@ -926,8 +969,9 @@ func _update_tooltip() -> void:
 	var world := get_global_mouse_position()
 	var text := ""
 	if _view_mode == 0 and not _snaps.is_empty():
-		var cx := int(floor(world.x / _cell))
-		var cy := int(floor(world.y / _cell))
+		var _cc := _cell_at(world)
+		var cx := _cc.x
+		var cy := _cc.y
 		var snap = _snaps[_idx]
 		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
 			var i: int = cy * snap.width + cx
@@ -967,8 +1011,9 @@ func _on_click() -> void:
 		if _snaps.is_empty():
 			return
 		var snap = _snaps[_idx]
-		var cx := int(floor(world.x / _cell))
-		var cy := int(floor(world.y / _cell))
+		var _cc := _cell_at(world)
+		var cx := _cc.x
+		var cy := _cc.y
 		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
 			var i: int = cy * snap.width + cx
 			_fill_detail("Cell (%d, %d)" % [cx, cy], _cell_lines(snap, i))
@@ -1031,14 +1076,19 @@ func _show(i: int) -> void:
 	_idx = i
 	var snap = _snaps[i]
 	_organisms.set_snapshot(snap, _cell)
+	if _iso_ground != null:
+		_iso_ground.set_snapshot(snap, _overlay_mode)  # iso draws ground + data overlay as diamonds
 	_update_overlay(snap)
 	_refresh_hud()
 	_sync_controls()
 
 
 ## Feed the per-cell data texture (R=density, G=allele_freq, B=fitness) to the data-layer shader and select
-## the active channel via the `layer` uniform. The colormap + alpha live in data_layer.gdshader (GPU).
+## the active channel via the `layer` uniform. The colormap + alpha live in data_layer.gdshader (GPU). Under
+## --iso the shader sprite stays hidden — the iso ground node renders the overlay into the diamonds instead.
 func _update_overlay(snap) -> void:
+	if _iso != null:
+		return  # iso_ground (fed in _show) owns the overlay in isometric mode
 	if _overlay_mode == 0:
 		_overlay.visible = false
 		return
