@@ -4,6 +4,28 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### ADR-011 S-A…S-F — real spatial dynamics + the selective CRISPR brush (feat, roadmap R1.2/R1.3 + R5)
+Designed via a multi-agent understand→design→ADR workflow; landed as gated, individually-re-pinned slices.
+The grid stops being a visualization and becomes real biology, on which a *selective* brush can act:
+- **S-A** per-organism `Position` on a canonical world grid (= soil dims), placed off the `SimRng` stream
+  (disjoint `PLACEMENT` derive_seed family) + folded into the hash. **RE-PIN #1** (`8722…` → `3ba0…`).
+- **S-B** Wright-Fisher offspring inherit the parent's cell + one bounded dispersal step → lineages cluster
+  into emergent regions. **RE-PIN #2** (`3ba0…` → `0413…`).
+- **S-C** snapshot aggregates by REAL position (retires the OrgId-hash layout) — hash-neutral.
+- **S-D** region-scoped edit: `crispr::evaluate_region_edit` runs the same gate but returns a signed allele
+  delta (no genome mutation); `sim_core::Region` + `Simulation::apply_edit_region` apply it to in-region
+  organisms; `harness::Action::ApplyEditRegion(EditAction, RegionSpec)` (cells, no organism handle). The gate
+  draws RNG **once** regardless of brushed area; hash-neutral on the no-edit pinned run.
+- **S-E** `LiveSim.apply_edit_region(cas,target,guide,cx,cy,radius)` gdext binding → `{applied,detail,
+  generation,covered}`.
+- **S-F** the **brush UI**: `brush.gd` highlights the disc (iso + ortho); B toggles, wheel/`[ ]` set radius,
+  click paints a region edit via the binding. `LIVE_GRID` = 32×32 so a render cell maps 1:1 to a world cell.
+
+Invariant #6 was human-adjudicated (ADR-011): a region edit is sub-species but cell-scoped (no organism
+handle, min radius) and allowed in an AI policy's action space. All deterministic (inv #3), headless-tested
+(inv #4), biology in the core (inv #2). Local-soil-coupled selection + gamification (objective + edit budget)
+remain as S-G. Full gate green at every slice.
+
 ### CI — GitHub Actions: the gate on every push + release executables (ci, roadmap §7)
 - `.github/workflows/ci.yml`: runs the single quality gate (`tools/gate.sh`) on every push to main + PR —
   fmt, clippy, full tests, determinism (inv #3), proptests, license (inv #1), the Godot headless reader, and
