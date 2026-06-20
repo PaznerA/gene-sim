@@ -61,7 +61,7 @@ func cell_count() -> int:
 	return width * height
 
 
-## Build a CPU-side Image whose pixels encode the data channels (R=density, G=allele_freq, B=fitness).
+## Build a CPU-side Image whose pixels encode the population channels (R=density, G=allele_freq, B=fitness).
 ## A 2D shader samples this as the data-layer texture (SPEC §W10). Pure CPU — safe under headless.
 func to_data_image() -> Image:
 	var img := Image.create(width, height, false, Image.FORMAT_RGBF)
@@ -69,4 +69,15 @@ func to_data_image() -> Image:
 		for x in width:
 			var i := y * width + x
 			img.set_pixel(x, y, Color(density[i], allele_freq[i], fitness[i]))
+	return img
+
+
+## Build a CPU-side Image encoding the soil channels (R=moisture, G=nutrients, B=pH) for the data-layer
+## shader's soil layers (R1.0 substrate made visible). Pure CPU — safe under headless.
+func to_soil_image() -> Image:
+	var img := Image.create(width, height, false, Image.FORMAT_RGBF)
+	for y in height:
+		for x in width:
+			var i := y * width + x
+			img.set_pixel(x, y, Color(soil_moisture[i], soil_nutrients[i], soil_ph[i]))
 	return img

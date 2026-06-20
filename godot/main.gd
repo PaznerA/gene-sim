@@ -29,7 +29,7 @@ const Organisms := preload("res://organisms.gd")
 const Lsystem := preload("res://lsystem.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
-const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness"]
+const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
 # The 5 species-genome traits, in canonical order (matches the core's Trait::ALL). Iterate THIS, never the
 # specimens.json Dictionary's keys, so the readout order is stable (inv #3 hygiene, even in UI).
 const TRAIT_KEYS := ["growth_rate", "reflectance", "drought_tolerance", "fecundity", "kill_switch_linkage"]
@@ -1016,7 +1016,9 @@ func _update_overlay(snap) -> void:
 	_overlay.scale = Vector2(_cell, _cell)
 	var mat := _overlay.material as ShaderMaterial
 	if mat != null:
-		mat.set_shader_parameter("layer", _overlay_mode - 1)  # 0 density / 1 allele_freq / 2 fitness
+		# layer 0..2 sample the population texture; 3..5 sample the soil texture (R1.0 made visible).
+		mat.set_shader_parameter("layer", _overlay_mode - 1)
+		mat.set_shader_parameter("soil_tex", ImageTexture.create_from_image(snap.to_soil_image()))
 
 
 func _refresh_hud() -> void:

@@ -5,9 +5,12 @@ shader_type canvas_item;
 // field. INVARIANT #2: this only VISUALISES values the core already computed; it does no biology.
 // The sprite uses NEAREST filtering so each texel renders as one crisp cell block.
 
-uniform int layer = 0;          // 0 = density, 1 = allele_freq, 2 = fitness
+// layer: 0 density, 1 allele_freq, 2 fitness (sampled from TEXTURE);
+//        3 soil_moisture, 4 soil_nutrients, 5 soil_ph (sampled from soil_tex).
+uniform int layer = 0;
+uniform sampler2D soil_tex : filter_nearest;  // R=moisture G=nutrients B=pH (the R1.0 soil field)
 uniform float opacity = 0.78;   // overall overlay strength
-uniform float alpha_gamma = 1.6;  // >1 fades low values further toward transparent (smoother heat read)
+uniform float alpha_gamma = 1.6;  // >1 fades low population values further toward transparent
 
 vec3 inferno(float t) {
 	vec3 c0 = vec3(0.05, 0.03, 0.15);  // deep indigo
@@ -26,16 +29,19 @@ vec3 inferno(float t) {
 }
 
 void fragment() {
-	vec3 d = texture(TEXTURE, UV).rgb;
-	float v = d.r;
-	if (layer == 1) {
-		v = d.g;
-	} else if (layer == 2) {
-		v = d.b;
-	}
+	bool is_soil = layer >= 3;
+	vec3 d = is_soil ? texture(soil_tex, UV).rgb : texture(TEXTURE, UV).rgb;
+	int ch = is_soil ? layer - 3 : layer;
+	float v = ch == 1 ? d.g : (ch == 2 ? d.b : d.r);
 	v = clamp(v, 0.0, 1.0);
-	// Colour uses the raw value (inferno mapping is byte-identical); only ALPHA is shaped by the gamma curve.
-	float shaped = pow(v, alpha_gamma);
-	float a = v <= 0.0 ? 0.0 : (0.16 + 0.64 * shaped) * opacity;
+
+	float a;
+	if (is_soil) {
+		// Soil is a FULL field (every cell) — uniform alpha, value shown via colour.
+		a = 0.7 * opacity;
+	} else {
+		// Population is SPARSE — fade low/empty cells toward transparent (gamma-shaped).
+		a = v <= 0.0 ? 0.0 : (0.16 + 0.64 * pow(v, alpha_gamma)) * opacity;
+	}
 	COLOR = vec4(inferno(v), a);
 }
