@@ -447,6 +447,16 @@ func _build_scene() -> void:
 	_build_interaction_ui(ui)
 	_build_timeline(ui)
 	_build_intervention_ui(ui)
+	# --live was requested but the LiveSim cdylib failed to load → show why (we fell back to file replay).
+	if _has_flag("--live") and _live == null:
+		var np := _dark_panel(0.82)
+		np.position = Vector2(238, 46)
+		var notice := Label.new()
+		notice.text = "⚠  --live needs the LiveSim cdylib — build it:\n   cargo build --manifest-path crates/godot-sim/Cargo.toml\n   (showing file replay for now)"
+		notice.add_theme_color_override("font_color", Color(0.98, 0.8, 0.4))
+		notice.add_theme_font_size_override("font_size", 13)
+		np.add_child(notice)
+		ui.add_child(np)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
