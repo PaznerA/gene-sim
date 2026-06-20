@@ -21,7 +21,7 @@ extends Node2D
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
 ##
 ## Keys (windowed): Space pause · V toggle ecosystem/specimen · Tab cycle specimen · D cycle layer ·
-##   ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
+##   S toggle plant sprites/dots · ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
 ## Mouse (windowed): drag = pan · hover = cell/plant tooltip · click = pin detail (cell stats + genome
 ##   ontology in ecosystem; focus + detail a plant in specimen).
 
@@ -1380,6 +1380,9 @@ func _unhandled_input(event: InputEvent) -> void:
 				if _layer_picker != null:
 					_layer_picker.selected = _overlay_mode
 				_show(_idx)
+		KEY_S:
+			if _view_mode == 0 and _organisms != null:  # toggle trait-driven plant sprites vs plain dots
+				_organisms.set_sprites_on(not _organisms._sprites_on)
 		KEY_PERIOD:
 			_paused = true
 			_show((_idx + 1) % _snaps.size())
