@@ -27,6 +27,7 @@ extends Node2D
 const SnapshotReader := preload("res://snapshot.gd")
 const Organisms := preload("res://organisms.gd")
 const Lsystem := preload("res://lsystem.gd")
+const Timeline := preload("res://timeline.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
@@ -77,6 +78,7 @@ var _gen_slider: HSlider
 var _gen_label: Label
 var _frame_seconds: float = FRAME_SECONDS  # runtime playback interval (the speed slider mutates this)
 var _syncing: bool = false  # re-entrancy guard so programmatic widget updates don't recurse via signals
+var _timeline: Control  # full-width bottom generation timeline (timeline.gd)
 var _tooltip: PanelContainer
 var _tooltip_label: Label
 var _detail_panel: PanelContainer
@@ -232,6 +234,7 @@ func _build_scene() -> void:
 	_build_controls(ui, _field_px)
 	_build_specimen_ui(ui, _field_px)
 	_build_interaction_ui(ui)
+	_build_timeline(ui)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
@@ -524,6 +527,8 @@ func _sync_controls() -> void:
 		_next_button.disabled = not eco
 	if _speed_slider != null:
 		_speed_slider.editable = eco
+	if _timeline != null:
+		_timeline.set_index(_idx)
 	_sync_scope_buttons()
 	_syncing = false
 
@@ -579,6 +584,8 @@ func _set_view_mode(m: int) -> void:
 		_detail_panel.visible = false  # clear stale inspection on view switch
 	if _tooltip != null:
 		_tooltip.visible = false
+	if _timeline != null:
+		_timeline.visible = (m == 0)  # the timeline indexes snapshots, irrelevant in specimen view
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
@@ -875,6 +882,30 @@ func _build_interaction_ui(ui: CanvasLayer) -> void:
 	_detail_box.add_theme_constant_override("separation", 3)
 	_detail_panel.add_child(_detail_box)
 	ui.add_child(_detail_panel)
+
+
+## Full-width bottom timeline: generation axis + play-head + click-to-seek (timeline.gd).
+func _build_timeline(ui: CanvasLayer) -> void:
+	_timeline = Timeline.new()
+	_timeline.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+	_timeline.offset_left = 8
+	_timeline.offset_right = -8
+	_timeline.offset_top = -54
+	_timeline.offset_bottom = -6
+	_timeline.seek.connect(_on_timeline_seek)
+	ui.add_child(_timeline)
+	var gens: Array = []
+	for s in _snaps:
+		gens.append(s.generation)
+	_timeline.setup(gens)
+
+
+func _on_timeline_seek(i: int) -> void:
+	if _view_mode != 0 or _snaps.is_empty():
+		return
+	_paused = true
+	_update_play_button()
+	_show(i)
 
 
 ## A reusable translucent rounded panel (used by the tooltip + detail panel).
