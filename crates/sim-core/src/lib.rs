@@ -86,11 +86,12 @@ struct GenomeRes(Genome);
 #[derive(Resource)]
 struct BaseGrowthRate(f64);
 
-/// The field-wide mean soil sample (R1.1 **global** coupling): the per-run scalar the
-/// [`EnvironmentModifier`](soil::EnvironmentModifier) feeds each individual's heritable drought tolerance.
-/// Held as a resource so [`selection`] reads it without owning the whole [`SoilField`](soil::SoilField).
+/// The static per-cell soil field as a resource (ADR-011 S-G): LOCAL soil-coupled selection samples each
+/// organism's OWN cell ([`soil::SoilField::sample_at`]) instead of a field-wide mean, so drought-tolerant
+/// lineages are favored in arid cells — real spatial selection. No `SimRng` draw (off the hash path beyond
+/// its coupling effect on per-individual fitness). Supersedes the R1.1 global `MeanSoil` coupling.
 #[derive(Resource)]
-struct MeanSoil(soil::SoilSample);
+struct SoilFieldRes(soil::SoilField);
 
 /// Stable per-organism id (0..entity_count), assigned at spawn. Gives a deterministic hash order
 /// independent of ECS query/archetype iteration order.
@@ -204,7 +205,7 @@ fn fitness(base: f64, genotype: f64) -> f64 {
 fn selection(
     mut rng: ResMut<SimRng>,
     base: Res<BaseGrowthRate>,
-    mean_soil: Res<MeanSoil>,
+    soil_field: Res<SoilFieldRes>,
     mut q: Query<(&OrgId, &mut Genotype, &mut DroughtTol, &mut Position)>,
 ) {
     use soil::EnvironmentModifier as _;
@@ -221,13 +222,14 @@ fn selection(
     }
     parents.sort_unstable_by_key(|p| p.0);
 
-    // Cumulative weights = base fitness × the soil-coupled environment factor (R1.1). The factor is
-    // strictly positive, so weights stay positive (ADR-005 no-extinction). Deterministic: mean_soil is a
-    // per-run constant and drought is per-parent; no RNG and no HashMap here.
+    // Weights = base fitness × the environment factor of the parent's OWN cell soil (ADR-011 S-G local
+    // coupling): an arid cell penalises drought-intolerant parents, so lineages adapt to their region. The
+    // factor stays strictly positive (ADR-005 no-extinction). Deterministic: sample_at is RNG-free, no HashMap.
     let mut cumulative: Vec<f64> = Vec::with_capacity(parents.len());
     let mut total = 0.0;
-    for &(_, g, d, _, _) in &parents {
-        total += fitness(base.0, g) * modifier.fitness_factor(mean_soil.0, d);
+    for &(_, g, d, x, y) in &parents {
+        let local_soil = soil_field.0.sample_at(x, y);
+        total += fitness(base.0, g) * modifier.fitness_factor(local_soil, d);
         cumulative.push(total);
     }
 
@@ -342,7 +344,6 @@ impl Simulation {
 
         // Static soil substrate, generated purely from the seed via derive_seed — ZERO SimRng draws (R1.0).
         let soil = soil::SoilField::generate(config.seed, soil::SOIL_DIMS.0, soil::SOIL_DIMS.1);
-        let mean_soil = soil.mean_sample();
 
         for i in 0..config.entity_count {
             // Per-individual genotype in [0,1] seeded from the single RNG so individuals VARY (the standing
@@ -367,7 +368,7 @@ impl Simulation {
         world.insert_resource(Tick::default());
         world.insert_resource(GenomeRes(genome));
         world.insert_resource(BaseGrowthRate(base_growth));
-        world.insert_resource(MeanSoil(mean_soil));
+        world.insert_resource(SoilFieldRes(soil.clone())); // per-cell source for LOCAL coupling (ADR-011 S-G)
 
         let mut schedule = Schedule::default();
         // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
@@ -670,15 +671,16 @@ mod tests {
         // reproducible-but-CHANGED hash — this guards that. The literal MUST change deliberately (in the same
         // commit) whenever real sim LOGIC changes; history: `c530…7ab1` pre-soil and through R1.0 (proving
         // soil was hash-neutral); `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
-        // soil-coupled selection); `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded into the
-        // hash); now `0413…ce77` after ADR-011 S-B (inherited dispersal adds one `next_u64`/offspring, so the
-        // selection loop draws 2N/gen instead of N — a legitimate stream reshape).
+        // soil-coupled selection); `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded in);
+        // `0413…ce77` after ADR-011 S-B (inherited dispersal adds one `next_u64`/offspring → 2N draws/gen);
+        // now `c01e…e40e` after ADR-011 S-G (LOCAL soil coupling — each parent's OWN cell soil, not the
+        // field mean, weights selection: same draw count, shifted trajectory).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x0413_3877_4dd7_ce77);
+        assert_eq!(run_headless(&cfg).hash, 0xc01e_1069_087c_e40e);
     }
 
     #[test]
@@ -733,38 +735,79 @@ mod tests {
         );
     }
 
-    fn mean_drought(world: &mut World) -> f64 {
-        let mut sum = 0.0;
-        let mut n = 0u32;
-        for d in world.query::<&DroughtTol>().iter(world) {
-            sum += d.0;
-            n += 1;
+    #[test]
+    fn local_soil_selection_adapts_drought_to_cell() {
+        // ADR-011 S-G (local coupling): organisms in the DRIEST cells evolve higher drought tolerance than
+        // those in the WETTEST cells (the modifier favors drought ≈ 1 - moisture per cell). After enough
+        // generations the driest-quartile mean drought exceeds the wettest-quartile mean — real spatial selection.
+        let cfg = SimConfig {
+            seed: 555,
+            generations: 150,
+            entity_count: 1200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let cells: Vec<(u32, u32, f64)> = sim
+            .world
+            .query::<(&Position, &DroughtTol)>()
+            .iter(&sim.world)
+            .map(|(p, d)| (p.x, p.y, d.0))
+            .collect();
+        // Pair each organism's drought with its cell moisture, then split into moisture quartiles.
+        let soil = &sim.world.resource::<SoilFieldRes>().0;
+        let mut md: Vec<(f64, f64)> = cells
+            .iter()
+            .map(|(x, y, d)| (soil.sample_at(*x, *y).moisture, *d))
+            .collect();
+        md.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let q = md.len() / 4;
+        assert!(q > 0, "need organisms to compare");
+        let mean = |s: &[(f64, f64)]| s.iter().map(|x| x.1).sum::<f64>() / s.len() as f64;
+        let driest = mean(&md[..q]);
+        let wettest = mean(&md[md.len() - q..]);
+        assert!(
+            driest > wettest,
+            "local coupling should raise drought tolerance in dry cells: driest {driest:.3} vs wettest {wettest:.3}"
+        );
+    }
+
+    /// Mean over organisms of |drought − (1 − local_moisture)| — how far the population is from its LOCAL
+    /// per-cell drought target. Drops as local-coupled selection adapts each lineage to its cell (ADR-011 S-G).
+    fn mean_local_mismatch(sim: &mut Simulation) -> f64 {
+        let cells: Vec<(u32, u32, f64)> = sim
+            .world
+            .query::<(&Position, &DroughtTol)>()
+            .iter(&sim.world)
+            .map(|(p, d)| (p.x, p.y, d.0))
+            .collect();
+        if cells.is_empty() {
+            return 0.0;
         }
-        if n == 0 {
-            0.0
-        } else {
-            sum / f64::from(n)
-        }
+        let soil = &sim.world.resource::<SoilFieldRes>().0;
+        let sum: f64 = cells
+            .iter()
+            .map(|(x, y, d)| (d - (1.0 - soil.sample_at(*x, *y).moisture)).abs())
+            .sum();
+        sum / cells.len() as f64
     }
 
     #[test]
-    fn soil_coupling_drives_drought_toward_terrain() {
-        // The mean soil moisture sets the selective target (1 - moisture). From a neutral ~0.5 start, after
-        // enough generations the population's mean drought tolerance moves TOWARD that target — proving soil
-        // now drives selection (R1.1). Deterministic.
+    fn local_soil_coupling_reduces_drought_mismatch() {
+        // ADR-011 S-G: each cell's soil sets a LOCAL drought target (1 - moisture). From a neutral ~0.5 start,
+        // local-coupled selection moves the population CLOSER to its per-cell targets — the mean local mismatch
+        // shrinks over generations (the population-level proof local coupling drives selection). Deterministic.
         let cfg = SimConfig {
             seed: 12345,
             generations: 400,
             entity_count: 1500,
         };
         let mut sim = Simulation::reset(&cfg);
-        let target = 1.0 - sim.soil.mean_sample().moisture;
-        let start = mean_drought(&mut sim.world);
+        let start = mean_local_mismatch(&mut sim);
         sim.step(cfg.generations);
-        let end = mean_drought(&mut sim.world);
+        let end = mean_local_mismatch(&mut sim);
         assert!(
-            (end - target).abs() < (start - target).abs(),
-            "mean drought should move toward terrain target {target}: start {start}, end {end}"
+            end < start,
+            "local coupling should shrink the per-cell drought mismatch: start {start:.3}, end {end:.3}"
         );
     }
 

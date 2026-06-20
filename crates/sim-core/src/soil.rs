@@ -105,6 +105,21 @@ impl SoilField {
         let idx = (sy * u64::from(self.width) + sx) as usize;
         self.channel(ch)[idx]
     }
+
+    /// The [`SoilSample`] at world cell `(x, y)`, clamped to the field — for LOCAL soil-coupled selection
+    /// (ADR-011 S-G): an organism reads the soil of the cell it occupies, not the field-wide mean. No RNG draw
+    /// (off the hash path beyond its coupling effect on per-individual fitness). World grid == field dims (1:1).
+    #[must_use]
+    pub fn sample_at(&self, x: u32, y: u32) -> SoilSample {
+        let cx = x.min(self.width - 1) as usize;
+        let cy = y.min(self.height - 1) as usize;
+        let idx = cy * self.width as usize + cx;
+        SoilSample {
+            moisture: f64::from(self.moisture[idx]),
+            nutrients: f64::from(self.nutrients[idx]),
+            ph: f64::from(self.ph[idx]),
+        }
+    }
 }
 
 /// Build one bilinearly-interpolated channel from a seed-derived control lattice. Determinism: control
