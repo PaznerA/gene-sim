@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Pinned minor (ADR/DECISIONS). Installed via Homebrew cask (cask symlinks the CLI to `godot`).
-GODOT_PIN="${GODOT_PIN:-4.7}"
+GODOT_PIN="${GODOT_PIN:-4.6}"  # repinned 4.7→4.6 for stable gdext api-4-6 (ADR-010, live-sim epic)
 
 if ! command -v godot >/dev/null 2>&1; then
   echo ">> installing Godot via Homebrew cask…"

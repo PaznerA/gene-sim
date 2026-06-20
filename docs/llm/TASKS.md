@@ -146,6 +146,33 @@
 (unblocks live intervention) → R5 → R3 (keystone) → R4 (editor) → R7/R8 (UX/visual, ongoing). Re-plan after R1
 sign-off; each core epic gets its own design workflow + ADR before code.
 
+### Gameplay batch — sequenced phases (P0–P8; multi-agent designed + adversarially vetted; ADR-010 signed off)
+Maps R5/R6/R3/R7/R8 to gateable phases. Live-sim = **Option A: a `crates/godot-sim` gdext GDExtension** over
+the (already stepwise + edit-able) `sim-core`/`GeneSimEnv`; determinism via the existing `actions.ndjson`
+replay contract; **Godot repinned 4.7→4.6** for stable gdext api-4-6 (ADR-010). Renderer phases (P2/P3/P8) are
+hash-neutral and ride the normal loop *while* the live-sim crate is built.
+- [x] **P0** Decision gate: ADR-010 (Option A + repin 4.6 + replay-equality determinism + `run_stats()`
+  clone-fold + integer cadence). ✅ DONE (signed off; pin docs updated).
+- [ ] 🛑 **P1 (R6.0)** `crates/godot-sim` gdext cdylib: `LiveSim` reset/step/observe/snapshot + action journal;
+  `harness --replay <dir>`. Gate-blocking proof = **pure-Rust replay-equality** test (no Godot); gdext smoke
+  skip-if-absent. *Needs Godot 4.6 installed.*
+- [ ] **P2 (R5-viz, renderer)** Injection markers on the existing `timeline.gd` + a harness path that writes
+  `actions.ndjson` + injection generations to a real run dir (today only replay temp dirs).
+- [ ] **P3 (R8-iso, renderer)** Isometric transform (`iso.gd`: CPU diamonds, depth `cx+cy`) + iso ground/soil
+  + framing fix + centralize cell↔pixel picking, behind a `--iso` toggle (orthographic stays default).
+- [ ] 🛑 **P4 (R6.1)** `LiveSim.apply_edit` + full journaling + `save_session`; **`run_stats()` clone-fold fix**
+  (the load-bearing determinism tripwire). Manual-intervention path proven reproducible headless.
+- [ ] 🛑 **P5 (R6.2)** Renderer `--live` mode: open-ended play/pause/step pulling snapshots from `LiveSim` at a
+  deterministic integer cadence; auto-extending timeline.
+- [ ] **P6 (R5)** Manual CRISPR intervention UI (`intervention.gd`: Cas/locus/guide/when pickers) → `LiveSim.
+  apply_edit`; Applied/Failed markers + per-gen sparkline on the timeline. Renderer requests, core applies (#2/#6).
+- [ ] 🛑 **P7 (R3)** Multi-species KEYSTONE — own design workflow + ADR. M0 `SpeciesId` plumbing K=1
+  hash-neutral; M1 K>1 (new hash literal, perf re-baseline, ordered-by-`SpeciesId` parents, specimen-view GRID,
+  GSS2→GSS3). Resolve the R1.2/R1.3-vs-R3 `selection()` rewrite collision first.
+- [ ] **P8 (R8+, renderer)** Trait-driven sprites (`sprite_gen.gd`, baked via `_plant_params_from_traits`),
+  density instancing (MultiMesh), soil-aware tint; dots demoted to a small secondary marker. Per-species
+  variety unblocked by P7.
+
 ---
 
 ## FOLLOW-UPS / TECH DEBT (non-blocking; pick up when convenient)

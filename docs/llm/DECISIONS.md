@@ -23,7 +23,7 @@
 | `tskit` / `pyslim` / `numpy` | **1.0.3 / 1.1.1 / 2.4.6** | installed (Stage 2, S2.3) | `.trees` read-back + stats. MIT / MIT / BSD. |
 | `msprime` | **1.4.2** | installed, optional | **GPL-3** — used ONLY by standalone analysis scripts (separate process, never linked); same pattern as the SLiM subprocess, so invariant #1 is unaffected. Optional (neutral-mutation overlay, S2.4). |
 | `pyarrow` | **24.0.0** | installed (Stage 3, S3.3) | Apache-2.0 — columnar Parquet for batch analytics (SPEC §5). Analysis-only (separate process), never linked. |
-| Godot | **4.7** (4.7.stable.official, commit `5b4e0cb0`) | **installed (Stage 4, S4.1)** | Thin 2D UI, built LAST (inv. #4); `tools/install_godot.sh`; `godot` on PATH (brew cask). GDScript reads snapshots only (inv. #2). |
+| Godot | **4.6** (repinned from 4.7 — ADR-010, for stable gdext api-4-6) | repin pending 4.6 install (dev still on 4.7) | Thin 2D UI, built LAST (inv. #4); `tools/install_godot.sh` (GODOT_PIN 4.6). Repinned so the `godot-sim` gdext cdylib targets a *released* gdext api level (inv #7). Renderer uses no 4.7-only API → runs on 4.6/4.7. |
 
 > Rows marked "NOT yet …" record the **intended** pin; the exact tag/minor is confirmed and the Status
 > flipped in the slice that installs the tool (S2.1 for SLiM, S4.1 for Godot). Bevy/RNG/Rust rows below
@@ -351,6 +351,58 @@ ADR-005's constant-N Wright-Fisher or determinism (#3).
 - **−** Coupling is **global/non-spatial** (mean soil) — "weak-but-real". Spatial selection (a per-cell
   `soil_factor` via a `Cell` component, offspring inheriting the sampled parent's cell) is R1.2; full local
   Wright-Fisher + dispersal is R1.3 (the target), each a further ADR-005 change.
+
+---
+
+## ADR-010 — Live-sim driving via a gdext GDExtension; repin Godot 4.7→4.6 (roadmap R6/R5, P0 decision gate)
+
+- **Date:** 2026-06-20
+- **Status:** Accepted (human signed off)
+- **Stage:** Roadmap R6/R5 (P0). Multi-agent designed + adversarially vetted. **Touches inv #2/#3/#4/#7.**
+
+### Context
+The gameplay batch needs a LIVE, continuous, interactively-editable sim (open-ended run + manual CRISPR
+interventions). Today the renderer only replays offline snapshot files. A design workflow weighed (A) a Rust
+GDExtension embedding sim-core, (B) an IPC/subprocess server, (C) file-tailing. The crux is *largely
+pre-solved*: `sim-core::Simulation` is already stepwise/single-seeded/edit-able and `harness::GeneSimEnv` +
+`replay.rs` already give a `reset/step/apply_edit/observe` surface with a `seed.json`+`actions.ndjson` replay
+contract. Adversarial vetting found that **stable godot-rust (gdext) supports Godot api 4.2–4.6 only**, while
+we pinned **4.7** — a stop-the-line pin conflict.
+
+### Decision
+- **Option A:** a new workspace crate `crates/godot-sim` (gdext **cdylib**) embedding `sim-core` (+ `harness`,
+  `crispr`, `genome`) that registers ONE node `LiveSim` exposing `reset(seed)`, `step(n)`,
+  `apply_edit(cas,target,guide)`, `observe()`, `snapshot(w,h)->PackedByteArray` (GSS2 bytes — reuses the
+  existing `snapshot.gd`/shader), `save_session(dir)`. GDScript only **calls** these → all biology stays in
+  Rust (inv #2 safe; the violation would be biology *written in* GDScript). Reject B (most build cost, no
+  benefit) and C (worst fit for interactive edits). gdext is **MPL-2.0** — `scripts/check_license.sh` already
+  anticipates it; the cdylib is a separate link unit so inv #1 (GPL boundary) is untouched.
+- **Repin Godot 4.7 → 4.6** (the human's choice over forward-compat or a git-pinned gdext rev): build the
+  cdylib against gdext **api-4-6** and run the project in Godot **4.6** — a clean, *released* gdext target
+  (preserves inv #7 pin discipline). The renderer uses no 4.7-specific API, so this is safe; the GDScript
+  gate runs on whatever `godot` is installed. `tools/install_godot.sh` GODOT_PIN→4.6; `project.godot`
+  `config/features` migrates to "4.6" when first opened in 4.6.
+- **Determinism (inv #3):** proven by **replay-equality**, NOT a second cdylib hash literal (avoid a second
+  platform-pinned hash across link units). `LiveSim` journals `reset`+`Advance(n)`+`ApplyEdit` in call order;
+  `save_session` writes `seed.json`+`actions.ndjson` via `record_episode`'s shape; `harness::replay`
+  reproduces the live session's hash bit-identically. The gate-blocking proof is a **pure-Rust** replay test
+  (no Godot needed); the gdext/Godot smoke is skip-if-absent + skip-if-dylib-unbuilt.
+- **`run_stats()` impurity fix (must-do, inv #3):** `hash_world` draws a final `rng.next_u64()`, so a mid-run
+  `save_session` would desync replay. Mitigation: **clone the `ChaCha8Rng`, fold for the hash, discard** — a
+  hash read never advances the single stream.
+- **Cadence (inv #3):** the open-ended play loop advances a **fixed integer N generations/tick** (speed =
+  integer multiplier), NEVER delta/wall-clock, so the journaled `Advance(n)` sum reproduces.
+- **Sessions auto-journal** to `data/runs/<id>/` for the reproducibility story.
+
+### Consequences
+- **+** Live/continuous + interactive edits with full determinism via the existing replay contract; near-total
+  renderer reuse (snapshot bytes); the hard part (stepwise edit-able core) already exists + is headless-gated.
+- **+** Renderer-only work (timeline markers, isometric, sprites) is hash-neutral and rides the normal loop
+  *while* the live-sim crate is built — visible gameplay unblocked early.
+- **−** Repinning to Godot 4.6 means installing 4.6 before building/using the live-sim crate (P1+); the
+  renderer keeps working on the currently-installed 4.7 in the meantime.
+- **−** Multi-species (R3) is sequenced AFTER the live seam + intervention (it rewrites the same `selection()`
+  loop as R1.2/R1.3 spatial — doing it first means rewriting selection twice); it gets its own design workflow.
 
 ---
 

@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Gameplay batch P0 — live-sim architecture decision (ADR-010; multi-agent designed, signed off)
+Decision gate (no code) for the live/continuous-sim + interventions + multi-species + isometric batch:
+- **Architecture (signed off):** Option A — a `crates/godot-sim` **gdext GDExtension** embedding the
+  already-stepwise/edit-able `sim-core`/`harness::GeneSimEnv`, exposing a `LiveSim` node
+  (reset/step/apply_edit/observe/snapshot/save_session). GDScript only *calls* it → biology stays in Rust
+  (inv #2). Determinism via the existing `actions.ndjson` replay contract (replay-equality, not a 2nd hash
+  literal); a pure-Rust replay test is the gate-blocking proof. The `run_stats()` RNG-draw impurity gets a
+  clone-fold fix; the play loop uses a fixed integer generations/tick cadence.
+- **Repin Godot 4.7→4.6** (`tools/install_godot.sh`, DECISIONS) so the cdylib targets stable gdext **api-4-6**
+  (inv #7); the renderer uses no 4.7-only API. gdext is MPL-2.0 (license gate unaffected; cdylib is a separate
+  link unit → inv #1 GPL boundary intact).
+- Sequenced into phases **P0–P8** (TASKS §Gameplay batch): renderer phases (timeline markers, isometric,
+  sprites) ride the normal loop hash-neutrally while the live-sim crate is built; multi-species (P7) is
+  sequenced last (it rewrites the same `selection()` as R1.2/R1.3). ADR-010.
+
 ### R1.0a + R1.1 — soil-coupled selection: terrain shapes evolution (feat, roadmap R1)
 The terrain stops being inert — it now drives selection (extends ADR-005):
 - **R1.0a:** a per-organism heritable `DroughtTol(f64)` ECS component — standing variation seeded once at
