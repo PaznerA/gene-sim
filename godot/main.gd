@@ -21,7 +21,10 @@ extends Node2D
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
 ##
 ## Keys (windowed): Space pause · V toggle ecosystem/specimen · Tab cycle specimen · D cycle layer ·
-##   S toggle plant sprites/dots · ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
+##   S toggle plant sprites/dots · B toggle selective edit brush (live) · [ / ] brush radius ·
+##   ,/. step · 1/2/3 zoom scope · wheel zoom (brush: wheel = radius) · arrows pan.
+## Brush (live, ADR-011): with B on, hover paints a disc on the map; click applies a CRISPR edit to ONLY the
+##   organisms in that region (LiveSim.apply_edit_region) using the intervention panel's Cas/locus/guide.
 ## Mouse (windowed): drag = pan · hover = cell/plant tooltip · click = pin detail (cell stats + genome
 ##   ontology in ecosystem; focus + detail a plant in specimen).
 
@@ -34,6 +37,7 @@ const Timeline := preload("res://timeline.gd")
 const Iso := preload("res://iso.gd")
 const IsoGround := preload("res://iso_ground.gd")
 const Sparkline := preload("res://sparkline.gd")
+const Brush := preload("res://brush.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
@@ -47,7 +51,8 @@ const SCOPES := [{"name": "field", "zoom": 1.0}, {"name": "patch", "zoom": 2.6},
 const ZOOM_MIN := 0.6
 const ZOOM_MAX := 12.0
 # --live (P5): drive the sim live via the LiveSim gdext node instead of replaying snapshot files.
-const LIVE_GRID := Vector2i(48, 48)  # snapshot grid pulled from LiveSim each tick
+const LIVE_GRID := Vector2i(32, 32)  # snapshot grid pulled from LiveSim each tick (== the core world grid, so
+# a render cell maps 1:1 to a world cell — the selective brush picks world cells directly, ADR-011 S-F)
 const LIVE_STEP := 1  # generations advanced per tick (a FIXED integer — deterministic cadence, inv #3)
 const LIVE_HISTORY := 150  # rolling snapshot buffer kept for the timeline / scrubbing
 
@@ -104,6 +109,11 @@ var _inject_status: Label
 var _cas_ids: Array = []  # cas variant id per _cas_picker item
 var _locus_ids: Array = []  # locus id per _locus_picker item
 var _injections: Array = []  # [{generation, applied}] for the timeline markers
+var _brush: Node2D  # selective-edit brush overlay (ADR-011 S-F)
+var _brush_on: bool = false  # brush mode active (paint region edits) vs normal pan/inspect
+var _brush_radius: int = 4  # brush disc radius in world cells
+var _brush_cell: Vector2i = Vector2i(-1, -1)  # hovered world cell
+var _brush_button: Button
 var _seed: int = 42  # active master seed (from --seed; New-run/Restart rebind it)
 var _restart_button: Button
 var _newrun_button: Button
@@ -186,6 +196,14 @@ func _ready() -> void:
 		_live.step(20)
 		_live_advance()
 		_on_inject_pressed()
+	if _live != null and _has_flag("--brush"):  # optional: show + fire one demo brush stroke for --shot
+		_live.step(20)
+		_live_advance()
+		_set_brush_mode(true)
+		_brush_cell = Vector2i(LIVE_GRID.x / 2, LIVE_GRID.y / 2)
+		_brush_radius = 6
+		_brush.set_brush(_brush_cell, _brush_radius)
+		_apply_brush()
 	if _arg_value("--view") == "specimen":  # optional: open the L-system specimen view for --shot
 		_set_view_mode(1)
 		var focus_arg := _arg_value("--focus")  # optional: focus a specific specimen (0=baseline, 1..=edits)
@@ -341,10 +359,19 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 	r3.add_child(_guide_edit)
 	col.add_child(r3)
 
+	var btns := HBoxContainer.new()
+	btns.add_theme_constant_override("separation", 6)
+	col.add_child(btns)
 	var inject := Button.new()
-	inject.text = "Inject edit"
+	inject.text = "Inject (whole species)"
 	inject.pressed.connect(_on_inject_pressed)
-	col.add_child(inject)
+	btns.add_child(inject)
+	_brush_button = Button.new()
+	_brush_button.text = "🖌 Brush: off"
+	_brush_button.toggle_mode = true
+	_brush_button.tooltip_text = "Paint a region edit on the map (key B); wheel = radius"
+	_brush_button.toggled.connect(_on_brush_toggled)
+	btns.add_child(_brush_button)
 
 	_inject_status = _dim_label("")
 	_inject_status.custom_minimum_size = Vector2(250, 0)
@@ -370,7 +397,12 @@ func _on_inject_pressed() -> void:
 		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
-	var outcome: Dictionary = _live.apply_edit(cas_id, locus_id, _guide_edit.text)
+	_record_edit_outcome(_live.apply_edit(cas_id, locus_id, _guide_edit.text))
+
+
+## Show an edit outcome (whole-species or region) in the status line + drop a timeline marker. Shared by the
+## "Inject" button and the selective brush.
+func _record_edit_outcome(outcome: Dictionary) -> void:
 	var applied := bool(outcome.get("applied", false))
 	_inject_status.text = ("✓ " if applied else "✗ ") + str(outcome.get("detail", ""))
 	_inject_status.add_theme_color_override(
@@ -378,6 +410,45 @@ func _on_inject_pressed() -> void:
 	_injections.append({"generation": int(outcome.get("generation", 0)), "applied": applied})
 	if _timeline != null:
 		_timeline.set_markers(_injections)
+
+
+## Toggle the selective brush mode (key B / the panel button). Live-mode only; clears the overlay when off.
+func _set_brush_mode(on: bool) -> void:
+	_brush_on = on and _live != null
+	if _brush_button != null:
+		_brush_button.set_pressed_no_signal(_brush_on)
+		_brush_button.text = "🖌 Brush: on" if _brush_on else "🖌 Brush: off"
+	if _brush != null and not _brush_on:
+		_brush.clear()
+
+
+func _on_brush_toggled(pressed: bool) -> void:
+	_set_brush_mode(pressed)
+
+
+## Apply a region-scoped edit centred on the current brush cell, using the panel's Cas/locus/guide selection.
+func _apply_brush() -> void:
+	if _live == null or _brush_cell.x < 0 or _cas_picker.selected < 0 or _locus_picker.selected < 0:
+		return
+	var cas_id := int(_cas_ids[_cas_picker.selected])
+	var locus_id := int(_locus_ids[_locus_picker.selected])
+	_record_edit_outcome(_live.apply_edit_region(
+		cas_id, locus_id, _guide_edit.text, _brush_cell.x, _brush_cell.y, _brush_radius))
+
+
+## Update the hovered brush cell from the mouse (world → cell, clamped to the world/live grid) + refresh preview.
+func _update_brush_cell() -> void:
+	if _brush == null:
+		return
+	var cc := _cell_at(get_global_mouse_position())
+	_brush_cell = Vector2i(clampi(cc.x, 0, LIVE_GRID.x - 1), clampi(cc.y, 0, LIVE_GRID.y - 1))
+	_brush.set_brush(_brush_cell, _brush_radius)
+
+
+func _set_brush_radius(r: int) -> void:
+	_brush_radius = clampi(r, 1, 16)
+	if _brush != null and _brush_cell.x >= 0:
+		_brush.set_brush(_brush_cell, _brush_radius)
 
 
 # ──────────────────────────── scene construction (read-only presentation) ────────────────────────────
@@ -420,6 +491,11 @@ func _build_scene() -> void:
 	_organisms = Organisms.new()
 	_organisms.set_iso(_iso)
 	_world.add_child(_organisms)
+
+	# Selective-edit brush overlay (drawn above organisms, in world space). Only used in --live mode.
+	_brush = Brush.new()
+	_brush.setup(_iso, _cell, LIVE_GRID)
+	_world.add_child(_brush)
 
 	# L-system specimen view (S4.5) — hidden until toggled.
 	_specimen_root = Node2D.new()
@@ -987,6 +1063,8 @@ func _set_view_mode(m: int) -> void:
 		_intervention_panel.visible = (_live != null and m == 0)
 	if _vitals_panel != null:
 		_vitals_panel.visible = (m == 0)
+		if m != 0:
+			_set_brush_mode(false)  # the brush only makes sense in the ecosystem view
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
@@ -1543,7 +1621,16 @@ func _advance() -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
-		# Wheel = continuous zoom; left button = drag-pan / click-to-inspect.
+		# Brush mode: wheel = brush radius, left-click = paint a region edit. Else wheel = zoom, click = inspect.
+		if _brush_on:
+			if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
+				_set_brush_radius(_brush_radius + 1)
+			elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
+				_set_brush_radius(_brush_radius - 1)
+			elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
+				_update_brush_cell()
+				_apply_brush()
+			return
 		if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
 			_set_zoom(_cam.zoom.x * 1.15)
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
@@ -1559,6 +1646,11 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 
 	if event is InputEventMouseMotion:
+		if _brush_on:
+			_update_brush_cell()  # follow the cursor with the brush preview
+			if _tooltip != null:
+				_tooltip.visible = false
+			return
 		if _dragging and (event.button_mask & MOUSE_BUTTON_MASK_LEFT):
 			_cam.position -= event.relative / _cam.zoom.x  # drag the map under the cursor
 			_drag_moved += event.relative.length()
@@ -1593,6 +1685,15 @@ func _unhandled_input(event: InputEvent) -> void:
 		KEY_S:
 			if _view_mode == 0 and _organisms != null:  # toggle trait-driven plant sprites vs plain dots
 				_organisms.set_sprites_on(not _organisms._sprites_on)
+		KEY_B:
+			if _view_mode == 0 and _live != null:  # toggle the selective region-edit brush (live only)
+				_set_brush_mode(not _brush_on)
+		KEY_BRACKETLEFT:
+			if _brush_on:
+				_set_brush_radius(_brush_radius - 1)
+		KEY_BRACKETRIGHT:
+			if _brush_on:
+				_set_brush_radius(_brush_radius + 1)
 		KEY_PERIOD:
 			_paused = true
 			_show((_idx + 1) % _snaps.size())
