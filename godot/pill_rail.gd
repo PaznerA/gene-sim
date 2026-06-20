@@ -21,8 +21,10 @@ func setup(ui: CanvasLayer) -> void:
 	set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
 	offset_left = 8
 	offset_right = -8
-	offset_top = -84   # 30px band sitting just above the timeline (-54)
-	offset_bottom = -58
+	# Raised well clear of the timeline (top -54) so a pill click can't bleed into the timeline scrub: the pill
+	# band ends at window-80, leaving a 26px gap above the timeline (Phase U user feedback).
+	offset_top = -106
+	offset_bottom = -80
 	mouse_filter = Control.MOUSE_FILTER_IGNORE  # empty rail never eats clicks; pills (children) STOP on their own
 	_row = HBoxContainer.new()
 	_row.add_theme_constant_override("separation", int(GAP))
@@ -67,6 +69,7 @@ func add_pill(panel: Object, label: String) -> void:
 	_row.add_child(pill)
 	_pills[panel] = pill
 	_order.append(panel)
+	_reflow()
 
 
 ## Remove the pill for a restored panel and reflow the row (HBox reflows automatically on child removal).
@@ -78,6 +81,18 @@ func remove_pill(panel: Object) -> void:
 	pill.queue_free()
 	_pills.erase(panel)
 	_order.erase(panel)
+	_reflow()
+
+
+## Shrink pills to fit when there are many, so a full set never overflows the window width (Phase U review).
+func _reflow() -> void:
+	var n := _order.size()
+	if n == 0:
+		return
+	var avail := get_viewport_rect().size.x - 16.0
+	var w := maxf(64.0, minf(PILL_W, (avail - float(n - 1) * GAP) / float(n)))
+	for p in _order:
+		(_pills[p] as Button).custom_minimum_size = Vector2(w, PILL_H)
 
 
 func _on_pill_pressed(panel: Object) -> void:

@@ -401,8 +401,8 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 
 	var fs := _field_screen_size()
 	_intervention_panel = PanelChrome.new()
-	_intervention_panel.setup("⌖ CRISPR", body, ui, Vector2(maxf(240.0, fs.x - 274.0), 70.0), _pill_rail)
-	_intervention_panel.visible = (_live != null)
+	_intervention_panel.setup("🧬 CRISPR", body, ui, Vector2(maxf(240.0, fs.x - 274.0), 70.0), _pill_rail)
+	_intervention_panel.set_active(_live != null)
 
 
 func _on_guide_submitted(_text: String) -> void:
@@ -492,8 +492,8 @@ func _build_mission_ui(ui: CanvasLayer) -> void:
 	_mission_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_mission_label)
 	_mission_panel = PanelChrome.new()
-	_mission_panel.setup("◎ MISSION", body, ui, Vector2(12, 286), _pill_rail)
-	_mission_panel.visible = _mission_on
+	_mission_panel.setup("🎯 MISSION", body, ui, Vector2(12, 286), _pill_rail)
+	_mission_panel.set_active(_mission_on)
 	if _mission_marker != null and _mission_on:
 		_mission_marker.set_brush(_mission_zone, _mission_radius)  # paint the static cyan goal zone (mission only)
 
@@ -660,8 +660,9 @@ func _build_scene() -> void:
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
-		# Extra bottom margin so the two-row control bar (S3) is fully on-screen, not clipped.
-		var win := (_field_screen_size() + Vector2(40, 150)).max(Vector2(760, 600))
+		# Bottom margin clears the control deck (~150) + the pill rail (window-100) + the timeline (window-54)
+		# stacked below the field without overlap (Phase U review fix).
+		var win := (_field_screen_size() + Vector2(40, 290)).max(Vector2(820, 680))
 		DisplayServer.window_set_size(Vector2i(int(win.x), int(win.y)))
 	RenderingServer.set_default_clear_color(Color(0.06, 0.08, 0.07))
 
@@ -803,9 +804,9 @@ func _build_vitals_ui(ui: CanvasLayer) -> void:
 	cap.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
 	col.add_child(cap)
 	# Wrap in the draggable/minimizable panel chrome (Phase U). The wrapper becomes _vitals_panel, so the
-	# existing `_vitals_panel.visible = (m==0)` toggle still hides chrome + body together.
+	# existing set_active(m==0) toggle still hides chrome + body together.
 	_vitals_panel = PanelChrome.new()
-	_vitals_panel.setup("VITALS", body, ui, Vector2(12, 46), _pill_rail)
+	_vitals_panel.setup("📊 VITALS", body, ui, Vector2(12, 46), _pill_rail)
 
 
 func _vital_label() -> Label:
@@ -908,7 +909,7 @@ func _build_hud(ui: CanvasLayer, field_px: Vector2) -> void:
 	bar.stretch_mode = TextureRect.STRETCH_SCALE
 	col.add_child(bar)
 	_legend = PanelChrome.new()
-	_legend.setup("LEGEND", body, ui, Vector2(12, maxf(120.0, field_px.y - 52.0)), _pill_rail)
+	_legend.setup("🎨 LEGEND", body, ui, Vector2(12, maxf(120.0, field_px.y - 52.0)), _pill_rail)
 
 
 ## 1-D inferno gradient texture matching data_layer.gdshader (low → high).
@@ -1068,7 +1069,7 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 
 	# Wrap the deck in the panel chrome (drag handle + minimize), docked bottom-left above the timeline.
 	_controls_panel = PanelChrome.new()
-	_controls_panel.setup("CONTROLS", body, ui, Vector2(12, field_px.y + 16), _pill_rail)
+	_controls_panel.setup("🎛 CONTROLS", body, ui, Vector2(12, field_px.y + 16), _pill_rail)
 	_sync_controls()
 
 
@@ -1230,19 +1231,19 @@ func _set_view_mode(m: int) -> void:
 	if _timeline != null:
 		_timeline.visible = (m == 0)  # the timeline indexes snapshots, irrelevant in specimen view
 	if _intervention_panel != null:
-		_intervention_panel.visible = (_live != null and m == 0)
+		_intervention_panel.set_active(_live != null and m == 0)
 	if _vitals_panel != null:
-		_vitals_panel.visible = (m == 0)
+		_vitals_panel.set_active(m == 0)
 		if m != 0:
 			_set_brush_mode(false)  # the brush only makes sense in the ecosystem view
 		if _mission_panel != null:
-			_mission_panel.visible = (_mission_on and m == 0)
+			_mission_panel.set_active(_mission_on and m == 0)
 	if _view_button != null:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
 		_layer_picker.disabled = (m == 1)
 	if _specimen_panel != null:
-		_specimen_panel.visible = (m == 1)
+		_specimen_panel.set_active(m == 1)
 	if m == 1:
 		_refresh_live_specimens()  # in --live there is no specimens.json — build one from the live genome
 		_render_specimens()  # also repopulates the picker
@@ -1475,8 +1476,8 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 		_trait_rows.append({"bar": bar, "value": val_lbl, "delta": delta_lbl})
 
 	_specimen_panel = PanelChrome.new()
-	_specimen_panel.setup("SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 70.0), _pill_rail)
-	_specimen_panel.visible = false
+	_specimen_panel.setup("🌱 SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 70.0), _pill_rail)
+	_specimen_panel.set_active(false)
 
 
 ## Refill the picker from the current specimen list (baseline first). Clamps _focus into range.
@@ -1580,7 +1581,7 @@ func _build_interaction_ui(ui: CanvasLayer) -> void:
 	body.add_child(_detail_box)
 	# Inspect (cell-click detail) docks BOTTOM-LEFT now (Phase U), above the control deck.
 	_detail_panel = PanelChrome.new()
-	_detail_panel.setup("INSPECT", body, ui, Vector2(12, maxf(120.0, _field_screen_size().y - 220.0)), _pill_rail)
+	_detail_panel.setup("🔍 INSPECT", body, ui, Vector2(12, maxf(120.0, _field_screen_size().y - 220.0)), _pill_rail)
 	_detail_panel.visible = false
 
 
@@ -1769,10 +1770,10 @@ func _refresh_hud() -> void:
 			_title_status.text = ("specimen view — baseline + %d edited genome(s)   [V back]" % maxi(0, edits)
 				if edits >= 0 else "specimen view — no specimens.json   [V back]")
 		if _legend != null:
-			_legend.visible = false
+			_legend.set_active(false)
 		return
 	if _legend != null:
-		_legend.visible = _overlay_mode != 0
+		_legend.set_active(_overlay_mode != 0)
 		if _overlay_mode != 0 and _legend_label != null:
 			_legend_label.text = "%s   low → high" % OVERLAY_NAMES[_overlay_mode]
 

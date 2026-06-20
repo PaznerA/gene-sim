@@ -30,6 +30,7 @@ var default_dock: Vector2 = Vector2.ZERO
 var pill_rail: Control = null          # the PillRail this panel reports to (set in setup)
 
 var _minimized: bool = false
+var _active: bool = true  # the caller's "should be shown when not minimized" intent (set via set_active)
 var _restore_pos: Vector2 = Vector2.ZERO  # where to fly back to on restore
 var _dragging: bool = false
 var _drag_offset: Vector2 = Vector2.ZERO
@@ -78,34 +79,32 @@ func _make_titlebar() -> PanelContainer:
 	_titlebar = HBoxContainer.new()
 	_titlebar.custom_minimum_size = Vector2(0, TITLE_H)
 	_titlebar.add_theme_constant_override("separation", 6)
-	_titlebar.mouse_filter = Control.MOUSE_FILTER_STOP  # the bar eats drags; the body does not
+	# PASS (not STOP) so a click on the header content falls THROUGH to the backing bar's gui_input — otherwise
+	# the HBox swallows the event and drag never fires. The whole header is the grab area (the user's ask).
+	_titlebar.mouse_filter = Control.MOUSE_FILTER_PASS
 	var bsb := StyleBoxFlat.new()
-	bsb.bg_color = Color(0.12, 0.17, 0.14, 0.92)
+	bsb.bg_color = Color(0.12, 0.17, 0.14, 0.95)
 	bsb.corner_radius_top_left = 7
 	bsb.corner_radius_top_right = 7
-	bsb.content_margin_left = 7
+	bsb.content_margin_left = 8
 	bsb.content_margin_right = 5
 	bsb.content_margin_top = 2
 	bsb.content_margin_bottom = 2
 	bsb.border_width_bottom = 1
 	bsb.border_color = Color(0.2, 0.45, 0.3, 0.6)
-	# HBoxContainer doesn't draw a stylebox, so the bg + drag-input live on a backing PanelContainer.
+	# HBoxContainer doesn't draw a stylebox, so the bg + drag-input live on a backing PanelContainer that spans
+	# the WHOLE header — grab anywhere on the title bar (the per-panel icon + name) to drag.
 	var bar := PanelContainer.new()
 	bar.add_theme_stylebox_override("panel", bsb)
 	bar.mouse_filter = Control.MOUSE_FILTER_STOP
-	bar.gui_input.connect(_on_titlebar_input)  # drag is handled here (the backing panel spans the full bar)
+	bar.mouse_default_cursor_shape = Control.CURSOR_MOVE  # the header reads as draggable
+	bar.gui_input.connect(_on_titlebar_input)
 
-	var handle := Label.new()
-	handle.text = "⠿"  # braille drag-dots — reads as a grab handle
-	handle.add_theme_font_size_override("font_size", 13)
-	handle.add_theme_color_override("font_color", Color(0.55, 0.72, 0.6))
-	handle.mouse_filter = Control.MOUSE_FILTER_PASS  # let the click fall through to the bar's gui_input
-	_titlebar.add_child(handle)
-
+	# Title = the per-panel unique icon + name (passed in by the caller, e.g. "📊 VITALS"). No generic handle.
 	var title := Label.new()
 	title.text = title_text
-	title.add_theme_font_size_override("font_size", 12)
-	title.add_theme_color_override("font_color", Color(0.86, 0.93, 0.86))
+	title.add_theme_font_size_override("font_size", 13)
+	title.add_theme_color_override("font_color", Color(0.88, 0.95, 0.88))
 	title.mouse_filter = Control.MOUSE_FILTER_PASS
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_titlebar.add_child(title)
@@ -114,9 +113,9 @@ func _make_titlebar() -> PanelContainer:
 	mini.text = "—"  # minimize glyph
 	mini.flat = true
 	mini.focus_mode = Control.FOCUS_NONE
-	mini.custom_minimum_size = Vector2(20, 18)
+	mini.custom_minimum_size = Vector2(22, 18)
 	mini.tooltip_text = "Minimize to a pill above the timeline"
-	mini.add_theme_font_size_override("font_size", 13)
+	mini.add_theme_font_size_override("font_size", 14)
 	mini.pressed.connect(minimize)
 	_titlebar.add_child(mini)
 
@@ -147,9 +146,21 @@ func _on_titlebar_input(ev: InputEvent) -> void:
 ## Collapse to a pill: remember the current position, tween the panel into the rail slot, then hide + spawn
 ## the labelled pill. main.gd's visibility toggles see a still-present node; while minimized we keep `visible`
 ## owned by the rail (restore() shows it again).
+## main.gd's visibility rules route through here (NOT a raw `.visible =`) so an external "show" can't resurrect
+## a MINIMIZED panel (while minimized the rail owns it). `_active` = the caller's shown-when-not-minimized intent.
+func set_active(on: bool) -> void:
+	_active = on
+	if not _minimized:
+		visible = on
+
+
 func minimize() -> void:
 	if _minimized:
 		return
+	# If a restore tween is still mid-flight, settle to its target first so we sample a STABLE dock position,
+	# not a value moving between the pill slot and the dock (fixes rapid restore→minimize corrupting _restore_pos).
+	if _tween != null and _tween.is_valid():
+		position = _restore_pos
 	_minimized = true
 	_restore_pos = position
 	var slot: Vector2 = pill_rail.reserve_slot() if pill_rail != null else position
@@ -176,6 +187,12 @@ func restore() -> void:
 	_minimized = false
 	if pill_rail != null:
 		pill_rail.remove_pill(self)
+	if not _active:
+		# The caller hid this panel (view switch) while it was parked — snap home hidden, no pop-out tween.
+		position = _restore_pos
+		visible = false
+		restored.emit(self)
+		return
 	visible = true
 	modulate.a = 0.0
 	move_to_front()
