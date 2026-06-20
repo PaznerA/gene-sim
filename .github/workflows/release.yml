@@ -45,13 +45,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # headless harness CLI (the sim core, no renderer)
-          cp target/release/harness dist/ 2>/dev/null || cp target/release/harness.exe dist/ 2>/dev/null || true
-          # LiveSim gdext cdylib (.so / .dylib / .dll depending on the platform)
-          cp crates/godot-sim/target/release/libgodot_sim.so dist/ 2>/dev/null || true
-          cp crates/godot-sim/target/release/libgodot_sim.dylib dist/ 2>/dev/null || true
-          cp crates/godot-sim/target/release/godot_sim.dll dist/ 2>/dev/null || true
-          cp crates/godot-sim/godot/gene_sim.gdextension dist/ 2>/dev/null || true
+          # headless harness CLI — the guaranteed deliverable; it MUST exist (no best-effort copy), and the
+          # LiveSim cdylib name + GDExtension platform key differ per OS, so branch explicitly.
+          case "$RUNNER_OS" in
+            Windows) cp target/release/harness.exe dist/; lib="godot_sim.dll";      key="windows.x86_64" ;;
+            macOS)   cp target/release/harness        dist/; lib="libgodot_sim.dylib"; key="macos" ;;
+            *)       cp target/release/harness        dist/; lib="libgodot_sim.so";    key="linux.x86_64" ;;
+          esac
+          cp "crates/godot-sim/target/release/$lib" dist/
+          # A per-OS GDExtension descriptor keyed for THIS platform, pointing at the flat lib beside it in dist/
+          # (the committed macOS-only descriptor would be wrong for Linux/Windows — see review).
+          cat > dist/gene_sim.gdextension <<EOF
+          [configuration]
+          entry_symbol = "gdext_rust_init"
+          compatibility_minimum = 4.6
+          reloadable = true
+          [libraries]
+          ${key}.debug = "res://${lib}"
+          ${key}.release = "res://${lib}"
+          EOF
           ls -la dist
 
       - uses: actions/upload-artifact@v4

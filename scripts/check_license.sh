@@ -22,15 +22,28 @@ META="$(cargo metadata --format-version 1 --locked 2>/dev/null)" \
 # SPDX-OR-aware: a crate is only a problem if EVERY OR-alternative is GPL-family (incl. LGPL/AGPL),
 # i.e. there is no GPL-free license we can choose. "MIT OR Apache-2.0 OR LGPL-2.1-or-later" is fine
 # (we pick MIT/Apache); "GPL-3.0-or-later" or "MIT AND GPL-3.0" is flagged.
-GPL="$(printf '%s' "$META" | jq -r '
-  .packages[]
-  | select(.source != null)
-  | . as $p
-  | ($p.license // "") as $lic
-  | select($lic != "")
-  | ($lic | ascii_upcase | gsub("/"; " OR ") | [splits(" OR ")] | map(gsub("^ +| +$"; ""))) as $alts
-  | select($alts | all(test("GPL")))
-  | "\($p.name) \($p.version)  [\($lic)]"')"
+gpl_filter() {  # reads `cargo metadata` JSON on stdin, prints "name version [license]" for GPL-only crates
+  jq -r '
+    .packages[]
+    | select(.source != null)
+    | . as $p
+    | ($p.license // "") as $lic
+    | select($lic != "")
+    | ($lic | ascii_upcase | gsub("/"; " OR ") | [splits(" OR ")] | map(gsub("^ +| +$"; ""))) as $alts
+    | select($alts | all(test("GPL")))
+    | "\($p.name) \($p.version)  [\($lic)]"'
+}
+
+GPL="$(printf '%s' "$META" | gpl_filter)"
+
+# Also scan the workspace-DETACHED godot-sim crate: its gdext cdylib (godot 0.5.3 et al.) is built + shipped
+# by release.yml, so its dependency closure must be GPL-scanned too even though the root metadata excludes it.
+# (gdext is MPL-2.0 — permissive, not flagged; this just closes the blind spot for any future transitive dep.)
+if [ -f crates/godot-sim/Cargo.toml ]; then
+  GS_META="$(cargo metadata --format-version 1 --locked --manifest-path crates/godot-sim/Cargo.toml 2>/dev/null)" \
+    || { echo "check_license: 'cargo metadata' failed for godot-sim" >&2; exit 2; }
+  GPL="$(printf '%s\n%s' "$GPL" "$(printf '%s' "$GS_META" | gpl_filter)" | sed '/^[[:space:]]*$/d')"
+fi
 
 if [ -n "$GPL" ]; then
   echo "LICENSE FAIL (invariant #1): GPL-licensed crate(s) found in the dependency tree:" >&2
