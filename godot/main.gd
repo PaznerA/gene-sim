@@ -13,9 +13,12 @@ extends Node2D
 ##   --gen  <n>            With --run/--shot: pick the snapshot whose generation == n (else the last).
 ##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
 ##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
+##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
+##   --focus <i>           With --view specimen: focus specimen i (0 baseline, 1.. edits) for --shot.
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
 ##
-## Keys (windowed): Space pause · D cycle layer · ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
+## Keys (windowed): Space pause · V toggle ecosystem/specimen · Tab cycle specimen · D cycle layer ·
+##   ,/. step · 1/2/3 zoom scope · wheel zoom · arrows pan.
 
 ## Load the reader by path, not via a `class_name` global: that registry is only populated by an editor
 ## import pass, so a bare identifier is unresolved under a fresh `--headless` run. `preload` needs no cache.
@@ -25,6 +28,9 @@ const Lsystem := preload("res://lsystem.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness"]
+# The 5 species-genome traits, in canonical order (matches the core's Trait::ALL). Iterate THIS, never the
+# specimens.json Dictionary's keys, so the readout order is stable (inv #3 hygiene, even in UI).
+const TRAIT_KEYS := ["growth_rate", "reflectance", "drought_tolerance", "fecundity", "kill_switch_linkage"]
 const FRAME_SECONDS := 0.45  # seconds per snapshot when playing a run
 const TARGET_FIELD_PX := 880.0  # the field is scaled to about this many pixels on its long side
 # Zoom "scopes": magnification presets the viewport switches between (keys 1/2/3; SPEC §W10).
@@ -56,6 +62,10 @@ var _view_button: Button
 var _play_button: Button
 var _layer_picker: OptionButton
 var _specimen_bounds := Rect2()
+var _focus: int = 0  # which specimen (index into _specimen_list()) is focused in the specimen view
+var _specimen_panel: Control
+var _specimen_picker: OptionButton
+var _trait_rows: Array = []  # [{bar:ProgressBar, value:Label, delta:Label}] one per TRAIT_KEYS entry
 
 
 func _ready() -> void:
@@ -114,6 +124,12 @@ func _ready() -> void:
 		_set_zoom(float(zoom_arg))
 	if _arg_value("--view") == "specimen":  # optional: open the L-system specimen view for --shot
 		_set_view_mode(1)
+		var focus_arg := _arg_value("--focus")  # optional: focus a specific specimen (0=baseline, 1..=edits)
+		if focus_arg != "" and not _specimen_list().is_empty():
+			_focus = clampi(int(focus_arg), 0, _specimen_list().size() - 1)
+			if _specimen_picker != null:
+				_specimen_picker.select(_focus)
+			_on_specimen_selected(_focus)  # re-run readout/emphasis/frame for the chosen specimen
 
 	# Headless render smoke (gate): build the scene + specimen plants, prove it constructs without a GPU, quit.
 	if _has_flag("--check"):
@@ -179,6 +195,7 @@ func _build_scene() -> void:
 	add_child(ui)
 	_build_hud(ui, _field_px)
 	_build_controls(ui, _field_px)
+	_build_specimen_ui(ui, _field_px)
 
 	# Size the window to the field (+ margin) when we have a display.
 	if DisplayServer.get_name() != "headless":
@@ -386,9 +403,13 @@ func _set_view_mode(m: int) -> void:
 		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
 	if _layer_picker != null:
 		_layer_picker.disabled = (m == 1)
+	if _specimen_panel != null:
+		_specimen_panel.visible = (m == 1)
 	if m == 1:
-		_render_specimens()
-		_frame_specimens()
+		_render_specimens()  # also repopulates the picker
+		_update_trait_readout()
+		_emphasise_focus()
+		_frame_focused_specimen()
 	else:
 		_frame_world()
 	_refresh_hud()
@@ -447,6 +468,7 @@ func _render_specimens() -> void:
 			union = wb
 			has_union = true
 	_specimen_bounds = union
+	_populate_specimen_picker()  # keep the A1 selector in sync with the rebuilt plant row
 
 
 ## Map a core-exported trait vector (each in [0,1]) to L-system visual params. PRESENTATION ONLY (the
@@ -490,6 +512,164 @@ func _frame_specimens() -> void:
 	var z := minf(vp.x / _specimen_bounds.size.x, vp.y / _specimen_bounds.size.y) * 0.82
 	_cam.zoom = Vector2(z, z)
 	_cam.position = _specimen_bounds.position + _specimen_bounds.size * 0.5
+
+
+# ──────────────────────────── specimen UX panel (A1) ────────────────────────────
+
+## A top-right panel for the specimen view: a picker to focus one specimen + a readout of its 5 trait values
+## as bars with a delta-vs-baseline arrow. Reads only the core-exported trait vectors (presentation, inv #2).
+func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
+	_specimen_panel = PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.0, 0.0, 0.0, 0.5)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(10)
+	_specimen_panel.add_theme_stylebox_override("panel", sb)
+	_specimen_panel.position = Vector2(maxf(240.0, field_px.x - 304.0), 70.0)
+	_specimen_panel.custom_minimum_size = Vector2(288, 0)
+	_specimen_panel.visible = false
+	ui.add_child(_specimen_panel)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	_specimen_panel.add_child(col)
+
+	var header := Label.new()
+	header.text = "Specimen"
+	header.add_theme_font_size_override("font_size", 16)
+	header.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
+	col.add_child(header)
+
+	_specimen_picker = OptionButton.new()
+	_specimen_picker.item_selected.connect(_on_specimen_selected)
+	col.add_child(_specimen_picker)
+
+	var traits_hdr := Label.new()
+	traits_hdr.text = "Traits  (vs baseline)"
+	traits_hdr.add_theme_font_size_override("font_size", 12)
+	traits_hdr.add_theme_color_override("font_color", Color(0.7, 0.78, 0.7))
+	col.add_child(traits_hdr)
+
+	_trait_rows.clear()
+	for key in TRAIT_KEYS:
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+		col.add_child(row)
+
+		var name_lbl := Label.new()
+		name_lbl.text = str(key)
+		name_lbl.custom_minimum_size = Vector2(118, 0)
+		name_lbl.add_theme_font_size_override("font_size", 11)
+		name_lbl.add_theme_color_override("font_color", Color(0.86, 0.9, 0.86))
+		row.add_child(name_lbl)
+
+		var bar := ProgressBar.new()
+		bar.min_value = 0.0
+		bar.max_value = 1.0
+		bar.show_percentage = false
+		bar.custom_minimum_size = Vector2(56, 12)
+		var bg := StyleBoxFlat.new()
+		bg.bg_color = Color(1, 1, 1, 0.10)
+		bg.set_corner_radius_all(3)
+		var fill := StyleBoxFlat.new()
+		fill.bg_color = Color(0.45, 0.78, 0.45)
+		fill.set_corner_radius_all(3)
+		bar.add_theme_stylebox_override("background", bg)
+		bar.add_theme_stylebox_override("fill", fill)
+		row.add_child(bar)
+
+		var val_lbl := Label.new()
+		val_lbl.custom_minimum_size = Vector2(40, 0)
+		val_lbl.add_theme_font_size_override("font_size", 11)
+		val_lbl.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
+		row.add_child(val_lbl)
+
+		var delta_lbl := Label.new()
+		delta_lbl.custom_minimum_size = Vector2(54, 0)
+		delta_lbl.add_theme_font_size_override("font_size", 11)
+		row.add_child(delta_lbl)
+
+		_trait_rows.append({"bar": bar, "value": val_lbl, "delta": delta_lbl})
+
+
+## Refill the picker from the current specimen list (baseline first). Clamps _focus into range.
+func _populate_specimen_picker() -> void:
+	if _specimen_picker == null:
+		return
+	_specimen_picker.clear()
+	var list := _specimen_list()
+	for spec in list:
+		_specimen_picker.add_item(str((spec as Dictionary).get("label", "specimen")))
+	_focus = clampi(_focus, 0, maxi(0, list.size() - 1))
+	if list.size() > 0:
+		_specimen_picker.select(_focus)
+
+
+func _on_specimen_selected(idx: int) -> void:
+	_focus = idx
+	_update_trait_readout()
+	_emphasise_focus()
+	_frame_focused_specimen()
+
+
+## Rewrite the trait bars/values/deltas for the focused specimen (vs baseline = list index 0).
+func _update_trait_readout() -> void:
+	if _trait_rows.is_empty():
+		return
+	var list := _specimen_list()
+	if list.is_empty():
+		return
+	var focused: Dictionary = (list[clampi(_focus, 0, list.size() - 1)] as Dictionary).get("traits", {})
+	var base: Dictionary = (list[0] as Dictionary).get("traits", {})
+	for i in TRAIT_KEYS.size():
+		var key: String = TRAIT_KEYS[i]
+		var v := clampf(float(focused.get(key, 0.0)), 0.0, 1.0)
+		var b := clampf(float(base.get(key, 0.0)), 0.0, 1.0)
+		var row: Dictionary = _trait_rows[i]
+		(row["bar"] as ProgressBar).value = v
+		(row["value"] as Label).text = "%.3f" % v
+		var d := v - b
+		var delta: Label = row["delta"]
+		if absf(d) < 0.0005:
+			delta.text = "="
+			delta.add_theme_color_override("font_color", Color(0.6, 0.62, 0.6))
+		elif d > 0.0:
+			delta.text = "▲ %+.2f" % d
+			delta.add_theme_color_override("font_color", Color(0.42, 0.9, 0.46))
+		else:
+			delta.text = "▼ %+.2f" % d
+			delta.add_theme_color_override("font_color", Color(0.95, 0.5, 0.45))
+
+
+## Brighten the focused plant; dim the others. Holders are added in _specimen_list() order by _render_specimens.
+func _emphasise_focus() -> void:
+	if _specimen_root == null:
+		return
+	var kids := _specimen_root.get_children()
+	for i in kids.size():
+		(kids[i] as Node2D).modulate = Color.WHITE if i == _focus else Color(1, 1, 1, 0.3)
+
+
+## Centre the camera on the focused specimen's plant (falls back to framing the whole row).
+func _frame_focused_specimen() -> void:
+	var kids := _specimen_root.get_children()
+	if _focus < 0 or _focus >= kids.size():
+		_frame_specimens()
+		return
+	var holder := kids[_focus] as Node2D
+	var plant := holder.get_child(0) as Node2D  # the Lsystem is the first child (label is second)
+	if plant == null or not plant.has_method("bounds"):
+		_frame_specimens()
+		return
+	var pb: Rect2 = plant.bounds()
+	if pb.size == Vector2.ZERO:
+		_frame_specimens()
+		return
+	var wb := Rect2(holder.position + pb.position, pb.size).grow(60.0)
+	var vp := get_viewport_rect().size
+	var z := minf(vp.x / wb.size.x, vp.y / wb.size.y) * 0.9
+	_cam.zoom = Vector2(z, z)
+	_cam.position = wb.position + wb.size * 0.5
 
 
 # ──────────────────────────── per-snapshot update ────────────────────────────
@@ -597,6 +777,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			_refresh_hud()
 		KEY_V:
 			_set_view_mode(1 - _view_mode)
+		KEY_TAB:
+			# Cycle the focused specimen (specimen view only); guard empty list (no div-by-zero).
+			if _view_mode == 1 and not _specimen_list().is_empty():
+				_focus = (_focus + 1) % _specimen_list().size()
+				if _specimen_picker != null:
+					_specimen_picker.select(_focus)
+				_on_specimen_selected(_focus)
 		KEY_D:
 			if _view_mode == 0:
 				_overlay_mode = (_overlay_mode + 1) % OVERLAY_NAMES.size()
