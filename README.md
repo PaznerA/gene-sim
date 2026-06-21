@@ -34,9 +34,12 @@ Requires **Rust 1.96** and **Godot 4.6**.
 # headless core + full test suite (determinism, proptests, license, oracle)
 cargo test --workspace
 
-# build the LiveSim native extension, then run the game (open-ended sandbox)
-cargo build --release --manifest-path crates/godot-sim/Cargo.toml
-godot --path godot --live
+# build the LiveSim native extension (debug — the dev launcher loads it from target/debug/)
+cargo build --manifest-path crates/godot-sim/Cargo.toml
+
+# run the game. NOTE the `--` — args after it are the game's (Godot consumes the ones before).
+godot --path godot -- --live              # open-ended sandbox (isometric by default; --ortho for flat)
+godot --path godot -- --live --mission    # the suppress-the-zone mission (core-computed zone read)
 ```
 
 In the game: drag a panel by its header, minimise panels to the pill rail, `Space` pauses,
