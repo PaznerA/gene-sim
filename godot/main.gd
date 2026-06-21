@@ -13,7 +13,7 @@ extends Node2D
 ##   --gen  <n>            With --run/--shot: pick the snapshot whose generation == n (else the last).
 ##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
 ##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
-##   --iso                 Render the ecosystem isometrically (CPU diamonds); orthographic is the default.
+##   --ortho               Render the ecosystem orthographically (flat); ISOMETRIC (CPU diamonds) is the default.
 ##   --live [--seed N]     Drive an OPEN-ENDED SANDBOX run live via the LiveSim gdext node (build the cdylib
 ##                         cargo build --manifest-path crates/godot-sim/Cargo.toml). Space pauses, ▶ steps.
 ##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
@@ -73,7 +73,7 @@ var _field_px := Vector2.ZERO
 
 var _world: Node2D  # holds the ecosystem layers (terrain/overlay/organisms)
 var _specimen_root: Node2D  # holds the L-system plant specimens
-var _iso = null  # iso.gd transform instance when --iso is active; null = orthographic (default)
+var _iso = null  # iso.gd transform instance (isometric is the DEFAULT); null = orthographic (--ortho opt-out)
 var _iso_ground: Node2D  # CPU-diamond ground + data overlay (iso mode only)
 var _vignette: CanvasLayer  # screen-space edge darkening (ecosystem view only)
 var _pill_rail: Control  # rail of minimized-panel pills above the timeline (Phase U panel framework)
@@ -650,12 +650,13 @@ func _build_scene() -> void:
 	_field_px = Vector2(float(w) * _cell, float(h) * _cell)
 
 	# Isometric mode (P3): a CPU-diamond ground + iso-projected organisms, instead of the ortho TileMap +
-	# axis-aligned shader overlay. Behind --iso; orthographic stays the default. Read-only presentation (#2).
-	if _has_flag("--iso"):
+	# axis-aligned shader overlay. ISOMETRIC is now the DEFAULT; pass --ortho to opt into the flat view.
+	# (--iso is still accepted as a no-op for back-compat.) Read-only presentation (#2).
+	if not _has_flag("--ortho"):
 		_iso = Iso.new()
 		var b: Rect2 = _iso.field_bounds(w, h, _cell)
 		_iso.origin = -b.position + Vector2(20, 20)  # shift the negative-x left edge fully on-screen
-	print("ecosystem mode: %s" % ("ISOMETRIC (--iso)" if _iso != null else "orthographic"))
+	print("ecosystem mode: %s" % ("ISOMETRIC (default)" if _iso != null else "orthographic (--ortho)"))
 
 	# Ecosystem layers live under _world so the whole view can be toggled off for the specimen view.
 	_world = Node2D.new()

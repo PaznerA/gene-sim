@@ -42,14 +42,14 @@ if ! printf '%s' "$OUT" | grep -q "snapshot OK"; then
 fi
 echo "GODOT READER OK — $(printf '%s' "$OUT" | grep 'snapshot OK')"
 
-# 2. S4.3 render scene (headless build smoke) — orthographic (default) AND isometric (--iso, P3).
-for mode in "" "--iso"; do
+# 2. S4.3 render scene (headless build smoke) — ISOMETRIC (default, P3) AND orthographic (--ortho opt-out).
+for mode in "" "--ortho"; do
   ROUT="$(godot --headless --path godot -- --run "$TMP" --check $mode 2>&1)"
   if ! printf '%s' "$ROUT" | grep -q "render scene OK"; then
-    echo "FAIL — Godot render scene (${mode:-ortho}) did not report 'render scene OK'. Full output:"
+    echo "FAIL — Godot render scene (${mode:-iso-default}) did not report 'render scene OK'. Full output:"
     printf '%s\n' "$ROUT"
     exit 1
   fi
-  echo "GODOT RENDER OK (${mode:-ortho}) — $(printf '%s' "$ROUT" | grep 'render scene OK')"
+  echo "GODOT RENDER OK (${mode:-iso-default}) — $(printf '%s' "$ROUT" | grep 'render scene OK')"
 done
 exit 0
