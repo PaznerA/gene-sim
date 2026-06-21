@@ -116,6 +116,20 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   - [ ] Later: S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2/`oracle-fba`
     KO-table bake · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7 decomposer.
 
+- [~] **Multi-species CORE SPINE** (user order: core logic → ecosystem → UI; design+verified
+  `docs/llm/proposals/multispecies-core-spine-draft.md`, R3-A "holds", R3-B "uncertain"→scoped re-pin).
+  - [x] **R3-A registry + tag (HASH-NEUTRAL)** — `SpeciesId(u16)`, `Species(SpeciesId)` component (off-stream,
+    heritable), `SpeciesEntry{name,genome,gp_map,base_growth,target_pop}` + `SpeciesRegistry{entries:Vec}` (ordered,
+    inv #3), `reset_with_roster(config,env,Vec<RosterEntry>)` (`reset_with_genome_and_map` delegates a 1-entry
+    roster). Spawns + selects ONLY the primary → byte-identical (pinned literal unchanged). Test: 1-entry registry
+    + every org tagged Species(0).
+  - [ ] **R3-B per-species Wright-Fisher 🛑** (deliberate re-pin, human-signed): S independent fixed-size pools by
+    ascending `SpeciesId`; spawn + select all entries; offspring inherit `Species`; per-species observe/snapshot.
+  - [ ] **F3 resource coupling 🛑** (separate re-pin): `nutrient_dynamics` system (RNG-free, after metabolism) +
+    `TrophicRole{Autotroph,Decomposer}` — plants deplete nutrient + shed detritus, decomposer mineralizes
+    detritus→nutrient (the obligate loop = the soil-microbiome ECOSYSTEM) + a `[0.5,1.5]` ResourceModifier into
+    selection. Then the **UI** (per-species view).
+
 Sequencing: U + S + E done. Next **BETA tag** (v0.1.0-beta; extend `release.yml` to ship installable .exe/.dmg/
 .deb per the review's release-readiness findings) →
 R3 (biggest sim leap, ADR sign-off) → Rel (relations + vector DB, ADR). Each core phase re-pins the determinism

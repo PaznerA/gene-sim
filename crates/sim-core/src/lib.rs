@@ -91,6 +91,43 @@ struct GenomeRes(Genome);
 #[derive(Resource)]
 struct BaseGrowthRate(f64);
 
+/// One species in the [`SpeciesRegistry`] — its genome, per-species genotype→phenotype map, the derived base
+/// growth rate, and its constant-population target (ADR R3-A, the multi-species spine). `base_growth` mirrors
+/// [`BaseGrowthRate`] for the registry's primary entry; the per-species Wright-Fisher (R3-B) reads these.
+/// `#[allow(dead_code)]` on `name`/`target_pop` until R3-B (per-species observe + selection) reads them.
+#[allow(dead_code)]
+struct SpeciesEntry {
+    name: String,
+    genome: Genome,
+    gp_map: gp::OntologyMap,
+    base_growth: f64,
+    target_pop: u32,
+}
+
+/// The ordered set of species in the run (ADR R3-A). Indexed by [`SpeciesId`] (= the `Vec` position); NEVER a
+/// `HashMap` iterated in sim logic (inv #3). At R3-A there is exactly ONE entry and only it is spawned/selected,
+/// so the run is byte-identical to the single-species core; R3-B spawns + selects all entries (a deliberate
+/// re-pin) and F3 couples them through the resource substrate.
+/// `#[allow(dead_code)]` until R3-B reads `entries` from the per-species selection/observe systems.
+#[derive(Resource)]
+#[allow(dead_code)]
+struct SpeciesRegistry {
+    entries: Vec<SpeciesEntry>,
+}
+
+/// A species to seed the run with (the boundary builds these from JSON; the core stays filesystem-free, inv #2).
+/// `reset_with_roster` turns a `Vec<RosterEntry>` into the [`SpeciesRegistry`] (expressing each `base_growth`).
+pub struct RosterEntry {
+    /// Human-readable species name (metadata; the registry key is its ordinal [`SpeciesId`]).
+    pub name: String,
+    /// The species genome.
+    pub genome: Genome,
+    /// The per-species genotype→phenotype map (e.g. `gp::ecoli_trait_map` for E. coli).
+    pub gp_map: gp::OntologyMap,
+    /// Constant-population target / spawn count for this species.
+    pub entity_count: u32,
+}
+
 /// The static per-cell soil field as a resource (ADR-011 S-G): LOCAL soil-coupled selection samples each
 /// organism's OWN cell ([`soil::SoilField::sample_at`]) instead of a field-wide mean, so drought-tolerant
 /// lineages are favored in arid cells — real spatial selection. No `SimRng` draw (off the hash path beyond
@@ -114,6 +151,11 @@ struct ResourceFieldRes(resource::ResourceField);
 /// independent of ECS query/archetype iteration order.
 #[derive(Component, Clone, Copy)]
 struct OrgId(u32);
+
+/// Ordinal id of a species in the [`SpeciesRegistry`] (= its `Vec` index). `Ord`/`Hash` so the per-species
+/// Wright-Fisher (R3-B) can sort + fold by `(SpeciesId, OrgId)` without a second edit (ADR R3-A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpeciesId(u16);
 
 /// Full-scale energy quantum (ADR-013 F0b): one "unit" of organism energy is `ENERGY_FULL` integer joules.
 /// Energy migrates from `f64` to the conserved `i64` currency the CHEMOSTAT-J economy will denominate
@@ -154,6 +196,12 @@ struct Position {
     x: u32,
     y: u32,
 }
+
+/// Which species an organism belongs to (ADR R3-A). Heritable — offspring inherit their parent's species (R3-B);
+/// assigned at SPAWN from the registry ordinal, NEVER from `SimRng` (zero `next_u64`, the `Position` off-stream
+/// precedent), so tagging organisms is hash-neutral (not folded into `hash_world` at R3-A).
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+struct Species(SpeciesId);
 
 /// Canonical world grid for per-organism positions (ADR-011). Equal to `soil::SOIL_DIMS` so an organism's
 /// cell maps 1:1 onto a soil cell (no resample for future local-soil coupling). The render snapshot resamples
@@ -428,15 +476,62 @@ impl Simulation {
         genome: Genome,
         gp_map: gp::OntologyMap,
     ) -> Self {
+        // A single-species roster — byte-identical to the historical path (the registry holds one entry).
+        Self::reset_with_roster(
+            config,
+            env,
+            vec![RosterEntry {
+                name: "default".to_string(),
+                genome,
+                gp_map,
+                entity_count: config.entity_count,
+            }],
+        )
+    }
+
+    /// Build a fresh simulation from a SPECIES ROSTER (ADR R3-A — the multi-species spine): each [`RosterEntry`]
+    /// becomes a [`SpeciesEntry`] in the [`SpeciesRegistry`]. At R3-A exactly the FIRST species is spawned +
+    /// selected, so a 1-entry roster is BYTE-IDENTICAL to the single-species core (the pinned literal is the
+    /// proof); R3-B spawns + selects every entry (a deliberate re-pin) and F3 couples them via the resource
+    /// substrate. The roster must be non-empty.
+    #[must_use]
+    pub fn reset_with_roster(
+        config: &SimConfig,
+        env: &climate::EnvParams,
+        roster: Vec<RosterEntry>,
+    ) -> Self {
+        assert!(
+            !roster.is_empty(),
+            "species roster must have at least one species"
+        );
         let mut world = World::new();
         // Seed the single RNG ONCE for the whole episode (inv. #3 — never re-seeded mid-run).
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
-        // Express the (passed) genome → phenotype ONCE through the per-species map (invariant #2;
-        // genotype→phenotype only here / in `genome`). The Wright-Fisher loop selects over per-individual
-        // genotypes modulated by base growth (GrowthRate is name-keyed, so it resolves under any species map).
-        let phenotype = gp_map.express(&genome);
-        let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
+        // Express each species' genome → phenotype ONCE through its OWN map (invariant #2); base_growth =
+        // GrowthRate (name-keyed, resolves under any species map). Build the ordered registry (inv #3).
+        let entries: Vec<SpeciesEntry> = roster
+            .into_iter()
+            .map(|r| {
+                let base_growth = r
+                    .gp_map
+                    .express(&r.genome)
+                    .get(Trait::GrowthRate)
+                    .unwrap_or(0.5);
+                SpeciesEntry {
+                    name: r.name,
+                    genome: r.genome,
+                    gp_map: r.gp_map,
+                    base_growth,
+                    target_pop: r.entity_count,
+                }
+            })
+            .collect();
+        // R3-A runs exactly the FIRST species; clone what the singletons + the stored map need before the
+        // registry takes ownership of `entries`.
+        let primary_genome = entries[0].genome.clone();
+        let primary_gp_map = entries[0].gp_map.clone();
+        let base_growth = entries[0].base_growth;
 
         // Static soil substrate, generated purely from the seed via derive_seed — ZERO SimRng draws (R1.0).
         let soil = soil::SoilField::generate(config.seed, soil::SOIL_DIMS.0, soil::SOIL_DIMS.1);
@@ -460,12 +555,17 @@ impl Simulation {
                 DroughtTol(drought),
                 ThermalTol(thermal),
                 placement(config.seed, i),
+                // R3-A: tag the species (the primary, ordinal 0). Off the SimRng stream — no `next_u64` — so the
+                // spawn draw order is unchanged and tagging is hash-neutral (the `Position` off-stream precedent).
+                Species(SpeciesId(0)),
             ));
         }
 
         world.insert_resource(SimRng(rng));
         world.insert_resource(Tick::default());
-        world.insert_resource(GenomeRes(genome));
+        // R3-A additive: the primary species' genome + base growth stay as singletons (selection/observe read
+        // them unchanged → byte-identical), and the full ordered registry is inserted alongside as the spine.
+        world.insert_resource(GenomeRes(primary_genome));
         world.insert_resource(BaseGrowthRate(base_growth));
         world.insert_resource(SoilFieldRes(soil.clone())); // per-cell source for LOCAL coupling (ADR-011 S-G)
                                                            // World climate from the player's params — off the SimRng stream; unused by selection until E3 (so
@@ -482,6 +582,9 @@ impl Simulation {
             resource::RESOURCE_DIMS.0,
             resource::RESOURCE_DIMS.1,
         )));
+        // The multi-species spine (ADR R3-A): the ordered species registry. Read by no system yet (R3-A spawns +
+        // selects only the primary), so inserting it is hash-neutral — proven by the unchanged pinned literal.
+        world.insert_resource(SpeciesRegistry { entries });
 
         let mut schedule = Schedule::default();
         // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
@@ -494,7 +597,7 @@ impl Simulation {
             config: config.clone(),
             // Static for the run; read-only w.r.t. the hash beyond its coupling effect on per-org state.
             soil,
-            gp_map,
+            gp_map: primary_gp_map,
         }
     }
 
@@ -913,6 +1016,31 @@ mod tests {
                 "position ({x},{y}) out of world bounds {WORLD_DIMS:?}"
             );
         }
+    }
+
+    #[test]
+    fn r3a_registry_and_species_tag_are_live() {
+        // R3-A (multi-species spine): a default reset builds a 1-entry SpeciesRegistry and tags every organism
+        // Species(SpeciesId(0)). Hash-neutral — proven by `determinism_hash_is_pinned` staying green unmodified.
+        let cfg = SimConfig {
+            seed: 42,
+            generations: 0,
+            entity_count: 50,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        {
+            let reg = sim.world.resource::<SpeciesRegistry>();
+            assert_eq!(reg.entries.len(), 1, "default reset → a 1-species registry");
+            assert_eq!(reg.entries[0].name, "default");
+            assert_eq!(reg.entries[0].target_pop, 50);
+        }
+        let tagged = sim
+            .world
+            .query::<&Species>()
+            .iter(&sim.world)
+            .filter(|s| **s == Species(SpeciesId(0)))
+            .count();
+        assert_eq!(tagged, 50, "every organism is tagged Species(SpeciesId(0))");
     }
 
     #[test]
