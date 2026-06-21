@@ -1,0 +1,16 @@
+{
+  "seed": 2002,
+  "generations": 0,
+  "entity_count": 1200,
+  "action_count": 6,
+  "lat": 0.0,
+  "lon": 0.0,
+  "avg_temp": 0.82,
+  "season": 1,
+  "toolchain": {
+    "rust": "1.96.0",
+    "bevy_ecs": "0.19",
+    "rand_chacha": "0.10"
+  },
+  "harness_version": "0.1.0"
+}

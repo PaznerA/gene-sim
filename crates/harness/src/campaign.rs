@@ -470,20 +470,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn intro_path() -> &'static str {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/campaign/intro.json"
+        )
+    }
+
     #[test]
     fn shipped_intro_manifest_loads() {
         // The committed campaign manifest must always parse (data, not code — caught by the gate).
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../data/campaign/intro.json"
-        );
-        let campaign = load_campaign(path).expect("data/campaign/intro.json should load");
-        assert_eq!(campaign.scenarios.len(), 2);
-        assert_eq!(campaign.scenarios[0].name, "Drought Belt");
+        let campaign = load_campaign(intro_path()).expect("data/campaign/intro.json should load");
+        assert_eq!(campaign.scenarios.len(), 3);
+        assert_eq!(campaign.scenarios[0].name, "First Bloom");
         assert_eq!(campaign.scenarios[0].grid, (32, 32));
         assert_eq!(
-            campaign.scenarios[1].objective.kind,
-            ObjectiveKind::Establish
+            campaign.scenarios[2].objective.kind,
+            ObjectiveKind::Suppress
+        );
+    }
+
+    #[test]
+    fn shipped_intro_campaign_is_solvable() {
+        // SOLVABILITY INVARIANT: the committed example solutions must WIN every scenario. This proves the
+        // campaign is beatable (and pins the "par"), and — because it replays through the real engine — it
+        // also catches a content/grader/determinism regression that breaks a known solution. (When a future
+        // engine re-pin shifts the dynamics, this test flags that the shipped solutions need re-authoring.)
+        let solutions = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/campaign/solutions/intro"
+        );
+        let campaign = load_campaign(intro_path()).expect("intro.json loads");
+        let result = evaluate_campaign(&campaign, solutions);
+        assert_eq!(
+            result.scenarios_won,
+            campaign.scenarios.len() as u32,
+            "every shipped scenario must be won by its shipped solution journal: {:?}",
+            result.per_scenario
         );
     }
 }
