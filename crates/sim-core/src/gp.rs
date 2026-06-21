@@ -5,7 +5,7 @@
 //! behind the [`GenotypePhenotypeMap`] trait so it is pluggable (invariant #5) — [`WeightedSumMap`] is the
 //! Stage-1 default. No `HashMap` is iterated: we walk the genome's ordered `loci`/`parameters` only.
 
-use genome::Genome;
+use genome::{Genome, GoTermId, LocusId, ParamId};
 
 /// A heritable trait expressed from the genome. Extensible (TAXONOMY §2); new *biological* kinds arrive as
 /// ontology nodes (Stage 5), but the small fixed set the engine reasons about is enumerated here.
@@ -70,75 +70,113 @@ pub trait GenotypePhenotypeMap {
     fn express(&self, genome: &Genome) -> Phenotype;
 }
 
-/// The transparent Stage-1 default: each trait is a fixed **weighted sum** of the genome's parameter
-/// unit-scalars ([`genome::ParamValue::as_unit_scalar`]), clamped to `[0, 1]`.
-///
-/// ## How the weighting works
-/// Parameters are gathered into one ordered vector by walking `genome.loci` then each locus's `parameters`
-/// (stable order — invariant #3). For trait `t`, parameter at flat index `i` contributes with weight
-/// `weight(t, i)` taken from [`WeightedSumMap::weight`]; the products are summed and clamped to `[0, 1]`.
-///
-/// ## Documented weights ([`WeightedSumMap::weight`])
-/// Each trait is anchored 1:1 on its OWN flat genome parameter (fully DECOUPLED, so an edit to one parameter
-/// moves exactly one trait — many independent, continuous specimen variants):
-/// * `GrowthRate`=p0 · `Stature`=p1 · `Branchiness`=p2 · `LeafSize`=p3 · `LeafHue`=p4 · `Reflectance`=p5 ·
-///   `Fecundity`=p6 · `DroughtTolerance`=p7 · `KillSwitchLinkage`=p8 (the kill-switch bool slot).
-///
-/// Parameter slots beyond those anchored contribute weight `0.0`. Because each trait reads exactly one
-/// `as_unit_scalar()` (in `[0, 1]`), the raw sum is already in `[0, 1]`; the final `clamp` is a belt-and-braces
-/// guarantee for arbitrary genomes (property AC3).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WeightedSumMap;
+/// How a [`TraitBinding`] selects the locus carrying its parameter (ADR-017 F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocusSelector {
+    /// The locus with this id — a stable positional layout (the plant's loci).
+    ByIndex(LocusId),
+    /// The FIRST locus (in genome `loci` Vec order) whose `go_refs` contains this GO term — an ONTOLOGY-driven
+    /// binding for species whose layout isn't positional (e.g. E. coli genes keyed by molecular function).
+    ByGoAnchor(GoTermId),
+}
 
-impl WeightedSumMap {
-    /// Weight of flat parameter index `i` toward trait `t`. Pure; the single source of truth for the scheme
-    /// documented on [`WeightedSumMap`]. Unknown slots weigh `0.0`.
-    #[must_use]
-    fn weight(t: Trait, i: usize) -> f64 {
-        // Each trait is anchored on its OWN flat genome parameter (decoupled): trait value == that parameter's
-        // unit scalar. So an edit to parameter k moves exactly trait k — independent, continuous variation.
-        let anchor = match t {
-            Trait::GrowthRate => 0,
-            Trait::Stature => 1,
-            Trait::Branchiness => 2,
-            Trait::LeafSize => 3,
-            Trait::LeafHue => 4,
-            Trait::Reflectance => 5,
-            Trait::Fecundity => 6,
-            Trait::DroughtTolerance => 7,
-            Trait::KillSwitchLinkage => 8,
-        };
-        if i == anchor {
-            1.0
-        } else {
-            0.0
-        }
+/// One trait's binding: which locus + which parameter within it expresses the trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraitBinding {
+    /// The expressed trait.
+    pub trait_: Trait,
+    /// Which locus carries the parameter.
+    pub locus: LocusSelector,
+    /// The parameter id within that locus.
+    pub param: ParamId,
+}
+
+/// An ordered, per-species set of trait bindings — the genotype→phenotype "wiring" for one species. An ordered
+/// `Vec` (never a `HashMap`, inv #3); the binding order IS the [`Phenotype`] order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMap(pub Vec<TraitBinding>);
+
+/// Resolve a [`LocusSelector`] against a genome (ordered, pure, no RNG). `ByGoAnchor` takes the FIRST matching
+/// locus in `loci` Vec order, so the result is deterministic.
+fn resolve_locus(genome: &Genome, sel: LocusSelector) -> Option<&genome::Locus> {
+    match sel {
+        LocusSelector::ByIndex(id) => genome.locus(id),
+        LocusSelector::ByGoAnchor(go) => genome.loci.iter().find(|l| l.tags.go_refs.contains(&go)),
     }
 }
 
-impl GenotypePhenotypeMap for WeightedSumMap {
-    fn express(&self, genome: &Genome) -> Phenotype {
-        // Flatten parameters in stable order (loci, then parameters) — no HashMap (invariant #3).
-        let scalars: Vec<f64> = genome
-            .loci
-            .iter()
-            .flat_map(|l| l.parameters.iter())
-            .map(|p| p.value.as_unit_scalar())
-            .collect();
+/// The genotype→phenotype map driven by a per-species [`TraitMap`] (ADR-017 F2): each trait reads exactly the
+/// locus + parameter its species names, so plant and microbe genomes express their OWN traits from one engine
+/// (invariant #5). Pure + ordered; a binding whose locus/param is absent expresses a documented `0.0` (never a
+/// panic), so an arbitrary loaded genome can never crash expression.
+#[derive(Debug, Clone)]
+pub struct OntologyMap {
+    map: TraitMap,
+}
 
-        let values = Trait::ALL
+impl OntologyMap {
+    /// Build an `OntologyMap` from a species' [`TraitMap`].
+    #[must_use]
+    pub fn new(map: TraitMap) -> Self {
+        Self { map }
+    }
+}
+
+impl GenotypePhenotypeMap for OntologyMap {
+    fn express(&self, genome: &Genome) -> Phenotype {
+        let values = self
+            .map
+            .0
             .iter()
-            .map(|&t| {
-                let raw: f64 = scalars
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &s)| WeightedSumMap::weight(t, i) * s)
-                    .sum();
-                (t, raw.clamp(0.0, 1.0))
+            .map(|b| {
+                let scalar = resolve_locus(genome, b.locus)
+                    .and_then(|l| l.parameters.iter().find(|p| p.id == b.param))
+                    .map_or(0.0, |p| p.value.as_unit_scalar());
+                (b.trait_, scalar.clamp(0.0, 1.0))
             })
             .collect();
-
         Phenotype { values }
+    }
+}
+
+/// The default PLANT trait map — the 9 bindings that reproduce the historical flat-index anchoring EXACTLY
+/// (`GrowthRate`=L0/P0, `Stature`=L0/P1, `Branchiness`=L0/P2, `LeafSize`=L1/P0, `LeafHue`=L1/P1,
+/// `Reflectance`=L1/P2, `Fecundity`=L2/P0, `DroughtTolerance`=L3/P0, `KillSwitchLinkage`=L3/P1). Because each
+/// binding reads exactly the parameter its old flat anchor did, [`WeightedSumMap`] expresses byte-identically
+/// to before F2 (hash-neutral — proven by the unchanged pinned determinism literal).
+#[must_use]
+pub fn default_plant_trait_map() -> TraitMap {
+    let b = |t, l, p| TraitBinding {
+        trait_: t,
+        locus: LocusSelector::ByIndex(LocusId(l)),
+        param: ParamId(p),
+    };
+    TraitMap(vec![
+        b(Trait::GrowthRate, 0, 0),
+        b(Trait::Stature, 0, 1),
+        b(Trait::Branchiness, 0, 2),
+        b(Trait::LeafSize, 1, 0),
+        b(Trait::LeafHue, 1, 1),
+        b(Trait::Reflectance, 1, 2),
+        b(Trait::Fecundity, 2, 0),
+        b(Trait::DroughtTolerance, 3, 0),
+        b(Trait::KillSwitchLinkage, 3, 1),
+    ])
+}
+
+/// The transparent Stage-1 default for the PLANT species: each of the 9 traits reads exactly its own anchored
+/// genome parameter ([`genome::ParamValue::as_unit_scalar`], clamped to `[0, 1]`), fully DECOUPLED so an edit to
+/// one parameter moves exactly one trait (many independent, continuous specimen variants).
+///
+/// Since ADR-017 F2 this is a thin wrapper over [`OntologyMap`] carrying [`default_plant_trait_map`] — the same
+/// anchoring (`GrowthRate`=L0/P0 … `KillSwitchLinkage`=L3/P1) expressed through the per-species binding engine,
+/// so it stays byte-identical (hash-neutral) while E. coli / other species supply their OWN [`TraitMap`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WeightedSumMap;
+
+impl GenotypePhenotypeMap for WeightedSumMap {
+    fn express(&self, genome: &Genome) -> Phenotype {
+        OntologyMap::new(default_plant_trait_map()).express(genome)
     }
 }
 
@@ -178,5 +216,60 @@ mod tests {
         let g = genome::sample_genome();
         let p = WeightedSumMap.express(&g);
         assert!((p.get(Trait::GrowthRate).unwrap() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn f2_default_plant_map_pins_expression() {
+        // F2 (ADR-017): the ontology re-key must express sample_genome BYTE-IDENTICALLY to the pre-F2 flat
+        // anchoring — pinning every trait value proves the re-key is hash-neutral (allele_freq unchanged).
+        let g = genome::sample_genome();
+        let p = WeightedSumMap.express(&g);
+        let expect = [
+            (Trait::GrowthRate, 0.6),
+            (Trait::Stature, 0.5),
+            (Trait::Branchiness, 0.5),
+            (Trait::LeafSize, 0.5),
+            (Trait::LeafHue, 0.45),
+            (Trait::Reflectance, 0.5),
+            (Trait::Fecundity, 0.4),
+            (Trait::DroughtTolerance, 0.5),
+            (Trait::KillSwitchLinkage, 0.0), // Bool(false) → 0.0
+        ];
+        assert_eq!(p.values.len(), expect.len());
+        for ((t, v), (et, ev)) in p.values.iter().zip(expect.iter()) {
+            assert_eq!(t, et, "phenotype must stay in Trait::ALL order");
+            assert!((v - ev).abs() < 1e-9, "{t:?} = {v}, expected {ev}");
+        }
+        // The wrapper is exactly OntologyMap(default_plant_trait_map).
+        assert_eq!(p, OntologyMap::new(default_plant_trait_map()).express(&g));
+    }
+
+    #[test]
+    fn by_go_anchor_resolves_first_matching_locus() {
+        // An ontology-driven binding reads the FIRST locus whose go_refs contains the anchor (Vec order):
+        // sample_genome's L0 carries GO 40007, so ByGoAnchor(40007)/P0 reads L0/P0 = 0.6.
+        let g = genome::sample_genome();
+        let map = TraitMap(vec![TraitBinding {
+            trait_: Trait::GrowthRate,
+            locus: LocusSelector::ByGoAnchor(GoTermId(40007)),
+            param: ParamId(0),
+        }]);
+        let p = OntologyMap::new(map).express(&g);
+        assert!((p.get(Trait::GrowthRate).unwrap() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_binding_expresses_zero_not_panic() {
+        // A binding whose locus/param is absent yields a documented 0.0 (so an arbitrary loaded genome is safe).
+        let g = genome::sample_genome();
+        let map = TraitMap(vec![TraitBinding {
+            trait_: Trait::GrowthRate,
+            locus: LocusSelector::ByIndex(LocusId(99)),
+            param: ParamId(0),
+        }]);
+        assert_eq!(
+            OntologyMap::new(map).express(&g).get(Trait::GrowthRate),
+            Some(0.0)
+        );
     }
 }

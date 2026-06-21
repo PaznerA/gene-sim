@@ -74,12 +74,24 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   ~134-gene core-model KO landscape OFFLINE → runtime edit is a deterministic lookup. **E. coli data: BiGG
   `e_coli_core` (human-accepted the academic non-commercial clause, 2026-06-21).**
   - [x] **P1** — `crates/genome/src/spec.rs` JSON `SpeciesSpec` DTO + validating `build()` + `from_genome()`
-    (golden round-trip). The vehicle for any species-as-data (abstract default / E. coli / decomposer) + the
-    future in-game editor. Hash-neutral, gate-green.
-  - [ ] Next (hash-neutral): species LOADER (boundary) + `data/species/default.json` · S0 license-boundary-list ·
-    S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2 E. coli data bake
-    (`oracle-fba`) · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7
-    decomposer · S9 predator kernel · F2 ontology re-key.
+    (golden round-trip). Hash-neutral, gate-green.
+  - [x] **species loader + `reset_with_genome` seam + `data/species/default.json`** — species-as-data, end-to-end
+    (boundary loads → core builds a run from an explicit genome; default delegates `sample_genome`). Hash-neutral.
+  - [x] **S0** — `scripts/check_license.sh` boundary check generalized to a crate LIST (oracle-fba/relations-index).
+  - [x] **F2-1 ontology re-key (HASH-NEUTRAL!)** — `gp.rs` per-species `TraitMap` (`LocusSelector` ByIndex/ByGoAnchor
+    + `TraitBinding` + `OntologyMap`); `WeightedSumMap` = thin wrapper over `default_plant_trait_map` so the plant
+    expresses BYTE-IDENTICALLY (re-key proven hash-neutral by the unchanged pin). Unblocks microbe species.
+    *(Plan: `docs/llm/proposals/ecoli-genome-f2-draft.md` — F2 verified hash-neutral, not the feared re-pin.)*
+  - [ ] **Next — the real E. coli genome (all hash-neutral):**
+    - **B-1 data bake** — `scripts/bake_ecoli_species.py` (pinned NCBI `GCF_000005845.2` CDS + BiGG `e_coli_core`
+      roster + UniProt GO) → `data/species/ecoli.json`: 136 per-gene loci (sorted by b-number, real CDS, so_term
+      704, curated GO MF go_refs, one Numeric activity param). BiGG GPR/stoichiometry → a Ring-1 sidecar (keeps
+      `ecoli.json` license-clean). + a `shipped_ecoli_species_loads` gate test.
+    - **F2-2** — append microbe `Trait` variants (GlucoseUptake, RespirationMode, AcetateOverflow,
+      FermentationCapacity) — NOT in `Trait::ALL` (that stays the 9 plant render order).
+    - **B-2** — the E. coli per-species `TraitMap` (in-core const, `ByGoAnchor` bindings to the 5 microbe traits).
+  - [ ] Later: S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2/`oracle-fba`
+    KO-table bake · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7 decomposer.
 
 Sequencing: U + S + E done. Next **BETA tag** (v0.1.0-beta; extend `release.yml` to ship installable .exe/.dmg/
 .deb per the review's release-readiness findings) →
