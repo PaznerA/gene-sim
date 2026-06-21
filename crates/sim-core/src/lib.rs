@@ -569,8 +569,9 @@ impl Simulation {
 
     /// Read the **mean allele frequency over the populated cells of a disc region**, on a `grid_w × grid_h`
     /// snapshot grid (ADR-013 campaign-grader). This is the CORE re-implementation of the mission/zone reading
-    /// in `godot/main.gd::_eval_mission` — the seam that lets the renderer stop computing biology in GDScript
-    /// (invariant #2; the live `_eval_mission` is not yet rewired to call this — that is a follow-up). It uses
+    /// in `godot/main.gd::_eval_mission` — which now CALLS this (via `LiveSim.region_allele`) for the live
+    /// mission's zone read instead of computing it in GDScript (invariant #2; a GDScript loop remains only as
+    /// the no-LiveSim replay fallback). The headless campaign-grader shares this same read. It uses
     /// the SAME [`snapshot`](Self::snapshot) the renderer draws and averages `allele_freq` over exactly the
     /// cells that are populated (`density > 0`) AND inside [`Region::contains`] — a mean-of-cell-means, not a
     /// per-organism mean. It matches `_eval_mission` bit-for-bit **for `radius ≥ MIN_REGION_RADIUS`**; at

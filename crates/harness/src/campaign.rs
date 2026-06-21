@@ -14,12 +14,12 @@
 //! `(edit_budget − edits_used)·10 + max(0, deadline − gen)`, and the win is latched on the first met frame just
 //! like the live `_mission_status` lock (see [`evaluate`]).
 //!
-//! NOTE on invariant #2: this does NOT yet retire the GDScript path — `_eval_mission` is unchanged and the live
-//! renderer still computes the zone read + win/score in GDScript. What this slice adds is (a) the core
-//! `region_allele` read (the SEAM that lets the renderer stop computing biology in GDScript) and (b) a headless
-//! grader that re-grades any journal deterministically. The follow-up that actually reduces the violation is:
-//! expose `region_allele` on the `LiveSim` gdext node and rewrite `_eval_mission` to call it instead of looping
-//! over the snapshot. Until then the rules live in BOTH places — by design, as a stepping stone.
+//! Invariant #2: the live renderer is now WIRED to the core — `godot/main.gd::_eval_mission` calls
+//! `LiveSim.region_allele` for the zone BIOLOGY read instead of looping over the snapshot in GDScript (a
+//! GDScript loop survives only as the no-LiveSim replay fallback). The win/score decision stays in GDScript,
+//! but that is game-rule UI state, not biology — so the biology zone-read violation is retired from the live
+//! path. This headless grader shares the exact same core read (`Simulation::region_allele`), so the live
+//! mission and the headless campaign grade by an identical formula.
 
 use std::io;
 use std::path::Path;

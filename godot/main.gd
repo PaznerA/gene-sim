@@ -601,22 +601,31 @@ func _eval_mission() -> void:
 		return
 	var snap = _snaps[_idx]
 	var w: int = snap.width
-	var sum := 0.0
+	var zone_allele := 0.0
 	var n := 0
-	var r2 := _mission_radius * _mission_radius
-	for dy in range(-_mission_radius, _mission_radius + 1):
-		for dx in range(-_mission_radius, _mission_radius + 1):
-			if dx * dx + dy * dy > r2:
-				continue
-			var cx := _mission_zone.x + dx
-			var cy := _mission_zone.y + dy
-			if cx < 0 or cy < 0 or cx >= w or cy >= snap.height:
-				continue
-			var i: int = cy * w + cx
-			if snap.density[i] > 0.0:
-				sum += snap.allele_freq[i]
-				n += 1
-	var zone_allele := (sum / float(n)) if n > 0 else 0.0
+	if _live != null:
+		# CORE-computed zone read (invariant #2): the mission's biology now lives in the Rust core, not
+		# GDScript — LiveSim.region_allele returns the same mean-of-populated-cell-means over the disc.
+		var rd: Dictionary = _live.region_allele(_mission_zone.x, _mission_zone.y, _mission_radius, w, snap.height)
+		zone_allele = float(rd.get("mean", 0.0))
+		n = int(rd.get("populated", 0))
+	else:
+		# Replay fallback (no LiveSim node): the legacy GDScript snapshot loop over the same disc.
+		var sum := 0.0
+		var r2 := _mission_radius * _mission_radius
+		for dy in range(-_mission_radius, _mission_radius + 1):
+			for dx in range(-_mission_radius, _mission_radius + 1):
+				if dx * dx + dy * dy > r2:
+					continue
+				var cx := _mission_zone.x + dx
+				var cy := _mission_zone.y + dy
+				if cx < 0 or cy < 0 or cx >= w or cy >= snap.height:
+					continue
+				var i: int = cy * w + cx
+				if snap.density[i] > 0.0:
+					sum += snap.allele_freq[i]
+					n += 1
+		zone_allele = (sum / float(n)) if n > 0 else 0.0
 	var gen: int = snap.generation
 	if _mission_status == 0:
 		if n > 0 and zone_allele <= _mission_target:

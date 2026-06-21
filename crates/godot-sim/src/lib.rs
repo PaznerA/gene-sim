@@ -193,6 +193,39 @@ impl LiveSim {
         PackedByteArray::from(bytes.as_slice())
     }
 
+    /// CORE-computed mission/zone read (invariant #2): the mean allele frequency over the populated cells of
+    /// a disc `(cx, cy, radius)` on a `grid_w × grid_h` snapshot grid, as `{mean: float, populated: int}`.
+    /// The renderer's mission evaluation (`_eval_mission`) calls this instead of looping over the snapshot in
+    /// GDScript, so the zone biology read lives in the core. Delegates to
+    /// [`sim_core::Simulation::region_allele`] via the env — read-only, RNG-free (cannot change the hash).
+    /// Empty (`mean 0`, `populated 0`) before `reset`.
+    #[func]
+    fn region_allele(
+        &mut self,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+        grid_w: i64,
+        grid_h: i64,
+    ) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::region_allele called before reset()");
+            d.set("mean", 0.0);
+            d.set("populated", 0_i64);
+            return d;
+        };
+        let region = sim_core::Region {
+            cx: cx.max(0) as u32,
+            cy: cy.max(0) as u32,
+            radius: radius.max(0) as u32,
+        };
+        let r = env.region_allele(region, grid_w.max(1) as u32, grid_h.max(1) as u32);
+        d.set("mean", r.mean);
+        d.set("populated", i64::from(r.populated_cells));
+        d
+    }
+
     /// Apply a CRISPR edit to the **species** genome live (P4 / R6.1) and return its outcome.
     ///
     /// `cas` = Cas-variant id, `target` = species-genome locus id, `guide` = the ACGT guide string. Builds a
@@ -209,7 +242,13 @@ impl LiveSim {
         };
         let g = match GuideSequence::new(guide.to_string().into_bytes()) {
             Ok(g) => g,
-            Err(pos) => return edit_dict(false, &format!("invalid guide (bad base at {pos})"), env_gen(env)),
+            Err(pos) => {
+                return edit_dict(
+                    false,
+                    &format!("invalid guide (bad base at {pos})"),
+                    env_gen(env),
+                );
+            }
         };
         let edit = EditAction {
             cas: CasVariantId(cas.clamp(0, i64::from(u16::MAX)) as u16),
@@ -265,7 +304,12 @@ impl LiveSim {
         let g = match GuideSequence::new(guide.to_string().into_bytes()) {
             Ok(g) => g,
             Err(pos) => {
-                return region_dict(false, &format!("invalid guide (bad base at {pos})"), env_gen(env), 0)
+                return region_dict(
+                    false,
+                    &format!("invalid guide (bad base at {pos})"),
+                    env_gen(env),
+                    0,
+                );
             }
         };
         let edit = EditAction {
@@ -354,7 +398,8 @@ impl LiveSim {
             entity_count: self.entity_count,
             env: self.env_params, // persist the climate so the saved session replays under it (ADR-012)
         };
-        match harness::replay::save_journal(dir.to_string(), &env_config, self.seed, &self.journal) {
+        match harness::replay::save_journal(dir.to_string(), &env_config, self.seed, &self.journal)
+        {
             Ok(()) => true,
             Err(e) => {
                 godot_error!("LiveSim::save_session failed: {e}");
