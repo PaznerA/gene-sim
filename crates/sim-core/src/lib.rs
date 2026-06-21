@@ -23,6 +23,7 @@ pub mod climate;
 pub mod det;
 pub mod fixed;
 pub mod gp;
+pub mod ledger;
 pub mod snapshot;
 pub mod soil;
 
@@ -405,6 +406,10 @@ impl Simulation {
                                                            // World climate from the player's params — off the SimRng stream; unused by selection until E3 (so
                                                            // inserting it here is hash-neutral, proven by the unchanged pinned literal). ADR-012 Phase E.
         world.insert_resource(ClimateFieldRes(climate::ClimateField::from_params(env)));
+        // The conserved-energy ledger (ADR-013 F0a). Empty at reset and read by no system yet, so inserting
+        // it is hash-neutral (not folded into hash_world, draws nothing from SimRng) — proven by the unchanged
+        // pinned literal. F0b/F1 seed `initial_total` and the metabolism phases drive the taps.
+        world.insert_resource(ledger::Ledger::default());
 
         let mut schedule = Schedule::default();
         // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
@@ -542,6 +547,13 @@ impl Simulation {
     #[must_use]
     pub fn species_genome(&self) -> &Genome {
         &self.world.resource::<GenomeRes>().0
+    }
+
+    /// The run's conserved-energy [`Ledger`](ledger::Ledger) (ADR-013 F0a; read-only copy). Empty until the
+    /// joule pools land (F1); thereafter `ledger().closes(live_total)` is the conservation invariant.
+    #[must_use]
+    pub fn ledger(&self) -> ledger::Ledger {
+        *self.world.resource::<ledger::Ledger>()
     }
 
     /// Mutate the **species** genome with access to the run's single seeded RNG, then re-express the
@@ -1255,6 +1267,29 @@ mod tests {
         let snap = sim.snapshot(8, 8);
         let max = snap.density.iter().copied().fold(0.0f32, f32::max);
         assert_eq!(max, 1.0, "busiest cell should have density 1.0");
+    }
+
+    #[test]
+    fn reset_inserts_a_closing_ledger() {
+        // ADR-013 F0a: the conserved-energy ledger is present at reset, empty, and closes trivially — no
+        // joule moves yet (energy is still f64, no pools). F1 will seed `initial_total` and assert against
+        // the real live total each tick.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 0,
+            entity_count: 100,
+        };
+        let sim = Simulation::reset(&cfg);
+        let led = sim.ledger();
+        assert_eq!(
+            led,
+            ledger::Ledger::default(),
+            "F0a: the ledger starts empty"
+        );
+        assert!(
+            led.closes(0),
+            "F0a: nothing moves J yet, so the books close at 0"
+        );
     }
 
     #[cfg(feature = "proptest")]
