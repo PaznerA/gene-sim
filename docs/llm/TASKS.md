@@ -67,6 +67,20 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   - Target: ≥2× more environment/resource "variables" than today (beyond sun + temperature) before the post-impl
     revision (stronger autonomous e2e testing + deeper algo/rand-param simulation in CI + roadmap).
 
+- [~] **ADR-017 — Layered E. coli ecosystem** (design done; `docs/llm/proposals/ecoli-layered-architecture-draft.md`).
+  KEEP the fast 30FPS abstract sim (plant/animal); ADD a deep real **E. coli** game mode (earned edits computed
+  in the BACKGROUND, fed back via the selection-modifier seam) + a **decomposer 3rd species** + **vector-DB
+  relations** (view-only over the emergent conserved-J FlowMatrix). Multi-fidelity firewall = precompute the
+  ~134-gene core-model KO landscape OFFLINE → runtime edit is a deterministic lookup. **E. coli data: BiGG
+  `e_coli_core` (human-accepted the academic non-commercial clause, 2026-06-21).**
+  - [x] **P1** — `crates/genome/src/spec.rs` JSON `SpeciesSpec` DTO + validating `build()` + `from_genome()`
+    (golden round-trip). The vehicle for any species-as-data (abstract default / E. coli / decomposer) + the
+    future in-game editor. Hash-neutral, gate-green.
+  - [ ] Next (hash-neutral): species LOADER (boundary) + `data/species/default.json` · S0 license-boundary-list ·
+    S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2 E. coli data bake
+    (`oracle-fba`) · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7
+    decomposer · S9 predator kernel · F2 ontology re-key.
+
 Sequencing: U + S + E done. Next **BETA tag** (v0.1.0-beta; extend `release.yml` to ship installable .exe/.dmg/
 .deb per the review's release-readiness findings) →
 R3 (biggest sim leap, ADR sign-off) → Rel (relations + vector DB, ADR). Each core phase re-pins the determinism

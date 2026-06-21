@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod spec;
+
 /// Stable, ordered handle into a [`Genome`]'s locus list (equals the index in `Genome::loci`).
 ///
 /// Serde-(de)serializable so it can ride in replay logs (`actions.ndjson`, SPEC §5): a trivial `u32`
