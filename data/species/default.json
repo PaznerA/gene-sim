@@ -1,0 +1,147 @@
+{
+  "format_version": 1,
+  "key": "default",
+  "name": "Abstract Default",
+  "niche": {
+    "entity_count": 1000,
+    "description": "The abstract fast-sim species — 9 decoupled morphology traits (plant-ish).",
+    "temp_optimum": null,
+    "parent_key": null
+  },
+  "genome": {
+    "version": 2,
+    "loci": [
+      {
+        "id": 0,
+        "name": "morphology_locus",
+        "sequence": "ACGTGGACGTTTTAGGCCGG",
+        "parameters": [
+          {
+            "id": 0,
+            "value": {
+              "kind": "numeric",
+              "value": 0.6,
+              "min": 0.0,
+              "max": 1.0
+            }
+          },
+          {
+            "id": 1,
+            "value": {
+              "kind": "numeric",
+              "value": 0.5,
+              "min": 0.0,
+              "max": 1.0
+            }
+          },
+          {
+            "id": 2,
+            "value": {
+              "kind": "numeric",
+              "value": 0.5,
+              "min": 0.0,
+              "max": 1.0
+            }
+          }
+        ],
+        "tags": {
+          "so_term": 704,
+          "go_refs": [
+            40007
+          ]
+        }
+      },
+      {
+        "id": 1,
+        "name": "foliage_locus",
+        "sequence": "ACGTGGTTTACCGGAAGGCC",
+        "parameters": [
+          {
+            "id": 0,
+            "value": {
+              "kind": "numeric",
+              "value": 0.5,
+              "min": 0.0,
+              "max": 1.0
+            }
+          },
+          {
+            "id": 1,
+            "value": {
+              "kind": "numeric",
+              "value": 0.45,
+              "min": 0.0,
+              "max": 1.0
+            }
+          },
+          {
+            "id": 2,
+            "value": {
+              "kind": "numeric",
+              "value": 0.5,
+              "min": 0.0,
+              "max": 1.0
+            }
+          }
+        ],
+        "tags": {
+          "so_term": 704,
+          "go_refs": [
+            9579
+          ]
+        }
+      },
+      {
+        "id": 2,
+        "name": "reproduction_locus",
+        "sequence": "GGCCAATTTAGGCCGGTTTA",
+        "parameters": [
+          {
+            "id": 0,
+            "value": {
+              "kind": "numeric",
+              "value": 0.4,
+              "min": 0.0,
+              "max": 1.0
+            }
+          }
+        ],
+        "tags": {
+          "so_term": 704,
+          "go_refs": [
+            3006
+          ]
+        }
+      },
+      {
+        "id": 3,
+        "name": "hardiness_locus",
+        "sequence": "TTTACCGGTTTAGGGCAAAC",
+        "parameters": [
+          {
+            "id": 0,
+            "value": {
+              "kind": "numeric",
+              "value": 0.5,
+              "min": 0.0,
+              "max": 1.0
+            }
+          },
+          {
+            "id": 1,
+            "value": {
+              "kind": "bool",
+              "value": false
+            }
+          }
+        ],
+        "tags": {
+          "so_term": 704,
+          "go_refs": [
+            3674
+          ]
+        }
+      }
+    ]
+  }
+}

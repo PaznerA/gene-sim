@@ -388,19 +388,26 @@ impl Simulation {
         Self::reset_with_env(config, &climate::EnvParams::default())
     }
 
-    /// Build a fresh simulation under a player-set climate (ADR-012 Phase E): seed the [`ChaCha8Rng`] **once**,
-    /// express the genome→phenotype once, spawn the population, and build the static soil + [`climate`] fields
-    /// off the seed/params (zero `SimRng` draws). The climate is inserted but only SHAPES selection once E3
-    /// couples it; until then this is byte-identical to [`reset`] at default `env` (invariant #3, #2).
+    /// Build a fresh simulation under a player-set climate (ADR-012 Phase E) using the DEFAULT species genome —
+    /// byte-identical to [`reset`] at default `env` (invariant #3, #2). Delegates to [`reset_with_genome`].
     #[must_use]
     pub fn reset_with_env(config: &SimConfig, env: &climate::EnvParams) -> Self {
+        Self::reset_with_genome(config, env, genome::sample_genome())
+    }
+
+    /// Build a fresh simulation under a climate AND an explicit species `genome` (ADR-017 — the vehicle for a
+    /// JSON [`genome::spec::SpeciesSpec`]-loaded species): seed the [`ChaCha8Rng`] **once**, express the
+    /// genome→phenotype once, spawn the population, and build the static soil + [`climate`] + resource fields
+    /// off the seed/params (zero `SimRng` draws). With `genome::sample_genome()` it is byte-identical to the
+    /// historical path (hash-neutral); only a DIFFERENT genome changes the run.
+    #[must_use]
+    pub fn reset_with_genome(config: &SimConfig, env: &climate::EnvParams, genome: Genome) -> Self {
         let mut world = World::new();
         // Seed the single RNG ONCE for the whole episode (inv. #3 — never re-seeded mid-run).
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
-        // Express the genome → phenotype ONCE (invariant #2; genotype→phenotype only here / in `genome`).
-        // The Wright-Fisher loop then selects over per-individual genotypes modulated by base growth rate.
-        let genome = genome::sample_genome();
+        // Express the (passed) genome → phenotype ONCE (invariant #2; genotype→phenotype only here / in
+        // `genome`). The Wright-Fisher loop then selects over per-individual genotypes modulated by base growth.
         let phenotype = WeightedSumMap.express(&genome);
         let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
 

@@ -34,6 +34,7 @@ use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod campaign;
 pub mod replay;
+pub mod species;
 
 /// The result of one [`Env::step`]: the new observation plus a scalar reward and an episode-`done` flag
 /// (Gymnasium `step` shape, SPEC §2.2).
