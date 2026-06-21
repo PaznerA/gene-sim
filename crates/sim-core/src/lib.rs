@@ -345,7 +345,7 @@ fn mean_genotype(world: &mut World) -> f64 {
 ///
 /// Returned by [`Simulation::observe`]. Every field is a pure function of the seeded run so far
 /// (invariant #3): `allele_freq` is the population statistic the selection loop drives, and
-/// `phenotype` is the species genome re-expressed through the [`WeightedSumMap`] (invariant #2 —
+/// `phenotype` is the species genome re-expressed through the run's stored per-species map (invariant #2 —
 /// genotype→phenotype only here / in `genome`/`sim-core`). A fixed (seed, step/edit sequence) always
 /// yields an identical sequence of `Observation`s.
 #[derive(Debug, Clone, PartialEq)]
@@ -378,6 +378,11 @@ pub struct Simulation {
     /// w.r.t. the run (off the determinism-hash path — roadmap R1.0). Exported into snapshots; not yet
     /// coupled to selection.
     soil: soil::SoilField,
+    /// The per-run genotype→phenotype map (ADR-017 "RUN E. coli"): set once at reset and reused by
+    /// [`observe`](Self::observe) + [`with_genome_and_rng`](Self::with_genome_and_rng) so the species expresses
+    /// CONSISTENTLY across reset/observe/edit. The default (plant) map keeps the run byte-identical; the map is
+    /// never folded into `hash_world`, so storing it is hash-neutral by construction.
+    gp_map: gp::OntologyMap,
 }
 
 impl Simulation {
@@ -395,20 +400,42 @@ impl Simulation {
         Self::reset_with_genome(config, env, genome::sample_genome())
     }
 
-    /// Build a fresh simulation under a climate AND an explicit species `genome` (ADR-017 — the vehicle for a
-    /// JSON [`genome::spec::SpeciesSpec`]-loaded species): seed the [`ChaCha8Rng`] **once**, express the
-    /// genome→phenotype once, spawn the population, and build the static soil + [`climate`] + resource fields
-    /// off the seed/params (zero `SimRng` draws). With `genome::sample_genome()` it is byte-identical to the
-    /// historical path (hash-neutral); only a DIFFERENT genome changes the run.
+    /// Build a fresh simulation under a climate AND an explicit species `genome`, expressed through the DEFAULT
+    /// (plant) trait map — byte-identical to the historical path (hash-neutral). Delegates to
+    /// [`reset_with_genome_and_map`](Self::reset_with_genome_and_map).
     #[must_use]
     pub fn reset_with_genome(config: &SimConfig, env: &climate::EnvParams, genome: Genome) -> Self {
+        Self::reset_with_genome_and_map(
+            config,
+            env,
+            genome,
+            gp::OntologyMap::new(gp::default_plant_trait_map()),
+        )
+    }
+
+    /// Build a fresh simulation under a climate, an explicit species `genome`, AND its per-species `gp_map`
+    /// (ADR-017 "RUN E. coli" — the vehicle for a JSON [`genome::spec::SpeciesSpec`]-loaded species expressing its
+    /// OWN traits, e.g. E. coli via [`gp::ecoli_trait_map`]): seed the [`ChaCha8Rng`] **once**, express the
+    /// genome→phenotype through `gp_map` once, spawn the population, and build the static soil, [`climate`], and
+    /// resource fields off the seed/params (zero `SimRng` draws). The map is STORED so [`observe`](Self::observe)
+    /// and [`with_genome_and_rng`](Self::with_genome_and_rng) re-express consistently. Given `sample_genome()`
+    /// under the default plant map ([`gp::default_plant_trait_map`]) the run is byte-identical to the historical
+    /// path; only a DIFFERENT genome/map changes it (the map itself is never folded into `hash_world`).
+    #[must_use]
+    pub fn reset_with_genome_and_map(
+        config: &SimConfig,
+        env: &climate::EnvParams,
+        genome: Genome,
+        gp_map: gp::OntologyMap,
+    ) -> Self {
         let mut world = World::new();
         // Seed the single RNG ONCE for the whole episode (inv. #3 — never re-seeded mid-run).
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
-        // Express the (passed) genome → phenotype ONCE (invariant #2; genotype→phenotype only here / in
-        // `genome`). The Wright-Fisher loop then selects over per-individual genotypes modulated by base growth.
-        let phenotype = WeightedSumMap.express(&genome);
+        // Express the (passed) genome → phenotype ONCE through the per-species map (invariant #2;
+        // genotype→phenotype only here / in `genome`). The Wright-Fisher loop selects over per-individual
+        // genotypes modulated by base growth (GrowthRate is name-keyed, so it resolves under any species map).
+        let phenotype = gp_map.express(&genome);
         let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
 
         // Static soil substrate, generated purely from the seed via derive_seed — ZERO SimRng draws (R1.0).
@@ -467,6 +494,7 @@ impl Simulation {
             config: config.clone(),
             // Static for the run; read-only w.r.t. the hash beyond its coupling effect on per-org state.
             soil,
+            gp_map,
         }
     }
 
@@ -485,8 +513,9 @@ impl Simulation {
         let allele_freq = mean_genotype(&mut self.world);
         let generation = self.world.resource::<Tick>().0;
         let population_size = self.world.query::<&OrgId>().iter(&self.world).count() as u32;
-        // Re-express the (possibly edited) species genome into traits — the only genotype→phenotype site.
-        let phenotype = WeightedSumMap.express(&self.world.resource::<GenomeRes>().0);
+        // Re-express the (possibly edited) species genome into traits through THIS run's stored species map, so
+        // an E. coli run observes microbe traits and a plant run observes plant traits (ADR-017).
+        let phenotype = self.gp_map.express(&self.world.resource::<GenomeRes>().0);
         Observation {
             generation,
             population_size,
@@ -663,8 +692,9 @@ impl Simulation {
         };
         self.world.resource_mut::<SimRng>().0 = rng;
 
-        // Re-express phenotype after the genome change so the edit feeds subsequent fitness (invariant #2).
-        let phenotype = WeightedSumMap.express(&self.world.resource::<GenomeRes>().0);
+        // Re-express phenotype after the genome change THROUGH this run's stored species map, so the edit feeds
+        // subsequent fitness consistently (e.g. an E. coli gltA knockout drops GrowthRate; invariant #2, ADR-017).
+        let phenotype = self.gp_map.express(&self.world.resource::<GenomeRes>().0);
         let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
         self.world.resource_mut::<BaseGrowthRate>().0 = base_growth;
         out
@@ -737,6 +767,22 @@ impl Simulation {
 #[must_use]
 pub fn run_headless(config: &SimConfig) -> RunStats {
     let mut sim = Simulation::reset(config);
+    sim.step(config.generations);
+    sim.run_stats()
+}
+
+/// Run a headless, deterministic simulation for an EXPLICIT species `genome` + its per-species `gp_map`
+/// (ADR-017 "RUN E. coli"). A SEPARATE seam from [`run_headless`] so the pinned default path (and
+/// `determinism_hash_is_pinned` / `check_determinism.sh`) stays untouched; a species run has its OWN hash.
+/// Same `config` + `genome` + `map` + build + platform ⇒ identical `hash`.
+#[must_use]
+pub fn run_headless_with(config: &SimConfig, genome: Genome, gp_map: gp::OntologyMap) -> RunStats {
+    let mut sim = Simulation::reset_with_genome_and_map(
+        config,
+        &climate::EnvParams::default(),
+        genome,
+        gp_map,
+    );
     sim.step(config.generations);
     sim.run_stats()
 }

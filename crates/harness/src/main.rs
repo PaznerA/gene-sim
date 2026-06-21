@@ -11,9 +11,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crispr::{default_cas_variants, EditOutcome, GuideSequence, RegionEditOutcome};
+use genome::spec::BuiltSpecies;
 use genome::LocusId;
 use harness::{Action, EditAction, Env, GeneSimEnv};
-use sim_core::{derive_seed, run_headless, Observation, RunStats, SimConfig, Simulation, Trait};
+use sim_core::gp::{trait_map_for, OntologyMap};
+use sim_core::{
+    derive_seed, run_headless, run_headless_with, EnvParams, Observation, RunStats, SimConfig,
+    Simulation, Trait,
+};
 
 const USAGE: &str = "\
 gene-sim harness — headless deterministic sim runner
@@ -33,6 +38,10 @@ OPTIONS:
     --grid <W>x<H>        Snapshot grid size for --snapshots. Default: 64x64
     --specimens <DIR>     Write specimens.json (baseline + edited species-genome trait vectors) for the
                           renderer's L-system plant view (SPEC §W10, S4.5). Read-only; no hash impact.
+    --species <FILE>      RUN a JSON SpeciesSpec (e.g. data/species/ecoli.json): the sim uses THAT genome +
+                          its per-species trait map (E. coli → gltA growth) on its OWN deterministic hash.
+                          Combine with --per-gen-stats (plant-shaped CSV: growth_rate is real, the other plant
+                          columns 0 for a microbe). Default (no --species) is the pinned plant — byte-identical.
     --hash-only           Print only the combined determinism hash (no files written)
     --record-episode <DIR>  Record a journaled reset+Advance+ApplyEdit episode to <DIR>/<run_id>/ (seed.json +
                           actions.ndjson) and print its hash — the live-session replay contract (R6/P1, ADR-010).
@@ -69,6 +78,7 @@ struct Args {
     snapshots: Option<PathBuf>,
     grid: (u32, u32),
     specimens: Option<PathBuf>,
+    species: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -83,6 +93,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut snapshots: Option<PathBuf> = None;
     let mut grid: (u32, u32) = (64, 64);
     let mut specimens: Option<PathBuf> = None;
+    let mut species: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -104,6 +115,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--snapshots" => snapshots = Some(PathBuf::from(take("--snapshots")?)),
             "--grid" => grid = parse_grid(&take("--grid")?)?,
             "--specimens" => specimens = Some(PathBuf::from(take("--specimens")?)),
+            "--species" => species = Some(PathBuf::from(take("--species")?)),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -120,6 +132,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         snapshots,
         grid,
         specimens,
+        species,
     }))
 }
 
@@ -172,21 +185,54 @@ fn main() -> ExitCode {
     let want_snapshots = args.snapshots.is_some() && !args.hash_only;
     let want_specimens = args.specimens.is_some() && !args.hash_only;
 
+    // ADR-017 RUN E. coli: load the optional --species roster ONCE; a missing/invalid file is a hard error.
+    let species = match args
+        .species
+        .as_ref()
+        .map(harness::species::load_species_file)
+    {
+        Some(Ok(b)) => Some(b),
+        Some(Err(e)) => {
+            eprintln!("error: --species: {e}");
+            return ExitCode::from(2);
+        }
+        None => None,
+    };
+    if species.is_some() && (want_snapshots || want_specimens) {
+        eprintln!(
+            "warning: --snapshots/--specimens still use the default plant genome; --species is not wired there yet"
+        );
+    }
+
     let mut results: Vec<RunStats> = Vec::with_capacity(indices.len());
     // Per-run, per-generation CSV rows (only populated when --per-gen-stats and not --hash-only).
     let mut per_gen: Vec<String> = Vec::with_capacity(if want_per_gen { indices.len() } else { 0 });
     let multi_run = indices.len() > 1;
     for &i in &indices {
-        let cfg = SimConfig {
+        let mut cfg = SimConfig {
             seed: derive_seed(args.master, u64::from(i)),
             generations: args.generations,
             entity_count: args.entities,
         };
+        // With --species, the species' niche entity_count (when set) governs the population.
+        if let Some(b) = &species {
+            if b.entity_count > 0 {
+                cfg.entity_count = b.entity_count;
+            }
+        }
         // The determinism hash always comes from the one-shot path (provably unchanged by --per-gen-stats):
-        // `run_headless` is reset → step(generations) → run_stats. Per-gen stepping is collected separately.
-        results.push(run_headless(&cfg));
+        // `run_headless` is reset → step(generations) → run_stats. With --species the SEPARATE
+        // `run_headless_with` seam runs that genome through its per-species trait map on its own hash.
+        results.push(match &species {
+            Some(b) => run_headless_with(
+                &cfg,
+                b.genome.clone(),
+                OntologyMap::new(trait_map_for(&b.key)),
+            ),
+            None => run_headless(&cfg),
+        });
         if want_per_gen {
-            per_gen.push(collect_per_gen_csv(i, &cfg));
+            per_gen.push(collect_per_gen_csv(i, &cfg, species.as_ref()));
         }
         if want_snapshots {
             // ADDITIVE & read-only: snapshots derive from a fresh stepwise Simulation and never feed the
@@ -535,8 +581,18 @@ const PER_GEN_HEADER: &str = "run_index,generation,population_size,allele_freq,g
 /// `simulation_stepwise_matches_one_shot` — one seeded stream, no re-seed) and `observe()` is pure, so
 /// this does NOT influence the determinism hash, which comes from the one-shot `run_headless` path
 /// (invariant #3). Trait values are pulled in fixed [`Trait::ALL`] order from each `Observation.phenotype`.
-fn collect_per_gen_csv(i: u32, cfg: &SimConfig) -> String {
-    let mut sim = Simulation::reset(cfg);
+fn collect_per_gen_csv(i: u32, cfg: &SimConfig, species: Option<&BuiltSpecies>) -> String {
+    // With --species the per-gen CSV runs THAT genome through its per-species trait map (so growth_rate is the
+    // microbe's, e.g. E. coli gltA); the other plant columns then read 0.0 (cosmetic — only GrowthRate drives).
+    let mut sim = match species {
+        Some(b) => Simulation::reset_with_genome_and_map(
+            cfg,
+            &EnvParams::default(),
+            b.genome.clone(),
+            OntologyMap::new(trait_map_for(&b.key)),
+        ),
+        None => Simulation::reset(cfg),
+    };
     // One data row per generation (generations 1..=cfg.generations), deterministic order.
     let mut body = String::new();
     for _ in 0..cfg.generations {

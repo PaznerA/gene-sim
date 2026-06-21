@@ -87,4 +87,75 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ecoli_runs_deterministically_off_gltacitrate() {
+        // RUN E. coli (ADR-017): the real 136-gene genome runs via run_headless_with through ecoli_trait_map —
+        // deterministic (same inputs → same hash twice), and its GrowthRate comes from gltA (1.0), NOT plant 0.6.
+        use sim_core::gp::{trait_map_for, OntologyMap, Trait};
+        use sim_core::{run_headless_with, EnvParams, SimConfig, Simulation};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/ecoli.json");
+        let built = load_species_file(path).expect("ecoli loads");
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 20,
+            entity_count: 300,
+        };
+        let map = || OntologyMap::new(trait_map_for(&built.key));
+        let h1 = run_headless_with(&cfg, built.genome.clone(), map());
+        let h2 = run_headless_with(&cfg, built.genome.clone(), map());
+        assert_eq!(h1.hash, h2.hash, "E. coli run must be deterministic");
+        let mut sim = Simulation::reset_with_genome_and_map(
+            &cfg,
+            &EnvParams::default(),
+            built.genome.clone(),
+            map(),
+        );
+        assert_eq!(
+            sim.observe().phenotype.get(Trait::GrowthRate),
+            Some(1.0),
+            "E. coli GrowthRate comes from gltA wild-type activity"
+        );
+    }
+
+    #[test]
+    fn gltacitrate_knockout_drops_growth_across_all_express_sites() {
+        // Edit-consistency: knocking out gltA (GO 4108, activity→0) drops the OBSERVED GrowthRate — proving
+        // observe + with_genome_and_rng both use the STORED E. coli map (would FAIL if either stayed on the plant
+        // WeightedSumMap, which has no GO-4108 binding).
+        use sim_core::gp::{trait_map_for, OntologyMap, Trait};
+        use sim_core::{EnvParams, SimConfig, Simulation};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/ecoli.json");
+        let built = load_species_file(path).expect("ecoli loads");
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 1,
+            entity_count: 100,
+        };
+        let mut sim = Simulation::reset_with_genome_and_map(
+            &cfg,
+            &EnvParams::default(),
+            built.genome.clone(),
+            OntologyMap::new(trait_map_for(&built.key)),
+        );
+        assert_eq!(sim.observe().phenotype.get(Trait::GrowthRate), Some(1.0));
+        sim.with_genome_and_rng(|g, _rng| {
+            for l in g.loci.iter_mut() {
+                if l.tags.go_refs.contains(&genome::GoTermId(4108)) {
+                    if let Some(p) = l.parameters.iter_mut().find(|p| p.id == genome::ParamId(0)) {
+                        p.value = genome::ParamValue::Numeric {
+                            value: 0.0,
+                            min: 0.0,
+                            max: 1.0,
+                        };
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            sim.observe().phenotype.get(Trait::GrowthRate),
+            Some(0.0),
+            "gltA knockout must drop GrowthRate through the stored E. coli map"
+        );
+    }
 }

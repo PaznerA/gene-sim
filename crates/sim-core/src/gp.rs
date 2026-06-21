@@ -197,6 +197,17 @@ pub fn ecoli_trait_map() -> TraitMap {
     ])
 }
 
+/// Select the per-species [`TraitMap`] by the species `key` (ADR-017 "RUN E. coli"). A pure, ordered `match`
+/// (never a `HashMap` — inv #3): `"ecoli-core"` → [`ecoli_trait_map`]; EVERY other key → the default plant map,
+/// so an unknown/missing key degrades safely to the historical behaviour.
+#[must_use]
+pub fn trait_map_for(key: &str) -> TraitMap {
+    match key {
+        "ecoli-core" => ecoli_trait_map(),
+        _ => default_plant_trait_map(),
+    }
+}
+
 /// The transparent Stage-1 default for the PLANT species: each of the 9 traits reads exactly its own anchored
 /// genome parameter ([`genome::ParamValue::as_unit_scalar`], clamped to `[0, 1]`), fully DECOUPLED so an edit to
 /// one parameter moves exactly one trait (many independent, continuous specimen variants).
@@ -289,6 +300,14 @@ mod tests {
         }]);
         let p = OntologyMap::new(map).express(&g);
         assert!((p.get(Trait::GrowthRate).unwrap() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trait_map_for_selects_by_key() {
+        // Ordered match (inv #3): the E. coli key → microbe map; every other key → the default plant map.
+        assert_eq!(trait_map_for("ecoli-core"), ecoli_trait_map());
+        assert_eq!(trait_map_for("default"), default_plant_trait_map());
+        assert_eq!(trait_map_for("unknown-species"), default_plant_trait_map());
     }
 
     #[test]
