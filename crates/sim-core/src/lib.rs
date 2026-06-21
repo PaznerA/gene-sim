@@ -21,6 +21,7 @@ use rand_chacha::rand_core::{Rng, SeedableRng};
 
 pub mod climate;
 pub mod det;
+pub mod fixed;
 pub mod gp;
 pub mod snapshot;
 pub mod soil;
