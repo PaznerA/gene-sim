@@ -174,9 +174,21 @@ pub struct Region {
     pub radius: u32,
 }
 
+/// A read of allele frequency over a disc region (ADR-013 campaign-grader): the mean of the per-cell
+/// `allele_freq` over the populated in-region cells, plus how many such cells there were (`populated_cells
+/// == 0` means the region is empty and `mean` is `0.0`). Returned by [`Simulation::region_allele`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegionReadout {
+    /// Mean-of-cell-means allele frequency over the populated in-region cells, in `[0, 1]`.
+    pub mean: f64,
+    /// Number of populated (`density > 0`) cells inside the region disc.
+    pub populated_cells: u32,
+}
+
 impl Region {
     /// Whether world cell `(x, y)` falls inside the disc (radius clamped to [`MIN_REGION_RADIUS`]).
-    fn contains(&self, x: u32, y: u32) -> bool {
+    #[must_use]
+    pub fn contains(&self, x: u32, y: u32) -> bool {
         let dx = i64::from(x) - i64::from(self.cx);
         let dy = i64::from(y) - i64::from(self.cy);
         let r = i64::from(self.radius.max(MIN_REGION_RADIUS));
@@ -552,6 +564,40 @@ impl Simulation {
             soil_moisture,
             soil_nutrients,
             soil_ph,
+        }
+    }
+
+    /// Read the **mean allele frequency over the populated cells of a disc region**, on a `grid_w × grid_h`
+    /// snapshot grid (ADR-013 campaign-grader). This is the CORE re-implementation of the mission/zone reading
+    /// in `godot/main.gd::_eval_mission` — the seam that lets the renderer stop computing biology in GDScript
+    /// (invariant #2; the live `_eval_mission` is not yet rewired to call this — that is a follow-up). It uses
+    /// the SAME [`snapshot`](Self::snapshot) the renderer draws and averages `allele_freq` over exactly the
+    /// cells that are populated (`density > 0`) AND inside [`Region::contains`] — a mean-of-cell-means, not a
+    /// per-organism mean. It matches `_eval_mission` bit-for-bit **for `radius ≥ MIN_REGION_RADIUS`**; at
+    /// `radius == 0` [`Region::contains`] clamps up to a radius-1 disc while `_eval_mission` reads only the
+    /// centre cell, so the two diverge there. Read-only and RNG-free (delegates to `snapshot`) — never perturbs
+    /// the hash.
+    #[must_use]
+    pub fn region_allele(&mut self, region: Region, grid_w: u32, grid_h: u32) -> RegionReadout {
+        let snap = self.snapshot(grid_w, grid_h);
+        let mut sum = 0.0f64;
+        let mut populated = 0u32;
+        for y in 0..grid_h {
+            for x in 0..grid_w {
+                let i = (y * grid_w + x) as usize;
+                if snap.density[i] > 0.0 && region.contains(x, y) {
+                    sum += f64::from(snap.allele_freq[i]);
+                    populated += 1;
+                }
+            }
+        }
+        RegionReadout {
+            mean: if populated > 0 {
+                sum / f64::from(populated)
+            } else {
+                0.0
+            },
+            populated_cells: populated,
         }
     }
 
@@ -1307,6 +1353,47 @@ mod tests {
             led.closes(0),
             "F0a: nothing moves J yet, so the books close at 0"
         );
+    }
+
+    #[test]
+    fn region_allele_reads_zone_deterministically() {
+        // campaign-grader: region_allele lifts _eval_mission into the core. It must be deterministic, bounded,
+        // and report an empty region honestly.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 5,
+            entity_count: 800,
+        };
+        let mut a = Simulation::reset(&cfg);
+        a.step(5);
+        let whole = Region {
+            cx: 16,
+            cy: 16,
+            radius: 64,
+        }; // covers the 32x32 world
+        let r1 = a.region_allele(whole, 32, 32);
+        let mut b = Simulation::reset(&cfg);
+        b.step(5);
+        let r2 = b.region_allele(whole, 32, 32);
+        assert_eq!(r1, r2, "same world+grid+region => identical readout");
+        assert!((0.0..=1.0).contains(&r1.mean), "mean in [0,1]");
+        assert!(
+            r1.populated_cells > 0,
+            "a populated world covers some cells"
+        );
+
+        // A region centred far off-grid with radius 0 contains no populated cell → honest empty read.
+        let empty = a.region_allele(
+            Region {
+                cx: 999,
+                cy: 999,
+                radius: 0,
+            },
+            32,
+            32,
+        );
+        assert_eq!(empty.populated_cells, 0);
+        assert_eq!(empty.mean, 0.0);
     }
 
     #[cfg(feature = "proptest")]

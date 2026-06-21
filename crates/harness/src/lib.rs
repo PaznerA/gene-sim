@@ -32,6 +32,7 @@ use genome::LocusId;
 use serde::{Deserialize, Serialize};
 use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
+pub mod campaign;
 pub mod replay;
 
 /// The result of one [`Env::step`]: the new observation plus a scalar reward and an episode-`done` flag
@@ -116,7 +117,10 @@ pub struct RegionSpec {
 }
 
 impl RegionSpec {
-    fn to_region(self) -> sim_core::Region {
+    /// Convert to the core's [`sim_core::Region`] (disc cells). Public so the campaign-grader can read a
+    /// scenario's target zone via [`GeneSimEnv::region_allele`].
+    #[must_use]
+    pub fn to_region(self) -> sim_core::Region {
         sim_core::Region {
             cx: self.cx,
             cy: self.cy,
@@ -212,6 +216,23 @@ impl GeneSimEnv {
             .as_mut()
             .expect("GeneSimEnv::snapshot called before reset")
             .snapshot(width, height)
+    }
+
+    /// Read the mean allele frequency over the populated cells of a disc `region` on a `grid_w × grid_h`
+    /// grid (campaign-grader). Delegates to [`sim_core::Simulation::region_allele`] — read-only, RNG-free
+    /// (panics if called before `reset`). This is the headless equivalent of the renderer's `_eval_mission`
+    /// zone reading, so the campaign scorer grades in Rust instead of GDScript (invariant #2).
+    #[must_use]
+    pub fn region_allele(
+        &mut self,
+        region: sim_core::Region,
+        grid_w: u32,
+        grid_h: u32,
+    ) -> sim_core::RegionReadout {
+        self.sim
+            .as_mut()
+            .expect("GeneSimEnv::region_allele called before reset")
+            .region_allele(region, grid_w, grid_h)
     }
 
     /// The deterministic [`sim_core::RunStats`] of the episode so far — its `hash` is the bit-identical

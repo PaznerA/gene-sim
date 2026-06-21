@@ -40,6 +40,10 @@ OPTIONS:
                           injections.json (stamped injection generations) for the renderer timeline (P2)
     --replay <DIR>        Replay a recorded episode dir (seed.json + actions.ndjson) and print its stats hash;
                           equals the recorded hash bit-for-bit on the same build (SPEC §6, inv #3)
+    --campaign <FILE>     Grade a JSON campaign manifest (scenarios = world + region objective + budget):
+                          replay one journal subdir per scenario from --journals <DIR>/<index>/ and print each
+                          Won/Lost + score + the total. Win/score rules live in the core (inv #2), not GDScript.
+    --journals <DIR>      Root dir of per-scenario journal subdirs for --campaign (default: current dir)
     -h, --help            Show this help
 
 Examples:
@@ -247,6 +251,42 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
             .position(|a| a == flag)
             .and_then(|i| argv.get(i + 1).cloned())
     };
+
+    if let Some(manifest) = val("--campaign") {
+        // Grade a campaign (let-loose/campaign-grader): load the JSON manifest, replay one journal subdir per
+        // scenario from --journals <dir>/<index>/, and print per-scenario Won/Lost/n.a. + score + the total.
+        // The grader re-implements _eval_mission's rules headlessly in Rust (the core `region_allele` read is the
+        // seam to later move the LIVE mission off GDScript — see campaign.rs; not done in this slice).
+        let journals = val("--journals").unwrap_or_else(|| ".".to_string());
+        return Some(match harness::campaign::load_campaign(&manifest) {
+            Ok(campaign) => {
+                let result = harness::campaign::evaluate_campaign(&campaign, &journals);
+                println!("campaign: {}", campaign.name);
+                for (name, r) in &result.per_scenario {
+                    let status = match r.status {
+                        harness::campaign::Status::Won => "WON ",
+                        harness::campaign::Status::Lost => "LOST",
+                        harness::campaign::Status::NotAttempted => "n.a.",
+                    };
+                    println!(
+                        "  [{}] {name:<24} score {:>5}   zone {:.3}  edits {}  gen {}",
+                        status, r.score, r.final_region_allele, r.edits_used, r.gen_reached
+                    );
+                }
+                println!(
+                    "total score {}  ·  scenarios won {}/{}",
+                    result.total_score,
+                    result.scenarios_won,
+                    result.per_scenario.len()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("campaign error: {e}");
+                ExitCode::from(1)
+            }
+        });
+    }
 
     if let Some(dir) = val("--replay") {
         return Some(match harness::replay::replay(&dir) {

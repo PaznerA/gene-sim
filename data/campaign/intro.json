@@ -1,0 +1,33 @@
+{
+  "name": "Intro: Two Climates",
+  "scenarios": [
+    {
+      "name": "Drought Belt",
+      "seed": 1001,
+      "lat": 10.0,
+      "lon": 0.0,
+      "avg_temp": 0.82,
+      "season": 1,
+      "entity_count": 1200,
+      "region": { "cx": 10, "cy": 16, "radius": 6 },
+      "grid": [32, 32],
+      "objective": { "kind": "Suppress", "threshold": 0.45 },
+      "deadline_gen": 40,
+      "edit_budget": 6
+    },
+    {
+      "name": "Cold Snap",
+      "seed": 2002,
+      "lat": 68.0,
+      "lon": 20.0,
+      "avg_temp": 0.16,
+      "season": 3,
+      "entity_count": 1200,
+      "region": { "cx": 22, "cy": 14, "radius": 6 },
+      "grid": [32, 32],
+      "objective": { "kind": "Establish", "threshold": 0.55 },
+      "deadline_gen": 40,
+      "edit_budget": 6
+    }
+  ]
+}
