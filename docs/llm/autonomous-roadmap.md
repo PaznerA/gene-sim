@@ -101,7 +101,8 @@ Candidate next units for BATCH 3 (pick by the morning state, most foundational f
 
 - 2026-06-21 21:00 CEST — playbook authored; batch 1 + batch 2 crons set. Queue not yet started.
 - 2026-06-21 22:02 CEST — **BATCH 1 START.** Branch `auto/night-2026-06-21` created from main; setup committed `53fb3d2`. Queue: [1 ecoli-visibility-impl, 2 f2-strategy-substrate-impl, 3 f3-metabolism-keystone-design🔁, 4 f4-trophic-decomposer-design🔁, 5 ui-multispecies-liveliness].
-  - [x] 1 ecoli-visibility-impl — **PASS** (gate GREEN 9/9 + bench-skip; determinism literal unchanged → hash-neutral confirmed independently). Added: harness `build_species_from_str` res:// boundary, godot-sim `set_species_json` #[func], `godot/microbe.gd` microbe specimen view, run.sh species mirror + `godot/data/` gitignored, species-mirror gate. Fixes the cwd species-not-found bug.
+  - [x] 1 ecoli-visibility-impl — **PASS** (gate GREEN 9/9 + bench-skip; determinism literal unchanged → hash-neutral confirmed independently). Added: harness `build_species_from_str` res:// boundary, godot-sim `set_species_json` #[func], `godot/microbe.gd` microbe specimen view, run.sh species mirror + `godot/data/` gitignored, species-mirror gate. Fixes the cwd species-not-found bug. Commit `d7391cf`.
+  - [x] 2 f2-strategy-substrate-impl — **PASS** (gate GREEN; determinism literal unchanged → hash-neutral; verified UNWIRED: `selection()` fitness uses base_growth only, `.strategy` only in `species_strategy()` accessor + reset-time re-express). Added gp.rs `Strategy{budget[5],role,affinity}` + `TrophicRole` + `express_strategy` (first caller of fixed.rs apportion) + `role_for`; cached in `SpeciesEntry.strategy`.
 
 ---
 

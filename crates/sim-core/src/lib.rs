@@ -92,9 +92,11 @@ struct GenomeRes(Genome);
 struct BaseGrowthRate(f64);
 
 /// One species in the [`SpeciesRegistry`] — its genome, per-species genotype→phenotype map, the derived base
-/// growth rate, and its constant-population target (ADR R3-A, the multi-species spine). `base_growth` mirrors
-/// [`BaseGrowthRate`] for the registry's primary entry; the per-species Wright-Fisher (R3-B) reads these.
-/// `#[allow(dead_code)]` on `name`/`target_pop` until R3-B (per-species observe + selection) reads them.
+/// growth rate, its constant-population target, and its expressed ecological [`gp::Strategy`] (the ADR R3-A
+/// spine and ADR-013 F2). `base_growth` mirrors [`BaseGrowthRate`] for the registry's primary entry; the per-species
+/// Wright-Fisher (R3-B) reads these. The `dead_code` allow now also covers `strategy`, which is expressed
+/// once at reset but UNREAD by selection (the F2 keystone) until F3 funds metabolism from the budget — so it
+/// stays hash-neutral, proven by the unchanged pinned literal.
 #[allow(dead_code)]
 struct SpeciesEntry {
     name: String,
@@ -102,6 +104,7 @@ struct SpeciesEntry {
     gp_map: gp::OntologyMap,
     base_growth: f64,
     target_pop: u32,
+    strategy: gp::Strategy,
 }
 
 /// The ordered set of species in the run (ADR R3-A). Indexed by [`SpeciesId`] (= the `Vec` position); NEVER a
@@ -126,6 +129,9 @@ pub struct RosterEntry {
     pub gp_map: gp::OntologyMap,
     /// Constant-population target / spawn count for this species.
     pub entity_count: u32,
+    /// The species' trophic role (ADR-013 F2) — CATEGORICAL data carried in from the JSON→roster boundary
+    /// via [`gp::role_for`], NOT derived from genome scalars. Defaulted to `Autotroph` at existing call sites.
+    pub role: gp::TrophicRole,
 }
 
 /// The static per-cell soil field as a resource (ADR-011 S-G): LOCAL soil-coupled selection samples each
@@ -504,6 +510,7 @@ impl Simulation {
                 genome,
                 gp_map,
                 entity_count: config.entity_count,
+                role: gp::TrophicRole::default(), // plant default (Autotroph) for the single-species path.
             }],
         )
     }
@@ -537,12 +544,17 @@ impl Simulation {
                     .express(&r.genome)
                     .get(Trait::GrowthRate)
                     .unwrap_or(0.5);
+                // ADR-013 F2: express the ecological Strategy ONCE in the SAME pre-spawn pass as base_growth,
+                // reusing the entry's own map/genome/role. Pure, ZERO SimRng draws (it runs BEFORE the spawn
+                // loop that consumes the stream and consumes nothing), and UNREAD by selection → hash-neutral.
+                let strategy = gp::express_strategy(&r.gp_map, &r.genome, r.role);
                 SpeciesEntry {
                     name: r.name,
                     genome: r.genome,
                     gp_map: r.gp_map,
                     base_growth,
                     target_pop: r.entity_count,
+                    strategy,
                 }
             })
             .collect();
@@ -785,6 +797,15 @@ impl Simulation {
         &self.world.resource::<GenomeRes>().0
     }
 
+    /// The expressed ecological [`gp::Strategy`] cached for species `sid` (ADR-013 F2; read-only, parallel to
+    /// [`species_genome`](Self::species_genome)). Pure read — no RNG draw, no mutation — so it cannot perturb
+    /// the run hash. UNREAD by the sim path at F2 (F3 metabolism is its first reader); exposed for tests and a
+    /// future UI. Panics only on an out-of-range `SpeciesId` (a programming error).
+    #[must_use]
+    pub fn species_strategy(&self, sid: SpeciesId) -> &gp::Strategy {
+        &self.world.resource::<SpeciesRegistry>().entries[sid.0 as usize].strategy
+    }
+
     /// The run's conserved-energy [`Ledger`](ledger::Ledger) (ADR-013 F0a; read-only copy). Empty until the
     /// joule pools land (F1); thereafter `ledger().closes(live_total)` is the conservation invariant.
     #[must_use]
@@ -828,8 +849,13 @@ impl Simulation {
         let edited = self.world.resource::<GenomeRes>().0.clone();
         {
             let primary = &mut self.world.resource_mut::<SpeciesRegistry>().entries[0];
+            // ADR-013 F2: re-express the cached Strategy from the edited genome so the cache stays consistent
+            // after a species edit (its FIRST reader is F3 metabolism). Still UNREAD by selection → still
+            // hash-neutral. Uses the entry's own map/role; the role is categorical (unchanged by the edit).
+            let strategy = gp::express_strategy(&primary.gp_map, &edited, primary.strategy.role);
             primary.genome = edited;
             primary.base_growth = base_growth;
+            primary.strategy = strategy;
         }
         out
     }
@@ -1011,6 +1037,9 @@ mod tests {
         // traits for distinct specimen variants). `GrowthRate` still anchors on `p0`=0.6 so `BaseGrowthRate` →
         // selection → allele_freq are UNCHANGED; the re-pin captures only the genome `parameter_count` folded
         // into `hash_world`. (Phenotype/expression is interim; ADR-013 F2 re-expresses the genome as a Strategy.)
+        // ADR-013 F2: the ecological `Strategy` is now expressed + cached in each `SpeciesEntry`, but is UNREAD by
+        // selection and NOT folded into `hash_world` → hash-neutral, so this literal is unchanged (the green run
+        // is the proof). The deliberate re-pin lands at F3 when the budget funds metabolism + births/deaths.
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
@@ -1075,6 +1104,101 @@ mod tests {
     }
 
     #[test]
+    fn species_entry_caches_strategy() {
+        // ADR-013 F2: reset_with_roster expresses + caches each species' Strategy once. The cached budget is a
+        // 1000-permille simplex and equals a fresh express_strategy over the same map/genome/role.
+        let cfg = SimConfig {
+            seed: 5,
+            generations: 0,
+            entity_count: 20,
+        };
+        let sim = Simulation::reset(&cfg);
+        let s = sim.species_strategy(SpeciesId(0));
+        assert_eq!(
+            s.budget.iter().map(|&x| u32::from(x)).sum::<u32>(),
+            fixed::PERMILLE,
+            "cached budget is a 1000-simplex"
+        );
+        let reg = sim.world.resource::<SpeciesRegistry>();
+        let entry = &reg.entries[0];
+        let expect = gp::express_strategy(&entry.gp_map, &entry.genome, entry.strategy.role);
+        assert_eq!(*sim.species_strategy(SpeciesId(0)), expect);
+    }
+
+    #[test]
+    fn strategy_persists_after_species_edit() {
+        // with_genome_and_rng re-expresses entries[0].strategy: after an edit the cached budget still sums to
+        // 1000 and reflects the edited genome (Acquisition<-LeafSize rises when LeafSize is maxed). The
+        // read-only accessor is pure: calling it does not change the run hash.
+        let cfg = SimConfig {
+            seed: 88,
+            generations: 4,
+            entity_count: 30,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let acq_before = sim.species_strategy(SpeciesId(0)).budget[0];
+        // Max out LeafSize (locus 1, param 0 — the Acquisition anchor) via the run RNG.
+        sim.with_genome_and_rng(|g, _rng| {
+            if let genome::ParamValue::Numeric { value, max, .. } =
+                &mut g.loci[1].parameters[0].value
+            {
+                *value = *max;
+            }
+        });
+        let post = sim.species_strategy(SpeciesId(0));
+        assert_eq!(
+            post.budget.iter().map(|&x| u32::from(x)).sum::<u32>(),
+            1000,
+            "post-edit budget still a 1000-simplex"
+        );
+        assert!(
+            post.budget[0] > acq_before,
+            "maxing LeafSize should raise the Acquisition share ({acq_before} -> {})",
+            post.budget[0]
+        );
+        // Read-only accessor purity: a run that calls species_strategy() yields the same hash as one that
+        // doesn't (the accessor cannot perturb the stream or the hash).
+        let with_read = {
+            let mut s = Simulation::reset(&cfg);
+            let _ = s.species_strategy(SpeciesId(0));
+            s.step(cfg.generations);
+            s.run_stats().hash
+        };
+        let without_read = {
+            let mut s = Simulation::reset(&cfg);
+            s.step(cfg.generations);
+            s.run_stats().hash
+        };
+        assert_eq!(with_read, without_read, "species_strategy() is read-only");
+    }
+
+    #[test]
+    fn strategy_cache_is_hash_neutral() {
+        // THE load-bearing F2 test: in ONE run the cached Strategy is exposed (a valid 1000-simplex) AND the
+        // pinned determinism literal is UNCHANGED — the cache exists yet the hash holds, the hash-neutrality
+        // proof. (determinism_hash_is_pinned also asserts the literal at the gate level.)
+        let cfg = SimConfig {
+            seed: 13_679_457_532_755_275_413,
+            generations: 50,
+            entity_count: 1000,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let budget_sum: u32 = sim
+            .species_strategy(SpeciesId(0))
+            .budget
+            .iter()
+            .map(|&x| u32::from(x))
+            .sum();
+        assert_eq!(budget_sum, 1000, "the Strategy cache is populated");
+        sim.step(cfg.generations);
+        assert_eq!(
+            sim.run_stats().hash,
+            0xf795_eac4_112f_acd5,
+            "Strategy expressed + cached, unread by selection → hash-neutral, literal unchanged"
+        );
+    }
+
+    #[test]
     fn r3b_two_species_run_deterministically_with_constant_pools() {
         // R3-B: two species in one run select as INDEPENDENT constant-size Wright-Fisher pools — deterministic
         // (same seed → same hash twice), and each species holds its own population. Hash-neutral for N=1 (the
@@ -1086,12 +1210,14 @@ mod tests {
                     genome: genome::sample_genome(),
                     gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                     entity_count: 60,
+                    role: gp::TrophicRole::default(),
                 },
                 RosterEntry {
                     name: "b".to_string(),
                     genome: genome::sample_genome(),
                     gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                     entity_count: 40,
+                    role: gp::TrophicRole::default(),
                 },
             ]
         };
