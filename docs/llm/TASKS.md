@@ -52,9 +52,17 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
     EMA, hash fold `as u64`). Energy is decorative → RNG stream + allele_freq unchanged; the **FIRST RE-PIN** is
     purely structural: `0x9fad…f73a → 0x49ee_0f17_6852_1cc2` (ledgered). Gate-green. *(Refinement: the heritable
     trait components stay `f64` until F2 REPLACES them with the integer Strategy genome — no double migration.)*
-  - [ ] **F1** dynamic resource pools (off-stream) · **F2** genome→Strategy allocation budget (re-pin).
+  - [x] **F1 (core)** — `crates/sim-core/src/resource.rs` `ResourceField` (light/free_nutrient/detritus) seeded
+    OFF-stream (disjoint `RESOURCE_STREAM_BASE`), inserted at reset but UNWIRED. Hash-neutral, gate-green.
+    *(F1b: snapshot channels GSS2→GSS3 + renderer overlay to VISUALISE the pools — follow-up.)*
+  - [ ] **F2** genome→Strategy allocation budget (re-pin).
   - [ ] **F3** 🛑 real metabolism + emergent births/deaths — breaks ADR-005 (re-pin; **needs the x86_64+aarch64 CI
     matrix gate FIRST**) · **F4** multi-species (R3 spine) + trophic web + emergent `FlowMatrix` (Rel re-ground).
+    - 🎯 **DIRECTION (user 2026-06-21):** soil/resource params (esp. **nutrient**) become a FUNCTION of nearby
+      organisms (not static) — depletion/production via metabolism (F3). The **first multi-species ecosystem** is
+      **soil MICROORGANISMS** (a decomposer species) coupled to plants through the dynamic nutrient/detritus
+      layer: plants draw nutrient + shed detritus, microbes turn detritus → free nutrient. (Folds F3 + F4 + the
+      multi-species/relations prep into one concrete target; see the `multispecies-relations-prep` workflow.)
   - [ ] **F5** chemical/signal diffusion field · **F6** emergent measurements + relations VIEW · **F7** Godot UI (last).
   - Target: ≥2× more environment/resource "variables" than today (beyond sun + temperature) before the post-impl
     revision (stronger autonomous e2e testing + deeper algo/rand-param simulation in CI + roadmap).

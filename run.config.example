@@ -1,0 +1,21 @@
+# gene-sim local run config — copy to `run.config` and tweak. Sourced by ./run.sh (a bash file).
+# Set FLAGS to a list of GAME flags (the args after `--`). CLI args to run.sh are appended after these.
+#
+# Available game flags (see godot/main.gd header for the full list):
+#   FEATURES (toggleable here OR in the pre-run menu):
+#     --mission            the suppress-the-zone mission (else free-play sandbox)
+#   VIEW:
+#     --ortho              flat orthographic view (isometric is the default)
+#   WORLD (also settable in the menu; --no-menu makes these the run's actual config):
+#     --no-menu            skip the pre-run menu and start immediately with the flags below
+#     --seed <u64>         master seed
+#     --lat <deg> --lon <deg>   GPS latitude/longitude → sun trajectory
+#     --temp <0..1>        average temperature
+#     --season <0..3>      0 Spring · 1 Summer · 2 Autumn · 3 Winter
+#     --entities <n>       starting population
+
+# Example: a warm-summer mission world, skipping the menu, 1500 organisms:
+# FLAGS=(--mission --no-menu --lat 10 --temp 0.82 --season 1 --entities 1500)
+
+# Default: empty (the menu drives everything interactively).
+FLAGS=()

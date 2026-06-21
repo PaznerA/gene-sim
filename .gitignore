@@ -41,3 +41,6 @@ __pycache__/
 # Claude Code session runtime (scheduled-task lock/state) — not project source
 /.claude/scheduled_tasks.lock
 /.claude/scheduled_tasks.json
+
+# Local run config (sourced by run.sh; ship run.config.example)
+/run.config

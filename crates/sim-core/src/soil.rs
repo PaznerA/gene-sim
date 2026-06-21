@@ -59,9 +59,9 @@ impl SoilField {
         Self {
             width,
             height,
-            moisture: gen_channel(seed, 0, width, height),
-            nutrients: gen_channel(seed, 1, width, height),
-            ph: gen_channel(seed, 2, width, height),
+            moisture: gen_channel(seed, SOIL_STREAM_BASE, 0, width, height),
+            nutrients: gen_channel(seed, SOIL_STREAM_BASE, 1, width, height),
+            ph: gen_channel(seed, SOIL_STREAM_BASE, 2, width, height),
         }
     }
 
@@ -123,14 +123,15 @@ impl SoilField {
 }
 
 /// Build one bilinearly-interpolated channel from a seed-derived control lattice. Determinism: control
-/// points come from `derive_seed(seed, SOIL_STREAM_BASE + ch*LATTICE² + point)` (no `SimRng`), and the
-/// interpolation is multiply-add only.
-fn gen_channel(seed: u64, ch: usize, width: u32, height: u32) -> Vec<f32> {
+/// points come from `derive_seed(seed, base + ch*LATTICE² + point)` (no `SimRng`), and the interpolation is
+/// multiply-add only. `base` is the disjoint `derive_seed` stream family base (e.g. [`SOIL_STREAM_BASE`] for
+/// soil, [`crate::resource::RESOURCE_STREAM_BASE`] for resources) — kept disjoint per the DECISIONS.md registry.
+pub(crate) fn gen_channel(seed: u64, base: u64, ch: usize, width: u32, height: u32) -> Vec<f32> {
     let mut ctrl = [[0.0f64; LATTICE]; LATTICE];
     for (ly, row) in ctrl.iter_mut().enumerate() {
         for (lx, v) in row.iter_mut().enumerate() {
             let point = (ly * LATTICE + lx) as u64;
-            let stream = SOIL_STREAM_BASE + (ch as u64) * (LATTICE * LATTICE) as u64 + point;
+            let stream = base + (ch as u64) * (LATTICE * LATTICE) as u64 + point;
             *v = unit_f64(derive_seed(seed, stream));
         }
     }

@@ -312,8 +312,11 @@ R1.0 ships the **substrate only, provably hash-neutral, no coupling**:
 
 ### `derive_seed` stream registry (keep disjoint — inv #3)
 - `1`, `2` — snapshot organism placement (`x`, `y`) — `Simulation::snapshot`.
-- `[SOIL_STREAM_BASE, SOIL_STREAM_BASE + SOIL_CHANNELS·LATTICE²)` (base `0x0050_4F49_4C00_0000`) — soil control points.
-- Future spatial phases (R1.2 Cell, R1.3 dispersal) must reserve new disjoint ranges here before use.
+- `PLACEMENT_STREAM_BASE` `0x0050_4C41_4300_0000` ("PLAC") — initial organism placement (ADR-011 S-A).
+- `SOIL_STREAM_BASE` `0x0050_4F49_4C00_0000` ("SOIL") — soil control points (ADR-008).
+- `CLIM_STREAM_BASE` `0x0043_4C49_4D00_0000` ("CLIM") — climate field (ADR-012).
+- `RESOURCE_STREAM_BASE` `0x0052_5352_4300_0000` ("RSRC") — resource pools light/nutrient/detritus (ADR-013 F1).
+- Future spatial/substrate phases must reserve new disjoint ranges here before use.
 
 ---
 

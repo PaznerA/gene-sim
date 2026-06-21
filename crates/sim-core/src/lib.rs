@@ -24,6 +24,7 @@ pub mod det;
 pub mod fixed;
 pub mod gp;
 pub mod ledger;
+pub mod resource;
 pub mod snapshot;
 pub mod soil;
 
@@ -101,6 +102,13 @@ struct SoilFieldRes(soil::SoilField);
 /// stream. Inserted at reset; CONSUMED by selection only once E3 couples it (until then it's hash-neutral).
 #[derive(Resource)]
 struct ClimateFieldRes(climate::ClimateField);
+
+/// The per-cell resource pools (ADR-013 F1): light / free_nutrient / detritus, generated off the `SimRng`
+/// stream. Inserted at reset but **UNWIRED** at F1 (the metabolism that consumes/regenerates them is F3), so it
+/// is hash-neutral — proven by the unchanged pinned literal. `#[allow(dead_code)]` until F3 reads it.
+#[derive(Resource)]
+#[allow(dead_code)]
+struct ResourceFieldRes(resource::ResourceField);
 
 /// Stable per-organism id (0..entity_count), assigned at spawn. Gives a deterministic hash order
 /// independent of ECS query/archetype iteration order.
@@ -433,6 +441,13 @@ impl Simulation {
         // it is hash-neutral (not folded into hash_world, draws nothing from SimRng) — proven by the unchanged
         // pinned literal. F0b/F1 seed `initial_total` and the metabolism phases drive the taps.
         world.insert_resource(ledger::Ledger::default());
+        // Per-cell resource pools (ADR-013 F1): generated off the SimRng stream (disjoint derive_seed family),
+        // inserted but UNWIRED — nothing reads them yet (F3 metabolism will), so this is hash-neutral.
+        world.insert_resource(ResourceFieldRes(resource::ResourceField::generate(
+            config.seed,
+            resource::RESOURCE_DIMS.0,
+            resource::RESOURCE_DIMS.1,
+        )));
 
         let mut schedule = Schedule::default();
         // Explicit, single-threaded ordering — the determinism backbone (ADR-002). Selection runs AFTER
