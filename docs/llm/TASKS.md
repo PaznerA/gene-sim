@@ -101,6 +101,18 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
       pre-species entity_count; the microbe specimen view warns (plant-shaped placeholder).
     *(Remaining follow-ups: a microbe GLYPH for the specimen view (now a flagged plant placeholder); observe/CSV
     are plant-shaped for microbes — only growth_rate is meaningful.)*
+  - [~] **CRISPR transcription edits** (Konermann/Arc research → `docs/llm/proposals/konermann-arc-crispr-verdict.md`,
+    verdict "yes-with-caveats"): re-implement the published E. coli dCas9-CRISPRi RELATIONSHIP, never import the
+    (mammalian, non-commercial) Konermann/Arc model weights (inv #1). Evo 2 (Apache-2.0) parked as a future
+    boundary essentiality oracle (could unblock the bake; does NOT replace FBA's exchange fluxes).
+    - [x] **Core mechanic** — `crispr::EditKind {Perturb(default), Knockout, Knockdown, Activate}` + `apply_edit_kind`
+      + `set_transcription` (Knockdown = graded partial repression `max − efficacy·span`; Knockout → floor;
+      Activate → ceiling, clamped). `apply_edit` is a Perturb wrapper → HASH-NEUTRAL (campaign/replay/determinism
+      byte-identical); identical RNG draw count across kinds. Tested. Now editing a gene gives a tunable activity.
+    - [ ] **Follow-ups:** wire `edit_kind` through `EditAction` (serde-default) + the live edit UI (a Knockout/
+      Knockdown/Activate picker), so a player can graded-edit E. coli. **ACTIVATE-CEILING 🛑** (lift the activity
+      domain > 1.0 in TAXONOMY + ecoli.json for real overexpression — re-pin + human sign-off). `oracle-evo`
+      (gated, secondary).
   - [ ] Later: S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2/`oracle-fba`
     KO-table bake · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7 decomposer.
 

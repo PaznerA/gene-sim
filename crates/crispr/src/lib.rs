@@ -518,6 +518,26 @@ pub struct Edit {
     pub guide: GuideSequence,
 }
 
+/// How an edit changes its target gene's parameter (ADR-017 — the Konermann CRISPR-transcription concept).
+/// The historical random [`Perturb`](EditKind::Perturb) (default, backward-compatible) plus graded TRANSCRIPTION
+/// verbs grounded in the real E. coli dCas9-CRISPRi relationship: `Knockout` (gene off), a graded CRISPRi
+/// `Knockdown` (partial repression scaled by on-target efficacy), and `Activate` (CRISPRa, toward the ceiling).
+/// `Activate` saturates at the parameter's `max` until the activity domain is lifted (ACTIVATE-CEILING; the
+/// genome-model change is a deliberate, human-signed re-pin). Re-implements the published RELATIONSHIP, never
+/// imports the (mammalian, non-commercial) Konermann/Arc model weights (inv #1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EditKind {
+    /// Random-signed perturbation of one parameter — the historical default (abstract / plant edits).
+    #[default]
+    Perturb,
+    /// Knock the target gene OUT: drive its parameter to the domain floor.
+    Knockout,
+    /// Graded CRISPRi KNOCKDOWN: partial repression, `target = max − efficacy·(max − min)`.
+    Knockdown,
+    /// CRISPRa ACTIVATION: toward the ceiling (clamped to `max` until the activity domain is lifted).
+    Activate,
+}
+
 /// Explicit gating thresholds for [`apply_edit`] (SPEC §4 step 2/3).
 ///
 /// An edit succeeds only when on-target efficiency `>= min_on_target` **and** the off-target hit
@@ -701,6 +721,44 @@ fn perturb_value(value: &mut genome::ParamValue, magnitude: f64, signed: f64) {
     value.clamp_into_domain();
 }
 
+/// Apply a graded TRANSCRIPTION edit (ADR-017 — the Konermann CRISPR-transcription concept): SET the target
+/// parameter to the activity its `kind` dictates, scaled by on-target `efficacy`. Grounded in the real E. coli
+/// dCas9-CRISPRi relationship (a strong guide → near-complete repression); fully deterministic, no RNG. The new
+/// value is clamped into the parameter's domain, so `Activate` saturates at `max` until the activity ceiling is
+/// lifted (ACTIVATE-CEILING). `Perturb` is handled by [`perturb_value`], not here.
+fn set_transcription(value: &mut genome::ParamValue, kind: EditKind, efficacy: f64) {
+    use genome::ParamValue;
+    let efficacy = efficacy.clamp(0.0, 1.0);
+    match value {
+        ParamValue::Numeric { value: v, min, max } => {
+            let span = (*max - *min).max(0.0);
+            let target = match kind {
+                EditKind::Knockout => *min,                    // gene off
+                EditKind::Knockdown => *max - efficacy * span, // graded repression below wild-type
+                EditKind::Activate => *max + efficacy * span, // overexpression (clamped to max below)
+                EditKind::Perturb => *v, // unreachable (handled in apply_edit_kind)
+            };
+            *v = target;
+        }
+        ParamValue::Enum {
+            value: v,
+            cardinality,
+        } => {
+            *v = match kind {
+                EditKind::Knockout | EditKind::Knockdown => 0,
+                EditKind::Activate => cardinality.saturating_sub(1),
+                EditKind::Perturb => *v,
+            };
+        }
+        ParamValue::Bool(b) => {
+            if !matches!(kind, EditKind::Perturb) {
+                *b = matches!(kind, EditKind::Activate);
+            }
+        }
+    }
+    value.clamp_into_domain();
+}
+
 /// Apply an [`Edit`] to `genome`, gated on on-target efficiency and off-target hit count (SPEC §4).
 ///
 /// Algorithm (SPEC §4 / TAXONOMY.md §3.2):
@@ -724,6 +782,35 @@ fn perturb_value(value: &mut genome::ParamValue, magnitude: f64, signed: f64) {
 pub fn apply_edit<On: OnTargetScore, Off: OffTargetScore>(
     genome: &mut genome::Genome,
     edit: &Edit,
+    variants: &[CasVariant],
+    on: &On,
+    off: &Off,
+    thresholds: &EditThresholds,
+    rng: &mut ChaCha8Rng,
+) -> EditOutcome {
+    // The historical random-perturbation edit (the default kind), preserved byte-identically.
+    apply_edit_kind(
+        genome,
+        edit,
+        EditKind::Perturb,
+        variants,
+        on,
+        off,
+        thresholds,
+        rng,
+    )
+}
+
+/// Like [`apply_edit`] but with an explicit [`EditKind`] (ADR-017 — Konermann CRISPR-transcription): `Perturb`
+/// is the historical random edit; the graded verbs (`Knockout`/`Knockdown`/`Activate`) SET the target parameter
+/// to the activity the kind dictates, scaled by on-target efficacy, instead of a random delta. The determinism
+/// and validity guarantees match [`apply_edit`] — the RNG draw COUNT is identical across kinds (the direction
+/// draw is still taken, just unused by the graded verbs), so a fixed stream reproduces regardless of `edit_kind`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_edit_kind<On: OnTargetScore, Off: OffTargetScore>(
+    genome: &mut genome::Genome,
+    edit: &Edit,
+    edit_kind: EditKind,
     variants: &[CasVariant],
     on: &On,
     off: &Off,
@@ -793,10 +880,16 @@ pub fn apply_edit<On: OnTargetScore, Off: OffTargetScore>(
     let locus = &mut genome.loci[target_idx];
     let locus_id = locus.id;
     let pick = (rng.next_u64() % locus.parameters.len() as u64) as usize;
+    // Drawn for ALL kinds so the RNG stream is identical regardless of `edit_kind` (Perturb stays byte-identical;
+    // the graded transcription verbs are deterministic in direction and ignore `signed`).
     let signed = rng_unit(rng) * 2.0 - 1.0; // direction/scale in [-1, 1)
     let magnitude = on_eff;
     let param_id = locus.parameters[pick].id;
-    perturb_value(&mut locus.parameters[pick].value, magnitude, signed);
+    let value = &mut locus.parameters[pick].value;
+    match edit_kind {
+        EditKind::Perturb => perturb_value(value, magnitude, signed),
+        kind => set_transcription(value, kind, on_eff),
+    }
 
     EditOutcome::Applied {
         locus: locus_id,
@@ -1464,6 +1557,88 @@ mod tests {
         // The target Parameter changed, and the genome is still valid.
         assert_ne!(g.loci[0].parameters[0].value, before);
         assert!(g.is_valid());
+    }
+
+    #[test]
+    fn knockdown_grades_target_activity_by_efficacy() {
+        // ADR-017 (Konermann CRISPR-transcription): a CRISPRi Knockdown SETS the target to a graded partial
+        // repression (max − efficacy·span = 1 − 0.95 for a [0,1] gene), not a random delta — a deterministic,
+        // tunable activity drop. Same setup + seed as the success test (so `pick` lands on param 0).
+        let variants = default_cas_variants();
+        let cas = variant("SpCas9").id;
+        let guide = GuideSequence::new(*b"ACGTACGTAC").unwrap();
+        let edit = Edit {
+            cas,
+            target: genome::LocusId(0),
+            guide,
+        };
+        let mut g = editable_genome();
+        let on = ConstOnTarget(0.95);
+        let off = ConstOffTarget(0);
+        let thresholds = EditThresholds::default();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+
+        let outcome = apply_edit_kind(
+            &mut g,
+            &edit,
+            EditKind::Knockdown,
+            &variants,
+            &on,
+            &off,
+            &thresholds,
+            &mut rng,
+        );
+        let EditOutcome::Applied {
+            param,
+            on_efficiency,
+            ..
+        } = outcome
+        else {
+            panic!("expected Applied, got {outcome:?}")
+        };
+        assert_eq!(param, genome::ParamId(0));
+        let genome::ParamValue::Numeric { value, .. } = g.loci[0].parameters[0].value else {
+            panic!("target param is not Numeric")
+        };
+        assert!(
+            (value - (1.0 - on_efficiency)).abs() < 1e-9,
+            "knockdown sets target to 1 − efficacy, got {value}"
+        );
+        assert!(
+            value > 0.0 && value < 1.0,
+            "partial repression lands in (0,1)"
+        );
+        assert!(g.is_valid());
+    }
+
+    #[test]
+    fn knockout_drives_target_to_floor() {
+        let variants = default_cas_variants();
+        let cas = variant("SpCas9").id;
+        let guide = GuideSequence::new(*b"ACGTACGTAC").unwrap();
+        let edit = Edit {
+            cas,
+            target: genome::LocusId(0),
+            guide,
+        };
+        let mut g = editable_genome();
+        let on = ConstOnTarget(0.95);
+        let off = ConstOffTarget(0);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        apply_edit_kind(
+            &mut g,
+            &edit,
+            EditKind::Knockout,
+            &variants,
+            &on,
+            &off,
+            &EditThresholds::default(),
+            &mut rng,
+        );
+        let genome::ParamValue::Numeric { value, .. } = g.loci[0].parameters[0].value else {
+            panic!("target param is not Numeric")
+        };
+        assert_eq!(value, 0.0, "knockout drives the gene to its floor");
     }
 
     #[test]
