@@ -43,4 +43,24 @@ mod tests {
         assert_eq!(built.key, "default");
         assert_eq!(built.entity_count, 1000);
     }
+
+    #[test]
+    fn shipped_ecoli_species_loads() {
+        // The baked real E. coli K-12 core genome (scripts/bake_ecoli_species.py: BiGG e_coli_core roster ×
+        // real NCBI GCF_000005845.2 CDS) must load + build — 136 real genes, each a non-empty ACGT CDS.
+        // Data-not-code: the gate catches a broken or incomplete re-bake.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/ecoli.json");
+        let built = load_species_file(path).expect("data/species/ecoli.json should load");
+        assert_eq!(built.key, "ecoli-core");
+        assert_eq!(
+            built.genome.loci.len(),
+            136,
+            "e_coli_core is 136 real genes"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every E. coli locus carries a real CDS"
+        );
+    }
 }
