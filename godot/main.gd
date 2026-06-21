@@ -50,7 +50,11 @@ const TRAIT_KEYS := [
 	"growth_rate", "stature", "branchiness", "leaf_size", "leaf_hue",
 	"reflectance", "fecundity", "drought_tolerance", "kill_switch_linkage"
 ]
-const FRAME_SECONDS := 0.45  # seconds per snapshot when playing a run
+const FRAME_SECONDS := 0.45  # seconds per snapshot when playing a FILE run (the Timer cadence)
+# Decoupled-single-thread live loop (keeps the brush/clicks responsive while the sim runs fast — see _process):
+const STEPS_PER_SECOND_BASE := 1.0 / FRAME_SECONDS  # live generations/sec at speed 1.0 (the speed slider scales it)
+const MAX_STEPS_PER_FRAME := 64  # hard cap so a slow/backlogged frame can't spiral — input keeps priority
+const RENDER_HZ := 30.0  # snapshot+redraw cadence, DECOUPLED from the sim step rate (the heavy work, throttled)
 const TARGET_FIELD_PX := 880.0  # the field is scaled to about this many pixels on its long side
 # Zoom "scopes": magnification presets the viewport switches between (keys 1/2/3; SPEC §W10).
 const SCOPES := [{"name": "field", "zoom": 1.0}, {"name": "patch", "zoom": 2.6}, {"name": "cells", "zoom": 6.0}]
@@ -101,7 +105,11 @@ var _prev_button: Button
 var _next_button: Button
 var _speed_slider: HSlider
 var _scope_buttons: Array = []  # 3 Buttons, one per SCOPES preset (field/patch/cells)
-var _frame_seconds: float = FRAME_SECONDS  # runtime playback interval (the speed slider mutates this)
+var _frame_seconds: float = FRAME_SECONDS  # runtime FILE-replay interval (the speed slider mutates this)
+# Live decoupled loop state (the speed slider sets _steps_per_second; carries accumulate fractional work).
+var _steps_per_second: float = STEPS_PER_SECOND_BASE  # live step-rate target (scaled by the speed slider)
+var _step_carry: float = 0.0  # fractional generations owed this frame (accumulator)
+var _render_carry: float = 0.0  # seconds since the last snapshot/redraw (throttles to RENDER_HZ)
 var _syncing: bool = false  # re-entrancy guard so programmatic widget updates don't recurse via signals
 var _timeline: Control  # full-width bottom generation timeline (timeline.gd)
 var _tooltip: PanelContainer
@@ -223,11 +231,11 @@ func _ready() -> void:
 		_do_reset(int(reseed))
 	if _live != null and _has_flag("--inject"):  # optional: fire one demo injection for --shot verification
 		_live.step(20)
-		_live_advance()
+		_publish_frame()
 		_on_inject_pressed()
 	if _live != null and _has_flag("--brush"):  # optional: show + fire one demo brush stroke for --shot
 		_live.step(20)
-		_live_advance()
+		_publish_frame()
 		_set_brush_mode(true)
 		_brush_cell = Vector2i(LIVE_GRID.x / 2, LIVE_GRID.y / 2)
 		_brush_radius = 6
@@ -268,13 +276,18 @@ func _ready() -> void:
 		await _take_shot(shot_path)
 		return
 
-	# Playback timer (windowed): in --live, advance the LiveSim each tick; else play through the file run.
+	# Playback driver (windowed). LIVE mode uses the decoupled per-frame loop in _process (input-first,
+	# step-budget, throttled render) so a fast sim never starves the brush/clicks; the Timer drives only FILE
+	# replay. (Determinism is unaffected — _process advances by whole LIVE_STEP generations, never wall-clock.)
 	_timer = Timer.new()
 	_timer.wait_time = _frame_seconds
-	_timer.timeout.connect(_live_advance if _live != null else _advance)
 	add_child(_timer)
-	if _live != null or _snaps.size() > 1:
-		_timer.start()
+	if _live != null:
+		set_process(true)
+	else:
+		_timer.timeout.connect(_advance)
+		if _snaps.size() > 1:
+			_timer.start()
 
 	# Main menu (ADR-012 E4): a plain windowed --live launch lets the player set the world before it runs.
 	if _live != null and _should_show_menu():
@@ -412,12 +425,37 @@ func _setup_live() -> bool:
 	return true
 
 
-## One live tick: advance the sim a fixed integer number of generations, pull the new snapshot, append it to
-## the rolling history, and display it. Deterministic cadence (inv #3: LIVE_STEP is a fixed integer).
-func _live_advance() -> void:
+## Live-mode per-frame loop (decoupled-single-thread, inv #2/#3): the engine delivers input BEFORE _process, so
+## the brush + clicks stay responsive; we advance the sim by whole LIVE_STEP generations on a per-frame budget
+## (fixed-integer steps → deterministic; the journal replays bit-exact) and do the heavy snapshot+redraw only at
+## RENDER_HZ. FILE replay uses the Timer, not this. (History granularity is the render rate, not per-generation;
+## lower the speed slider for finer detail.)
+func _process(delta: float) -> void:
 	if _paused or _view_mode != 0 or _live == null:
 		return
-	_live.step(LIVE_STEP)
+	# Advance: accumulate owed generations, then step in a bounded loop (cap so a slow/backlogged frame can't
+	# spiral — input keeps priority over throughput).
+	_step_carry += _steps_per_second * delta
+	var steps := int(_step_carry)
+	_step_carry -= float(steps)
+	if steps > MAX_STEPS_PER_FRAME:
+		steps = MAX_STEPS_PER_FRAME
+		_step_carry = 0.0  # drop the backlog rather than chase it
+	for _i in steps:
+		_live.step(LIVE_STEP)
+	# Render: throttle the heavy snapshot+parse+redraw to RENDER_HZ, decoupled from the step rate.
+	_render_carry += delta
+	if steps > 0 and _render_carry >= 1.0 / RENDER_HZ:
+		_render_carry = 0.0
+		_publish_frame()
+
+
+## Pull the current snapshot from the live env + refresh the rolling history/display — the heavy per-frame work,
+## throttled to RENDER_HZ by _process (stepping happens THERE, not here). Main-thread only: a future worker-thread
+## migration would reintroduce the &mut aliasing hazard (every LiveSim method is &mut self) the design avoided.
+func _publish_frame() -> void:
+	if _live == null:
+		return
 	var snap = SnapshotReader.parse_bytes(_live.snapshot(LIVE_GRID.x, LIVE_GRID.y))
 	if snap == null:
 		return
@@ -1001,7 +1039,7 @@ func _refresh_vitals() -> void:
 		_vitals_pop.text = "%s  Population    %d" % [_trend(float(v.population), "population"), int(v.population)]
 		_vitals_fit.text = "%s  Mean fitness  %.2f" % [_trend(float(v.fitness), "fitness"), float(v.fitness)]
 		_vitals_allele.text = "%s  Allele freq   %.2f" % [_trend(float(v.allele), "allele"), float(v.allele)]
-	if _live == null:  # replay: plot the whole run; live appends per tick in _live_advance
+	if _live == null:  # replay: plot the whole run; live appends per render in _publish_frame
 		_fit_history = []
 		_allele_history = []
 		for s in _snaps:
@@ -1207,8 +1245,10 @@ func _dim_label(text: String) -> Label:
 
 
 func _on_speed_changed(v: float) -> void:
-	# Higher slider = faster playback = shorter interval.
-	_frame_seconds = FRAME_SECONDS / maxf(0.1, v)
+	# Higher slider = faster. LIVE scales the decoupled step rate (_process); FILE replay scales the Timer.
+	var speed := maxf(0.1, v)
+	_steps_per_second = STEPS_PER_SECOND_BASE * speed
+	_frame_seconds = FRAME_SECONDS / speed
 	if _timer != null:
 		_timer.wait_time = _frame_seconds
 	_sync_controls()
@@ -1253,6 +1293,8 @@ func _resync_to_live() -> void:
 	_log_live_genome("baseline — gen 0")
 	_prev_obs = {}
 	_paused = false
+	_step_carry = 0.0  # fresh run → no owed steps / render backlog (the decoupled live loop, _process)
+	_render_carry = 0.0
 	if _timeline != null:
 		_timeline.setup([snap.generation])
 		_timeline.set_markers(_injections)
