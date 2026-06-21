@@ -48,7 +48,10 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
     integer-division backbone; conserves the total exactly). Hash-neutral, gate-green.
   - [x] **F0a** — `crates/sim-core/src/ledger.rs` conserved-energy `Ledger` + `ledger_closes` invariant +
     `Simulation::ledger()` accessor, inserted at reset. Hash-neutral, gate-green.
-  - [ ] **F0b** `f64→i64` energy migration (FIRST re-pin) — next.
+  - [x] **F0b** — `Energy(f64)→Energy(i64)` joule-currency precursor (`ENERGY_FULL` quantum, integer metabolism
+    EMA, hash fold `as u64`). Energy is decorative → RNG stream + allele_freq unchanged; the **FIRST RE-PIN** is
+    purely structural: `0x9fad…f73a → 0x49ee_0f17_6852_1cc2` (ledgered). Gate-green. *(Refinement: the heritable
+    trait components stay `f64` until F2 REPLACES them with the integer Strategy genome — no double migration.)*
   - [ ] **F1** dynamic resource pools (off-stream) · **F2** genome→Strategy allocation budget (re-pin).
   - [ ] **F3** 🛑 real metabolism + emergent births/deaths — breaks ADR-005 (re-pin; **needs the x86_64+aarch64 CI
     matrix gate FIRST**) · **F4** multi-species (R3 spine) + trophic web + emergent `FlowMatrix` (Rel re-ground).

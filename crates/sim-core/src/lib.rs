@@ -107,10 +107,17 @@ struct ClimateFieldRes(climate::ClimateField);
 #[derive(Component, Clone, Copy)]
 struct OrgId(u32);
 
-/// Placeholder organism energy advanced each generation (metabolism). Kept from Stage 0 so the prior
-/// behaviour/hash structure is preserved alongside the new selection loop.
+/// Full-scale energy quantum (ADR-013 F0b): one "unit" of organism energy is `ENERGY_FULL` integer joules.
+/// Energy migrates from `f64` to the conserved `i64` currency the CHEMOSTAT-J economy will denominate
+/// everything in (the first fixed-point type migration; later phases F1/F3 give it real metabolic meaning).
+const ENERGY_FULL: i64 = 1_000_000;
+
+/// Per-organism energy as an integer joule quantum in `[0, ENERGY_FULL]` (ADR-013 F0b — was `f64`). Still
+/// decorative w.r.t. selection (a metabolism placeholder that relaxes toward a fresh draw, fed to nothing yet),
+/// so migrating it to `i64` changes only its hash contribution + the snapshot fitness channel, never the
+/// selection dynamics — a deliberate, isolated determinism RE-PIN. F1/F3 wire it into the joule ledger.
 #[derive(Component, Clone, Copy)]
-struct Energy(f64);
+struct Energy(i64);
 
 /// Per-individual heritable scalar in `[0, 1]` — the "allele" under selection. Seeded at spawn from
 /// [`SimRng`] so individuals vary; resampled each generation by [`selection`]. Higher fitness ⇒ more copies.
@@ -194,12 +201,14 @@ fn advance_tick(mut tick: ResMut<Tick>) {
     tick.0 += 1;
 }
 
-/// Empty-but-deterministic metabolism: each organism's energy relaxes toward a fresh RNG draw.
-/// Draws happen in stable spawn/table order, so the RNG stream is reproducible.
+/// Empty-but-deterministic metabolism: each organism's integer energy relaxes 1% toward a fresh draw, in pure
+/// fixed-point (ADR-013 F0b — no float in the recurring path). Exactly ONE `next_u64` per organism in stable
+/// spawn/table order, so the RNG stream — and therefore every downstream draw (selection) — is byte-unchanged;
+/// only the integer energy VALUES + their hash contribution differ from the old `f64` path.
 fn metabolism(mut rng: ResMut<SimRng>, mut q: Query<&mut Energy>) {
     for mut energy in &mut q {
-        let draw = unit_f64(rng.0.next_u64());
-        energy.0 = (energy.0 * 0.99 + draw * 0.01).clamp(0.0, 1.0);
+        let draw = (rng.0.next_u64() % (ENERGY_FULL as u64 + 1)) as i64; // [0, ENERGY_FULL], no float
+        energy.0 = ((energy.0 * 99 + draw) / 100).clamp(0, ENERGY_FULL);
     }
 }
 
@@ -390,7 +399,9 @@ impl Simulation {
                                                     // Initial cell from a DISJOINT off-SimRng stream (ADR-011): no next_u64 draw here.
             world.spawn((
                 OrgId(i),
-                Energy(init),
+                // Quantize the seeded energy fraction to the i64 joule grid (ADR-013 F0b). One-time spawn
+                // conversion (IEEE multiply + truncate is platform-stable); the recurring path stays integer.
+                Energy((init * (ENERGY_FULL as f64)).clamp(0.0, ENERGY_FULL as f64) as i64),
                 Genotype(g0),
                 DroughtTol(drought),
                 ThermalTol(thermal),
@@ -473,7 +484,7 @@ impl Simulation {
 
         // Collect organisms in STABLE OrgId order (decouples from ECS archetype iteration — inv. #3),
         // carrying each one's REAL world Position (ADR-011 S-C — no longer the OrgId-hash layout).
-        let mut rows: Vec<(u32, f64, f64, u32, u32)> = self
+        let mut rows: Vec<(u32, f64, i64, u32, u32)> = self
             .world
             .query::<(&OrgId, &Genotype, &Energy, &Position)>()
             .iter(&self.world)
@@ -497,7 +508,7 @@ impl Simulation {
             let cell = y * (width as usize) + x;
             count[cell] += 1;
             genotype_sum[cell] += *g;
-            energy_sum[cell] += *e;
+            energy_sum[cell] += *e as f64; // i64 energy → f64 for the (display-only) fitness channel mean
         }
 
         let max_count = count.iter().copied().max().unwrap_or(0);
@@ -513,7 +524,8 @@ impl Simulation {
                 density[c] = (f64::from(n) / f64::from(max_count)) as f32;
             }
             allele_freq[c] = (genotype_sum[c] / f64::from(n)) as f32;
-            fitness[c] = (energy_sum[c] / f64::from(n)) as f32;
+            // Mean energy normalized to [0,1] by ENERGY_FULL for the f32 fitness channel (display-only).
+            fitness[c] = (energy_sum[c] / f64::from(n) / (ENERGY_FULL as f64)) as f32;
         }
 
         // Resample the static soil field onto the snapshot grid (read-only, no RNG → off the hash path).
@@ -682,7 +694,7 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
         .map(|(id, e, g, d, t, p)| {
             (
                 id.0,
-                e.0.to_bits(),
+                e.0 as u64, // ADR-013 F0b: integer energy reinterpreted (was f64 to_bits) — RE-PIN
                 g.0.to_bits(),
                 d.0.to_bits(),
                 t.0.to_bits(),
@@ -740,16 +752,20 @@ mod tests {
         // soil was hash-neutral); `8722…44aa` after R1.0a/R1.1 (per-individual heritable drought +
         // soil-coupled selection); `3ba0…82ba` after ADR-011 S-A (per-organism `Position` folded in);
         // `0413…ce77` after ADR-011 S-B (inherited dispersal adds one `next_u64`/offspring → 2N draws/gen);
-        // `c01e…e40e` after ADR-011 S-G (LOCAL soil coupling); now `9fad…f73a` after ADR-012 E3 (climate:
+        // `c01e…e40e` after ADR-011 S-G (LOCAL soil coupling); `9fad…f73a` after ADR-012 E3 (climate:
         // heritable ThermalTol — a 4th spawn draw, folded into the hash — and TemperatureMatchModifier weights
         // selection by the world climate. At the default TEMPERATE env the modifier is selection-neutral, so the
-        // re-pin captures only the structural change: the extra spawn draw + ThermalTol in the hash).
+        // re-pin captured only the structural change: the extra spawn draw + ThermalTol in the hash);
+        // now `49ee…1cc2` after ADR-013 F0b (Energy migrated `f64`→`i64`, the joule-currency precursor). Energy
+        // is decorative w.r.t. selection (drives no fitness), and metabolism still draws exactly one `next_u64`
+        // per organism, so the RNG stream + allele_freq are UNCHANGED — the re-pin captures only Energy's changed
+        // representation in `hash_world` (`as u64` vs `to_bits`) + its seeded/metabolized integer values.
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x9fad_2c9f_d298_f73a);
+        assert_eq!(run_headless(&cfg).hash, 0x49ee_0f17_6852_1cc2);
     }
 
     #[test]
@@ -1272,7 +1288,8 @@ mod tests {
     #[test]
     fn reset_inserts_a_closing_ledger() {
         // ADR-013 F0a: the conserved-energy ledger is present at reset, empty, and closes trivially — no
-        // joule moves yet (energy is still f64, no pools). F1 will seed `initial_total` and assert against
+        // joule MOVES yet (Energy is now i64 per F0b but is not in the ledger; no pools). F1 will seed
+        // `initial_total` and assert against
         // the real live total each tick.
         let cfg = SimConfig {
             seed: 7,
