@@ -296,11 +296,12 @@ fn fitness(base: f64, genotype: f64) -> f64 {
 /// cumulative-weight table and the draws are ordered, and there is no `HashMap` iteration (invariant #3).
 fn selection(
     mut rng: ResMut<SimRng>,
-    base: Res<BaseGrowthRate>,
+    registry: Res<SpeciesRegistry>,
     soil_field: Res<SoilFieldRes>,
     climate_field: Res<ClimateFieldRes>,
     mut q: Query<(
         &OrgId,
+        &Species,
         &mut Genotype,
         &mut DroughtTol,
         &mut ThermalTol,
@@ -313,49 +314,67 @@ fn selection(
     let clim_mod = climate::TemperatureMatchModifier;
     let clim_sample = climate_field.0.sample(); // GLOBAL climate coupling (ADR-012 E3); per-cell is a follow-up.
 
-    // Snapshot parents (id, genotype, drought, thermal, x, y) in stable id order. Position rides along so
-    // offspring INHERIT the sampled parent's cell (+ disperse) — ADR-011; thermal rides for the climate factor.
-    let mut parents: Vec<(u32, f64, f64, f64, u32, u32)> = q
+    // Snapshot parents (species, id, genotype, drought, thermal, x, y) sorted by (species, id) — so each
+    // species' members form a CONTIGUOUS slice in a fully deterministic order (no HashMap, inv #3). Position
+    // rides so offspring INHERIT the sampled parent's cell (+ disperse); thermal rides for the climate factor.
+    let mut parents: Vec<(u16, u32, f64, f64, f64, u32, u32)> = q
         .iter()
-        .map(|(id, g, d, t, p)| (id.0, g.0, d.0, t.0, p.x, p.y))
+        .map(|(id, sp, g, d, t, p)| (sp.0 .0, id.0, g.0, d.0, t.0, p.x, p.y))
         .collect();
     if parents.len() < 2 {
         return; // nothing to select between (also the empty-population fast path).
     }
-    parents.sort_unstable_by_key(|p| p.0);
+    parents.sort_unstable_by_key(|p| (p.0, p.1));
 
-    // Weights = base fitness × the parent's OWN-cell SOIL factor (ADR-011 S-G) × the CLIMATE factor (ADR-012 E3:
-    // warm-adapted individuals win in warm climates). Both factors strictly positive (ADR-005 no-extinction);
-    // both RNG-free, no HashMap → deterministic.
-    let mut cumulative: Vec<f64> = Vec::with_capacity(parents.len());
-    let mut total = 0.0;
-    for &(_, g, d, t, x, y) in &parents {
-        let local_soil = soil_field.0.sample_at(x, y);
-        let w = fitness(base.0, g)
-            * soil_mod.fitness_factor(local_soil, d)
-            * clim_mod.fitness_factor(clim_sample, t);
-        total += w;
-        cumulative.push(total);
+    // S INDEPENDENT constant-size Wright-Fisher pools, in ASCENDING SpeciesId order: each species regenerates
+    // its OWN `target_pop` offspring from its OWN members, weighted by THAT species' base growth (per-species
+    // ADR-005 constant population). Offspring write back to their own species' organisms (OrgIds are globally
+    // unique, so the merged map never cross-pairs). EXACTLY 2 draws/offspring, fixed order (select, disperse).
+    // For a 1-species roster this reduces to the historical single-pool loop (byte-identical).
+    let mut by_id: std::collections::BTreeMap<u32, (f64, f64, f64, u32, u32)> =
+        std::collections::BTreeMap::new();
+    let mut start = 0usize;
+    for (sid, entry) in registry.entries.iter().enumerate() {
+        let species = sid as u16;
+        let end = start
+            + parents[start..]
+                .iter()
+                .take_while(|p| p.0 == species)
+                .count();
+        let pool = &parents[start..end];
+        start = end;
+        if pool.len() < 2 {
+            continue; // a species with < 2 live members does not regenerate this generation
+        }
+        let plen = pool.len();
+        // Weights = base fitness × the parent's OWN-cell SOIL factor (ADR-011 S-G) × the CLIMATE factor
+        // (ADR-012 E3). Both factors strictly positive (ADR-005); RNG-free, no HashMap → deterministic.
+        let mut cumulative: Vec<f64> = Vec::with_capacity(plen);
+        let mut total = 0.0;
+        for &(_, _, g, d, t, x, y) in pool {
+            let local_soil = soil_field.0.sample_at(x, y);
+            let w = fitness(entry.base_growth, g)
+                * soil_mod.fitness_factor(local_soil, d)
+                * clim_mod.fitness_factor(clim_sample, t);
+            total += w;
+            cumulative.push(total);
+        }
+        // Draw target_pop offspring; offspring `slot` writes back into this pool's `slot`-th organism (constant
+        // population ⇒ target_pop == plen; a short pool just fills the slots it has).
+        for slot in 0..entry.target_pop as usize {
+            let target = unit_f64(rng.0.next_u64()) * total;
+            let idx = cumulative.partition_point(|&c| c <= target).min(plen - 1);
+            let (_, _, pg, pd, pt, px, py) = pool[idx];
+            let k = (unit_f64(rng.0.next_u64()) * 9.0) as i64; // 0..=8 → a 9-cell Moore step
+            let nx = (px as i64 + (k % 3 - 1)).clamp(0, WORLD_DIMS.0 as i64 - 1) as u32;
+            let ny = (py as i64 + (k / 3 - 1)).clamp(0, WORLD_DIMS.1 as i64 - 1) as u32;
+            if let Some(&(_, oid, ..)) = pool.get(slot) {
+                by_id.insert(oid, (pg, pd, pt, nx, ny));
+            }
+        }
     }
 
-    // Draw N offspring, each INHERITING a fitness-proportional parent's (genotype, drought, thermal, position)
-    // then dispersing one bounded step. EXACTLY two draws/offspring in a fixed order (select, then disperse).
-    let n = parents.len();
-    let mut offspring: Vec<(f64, f64, f64, u32, u32)> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let target = unit_f64(rng.0.next_u64()) * total;
-        let idx = cumulative.partition_point(|&c| c <= target).min(n - 1);
-        let (_, pg, pd, pt, px, py) = parents[idx];
-        let k = (unit_f64(rng.0.next_u64()) * 9.0) as i64; // 0..=8 → a 9-cell Moore step
-        let nx = (px as i64 + (k % 3 - 1)).clamp(0, WORLD_DIMS.0 as i64 - 1) as u32;
-        let ny = (py as i64 + (k / 3 - 1)).clamp(0, WORLD_DIMS.1 as i64 - 1) as u32;
-        offspring.push((pg, pd, pt, nx, ny));
-    }
-
-    // Map each id to its inherited (genotype, drought, thermal, position), then write back (ordered BTreeMap).
-    let by_id: std::collections::BTreeMap<u32, (f64, f64, f64, u32, u32)> =
-        parents.iter().map(|p| p.0).zip(offspring).collect();
-    for (id, mut g, mut d, mut t, mut p) in &mut q {
+    for (id, _sp, mut g, mut d, mut t, mut p) in &mut q {
         if let Some(&(new_g, new_d, new_t, new_x, new_y)) = by_id.get(&id.0) {
             g.0 = new_g;
             d.0 = new_d;
@@ -536,29 +555,33 @@ impl Simulation {
         // Static soil substrate, generated purely from the seed via derive_seed — ZERO SimRng draws (R1.0).
         let soil = soil::SoilField::generate(config.seed, soil::SOIL_DIMS.0, soil::SOIL_DIMS.1);
 
-        for i in 0..config.entity_count {
-            // Per-individual genotype in [0,1] seeded from the single RNG so individuals VARY (the standing
-            // variation selection acts on); energy keeps the Stage-0 metabolism behaviour; drought tolerance
-            // is the new heritable standing variation soil-coupled selection acts on (R1.0a). Draw order is
-            // fixed (genotype, energy, drought) so the stream is reproducible.
-            let g0 = unit_f64(rng.next_u64());
-            let init = base_growth * unit_f64(rng.next_u64());
-            let drought = unit_f64(rng.next_u64());
-            let thermal = unit_f64(rng.next_u64()); // ADR-012 E3: fixed draw order (g0, energy, drought, thermal)
-                                                    // Initial cell from a DISJOINT off-SimRng stream (ADR-011): no next_u64 draw here.
-            world.spawn((
-                OrgId(i),
-                // Quantize the seeded energy fraction to the i64 joule grid (ADR-013 F0b). One-time spawn
-                // conversion (IEEE multiply + truncate is platform-stable); the recurring path stays integer.
-                Energy((init * (ENERGY_FULL as f64)).clamp(0.0, ENERGY_FULL as f64) as i64),
-                Genotype(g0),
-                DroughtTol(drought),
-                ThermalTol(thermal),
-                placement(config.seed, i),
-                // R3-A: tag the species (the primary, ordinal 0). Off the SimRng stream — no `next_u64` — so the
-                // spawn draw order is unchanged and tagging is hash-neutral (the `Position` off-stream precedent).
-                Species(SpeciesId(0)),
-            ));
+        // R3-B: spawn EVERY species' population with GLOBAL contiguous OrgIds (`0..Σtarget_pop` — `hash_world`
+        // keys/sorts by OrgId), each tagged with its `SpeciesId` and seeded from ITS OWN `base_growth`. The
+        // per-org 4-draw order (g0, energy, drought, thermal) is unchanged, so a 1-species roster spawns exactly
+        // as before (byte-identical). Species is assigned off the SimRng stream (no `next_u64`).
+        let mut org_i: u32 = 0;
+        for (sid, entry) in entries.iter().enumerate() {
+            for _ in 0..entry.target_pop {
+                // Per-individual genotype in [0,1] seeded from the single RNG so individuals VARY (the standing
+                // variation selection acts on); energy keeps the Stage-0 metabolism behaviour; drought tolerance
+                // is the heritable standing variation soil-coupled selection acts on. Draw order is fixed.
+                let g0 = unit_f64(rng.next_u64());
+                let init = entry.base_growth * unit_f64(rng.next_u64());
+                let drought = unit_f64(rng.next_u64());
+                let thermal = unit_f64(rng.next_u64()); // fixed draw order (g0, energy, drought, thermal)
+                world.spawn((
+                    OrgId(org_i),
+                    // Quantize the seeded energy fraction to the i64 joule grid (ADR-013 F0b). One-time spawn
+                    // conversion (IEEE multiply + truncate is platform-stable); the recurring path stays integer.
+                    Energy((init * (ENERGY_FULL as f64)).clamp(0.0, ENERGY_FULL as f64) as i64),
+                    Genotype(g0),
+                    DroughtTol(drought),
+                    ThermalTol(thermal),
+                    placement(config.seed, org_i),
+                    Species(SpeciesId(sid as u16)),
+                ));
+                org_i += 1;
+            }
         }
 
         world.insert_resource(SimRng(rng));
@@ -800,6 +823,14 @@ impl Simulation {
         let phenotype = self.gp_map.express(&self.world.resource::<GenomeRes>().0);
         let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
         self.world.resource_mut::<BaseGrowthRate>().0 = base_growth;
+        // R3-B: a species edit targets the PRIMARY species — mirror the edited genome + base growth into the
+        // registry, which is now what `selection` reads, so the edit actually changes subsequent dynamics.
+        let edited = self.world.resource::<GenomeRes>().0.clone();
+        {
+            let primary = &mut self.world.resource_mut::<SpeciesRegistry>().entries[0];
+            primary.genome = edited;
+            primary.base_growth = base_growth;
+        }
         out
     }
 
@@ -1041,6 +1072,54 @@ mod tests {
             .filter(|s| **s == Species(SpeciesId(0)))
             .count();
         assert_eq!(tagged, 50, "every organism is tagged Species(SpeciesId(0))");
+    }
+
+    #[test]
+    fn r3b_two_species_run_deterministically_with_constant_pools() {
+        // R3-B: two species in one run select as INDEPENDENT constant-size Wright-Fisher pools — deterministic
+        // (same seed → same hash twice), and each species holds its own population. Hash-neutral for N=1 (the
+        // pinned literal is unchanged); a multi-species run is new behaviour with its own deterministic hash.
+        let roster = || {
+            vec![
+                RosterEntry {
+                    name: "a".to_string(),
+                    genome: genome::sample_genome(),
+                    gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                    entity_count: 60,
+                },
+                RosterEntry {
+                    name: "b".to_string(),
+                    genome: genome::sample_genome(),
+                    gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                    entity_count: 40,
+                },
+            ]
+        };
+        let cfg = SimConfig {
+            seed: 9,
+            generations: 12,
+            entity_count: 100,
+        };
+        let mut a = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster());
+        a.step(cfg.generations);
+        let mut b = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster());
+        b.step(cfg.generations);
+        assert_eq!(
+            a.run_stats().hash,
+            b.run_stats().hash,
+            "a 2-species run must be deterministic"
+        );
+        let mut q = a.world.query::<&Species>();
+        let s0 = q
+            .iter(&a.world)
+            .filter(|s| **s == Species(SpeciesId(0)))
+            .count();
+        let s1 = q
+            .iter(&a.world)
+            .filter(|s| **s == Species(SpeciesId(1)))
+            .count();
+        assert_eq!(s0, 60, "species 0 keeps its constant pool");
+        assert_eq!(s1, 40, "species 1 keeps its constant pool");
     }
 
     #[test]

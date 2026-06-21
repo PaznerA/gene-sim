@@ -123,8 +123,13 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
     inv #3), `reset_with_roster(config,env,Vec<RosterEntry>)` (`reset_with_genome_and_map` delegates a 1-entry
     roster). Spawns + selects ONLY the primary → byte-identical (pinned literal unchanged). Test: 1-entry registry
     + every org tagged Species(0).
-  - [ ] **R3-B per-species Wright-Fisher 🛑** (deliberate re-pin, human-signed): S independent fixed-size pools by
-    ascending `SpeciesId`; spawn + select all entries; offspring inherit `Species`; per-species observe/snapshot.
+  - [x] **R3-B per-species Wright-Fisher** — `selection` now runs S INDEPENDENT constant-size pools by ascending
+    `SpeciesId` (each species' own `base_growth` + `target_pop`, 2 draws/offspring, per-pool write-back by OrgId);
+    `reset_with_roster` spawns ALL species (global OrgIds, per-species seed); `with_genome_and_rng` mirrors a
+    species edit into the registry (selection's source). **Turned out HASH-NEUTRAL** — the 1-species pool reduces
+    exactly to the historical single-pool loop, so the pinned literal + campaign + replay are unchanged; a
+    multi-species run is new behaviour with its own deterministic hash. Test: 2 species run deterministically,
+    each keeps its constant pool (60/40). *(Human pre-approved a re-pin; none was needed.)*
   - [ ] **F3 resource coupling 🛑** (separate re-pin): `nutrient_dynamics` system (RNG-free, after metabolism) +
     `TrophicRole{Autotroph,Decomposer}` — plants deplete nutrient + shed detritus, decomposer mineralizes
     detritus→nutrient (the obligate loop = the soil-microbiome ECOSYSTEM) + a `[0.5,1.5]` ResourceModifier into
