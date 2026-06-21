@@ -8,23 +8,67 @@ use std::path::Path;
 
 use genome::spec::{BuiltSpecies, SpeciesSpec};
 
+/// Build + validate a species from an already-read JSON STRING — no filesystem I/O. This is the `res://` VFS
+/// boundary (ADR-017): GDScript reads the bytes via `FileAccess` and hands the text here, so the core never
+/// touches the filesystem (inv #2/#4). Pure: serde parse + [`SpeciesSpec::build`] — draws NO RNG (inv #3).
+///
+/// # Errors
+/// A JSON deserialization error or a [`genome::spec::SpecError`] build/validation error (locus-id/index
+/// mismatch, non-ACGT base, out-of-domain parameter) — all surfaced as an [`io::Error`] of kind
+/// [`io::ErrorKind::InvalidData`].
+pub fn build_species_from_str(json: &str) -> io::Result<BuiltSpecies> {
+    let spec: SpeciesSpec =
+        serde_json::from_str(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    spec.build()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Load + validate a species JSON file (`data/species/<key>.json`) into a [`BuiltSpecies`].
+///
+/// Delegates to [`build_species_from_str`] after reading the file — the single parse/validate path (DRY), so
+/// the file-path callers (harness CLI / campaign) and the `res://`-string boundary stay byte-for-byte in sync.
 ///
 /// # Errors
 /// An I/O error reading the file, a JSON deserialization error, or a [`genome::spec::SpecError`] build/validation
 /// error (locus-id/index mismatch, non-ACGT base, out-of-domain parameter) — all surfaced as an
-/// [`io::Error`] of kind [`io::ErrorKind::InvalidData`], preserving the offending path in its message.
+/// [`io::Error`] of kind [`io::ErrorKind::InvalidData`].
 pub fn load_species_file(path: impl AsRef<Path>) -> io::Result<BuiltSpecies> {
-    let text = std::fs::read_to_string(path)?;
-    let spec: SpeciesSpec =
-        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    spec.build()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    build_species_from_str(&std::fs::read_to_string(path)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_str_matches_load_file_on_shipped_species() {
+        // The `res://`-string boundary (build_species_from_str) and the file-path loader (load_species_file)
+        // are the SAME parse/validate path: building from the shipped JSON TEXT must yield a BuiltSpecies
+        // identical (key, entity_count, genome, …) to loading the file. This locks the two byte SOURCES in
+        // sync so the gate catches any drift between the renderer's res:// path and the harness CLI path.
+        for stem in ["default", "ecoli"] {
+            let path = format!(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/{}.json"),
+                stem
+            );
+            let from_file = load_species_file(&path).expect("file loads");
+            let text = std::fs::read_to_string(&path).expect("read text");
+            let from_str = build_species_from_str(&text).expect("string builds");
+            assert_eq!(
+                from_file, from_str,
+                "build_species_from_str must equal load_species_file for {stem}.json"
+            );
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_malformed_json_as_invalid_data() {
+        // Malformed bytes must surface as io::ErrorKind::InvalidData (not a panic, not an I/O error), exactly
+        // like a serde failure inside load_species_file — the renderer reads this as a `false` + a clean error.
+        let err =
+            build_species_from_str("{ not valid json ").expect_err("malformed JSON must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn shipped_default_species_loads_to_sample_genome() {

@@ -149,7 +149,8 @@ impl LiveSim {
         match harness::species::load_species_file(&path) {
             Ok(built) => {
                 if built.entity_count > 0 {
-                    self.entity_count_before_species.get_or_insert(self.entity_count);
+                    self.entity_count_before_species
+                        .get_or_insert(self.entity_count);
                     self.entity_count = built.entity_count;
                 }
                 self.species = Some(built);
@@ -160,6 +161,48 @@ impl LiveSim {
                 false
             }
         }
+    }
+
+    /// Select the species the next `reset` runs from its `SpeciesSpec` JSON TEXT (`res://` boundary, ADR-017):
+    /// GDScript reads the bytes via `FileAccess(res://data/species/<stem>.json)` and passes the string; the core
+    /// does zero file I/O (inv #2/#4). An EMPTY string clears back to the default plant (restoring the player's
+    /// pre-species `entity_count`). Returns `true` on success (`false` + a `godot_error!` on invalid/un-buildable
+    /// JSON). Call before `reset`. This is the renderer's loader; [`set_species`](Self::set_species) is kept for
+    /// the harness CLI / exe-staged path (cwd-relative file lookup), so there are two byte sources, one biology
+    /// path (both funnel through `harness::species::build_species_from_str`).
+    #[func]
+    fn set_species_json(&mut self, json: GString) -> bool {
+        let json = json.to_string();
+        if json.is_empty() {
+            // Clear back to the default plant, restoring the player's pre-species population.
+            if let Some(prev) = self.entity_count_before_species.take() {
+                self.entity_count = prev;
+            }
+            self.species = None;
+            return true;
+        }
+        match harness::species::build_species_from_str(&json) {
+            Ok(built) => {
+                if built.entity_count > 0 {
+                    self.entity_count_before_species
+                        .get_or_insert(self.entity_count);
+                    self.entity_count = built.entity_count;
+                }
+                self.species = Some(built);
+                true
+            }
+            Err(e) => {
+                godot_error!("LiveSim::set_species_json: {e}");
+                false
+            }
+        }
+    }
+
+    /// The active species key (`"ecoli-core"` | `"default"` | `""`), a pure read of already-loaded data (no
+    /// biology — inv #2). The renderer can route presentation on this CORE key as the authoritative tiebreak.
+    #[func]
+    fn species_key(&self) -> GString {
+        GString::from(self.species.as_ref().map(|b| b.key.as_str()).unwrap_or(""))
     }
 
     /// CORE-computed climate preview for the main menu (ADR-012 E4): the `{day_length, insolation, temperature}`
