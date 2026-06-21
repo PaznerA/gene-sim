@@ -7,13 +7,14 @@ extends CanvasLayer
 ## LiveSim.preview_climate — this script never computes climate itself. Loaded by path (no class_name; ADR-010):
 ##   const MainMenu := preload("res://main_menu.gd")
 
-signal start_run(cfg)  # { seed:int, lat:float, lon:float, temp:float, season:int, entities:int }
+signal start_run(cfg)  # { seed:int, lat:float, lon:float, temp:float, season:int, entities:int, mission:bool }
 
 const SEASONS := ["Spring", "Summer", "Autumn", "Winter"]
 
 var _live: Object = null
 var _seed: int = 42
 var _season: int = 0
+var _mission_default: bool = false
 
 var _seed_edit: LineEdit = null
 var _random_chk: CheckBox = null
@@ -26,13 +27,16 @@ var _lon_val: Label = null
 var _temp_val: Label = null
 var _ent_val: Label = null
 var _season_btn: Button = null
+var _mission_chk: CheckBox = null
 var _preview: Label = null
 
 
-## Called by main.gd before the overlay is added to the tree. `live` is the LiveSim (for the core preview).
-func setup(live: Object, p_seed: int) -> void:
+## Called by main.gd before the overlay is added to the tree. `live` is the LiveSim (for the core preview);
+## `p_mission` seeds the mission checkbox (the --mission CLI flag), default off.
+func setup(live: Object, p_seed: int, p_mission: bool = false) -> void:
 	_live = live
 	_seed = p_seed
+	_mission_default = p_mission
 
 
 func _ready() -> void:
@@ -133,6 +137,12 @@ func _build() -> void:
 	next.pressed.connect(_on_season_next)
 	season_row.add_child(next)
 	col.add_child(_labeled("Season", season_row))
+
+	# --- MISSION toggle: off by default = free-play sandbox; on = the suppress-the-zone challenge.
+	_mission_chk = CheckBox.new()
+	_mission_chk.text = "Mission: suppress the zone"
+	_mission_chk.button_pressed = _mission_default
+	col.add_child(_mission_chk)
 
 	col.add_child(_sep())
 
@@ -260,6 +270,7 @@ func _on_start() -> void:
 			"temp": _temp.value,
 			"season": _season,
 			"entities": int(_entities.value),
+			"mission": _mission_chk.button_pressed,
 		}
 	)
 	queue_free()

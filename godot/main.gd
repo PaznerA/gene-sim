@@ -310,7 +310,7 @@ func _should_show_menu() -> bool:
 ## Instantiate the main-menu overlay, pause the sim behind it, and wire Start → reconfigure + reseed in place.
 func _show_main_menu() -> void:
 	var menu := MainMenu.new()
-	menu.setup(_live, _seed)
+	menu.setup(_live, _seed, _mission_on)  # seed the mission checkbox from the --mission CLI flag (default off)
 	menu.start_run.connect(_on_menu_start)
 	add_child(menu)
 	_menu = menu  # mark the modal open so _unhandled_input swallows sim hotkeys until Start
@@ -334,6 +334,17 @@ func _on_menu_start(cfg: Dictionary) -> void:
 		int(cfg.get("season", 0)),
 	)
 	_do_reset(_seed)
+	# Mission is a MENU choice now (off by default = free-play sandbox). Apply it + (re)activate its UI on Start;
+	# the --mission CLI flag is the headless/scripted equivalent (set in _setup_live, overridden here).
+	_mission_on = bool(cfg.get("mission", false))
+	_mission_status = 0
+	_edits_used = 0
+	if _mission_panel != null:
+		_mission_panel.set_active(_mission_on)
+	if _mission_marker != null and _mission_on:
+		_mission_marker.set_brush(_mission_zone, _mission_radius)
+	if _mission_banner != null:
+		_mission_banner.visible = false
 	_paused = false
 	if _timer != null:
 		_timer.start()
