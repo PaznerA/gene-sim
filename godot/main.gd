@@ -83,6 +83,12 @@ var _paused: bool = false
 var _view_mode: int = 0  # 0 = ecosystem, 1 = specimen (L-system plants)
 var _specimens: Dictionary = {}  # parsed specimens.json: {baseline:{...}, edits:[...]}
 var _live_specimen_log: Array = []  # --live: incremental log of distinct genome states (baseline + per edit)
+# --live, multi-species: per-species incremental specimen log, keyed by species_id (int) ->
+# {key:String, name:String, entries:Array of {label,traits}}. Fed from LiveSim.observe_species() so EVERY
+# species (not just the active observe() one) shows its OWN baseline + edits. _live_specimen_log mirrors the
+# PRIMARY species' entries for back-compat with the existing single-species paths.
+var _live_species_logs: Dictionary = {}
+var _live_species_order: Array = []  # species_id ints in registry (SpeciesId) order — stable iteration (inv #3)
 var _run_dir: String = ""
 var _field_px := Vector2.ZERO
 
@@ -453,6 +459,8 @@ func _setup_live() -> bool:
 		return false
 	_snaps = [snap]
 	_live_specimen_log = []
+	_live_species_logs = {}
+	_live_species_order = []
 	_log_live_genome("baseline — gen 0")  # seed the specimen history before any edit (incremental log)
 	# Default = SANDBOX (free play, unlimited edits). The suppress-the-zone mission is opt-in behind --mission
 	# until deeper tasks exist (S-G2 stays available but off by default).
@@ -1327,6 +1335,8 @@ func _resync_to_live() -> void:
 	_fit_history = []
 	_allele_history = []
 	_live_specimen_log = []  # fresh run → fresh specimen history
+	_live_species_logs = {}
+	_live_species_order = []
 	_log_live_genome("baseline — gen 0")
 	_prev_obs = {}
 	_paused = false
@@ -1468,61 +1478,145 @@ func _set_view_mode(m: int) -> void:
 ## In --live mode there is no specimens.json, so synthesise the specimen list from the LIVE species genome's
 ## expressed phenotype (LiveSim.observe()). The plant's shape then reflects the current genome and updates as
 ## the player edits it. Read-only (inv #2): observe() exports the traits; the renderer only maps them to shape.
-## Maps the core's Debug-cased trait keys (GrowthRate…) to the snake_case TRAIT_KEYS the specimen view uses.
-## Map the live genome's expressed phenotype (LiveSim.observe, Debug-cased keys) to the snake_case TRAIT_KEYS.
-func _capture_live_traits() -> Dictionary:
-	# Merged map: the 9 plant traits + the 5 microbe traits, both keyed by the core's Debug names. observe() for a
-	# given species emits ONLY that species' bound traits (9 for the plant via the WeightedSumMap, 5 for E. coli
-	# via ecoli_trait_map), so we iterate whatever keys observe() actually returns and translate each — no microbe
-	# phenotype is silently dropped (the root cause of the old plant-shaped placeholder). growth_rate is shared.
-	const KEY_MAP := {
-		# plant (9)
-		"GrowthRate": "growth_rate", "Stature": "stature", "Branchiness": "branchiness",
-		"LeafSize": "leaf_size", "LeafHue": "leaf_hue", "Reflectance": "reflectance",
-		"Fecundity": "fecundity", "DroughtTolerance": "drought_tolerance",
-		"KillSwitchLinkage": "kill_switch_linkage",
-		# microbe (5) — E. coli phenotype (ecoli_trait_map); GrowthRate is shared with the plant set above.
-		"GlucoseUptake": "glucose_uptake", "RespirationMode": "respiration_mode",
-		"AcetateOverflow": "acetate_overflow", "FermentationCapacity": "fermentation_capacity",
-	}
-	var pheno: Dictionary = _live.observe().get("phenotype", {})
+## The Debug-cased → snake_case trait-key translation (plant 9 + microbe 5), shared by every capture path.
+## A species' phenotype dict carries ONLY that species' bound traits, so iterating its keys and translating each
+## drops nothing (growth_rate is shared). Defined once here (was inline in _capture_live_traits).
+const TRAIT_KEY_MAP := {
+	# plant (9)
+	"GrowthRate": "growth_rate", "Stature": "stature", "Branchiness": "branchiness",
+	"LeafSize": "leaf_size", "LeafHue": "leaf_hue", "Reflectance": "reflectance",
+	"Fecundity": "fecundity", "DroughtTolerance": "drought_tolerance",
+	"KillSwitchLinkage": "kill_switch_linkage",
+	# microbe (5) — E. coli phenotype (ecoli_trait_map); GrowthRate is shared with the plant set above.
+	"GlucoseUptake": "glucose_uptake", "RespirationMode": "respiration_mode",
+	"AcetateOverflow": "acetate_overflow", "FermentationCapacity": "fermentation_capacity",
+}
+
+
+## Translate ANY core-exported phenotype dict (Debug-cased keys) into the snake_case keys the specimen view uses.
+## Works for the active observe() phenotype AND every per-species observe_species() phenotype — pure renaming
+## (no biology, inv #2). Factored out of the old _capture_live_traits so the multi-species fan-out reuses it.
+func _capture_traits_from(pheno: Dictionary) -> Dictionary:
 	var traits := {}
 	for k in pheno:
-		if KEY_MAP.has(k):
-			traits[KEY_MAP[k]] = float(pheno[k])
+		if TRAIT_KEY_MAP.has(k):
+			traits[TRAIT_KEY_MAP[k]] = float(pheno[k])
 	return traits
 
 
-## Append the current live genome's phenotype to the specimen log — but ONLY if it differs from the last entry.
-## The species genome changes only on a WHOLE-species CRISPR edit (selection drives per-individual alleles, not
-## the genome), so without edits there is exactly one entry; each successful edit logs a new static record (the
-## user's "log each unique genome state"). Brush/region edits shift alleles, not the genome → no new entry.
+## The PRIMARY (active observe()) species' translated phenotype — back-compat thin wrapper over the factored map.
+func _capture_live_traits() -> Dictionary:
+	return _capture_traits_from(_live.observe().get("phenotype", {}))
+
+
+## The species template the ECOSYSTEM field renders with: {traits, key}. The GSS2 snapshot is species-BLIND
+## (no per-cell species id; R3-B's observe path is single-active-species per run), so the field is parameterized
+## by the run-level species phenotype applied uniformly + the existing per-cell channels for intra-field variation
+## (per the renderer-only mapping — a per-cell species channel would be a core snapshot-format change, out of
+## scope here). Live → the active observe() species (with its core key); file-replay → the specimens.json
+## baseline (plant). Pure reads (inv #2).
+func _ecosystem_species_traits() -> Dictionary:
+	if _live != null:
+		var key := "default"
+		if _live.has_method("species_key"):
+			var k := String(_live.species_key())
+			if k != "":
+				key = k
+		return {"traits": _capture_live_traits(), "key": key}
+	# File-replay: the plant baseline from specimens.json (key defaults to plant).
+	if _specimens.has("baseline"):
+		return {"traits": (_specimens["baseline"] as Dictionary).get("traits", {}), "key": "default"}
+	return {"traits": {}, "key": "default"}
+
+
+## Append the current genome state of EVERY species to its own per-species log — but only entries that DIFFER
+## from that species' last entry. The species genome changes only on a WHOLE-species CRISPR edit (selection
+## drives per-individual alleles, not the genome), and an edit targets the ACTIVE species, so a CRISPR edit logs
+## a new specimen under exactly the edited species (the others' traits are unchanged → no duplicate). Fed by the
+## read-only observe_species() (every species' baseline+edits cross the boundary; inv #2/#3). The `label` carries
+## the edit/gen context; per-species entries are suffixed so the picker reads "Species — baseline / edit N".
 func _log_live_genome(label: String) -> void:
 	if _live == null:
 		return
+	if not _live.has_method("observe_species"):
+		# Older cdylib without the per-species export → fall back to the single primary-species log.
+		_log_primary_genome(label)
+		return
+	for sp in _live.observe_species():
+		var spd: Dictionary = sp
+		var sid := int(spd.get("species_id", 0))
+		var key := str(spd.get("key", "default"))
+		var sname := str(spd.get("name", "species"))
+		var traits := _capture_traits_from(spd.get("phenotype", {}))
+		if not _live_species_logs.has(sid):
+			_live_species_logs[sid] = {"key": key, "name": sname, "entries": []}
+			_live_species_order.append(sid)
+		var log_entry: Dictionary = _live_species_logs[sid]
+		var entries: Array = log_entry["entries"]
+		if not entries.is_empty() and (entries.back() as Dictionary).get("traits", {}) == traits:
+			continue  # unchanged genome for this species — don't log a duplicate
+		# Label: "baseline — …" for the first entry; "edit N — …" thereafter (per-species edit count).
+		var per_label := label
+		if not entries.is_empty():
+			per_label = "edit %d — gen %d" % [entries.size(), int(_live.observe().get("generation", 0))]
+		entries.append({"label": per_label, "traits": traits})
+	_live_species_order.sort()  # stable SpeciesId order (inv #3)
+	# Keep the legacy flat log mirroring the PRIMARY species (species_id 0) for any back-compat reader.
+	if _live_species_order.size() > 0:
+		_live_specimen_log = (_live_species_logs[_live_species_order[0]] as Dictionary)["entries"]
+
+
+## Single-active-species fallback (older cdylib without observe_species): mirrors the pre-fan-out behaviour.
+func _log_primary_genome(label: String) -> void:
 	var traits := _capture_live_traits()
-	if not _live_specimen_log.is_empty() and _live_specimen_log.back().get("traits", {}) == traits:
-		return  # unchanged genome — don't log a duplicate
+	if not _live_specimen_log.is_empty() and (_live_specimen_log.back() as Dictionary).get("traits", {}) == traits:
+		return
 	_live_specimen_log.append({"label": label, "traits": traits})
 
 
 func _refresh_live_specimens() -> void:
 	if _live == null:
 		return
-	if _live_specimen_log.is_empty():
+	if _live_specimen_log.is_empty() and _live_species_logs.is_empty():
 		_log_live_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
-	_specimens = {"baseline": _live_specimen_log[0], "edits": _live_specimen_log.slice(1)}
-	_focus = clampi(_focus, 0, _live_specimen_log.size() - 1)
+	# _specimen_list() now flattens the per-species logs directly; clamp focus into the new flat range.
+	_focus = clampi(_focus, 0, maxi(0, _specimen_list().size() - 1))
 
 
+## The flat, ordered specimen row: every species' baseline + edits, grouped by species (SpeciesId order), each
+## entry carrying its own `key` so the per-row glyph (microbe rod vs L-system) and the readout dispatch per
+## species. File-replay (specimens.json, plant-only) keeps its baseline/edits shape, tagged key "default".
 func _specimen_list() -> Array:
 	var out: Array = []
+	# --live: walk per-species logs in SpeciesId order; caption each "Species — baseline / edit N".
+	if not _live_species_order.is_empty():
+		for sid in _live_species_order:
+			var log_entry: Dictionary = _live_species_logs[sid]
+			var key := str(log_entry.get("key", "default"))
+			var sname := str(log_entry.get("name", "species"))
+			for e in (log_entry["entries"] as Array):
+				var ed: Dictionary = e
+				out.append({
+					"label": "%s — %s" % [sname, str(ed.get("label", ""))],
+					"traits": ed.get("traits", {}),
+					"key": key,
+				})
+		return out
+	# File-replay / single-species fallback: the specimens.json baseline+edits, all plant ("default").
 	if _specimens.has("baseline"):
-		out.append(_specimens["baseline"])
+		out.append(_with_key(_specimens["baseline"]))
 	if _specimens.has("edits"):
 		for e in _specimens["edits"]:
-			out.append(e)
+			out.append(_with_key(e))
 	return out
+
+
+## Tag a legacy (plant) specimen dict with the plant key so per-row dispatch treats it as a plant.
+func _with_key(spec: Variant) -> Dictionary:
+	var d: Dictionary = (spec as Dictionary).duplicate()
+	if not d.has("key"):
+		d["key"] = "default"
+	return d
 
 
 ## Build one L-system plant per specimen, laid out in a row with a caption. The plant geometry comes from
@@ -1551,8 +1645,10 @@ func _render_specimens() -> void:
 		# Node2D + build(Dictionary) + bounds()->Rect2 contract, so the row/label/focus/framing machinery below
 		# (and _frame_focused_specimen / _emphasise_focus) is reused verbatim. Presentation only (inv #2):
 		# trait scalars → visual params, the biology already ran in the core.
+		# Dispatch per-ROW on the specimen's OWN species key (not the global active species) so a mixed roster
+		# draws a Microbe rod for the E. coli row AND an L-system tree for the plant row IN THE SAME view.
 		var glyph: Node2D
-		if _is_microbe():
+		if _is_microbe_key(str(spec.get("key", "default"))):
 			glyph = Microbe.new()
 			holder.add_child(glyph)
 			glyph.build(_microbe_params_from_traits(spec.get("traits", {}), i + 1))
@@ -1615,6 +1711,9 @@ func _plant_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
 		"branch_tip": Color(0.30, 0.50, 0.20).lerp(Color(0.64, 0.60, 0.22), drought),
 		"leaf_color": leaf_hsv,
 		"flower_color": Color(0.95, 0.45, 0.55).lerp(Color(0.98, 0.85, 0.35), hue),
+		# Two previously-weak traits get DEDICATED channels (distinct from leaf_color / jitter):
+		"leaf_sheen": refl,  # reflectance → a specular glint on each leaf poly (independent of leaf_color value)
+		"kill_marker": ksl,  # kill_switch_linkage → a red base "genetic-instability" ring (on top of its jitter)
 	}
 
 
@@ -1636,7 +1735,13 @@ func _microbe_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
 	return {
 		"length": 56.0 + growth * 86.0,  # growth → longer cell (fast growth = elongated, dividing)
 		"width": 24.0 + glucose * 26.0,  # glucose uptake → fatter cell
-		"septum": growth > 0.7,  # high growth → a binary-fission septum (dividing-cell cue)
+		# Graded fission-septum PINCH: reads across the whole growth range (waist pinch ~ (growth-0.7)/0.3,
+		# clamped 0..1), not just a binary >0.7 toggle — high growth = a deeper, more divided waist.
+		"septum_pinch": clampf((growth - 0.7) / 0.3, 0.0, 1.0),
+		# Respiration as its OWN channel (independent of acetate's reddish push): aerobic crisp membrane + O2 dots
+		# vs fermentative striped cytoplasm. The microbe.gd cytoplasm texture reads this, so respiration is legible
+		# separately from the acetate tint.
+		"respiration": respiration,
 		"flagella_count": 2 + int(round(glucose * 4.0)),  # motility leans on uptake/chemotaxis (2..6)
 		"flagella_len": 44.0 + glucose * 46.0,  # uptake → longer flagella reach
 		"granule_count": int(round(ferment * 12.0)),  # fermentation capacity → internal granule density (0..12)
@@ -1797,10 +1902,27 @@ func _is_microbe() -> bool:
 	return false
 
 
-## The trait-key list for the ACTIVE species: the 5 microbe phenotypes for E. coli, else the 9 plant traits.
-## Iterated everywhere the readout walks traits, so the panel shows exactly the species' real phenotype set.
+## Whether a SPECIMEN ROW's species key is the microbe (E. coli) — drives the per-row glyph + readout dispatch
+## in a mixed run, independent of the globally-active species. The authoritative tiebreak is the core's key.
+func _is_microbe_key(key: String) -> bool:
+	return key == "ecoli-core"
+
+
+## The `key` of the currently focused specimen row (drives the readout's trait set + chrome glyph). Falls back
+## to the globally-active species when the row has no key (legacy/empty list).
+func _focused_key() -> String:
+	var list := _specimen_list()
+	if not list.is_empty():
+		var spec: Dictionary = list[clampi(_focus, 0, list.size() - 1)]
+		if spec.has("key"):
+			return str(spec["key"])
+	return "ecoli-core" if _is_microbe() else "default"
+
+
+## The trait-key list for the FOCUSED specimen's species: the 5 microbe phenotypes for E. coli, else the 9 plant
+## traits. Iterated everywhere the readout walks traits, so the panel shows exactly that species' phenotype set.
 func _active_trait_keys() -> Array:
-	return MICROBE_TRAIT_KEYS if _is_microbe() else TRAIT_KEYS
+	return MICROBE_TRAIT_KEYS if _is_microbe_key(_focused_key()) else TRAIT_KEYS
 
 
 ## Rewrite the trait bars/values/deltas for the focused specimen (vs baseline = list index 0). The row COUNT is
@@ -1812,6 +1934,9 @@ func _update_trait_readout() -> void:
 	var list := _specimen_list()
 	if list.is_empty():
 		return
+	# Chrome glyph follows the FOCUSED specimen's species (🦠 for E. coli, 🌱 for the plant).
+	if _specimen_panel != null and _specimen_panel.has_method("set_title"):
+		_specimen_panel.set_title("🦠 SPECIMEN" if _is_microbe_key(_focused_key()) else "🌱 SPECIMEN")
 	var keys := _active_trait_keys()
 	var focused: Dictionary = (list[clampi(_focus, 0, list.size() - 1)] as Dictionary).get("traits", {})
 	var base: Dictionary = (list[0] as Dictionary).get("traits", {})
@@ -2046,6 +2171,11 @@ func _show(i: int) -> void:
 		return
 	_idx = i
 	var snap = _snaps[i]
+	# Feed the ecosystem sprites the run-level species visual template BEFORE the snapshot, so the per-cell draw
+	# reads the precomputed glyph params. Pure presentation (inv #2): traits are already-expressed core scalars.
+	if _organisms.has_method("set_species_traits"):
+		var st := _ecosystem_species_traits()
+		_organisms.set_species_traits(st.get("traits", {}), str(st.get("key", "default")))
 	_organisms.set_snapshot(snap, _cell)
 	if _iso_ground != null:
 		_iso_ground.set_snapshot(snap, _overlay_mode)  # iso draws ground + data overlay as diamonds

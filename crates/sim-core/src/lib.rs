@@ -100,6 +100,10 @@ struct BaseGrowthRate(f64);
 #[allow(dead_code)]
 struct SpeciesEntry {
     name: String,
+    /// The species DATA key (mirrors [`RosterEntry::key`]) — read ONLY by the read-only [`Simulation::observe_all`]
+    /// display projection so the renderer can route its per-species glyph; never a `SimRng` input, never folded
+    /// into `hash_world` (inv #2/#3).
+    key: String,
     genome: Genome,
     gp_map: gp::OntologyMap,
     base_growth: f64,
@@ -123,6 +127,10 @@ struct SpeciesRegistry {
 pub struct RosterEntry {
     /// Human-readable species name (metadata; the registry key is its ordinal [`SpeciesId`]).
     pub name: String,
+    /// The species DATA key (`"ecoli-core"` | `"default"` | `""`) — the SAME stable identifier the renderer
+    /// dispatches its glyph on (microbe vs plant). Carried verbatim from the JSON boundary; never a `SimRng`
+    /// input, never folded into `hash_world` — display metadata only (inv #2/#3).
+    pub key: String,
     /// The species genome.
     pub genome: Genome,
     /// The per-species genotype→phenotype map (e.g. `gp::ecoli_trait_map` for E. coli).
@@ -433,6 +441,28 @@ pub struct Observation {
     pub phenotype: Phenotype,
 }
 
+/// A single species' read-only display projection, returned by [`Simulation::observe_all`].
+///
+/// Like [`Observation`], every field is a PURE read of the run so far (invariant #3): `observe_all` walks the
+/// [`SpeciesRegistry`] in [`SpeciesId`] (Vec-index) order and expresses each entry's OWN genome through its OWN
+/// `gp_map` — the SAME genotype→phenotype machinery [`observe`](Simulation::observe) uses, just per-entry. It
+/// draws ZERO `SimRng`, mutates nothing, and is NEVER folded into `hash_world`, so it cannot move the
+/// determinism hash. It exists so the renderer can show EVERY species (each with its own trait set + glyph),
+/// not just the primary `observe()` species — presentation metadata only (inv #2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeciesObservation {
+    /// The species' ordinal id (its [`SpeciesRegistry`] Vec index).
+    pub species_id: u16,
+    /// Human-readable species name.
+    pub name: String,
+    /// The species DATA key (`"ecoli-core"` | `"default"` | `""`) — the renderer dispatches its glyph on this.
+    pub key: String,
+    /// The species' trophic role (carried from the roster; the renderer may caption it).
+    pub role: gp::TrophicRole,
+    /// This species' genome expressed through ITS OWN map (microbe traits for E. coli, plant traits for plants).
+    pub phenotype: Phenotype,
+}
+
 /// A stepwise, deterministic headless simulation handle (SPEC §2.2 — the gym-like env builds on this).
 ///
 /// Owns the ECS [`World`], the explicitly-ordered [`Schedule`], and — as the `SimRng` world resource —
@@ -502,11 +532,14 @@ impl Simulation {
         gp_map: gp::OntologyMap,
     ) -> Self {
         // A single-species roster — byte-identical to the historical path (the registry holds one entry).
+        // The default key is the plant's `"default"` (the renderer's plant-glyph branch). A boundary that knows
+        // the real species key (e.g. E. coli) builds the roster itself so `observe_all` reports the right key.
         Self::reset_with_roster(
             config,
             env,
             vec![RosterEntry {
                 name: "default".to_string(),
+                key: "default".to_string(),
                 genome,
                 gp_map,
                 entity_count: config.entity_count,
@@ -550,6 +583,7 @@ impl Simulation {
                 let strategy = gp::express_strategy(&r.gp_map, &r.genome, r.role);
                 SpeciesEntry {
                     name: r.name,
+                    key: r.key,
                     genome: r.genome,
                     gp_map: r.gp_map,
                     base_growth,
@@ -660,6 +694,33 @@ impl Simulation {
             allele_freq,
             phenotype,
         }
+    }
+
+    /// Observe EVERY species in the roster (a read-only per-species display projection — ADR R3 renderer view).
+    ///
+    /// Walks the [`SpeciesRegistry`] in [`SpeciesId`] (Vec-index) order — never a `HashMap` (inv #3) — and, for
+    /// each entry, expresses ITS OWN genome through ITS OWN `gp_map` (the SAME genotype→phenotype machinery
+    /// [`observe`](Self::observe) uses, so an E. coli entry yields microbe traits and a plant entry plant
+    /// traits — invariant #2). This is **pure** exactly like [`observe`](Self::observe) /
+    /// [`snapshot`](Self::snapshot): it draws ZERO `SimRng`, mutates nothing, and is NEVER folded into
+    /// `hash_world`, so calling it cannot change the determinism hash (invariant #3). A single-species run
+    /// returns one element (the same phenotype `observe()` reports); a multi-species roster returns one per
+    /// species so the renderer can show them all.
+    #[must_use]
+    pub fn observe_all(&self) -> Vec<SpeciesObservation> {
+        let registry = self.world.resource::<SpeciesRegistry>();
+        registry
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| SpeciesObservation {
+                species_id: idx as u16,
+                name: entry.name.clone(),
+                key: entry.key.clone(),
+                role: entry.strategy.role,
+                phenotype: entry.gp_map.express(&entry.genome),
+            })
+            .collect()
     }
 
     /// Produce a read-only, derived per-cell [`GridSnapshot`] for the renderer (SPEC §5, §W10; S4.2).
@@ -1207,6 +1268,7 @@ mod tests {
             vec![
                 RosterEntry {
                     name: "a".to_string(),
+                    key: "default".to_string(),
                     genome: genome::sample_genome(),
                     gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                     entity_count: 60,
@@ -1214,6 +1276,7 @@ mod tests {
                 },
                 RosterEntry {
                     name: "b".to_string(),
+                    key: "default".to_string(),
                     genome: genome::sample_genome(),
                     gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                     entity_count: 40,
@@ -1246,6 +1309,99 @@ mod tests {
             .count();
         assert_eq!(s0, 60, "species 0 keeps its constant pool");
         assert_eq!(s1, 40, "species 1 keeps its constant pool");
+    }
+
+    #[test]
+    fn observe_all_returns_one_projection_per_species_in_id_order() {
+        // The renderer view: observe_all walks the registry in SpeciesId order and expresses EACH entry's own
+        // genome through its own map, so a 2-species roster returns two correctly-keyed phenotypes. Pure read.
+        let mut g_a = genome::sample_genome();
+        let mut g_b = genome::sample_genome();
+        // Make the two genomes express DIFFERENT growth so the per-entry expression is observable. Locus 0,
+        // param 0 is the GrowthRate anchor in the sample plant genome; set distinct Numeric values directly.
+        if let genome::ParamValue::Numeric { value, .. } = &mut g_a.loci[0].parameters[0].value {
+            *value = 0.2;
+        }
+        if let genome::ParamValue::Numeric { value, .. } = &mut g_b.loci[0].parameters[0].value {
+            *value = 0.9;
+        }
+        let roster = vec![
+            RosterEntry {
+                name: "plant-a".to_string(),
+                key: "default".to_string(),
+                genome: g_a.clone(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 50,
+                role: gp::TrophicRole::Autotroph,
+            },
+            RosterEntry {
+                name: "microbe-b".to_string(),
+                key: "ecoli-core".to_string(),
+                genome: g_b.clone(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 50,
+                role: gp::TrophicRole::Heterotroph,
+            },
+        ];
+        let cfg = SimConfig {
+            seed: 11,
+            generations: 0,
+            entity_count: 100,
+        };
+        let sim = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster);
+        let all = sim.observe_all();
+        assert_eq!(all.len(), 2, "one projection per species");
+        // Order = SpeciesId (Vec index).
+        assert_eq!(all[0].species_id, 0);
+        assert_eq!(all[1].species_id, 1);
+        assert_eq!(all[0].name, "plant-a");
+        assert_eq!(all[1].name, "microbe-b");
+        assert_eq!(all[0].key, "default");
+        assert_eq!(all[1].key, "ecoli-core");
+        assert_eq!(all[0].role, gp::TrophicRole::Autotroph);
+        assert_eq!(all[1].role, gp::TrophicRole::Heterotroph);
+        // Each entry expresses ITS OWN genome — the distinct growth-knockdown shows through.
+        let ga = all[0].phenotype.get(Trait::GrowthRate).unwrap();
+        let gb = all[1].phenotype.get(Trait::GrowthRate).unwrap();
+        assert!(ga < gb, "per-species expression: a's growth < b's growth");
+        // observe_all matches the per-entry express directly (pure projection, no run state).
+        assert_eq!(
+            all[0].phenotype,
+            gp::OntologyMap::new(gp::default_plant_trait_map()).express(&g_a)
+        );
+    }
+
+    #[test]
+    fn observe_all_is_read_only_does_not_change_hash() {
+        // Calling observe_all is a pure projection: it must not advance the run or move the determinism hash.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 5,
+            entity_count: 200,
+        };
+        let mut a = Simulation::reset(&cfg);
+        a.step(cfg.generations);
+        let _ = a.observe_all();
+        let _ = a.observe_all();
+        let mut b = Simulation::reset(&cfg);
+        b.step(cfg.generations);
+        assert_eq!(
+            a.run_stats().hash,
+            b.run_stats().hash,
+            "observe_all is read-only: it cannot perturb the determinism hash"
+        );
+        // And the canonical headless run still hashes to the PINNED literal — observe_all is hash-neutral.
+        // Same config as `determinism_hash_is_pinned`.
+        let cfg_pin = SimConfig {
+            seed: 13_679_457_532_755_275_413,
+            generations: 50,
+            entity_count: 1000,
+        };
+        assert_eq!(
+            run_headless(&cfg_pin).hash,
+            0xf795_eac4_112f_acd5,
+            "pinned determinism literal must stay unchanged with observe_all present"
+        );
     }
 
     #[test]

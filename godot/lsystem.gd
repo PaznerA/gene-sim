@@ -19,13 +19,16 @@ const AXIOM := "X"
 const RULES := {"X": "F+[[X]-X]-F[-FX]+X", "F": "FF"}
 
 var _segments: Array = []  # [{a:Vector2, b:Vector2, width:float, color:Color}]
-var _leaf_polys: Array = []  # [{poly:PackedVector2Array, color:Color}]
+var _leaf_polys: Array = []  # [{poly:PackedVector2Array, color:Color, sheen:PackedVector2Array, sheen_color:Color}]
 var _flowers: Array = []  # [{petals:Array[Vector2], r:float, color:Color, center:Vector2, center_color:Color}]
 var _shadow_poly := PackedVector2Array()
 var _shadow_color := Color(0, 0, 0, 0.22)
 var _ground_a := Vector2.ZERO
 var _ground_b := Vector2.ZERO
 var _ground_color := Color(0.10, 0.16, 0.09, 0.9)
+# kill_switch_linkage → a red "genetic-instability" base ring (a dedicated channel, ON TOP of its jitter effect).
+var _kill_ring_r := 0.0
+var _kill_ring_color := Color(0.0, 0.0, 0.0, 0.0)
 var _bounds := Rect2()
 
 
@@ -50,6 +53,10 @@ func build(p: Dictionary) -> void:
 	var branch_tip: Color = p.get("branch_tip", Color(0.30, 0.55, 0.20))
 	var leaf_color: Color = p.get("leaf_color", Color(0.45, 0.80, 0.30))
 	var flower_color: Color = p.get("flower_color", Color(0.95, 0.55, 0.55))
+	# reflectance → a specular leaf glint (a dedicated channel, distinct from leaf_color's value); 0..1.
+	var leaf_sheen: float = clampf(float(p.get("leaf_sheen", 0.0)), 0.0, 1.0)
+	# kill_switch_linkage → a red base "genetic-instability" ring; 0..1.
+	var kill_marker: float = clampf(float(p.get("kill_marker", 0.0)), 0.0, 1.0)
 
 	_segments.clear()
 	_leaf_polys.clear()
@@ -114,13 +121,29 @@ func build(p: Dictionary) -> void:
 		if flower_idx.has(i):
 			_flowers.append(_make_flower(tip["pos"], leaf_size * 1.1, petal_count, flower_color))
 		else:
+			var lpoly := _make_leaf(tip["pos"], tip["heading"], leaf_size * 2.2, leaf_aspect)
+			# reflectance → a small specular glint polygon over the leaf's upper face; a white highlight whose
+			# alpha scales with leaf_sheen (so a high-reflectance leaf reads glossy, distinct from leaf hue/value).
+			var sheen_poly := PackedVector2Array()
+			if leaf_sheen > 0.02:
+				sheen_poly = _make_leaf(tip["pos"], tip["heading"], leaf_size * 2.2 * 0.5, leaf_aspect * 0.7)
 			_leaf_polys.append({
-				"poly": _make_leaf(tip["pos"], tip["heading"], leaf_size * 2.2, leaf_aspect),
+				"poly": lpoly,
 				"color": leaf_color,
+				"sheen": sheen_poly,
+				"sheen_color": Color(1.0, 1.0, 1.0, 0.10 + 0.35 * leaf_sheen),
 			})
 
 	_recompute_bounds()
 	_build_ground_and_shadow(thickness)
+	# kill_switch_linkage → a red base ring (genetic-instability tag) at the plant's foot (origin), sized to the
+	# branch span so it reads as a marker without overwhelming the silhouette. Built after bounds (uses _bounds).
+	if kill_marker > 0.02:
+		_kill_ring_r = maxf(6.0, _bounds.size.x * 0.18)
+		_kill_ring_color = Color(0.92, 0.18, 0.16, 0.30 + 0.55 * kill_marker)
+	else:
+		_kill_ring_r = 0.0
+		_kill_ring_color = Color(0.0, 0.0, 0.0, 0.0)
 	queue_redraw()
 
 
@@ -190,10 +213,17 @@ func _draw() -> void:
 	if not _shadow_poly.is_empty():
 		draw_colored_polygon(_shadow_poly, _shadow_color)
 		draw_line(_ground_a, _ground_b, _ground_color, 2.0, true)
+	# kill_switch_linkage marker: a red instability ring at the base, behind the branches.
+	if _kill_ring_r > 0.0:
+		draw_arc(Vector2.ZERO, _kill_ring_r, 0.0, TAU, 28, _kill_ring_color, maxf(1.5, _kill_ring_r * 0.12), true)
 	for seg in _segments:
 		draw_line(seg["a"], seg["b"], seg["color"], seg["width"], true)
 	for leaf in _leaf_polys:
 		draw_colored_polygon(leaf["poly"], leaf["color"])
+		# reflectance specular glint over the leaf's upper face.
+		var sheen: PackedVector2Array = leaf.get("sheen", PackedVector2Array())
+		if sheen.size() >= 3:
+			draw_colored_polygon(sheen, leaf["sheen_color"])
 	for fl in _flowers:
 		for petal in fl["petals"]:
 			draw_circle(petal, fl["r"], fl["color"])

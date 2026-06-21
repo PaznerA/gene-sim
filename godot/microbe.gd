@@ -18,10 +18,15 @@ extends Node2D
 var _body_poly := PackedVector2Array()  # the capsule (rod) outline, filled with _body_color
 var _body_color := Color(0.55, 0.78, 0.85)
 var _outline_color := Color(0.85, 0.95, 0.98, 0.9)
-var _septum: Array = []  # [{a:Vector2, b:Vector2}] the binary-fission septum line(s) at high growth_rate
+var _septum: Array = []  # [{a:Vector2, b:Vector2, w:float}] the graded fission septum pinch line(s)
 var _flagella: Array = []  # [{points:PackedVector2Array, color:Color, width:float}]
 var _granules: Array = []  # [{pos:Vector2, r:float, color:Color}]  internal fermentation granules
 var _halo: Array = []  # [{pos:Vector2, r:float, color:Color}]  excreted acetate-overflow dots around the cell
+# Respiration cytoplasm texture (its OWN channel, independent of acetate tint): aerobic → crisp O2 dots,
+# fermentative → striped cytoplasm. Precomputed at build() so --check catches a malformed shape, not only the GPU.
+var _o2_dots: Array = []  # [{pos:Vector2, r:float}]  faint O2 dots (aerobic, crisp membrane)
+var _stripes: Array = []  # [{a:Vector2, b:Vector2}]  cytoplasm stripes (fermentative)
+var _cyto_color := Color(0.0, 0.0, 0.0, 0.0)  # stripe/O2 tint, derived from respiration
 var _bounds := Rect2()
 
 
@@ -31,7 +36,12 @@ var _bounds := Rect2()
 func build(p: Dictionary) -> void:
 	var length: float = maxf(20.0, float(p.get("length", 90.0)))
 	var width: float = maxf(10.0, float(p.get("width", 34.0)))
-	var septum: bool = bool(p.get("septum", false))
+	# Graded fission-septum pinch in [0,1] (deeper waist = more divided). Back-compat: a legacy bool `septum`
+	# maps to a full pinch so an older caller still shows a dividing cell.
+	var septum_pinch: float = clampf(float(p.get("septum_pinch", 1.0 if bool(p.get("septum", false)) else 0.0)), 0.0, 1.0)
+	# Respiration in [0,1]: 0 aerobic (crisp membrane + O2 dots) … 1 fermentative (striped cytoplasm). Its OWN
+	# channel — independent of the acetate-overflow tint already folded into body_color by the caller.
+	var respiration: float = clampf(float(p.get("respiration", 0.5)), 0.0, 1.0)
 	var flagella_count: int = clampi(int(p.get("flagella_count", 3)), 0, 8)
 	var flagella_len: float = maxf(0.0, float(p.get("flagella_len", 60.0)))
 	var granule_count: int = clampi(int(p.get("granule_count", 0)), 0, 14)
@@ -47,6 +57,8 @@ func build(p: Dictionary) -> void:
 	_flagella = []
 	_granules = []
 	_halo = []
+	_o2_dots = []
+	_stripes = []
 
 	# The cell is drawn HORIZONTALLY (long axis = x), centred on the origin, pointing up like the plant is not
 	# needed — the specimen view frames by bounds(). half = half-length along x; r = the capsule radius (width/2).
@@ -71,10 +83,35 @@ func build(p: Dictionary) -> void:
 		var a := PI / 2.0 + PI * float(k) / float(seg)
 		_body_poly.append(Vector2(-straight, 0.0) + Vector2(cos(a), sin(a)) * r)
 
-	# ── Septum (binary-fission constriction) at high growth_rate: a vertical pinch line across the centre, read
-	# as a dividing cell (figure-8 cue without changing the silhouette).
-	if septum:
-		_septum.append({"a": Vector2(0.0, -r), "b": Vector2(0.0, r)})
+	# ── Septum (binary-fission constriction): a GRADED vertical pinch across the centre, read as a dividing cell.
+	# Depth = septum_pinch: shallow pinch at the low end → a near-full waist line at the high end (so growth reads
+	# across the whole range, not just a binary toggle). Thickness + inset both scale with the pinch.
+	if septum_pinch > 0.02:
+		var inset := r * (1.0 - 0.85 * septum_pinch)  # the line shrinks toward the centre as the pinch deepens
+		_septum.append({
+			"a": Vector2(0.0, -inset),
+			"b": Vector2(0.0, inset),
+			"w": maxf(1.5, r * (0.04 + 0.08 * septum_pinch)),
+		})
+
+	# ── Respiration cytoplasm texture (its OWN channel): aerobic (low) → faint O2 dots + a crisp membrane;
+	# fermentative (high) → striped cytoplasm. Blend across the range so respiration reads independently of the
+	# acetate tint. All positions precomputed here (so --check surfaces a bad shape, not only the GPU).
+	_cyto_color = Color(0.55, 0.85, 0.95, 0.35).lerp(Color(0.80, 0.55, 0.25, 0.4), respiration)
+	if respiration < 0.6:
+		# Aerobic: a scatter of faint O2 dots inside the body (more dots the more aerobic).
+		var o2 := int(round((1.0 - respiration) * 7.0))
+		for oi in o2:
+			var ox := (_hash01(seed_val, oi, 91) - 0.5) * 2.0 * straight * 0.9
+			var oy := (_hash01(seed_val, oi, 97) - 0.5) * 2.0 * r * 0.6
+			_o2_dots.append({"pos": Vector2(ox, oy), "r": maxf(1.0, r * 0.07)})
+	if respiration > 0.4:
+		# Fermentative: vertical cytoplasm stripes across the straight body (more stripes the more fermentative).
+		var n := 1 + int(round(respiration * 4.0))
+		for si in n:
+			var sx := (float(si + 1) / float(n + 1) - 0.5) * 2.0 * straight * 0.85
+			var sh := r * (0.55 + 0.3 * _hash01(seed_val, si, 103))
+			_stripes.append({"a": Vector2(sx, -sh), "b": Vector2(sx, sh)})
 
 	# ── Flagella: wavy polylines streaming off the LEFT pole (trailing), count/length from glucose_uptake/motility.
 	for fi in flagella_count:
@@ -153,16 +190,22 @@ func _draw() -> void:
 	# Body fill + membrane outline.
 	if not _body_poly.is_empty():
 		draw_colored_polygon(_body_poly, _body_color)
-		# Closed outline: re-emit the first point so the membrane reads as a continuous ring.
+		# Closed outline: re-emit the first point so the membrane reads as a continuous ring. Aerobic cells get a
+		# crisper (slightly thicker, brighter) membrane via _cyto_color's alpha being lower at the aerobic end.
 		var ring := PackedVector2Array(_body_poly)
 		ring.append(_body_poly[0])
 		draw_polyline(ring, _outline_color, maxf(1.5, _bounds.size.y * 0.04), true)
+	# Respiration cytoplasm texture: fermentative stripes (under the granules), then aerobic O2 dots.
+	for st in _stripes:
+		draw_line(st["a"], st["b"], _cyto_color, maxf(1.0, _bounds.size.y * 0.03), true)
+	for o in _o2_dots:
+		draw_circle(o["pos"], o["r"], _cyto_color)
 	# Internal granules.
 	for g in _granules:
 		draw_circle(g["pos"], g["r"], g["color"])
-	# Septum (dividing-cell pinch).
+	# Septum (graded dividing-cell pinch).
 	for s in _septum:
-		draw_line(s["a"], s["b"], _outline_color, maxf(1.5, _bounds.size.y * 0.05), true)
+		draw_line(s["a"], s["b"], _outline_color, float(s.get("w", maxf(1.5, _bounds.size.y * 0.05))), true)
 
 
 ## Deterministic [0,1) hash for per-glyph jitter (no global RNG — inv #3 hygiene). Mirrors lsystem.gd::_hash01.

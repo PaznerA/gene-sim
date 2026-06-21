@@ -278,6 +278,27 @@ impl LiveSim {
         }
     }
 
+    /// Observe EVERY species in the roster (the renderer's specimen view shows them all — ADR R3).
+    ///
+    /// Returns an Array of Dictionaries, one per species in `species_id` order, each
+    /// `{species_id, name, key, role, phenotype: {trait_name: value, ...}}`. A pure read-only display
+    /// projection delegating to [`harness::GeneSimEnv::observe_all`] → [`sim_core::Simulation::observe_all`]:
+    /// it draws no RNG, mutates nothing, and is never folded into the determinism hash (invariant #2/#3).
+    /// No biology is computed here — only data marshalling. Empty before `reset`.
+    #[func]
+    fn observe_species(&self) -> VarArray {
+        let mut arr = VarArray::new();
+        match self.env.as_ref() {
+            Some(env) => {
+                for obs in env.observe_all() {
+                    arr.push(&species_observation_to_dict(&obs).to_variant());
+                }
+            }
+            None => godot_error!("LiveSim::observe_species called before reset()"),
+        }
+        arr
+    }
+
     /// Produce the read-only GSS2 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
     ///
     /// Read-only: it never draws from the RNG or mutates state, so taking snapshots cannot change the
@@ -618,6 +639,27 @@ fn observation_to_dict(obs: &Observation) -> VarDictionary {
     }
     // Nest the phenotype dict as a Variant value (VarDictionary's V = Variant); `&Dictionary`
     // implements `AsArg<Variant>`, so pass it by reference.
+    dict.set("phenotype", &pheno);
+    dict
+}
+
+/// Convert a [`sim_core::SpeciesObservation`] into a GDScript-facing `Dictionary` (the specimen view's
+/// per-species row). Keys: `species_id` (int), `name` (string), `key` (string — the renderer's glyph
+/// tiebreak), `role` (string), and `phenotype` (nested `{trait_name: value}`). Pure data marshalling; no
+/// biology (invariant #2).
+fn species_observation_to_dict(obs: &sim_core::SpeciesObservation) -> VarDictionary {
+    let mut dict = VarDictionary::new();
+    dict.set("species_id", i64::from(obs.species_id));
+    dict.set("name", obs.name.as_str());
+    dict.set("key", obs.key.as_str());
+    // The role's Debug repr is presentation only (e.g. "Autotroph"/"Heterotroph") — no biology here.
+    let role = format!("{:?}", obs.role);
+    dict.set("role", role.as_str());
+
+    let mut pheno = VarDictionary::new();
+    for (trait_, value) in &obs.phenotype.values {
+        pheno.set(format!("{trait_:?}"), *value);
+    }
     dict.set("phenotype", &pheno);
     dict
 }

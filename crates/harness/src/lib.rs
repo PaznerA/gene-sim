@@ -222,6 +222,17 @@ impl GeneSimEnv {
             .observe()
     }
 
+    /// Observe EVERY species in the roster (delegates to [`sim_core::Simulation::observe_all`]; panics if
+    /// called before `reset`). A read-only per-species display projection for the renderer's specimen view —
+    /// pure w.r.t. the run (no RNG draw, no mutation, never folded into the determinism hash, inv #2/#3).
+    #[must_use]
+    pub fn observe_all(&self) -> Vec<sim_core::SpeciesObservation> {
+        self.sim
+            .as_ref()
+            .expect("GeneSimEnv::observe_all called before reset")
+            .observe_all()
+    }
+
     /// A read-only, derived per-cell [`sim_core::GridSnapshot`] of the current state (delegates to
     /// [`sim_core::Simulation::snapshot`]; panics if called before `reset`).
     ///
@@ -291,12 +302,22 @@ impl Env for GeneSimEnv {
         };
         // Build the world under the player's climate (ADR-012 Phase E; default env = byte-identical to before).
         // With a selected species (ADR-017), run ITS genome through ITS trait map; otherwise the default plant.
+        // A selected species goes through a 1-entry ROSTER so the species' KEY + trophic ROLE reach the registry
+        // (read by the read-only `observe_all` so the renderer can show the right glyph). The roster path is
+        // byte-identical to `reset_with_genome_and_map` for a single entry (name/key/role are display metadata,
+        // never folded into the determinism hash) — so determinism is preserved (inv #3).
         let mut sim = match &self.species {
-            Some(b) => Simulation::reset_with_genome_and_map(
+            Some(b) => Simulation::reset_with_roster(
                 &cfg,
                 &self.env,
-                b.genome.clone(),
-                OntologyMap::new(trait_map_for(&b.key)),
+                vec![sim_core::RosterEntry {
+                    name: b.name.clone(),
+                    key: b.key.clone(),
+                    genome: b.genome.clone(),
+                    gp_map: OntologyMap::new(trait_map_for(&b.key)),
+                    entity_count: cfg.entity_count,
+                    role: sim_core::gp::role_for(&b.key),
+                }],
             ),
             None => Simulation::reset_with_env(&cfg, &self.env),
         };
