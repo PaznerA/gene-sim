@@ -37,6 +37,25 @@ if cargo test --workspace; then record PASS "test"; else record FAIL "test"; fi
 step "4/10  ./tools/check_determinism.sh   (HARD — inv. #3)"
 if ./tools/check_determinism.sh; then record PASS "determinism"; else record FAIL "determinism [HARD]"; fi
 
+step "4b/10  ./tools/check_determinism_multi_isa.sh   (cross-ISA inv. #3; SKIPs locally — CI matrix is authoritative)"
+# The real cross-ISA byte-equality assertion lives in the CI matrix (.github/workflows/ci.yml: determinism-
+# multi-isa + assert-isa-match). Locally only one arch is reachable, so this records this host's hash and
+# no-op-SKIPs (like the bench gate) unless a second-arch reference hash is supplied. ADR-013 F3 precondition.
+if [ -x ./tools/check_determinism_multi_isa.sh ]; then
+  MISA_OUT="$(./tools/check_determinism_multi_isa.sh 2>&1)"; MISA_RC=$?
+  printf '%s\n' "$MISA_OUT"
+  if [ "$MISA_RC" != "0" ]; then
+    record FAIL "determinism-multi-isa"
+  elif printf '%s' "$MISA_OUT" | grep -q "SKIP"; then
+    record SKIP "determinism-multi-isa (single arch local; CI matrix is the gate)"
+  else
+    record PASS "determinism-multi-isa"
+  fi
+else
+  echo "N/A — tools/check_determinism_multi_isa.sh not present."
+  record "N/A" "determinism-multi-isa"
+fi
+
 step "5/10  cargo test --workspace --features proptest"
 if cargo test --workspace --features proptest; then record PASS "proptest"; else record FAIL "proptest"; fi
 

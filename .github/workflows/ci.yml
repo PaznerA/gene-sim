@@ -40,3 +40,93 @@ jobs:
 
       - name: Run the gate
         run: ./tools/gate.sh
+
+  # ── Cross-ISA determinism (ADR-013 §"Cross-platform determinism gate"; HARD precondition for F3) ──
+  # The single-host gate above (check_determinism.sh) only proves run==run ON ONE ARCH — it cannot catch a
+  # reproducible-but-arch-DIVERGENT hash (the f64 / fp-contraction divergence only manifests at RUNTIME on the
+  # real ISA, so cross-compile-without-execution proves nothing). This matrix builds --release and RUNS the
+  # full harness pipeline on BOTH x86_64 (ubuntu-latest) and aarch64 (ubuntu-24.04-arm, GitHub-hosted ARM,
+  # GA since 2025) — NOT QEMU emulation. Each leg emits its hash as an artifact; `assert-isa-match` then fails
+  # unless the two are BYTE-IDENTICAL. This is "the real gate". It runs GREEN on TODAY's hash first (proving the
+  # harness is already cross-ISA-identical); F3 then re-pins on top with both arches regenerating the new
+  # literal in lockstep. fp-contraction is pinned off identically on both legs so no surviving f64 path can
+  # contract differently per ISA. See tools/check_determinism_multi_isa.sh for the local/no-op-skip mirror.
+  determinism-multi-isa:
+    name: determinism (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    # Pin codegen determinism identically on BOTH legs: a fixed CPU baseline + fp-contraction OFF so any f64
+    # that survives review on the J/hash path cannot fuse multiply-add differently across ISAs.
+    env:
+      RUSTFLAGS: "-C target-cpu=generic -C llvm-args=-fp-contract=off"
+      # The pinned (seed, generations, entities) — MUST match crates/sim-core determinism_hash_is_pinned and
+      # tools/check_determinism_multi_isa.sh. Tuned (post-F3) to fire births, ≥1 death, and a contended cell so
+      # the full integer pipeline (solar_influx→metabolism→maintenance→reproduce_or_die→measure→ledger) is
+      # exercised end-to-end. At F3 this seed/gen is re-tuned; today it runs the present single-species core.
+      ISA_SEED: "13679457532755275413"
+      ISA_GENERATIONS: "50"
+      ISA_ENTITIES: "1000"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Rust toolchain
+        run: rustup show
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: isa-${{ matrix.arch }}
+      # Build --release (matching check_determinism.sh — wrap-on-overflow and any fp behaviour only reproduce
+      # in release) and run the FULL harness pipeline to the pinned (seed, generations, entities). At F3 this
+      # build will carry --features determinism so assert_ledger_closes is a HARD assert on both arches (a lost
+      # quantum then fails the gate semantically, not only on hash mismatch).
+      - name: Compute determinism hash (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          hash="$(cargo run -q --release -p harness -- \
+            --seed "$ISA_SEED" --generations "$ISA_GENERATIONS" --entities "$ISA_ENTITIES" --hash-only)"
+          echo "arch=${{ matrix.arch }} hash=$hash"
+          printf '%s' "$hash" > "isa-hash-${{ matrix.arch }}.txt"
+      - name: Upload hash artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isa-hash-${{ matrix.arch }}
+          path: isa-hash-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  # The REAL gate: download both legs' hashes and fail unless they are byte-identical (string equality on the
+  # hex literal). Same-arch run==run (check_determinism.sh) is necessary but NOT sufficient. Wire this job into
+  # branch protection as a REQUIRED status check so F3's PR cannot merge unless both legs are green AND identical.
+  assert-isa-match:
+    name: assert-isa-match (the real gate)
+    needs: [determinism-multi-isa]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download x86_64 hash
+        uses: actions/download-artifact@v4
+        with:
+          name: isa-hash-x86_64
+          path: x86_64
+      - name: Download aarch64 hash
+        uses: actions/download-artifact@v4
+        with:
+          name: isa-hash-aarch64
+          path: aarch64
+      - name: Assert byte-identical across ISAs
+        run: |
+          set -euo pipefail
+          x86="$(cat x86_64/isa-hash-x86_64.txt)"
+          arm="$(cat aarch64/isa-hash-aarch64.txt)"
+          echo "x86_64  hash = $x86"
+          echo "aarch64 hash = $arm"
+          if [ "$x86" != "$arm" ]; then
+            echo "CROSS-ISA DETERMINISM FAIL: x86_64 ($x86) != aarch64 ($arm)" >&2
+            echo "The determinism hash diverges across architectures — inv #3 violated." >&2
+            exit 1
+          fi
+          echo "CROSS-ISA OK: x86_64 == aarch64 == $x86 (byte-identical)"
