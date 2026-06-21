@@ -44,9 +44,12 @@ const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
-# The 5 species-genome traits, in canonical order (matches the core's Trait::ALL). Iterate THIS, never the
+# The species-genome traits, in canonical order (matches the core's Trait::ALL). Iterate THIS, never the
 # specimens.json Dictionary's keys, so the readout order is stable (inv #3 hygiene, even in UI).
-const TRAIT_KEYS := ["growth_rate", "reflectance", "drought_tolerance", "fecundity", "kill_switch_linkage"]
+const TRAIT_KEYS := [
+	"growth_rate", "stature", "branchiness", "leaf_size", "leaf_hue",
+	"reflectance", "fecundity", "drought_tolerance", "kill_switch_linkage"
+]
 const FRAME_SECONDS := 0.45  # seconds per snapshot when playing a run
 const TARGET_FIELD_PX := 880.0  # the field is scaled to about this many pixels on its long side
 # Zoom "scopes": magnification presets the viewport switches between (keys 1/2/3; SPEC §W10).
@@ -1367,8 +1370,9 @@ func _set_view_mode(m: int) -> void:
 ## Map the live genome's expressed phenotype (LiveSim.observe, Debug-cased keys) to the snake_case TRAIT_KEYS.
 func _capture_live_traits() -> Dictionary:
 	const KEY_MAP := {
-		"GrowthRate": "growth_rate", "Reflectance": "reflectance",
-		"DroughtTolerance": "drought_tolerance", "Fecundity": "fecundity",
+		"GrowthRate": "growth_rate", "Stature": "stature", "Branchiness": "branchiness",
+		"LeafSize": "leaf_size", "LeafHue": "leaf_hue", "Reflectance": "reflectance",
+		"Fecundity": "fecundity", "DroughtTolerance": "drought_tolerance",
 		"KillSwitchLinkage": "kill_switch_linkage",
 	}
 	var pheno: Dictionary = _live.observe().get("phenotype", {})
@@ -1463,27 +1467,34 @@ func _render_specimens() -> void:
 ## Map a core-exported trait vector (each in [0,1]) to L-system visual params. PRESENTATION ONLY (the
 ## genome→trait biology already ran in the Rust core; this is trait→appearance, the renderer's job).
 func _plant_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
+	# 9 independent traits → distinct visual axes, so each edit changes the plant in a legible, different way.
 	var growth := clampf(float(t.get("growth_rate", 0.5)), 0.0, 1.0)
+	var stature := clampf(float(t.get("stature", 0.5)), 0.0, 1.0)
+	var branchy := clampf(float(t.get("branchiness", 0.5)), 0.0, 1.0)
+	var leaf := clampf(float(t.get("leaf_size", 0.5)), 0.0, 1.0)
+	var hue := clampf(float(t.get("leaf_hue", 0.5)), 0.0, 1.0)
 	var refl := clampf(float(t.get("reflectance", 0.5)), 0.0, 1.0)
-	var drought := clampf(float(t.get("drought_tolerance", 0.5)), 0.0, 1.0)
 	var fec := clampf(float(t.get("fecundity", 0.5)), 0.0, 1.0)
+	var drought := clampf(float(t.get("drought_tolerance", 0.5)), 0.0, 1.0)
 	var ksl := clampf(float(t.get("kill_switch_linkage", 0.0)), 0.0, 1.0)
+	# Leaf hue sweeps yellow-green → deep green → blue-green; reflectance brightens it.
+	var leaf_hsv := Color.from_hsv(0.18 + hue * 0.30, 0.55 + drought * 0.25, 0.55 + refl * 0.35)
 	return {
-		"iterations": 4 + int(round(growth * 2.0)),  # growth → size/complexity (4..6)
-		"angle_deg": 16.0 + refl * 32.0,  # reflectance → branch spread
-		"segment_len": 5.0 + growth * 9.0,  # growth → reach
-		"len_falloff": 0.80 + drought * 0.12,  # drought tolerance → sturdier taper
-		"thickness": 3.0 + growth * 3.5,
-		"leaf_size": 2.0 + fec * 6.5,  # fecundity → bigger/more prominent leaves
-		"leaf_aspect": 0.5 + drought * 0.2,  # drought → narrower/sturdier leaves
-		"jitter_deg": 3.0 + ksl * 9.0,  # kill-switch linkage → unruliness
+		"iterations": 3 + int(round(branchy * 3.0)),  # branchiness → recursion depth / density (3..6)
+		"angle_deg": 14.0 + branchy * 34.0,  # branchiness → branch spread
+		"segment_len": 5.0 + stature * 10.0,  # stature → reach/height
+		"len_falloff": 0.78 + drought * 0.16,  # drought → sturdier (slower) taper
+		"thickness": 2.5 + growth * 4.0,  # growth → trunk vigour
+		"leaf_size": 1.5 + leaf * 7.0,  # leaf_size → leaf area
+		"leaf_aspect": 0.42 + drought * 0.30,  # drought → narrower, sturdier leaves
+		"jitter_deg": 2.0 + ksl * 11.0,  # kill-switch linkage → unruliness
 		"seed": seed_val,
-		"flower_count": int(round(fec * 4.0)),  # fecundity → more flowers (0..4)
-		"petal_count": 5,
-		"branch_base": Color(0.36, 0.24, 0.12),
-		"branch_tip": Color(0.30, 0.55, 0.20).lerp(Color(0.66, 0.62, 0.20), drought),
-		"leaf_color": Color(0.85, 0.55, 0.20).lerp(Color(0.35, 0.78, 0.30), refl),
-		"flower_color": Color(0.95, 0.45, 0.55).lerp(Color(0.98, 0.85, 0.35), refl),
+		"flower_count": int(round(fec * 5.0)),  # fecundity → flowers (0..5)
+		"petal_count": 4 + int(round(fec * 4.0)),  # fecundity → fuller blooms (4..8)
+		"branch_base": Color(0.34, 0.23, 0.12).lerp(Color(0.45, 0.34, 0.18), growth),
+		"branch_tip": Color(0.30, 0.50, 0.20).lerp(Color(0.64, 0.60, 0.22), drought),
+		"leaf_color": leaf_hsv,
+		"flower_color": Color(0.95, 0.45, 0.55).lerp(Color(0.98, 0.85, 0.35), hue),
 	}
 
 

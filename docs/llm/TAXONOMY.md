@@ -93,13 +93,17 @@ graphs and lets the LLM add schema-validated subclasses (§4 below).
 
 ## 2. GenotypePhenotypeMap & Traits 🔭 (lands in S1.5)
 
-A transparent function turning Parameters → **Traits**. Start: weighted-sum / simple GRN; later optional
-indirect encoding. Traits feed **selection** in the sim and **morphology** in the renderer (via L-system
-rule params). Deterministic for a fixed genome.
+A transparent function turning Parameters → **Traits**. Current: a decoupled weighted-sum (`WeightedSumMap`)
+where each trait anchors 1:1 on its OWN flat genome parameter, so an edit moves exactly one trait — many
+independent, continuous specimen variants. `GrowthRate` feeds **selection**; the rest drive **morphology** in
+the renderer (L-system rule params). Deterministic for a fixed genome. (ADR-013 F2 will re-express the genome
+as a Strategy allocation budget; these traits are the interim expression.)
 
 ```rust
 pub enum Trait {
-    GrowthRate, Reflectance, DroughtTolerance, Fecundity, KillSwitchLinkage, /* … extensible via ontology */
+    // 9 traits, anchored on sample_genome params p0..p8 (4 loci, 8 Numeric + 1 Bool):
+    GrowthRate, Stature, Branchiness, LeafSize, LeafHue,
+    Reflectance, Fecundity, DroughtTolerance, KillSwitchLinkage, /* … extensible via ontology */
 }
 pub struct Phenotype { pub values: Vec<(Trait, f64)> }   // ordered
 

@@ -526,8 +526,7 @@ fn combine_hashes(hashes: impl Iterator<Item = u64>) -> u64 {
 }
 
 /// CSV header for the per-generation columnar stats (SPEC §5). Fixed, deterministic column order.
-const PER_GEN_HEADER: &str =
-    "run_index,generation,population_size,allele_freq,growth_rate,reflectance,drought_tolerance,fecundity,kill_switch_linkage";
+const PER_GEN_HEADER: &str = "run_index,generation,population_size,allele_freq,growth_rate,stature,branchiness,leaf_size,leaf_hue,reflectance,fecundity,drought_tolerance,kill_switch_linkage";
 
 /// Drive the stepwise [`Simulation`] for run `i`, advancing ONE generation at a time and calling
 /// `observe()` after each, building the per-generation CSV body (one row per generation; no header).
@@ -547,15 +546,19 @@ fn collect_per_gen_csv(i: u32, cfg: &SimConfig) -> String {
         // Trait values in canonical Trait::ALL order; `0.0` for any (shouldn't happen) missing trait.
         let _ = writeln!(
             body,
-            "{run},{gen},{pop},{af},{gr},{refl},{dt},{fec},{ksl}",
+            "{run},{gen},{pop},{af},{gr},{st},{br},{ls},{lh},{refl},{fec},{dt},{ksl}",
             run = i,
             gen = o.generation,
             pop = o.population_size,
             af = o.allele_freq,
             gr = p.get(Trait::GrowthRate).unwrap_or(0.0),
+            st = p.get(Trait::Stature).unwrap_or(0.0),
+            br = p.get(Trait::Branchiness).unwrap_or(0.0),
+            ls = p.get(Trait::LeafSize).unwrap_or(0.0),
+            lh = p.get(Trait::LeafHue).unwrap_or(0.0),
             refl = p.get(Trait::Reflectance).unwrap_or(0.0),
-            dt = p.get(Trait::DroughtTolerance).unwrap_or(0.0),
             fec = p.get(Trait::Fecundity).unwrap_or(0.0),
+            dt = p.get(Trait::DroughtTolerance).unwrap_or(0.0),
             ksl = p.get(Trait::KillSwitchLinkage).unwrap_or(0.0),
         );
     }
@@ -610,7 +613,7 @@ fn demo_edits() -> Vec<(&'static str, EditAction)> {
     let mut out = Vec::new();
     if let (Some(sp), Ok(g)) = (cas("SpCas9"), GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG")) {
         out.push((
-            "SpCas9 → growth_locus",
+            "SpCas9 → morphology_locus",
             EditAction {
                 cas: sp.id,
                 target: LocusId(0),
@@ -623,10 +626,10 @@ fn demo_edits() -> Vec<(&'static str, EditAction)> {
         GuideSequence::new(*b"TTTACCGGTTTAGGGCAAAC"),
     ) {
         out.push((
-            "AsCas12a → killswitch_locus",
+            "AsCas12a → hardiness_locus",
             EditAction {
                 cas: asc.id,
-                target: LocusId(1),
+                target: LocusId(3),
                 guide: g,
             },
         ));
@@ -667,19 +670,25 @@ fn genome_json() -> String {
     format!("{{\"loci\": [\n{loci}\n    ]}}")
 }
 
-/// JSON object of the 5 trait values (canonical [`Trait::ALL`] order) carried by an [`Observation`].
+/// JSON object of the trait values (canonical [`Trait::ALL`] order) carried by an [`Observation`].
 fn traits_json(o: &Observation) -> String {
     let p = &o.phenotype;
+    let g = |t| p.get(t).unwrap_or(0.0);
     format!(
         concat!(
-            "{{\"growth_rate\":{:.6},\"reflectance\":{:.6},\"drought_tolerance\":{:.6},",
-            "\"fecundity\":{:.6},\"kill_switch_linkage\":{:.6}}}"
+            "{{\"growth_rate\":{:.6},\"stature\":{:.6},\"branchiness\":{:.6},\"leaf_size\":{:.6},",
+            "\"leaf_hue\":{:.6},\"reflectance\":{:.6},\"fecundity\":{:.6},\"drought_tolerance\":{:.6},",
+            "\"kill_switch_linkage\":{:.6}}}"
         ),
-        p.get(Trait::GrowthRate).unwrap_or(0.0),
-        p.get(Trait::Reflectance).unwrap_or(0.0),
-        p.get(Trait::DroughtTolerance).unwrap_or(0.0),
-        p.get(Trait::Fecundity).unwrap_or(0.0),
-        p.get(Trait::KillSwitchLinkage).unwrap_or(0.0),
+        g(Trait::GrowthRate),
+        g(Trait::Stature),
+        g(Trait::Branchiness),
+        g(Trait::LeafSize),
+        g(Trait::LeafHue),
+        g(Trait::Reflectance),
+        g(Trait::Fecundity),
+        g(Trait::DroughtTolerance),
+        g(Trait::KillSwitchLinkage),
     )
 }
 

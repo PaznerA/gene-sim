@@ -189,51 +189,75 @@ impl Genome {
     }
 }
 
-/// A tiny, deterministic built-in genome for Stage 0 wiring, tests, and benches.
+/// The deterministic built-in species genome (wiring, tests, benches, and the live default).
 ///
-/// Two loci with numeric/enum/bool parameters and SO/GO tags. Fixed content → reproducible.
+/// FOUR loci (morphology / foliage / reproduction / hardiness) holding **9 parameters** — 8 continuous
+/// `Numeric` + 1 `Bool` — that map 1:1 onto the 9 decoupled `gp::Trait`s, so the specimen view can render many
+/// distinct, continuously-varying plants. Fixed content → reproducible.
 #[must_use]
 pub fn sample_genome() -> Genome {
+    // Helper: a Numeric parameter in [0, 1].
+    let num = |id: u32, value: f64| Parameter {
+        id: ParamId(id),
+        value: ParamValue::Numeric {
+            value,
+            min: 0.0,
+            max: 1.0,
+        },
+    };
+    // The flat parameter order (loci then params) maps 1:1 onto the gp.rs trait anchors:
+    //   p0 GrowthRate · p1 Stature · p2 Branchiness · p3 LeafSize · p4 LeafHue · p5 Reflectance ·
+    //   p6 Fecundity · p7 DroughtTolerance · p8 KillSwitchLinkage (bool). Each is INDEPENDENTLY editable, so
+    //   the specimen view yields many distinct, continuously-varying plants.
     Genome {
-        version: 1,
+        version: 2,
         loci: vec![
             Locus {
                 id: LocusId(0),
-                name: "growth_locus".to_string(),
-                // SO:0000704 "gene"; bases chosen to contain NGG/TTTV PAM material for Stage 1.
+                name: "morphology_locus".to_string(),
+                // SO:0000704 "gene"; bases contain NGG/TTTV PAM material for Stage 1.
                 sequence: DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG")
                     .expect("sample bases are valid ACGT"),
-                parameters: vec![
-                    Parameter {
-                        id: ParamId(0),
-                        value: ParamValue::Numeric {
-                            value: 0.6,
-                            min: 0.0,
-                            max: 1.0,
-                        },
-                    },
-                    Parameter {
-                        id: ParamId(1),
-                        value: ParamValue::Enum {
-                            value: 1,
-                            cardinality: 4,
-                        },
-                    },
-                ],
+                parameters: vec![num(0, 0.6), num(1, 0.5), num(2, 0.5)], // growth, stature, branchiness
                 tags: OntologyTags {
                     so_term: SoTermId(704),
-                    go_refs: vec![GoTermId(8150)],
+                    go_refs: vec![GoTermId(40007)], // GO growth
                 },
             },
             Locus {
                 id: LocusId(1),
-                name: "killswitch_locus".to_string(),
+                name: "foliage_locus".to_string(),
+                sequence: DnaSequence::new(*b"ACGTGGTTTACCGGAAGGCC")
+                    .expect("sample bases are valid ACGT"),
+                parameters: vec![num(0, 0.5), num(1, 0.45), num(2, 0.5)], // leaf_size, leaf_hue, reflectance
+                tags: OntologyTags {
+                    so_term: SoTermId(704),
+                    go_refs: vec![GoTermId(9579)], // GO photosynthesis-ish
+                },
+            },
+            Locus {
+                id: LocusId(2),
+                name: "reproduction_locus".to_string(),
+                sequence: DnaSequence::new(*b"GGCCAATTTAGGCCGGTTTA")
+                    .expect("sample bases are valid ACGT"),
+                parameters: vec![num(0, 0.4)], // fecundity
+                tags: OntologyTags {
+                    so_term: SoTermId(704),
+                    go_refs: vec![GoTermId(3006)], // GO reproduction
+                },
+            },
+            Locus {
+                id: LocusId(3),
+                name: "hardiness_locus".to_string(),
                 sequence: DnaSequence::new(*b"TTTACCGGTTTAGGGCAAAC")
                     .expect("sample bases are valid ACGT"),
-                parameters: vec![Parameter {
-                    id: ParamId(0),
-                    value: ParamValue::Bool(false),
-                }],
+                parameters: vec![
+                    num(0, 0.5), // drought_tol
+                    Parameter {
+                        id: ParamId(1),
+                        value: ParamValue::Bool(false), // kill_switch_linkage
+                    },
+                ],
                 tags: OntologyTags {
                     so_term: SoTermId(704),
                     go_refs: vec![GoTermId(3674)],
@@ -319,10 +343,10 @@ mod tests {
     fn sample_genome_is_valid_and_stable() {
         let g = sample_genome();
         assert!(g.is_valid());
-        assert_eq!(g.loci.len(), 2);
-        assert_eq!(g.parameter_count(), 3);
-        // Determinism: constructing twice yields byte-identical genomes.
+        assert_eq!(g.loci.len(), 4);
+        assert_eq!(g.parameter_count(), 9); // 8 Numeric + 1 Bool → the 9 decoupled gp::Trait anchors
+                                            // Determinism: constructing twice yields byte-identical genomes.
         assert_eq!(g, sample_genome());
-        assert_eq!(g.locus(LocusId(0)).unwrap().name, "growth_locus");
+        assert_eq!(g.locus(LocusId(0)).unwrap().name, "morphology_locus");
     }
 }

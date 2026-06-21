@@ -11,21 +11,40 @@ use genome::Genome;
 /// ontology nodes (Stage 5), but the small fixed set the engine reasons about is enumerated here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trait {
+    /// Growth rate — feeds [`crate::Simulation`] selection (the only trait that drives the sim).
     GrowthRate,
+    /// Overall height / reach of the plant.
+    Stature,
+    /// How much the plant branches (architecture density).
+    Branchiness,
+    /// Leaf size.
+    LeafSize,
+    /// Leaf colour hue.
+    LeafHue,
+    /// Surface reflectance (colour + spread).
     Reflectance,
-    DroughtTolerance,
+    /// Reproductive output (flowering).
     Fecundity,
+    /// Drought tolerance (sturdier taper / narrower leaves).
+    DroughtTolerance,
+    /// CRISPR kill-switch linkage (a discrete bool trait).
     KillSwitchLinkage,
 }
 
 impl Trait {
     /// The traits in canonical (declaration) order — the order a [`Phenotype`] stores them in.
-    /// A fixed array (not a `HashMap`) so iteration is deterministic (invariant #3).
-    pub const ALL: [Trait; 5] = [
+    /// A fixed array (not a `HashMap`) so iteration is deterministic (invariant #3). Each trait is anchored
+    /// on its OWN flat genome parameter (see [`WeightedSumMap::weight`]) so they vary INDEPENDENTLY — an edit
+    /// to one parameter moves exactly one trait, giving the specimen view many distinct, continuous variants.
+    pub const ALL: [Trait; 9] = [
         Trait::GrowthRate,
+        Trait::Stature,
+        Trait::Branchiness,
+        Trait::LeafSize,
+        Trait::LeafHue,
         Trait::Reflectance,
-        Trait::DroughtTolerance,
         Trait::Fecundity,
+        Trait::DroughtTolerance,
         Trait::KillSwitchLinkage,
     ];
 }
@@ -60,17 +79,14 @@ pub trait GenotypePhenotypeMap {
 /// `weight(t, i)` taken from [`WeightedSumMap::weight`]; the products are summed and clamped to `[0, 1]`.
 ///
 /// ## Documented weights ([`WeightedSumMap::weight`])
-/// The scheme is deliberately simple and transparent: each trait is anchored on one parameter slot with a
-/// small spillover from its neighbour, so an edit to one parameter has a legible, bounded effect.
-/// * `GrowthRate`        = `1.0 * p0`
-/// * `Reflectance`       = `0.5 * p1 + 0.5 * p2`
-/// * `DroughtTolerance`  = `1.0 * p2`
-/// * `Fecundity`         = `0.7 * p0 + 0.3 * p1`
-/// * `KillSwitchLinkage` = `1.0 * p2` (the kill-switch bool slot in `sample_genome`)
+/// Each trait is anchored 1:1 on its OWN flat genome parameter (fully DECOUPLED, so an edit to one parameter
+/// moves exactly one trait — many independent, continuous specimen variants):
+/// * `GrowthRate`=p0 · `Stature`=p1 · `Branchiness`=p2 · `LeafSize`=p3 · `LeafHue`=p4 · `Reflectance`=p5 ·
+///   `Fecundity`=p6 · `DroughtTolerance`=p7 · `KillSwitchLinkage`=p8 (the kill-switch bool slot).
 ///
-/// Parameter slots beyond those named contribute weight `0.0`. Because every `as_unit_scalar()` is in
-/// `[0, 1]` and the named weights per trait sum to `<= 1.0`, the raw sum is already in `[0, 1]`; the final
-/// `clamp` is a belt-and-braces guarantee for arbitrary genomes (property AC3).
+/// Parameter slots beyond those anchored contribute weight `0.0`. Because each trait reads exactly one
+/// `as_unit_scalar()` (in `[0, 1]`), the raw sum is already in `[0, 1]`; the final `clamp` is a belt-and-braces
+/// guarantee for arbitrary genomes (property AC3).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WeightedSumMap;
 
@@ -79,15 +95,23 @@ impl WeightedSumMap {
     /// documented on [`WeightedSumMap`]. Unknown slots weigh `0.0`.
     #[must_use]
     fn weight(t: Trait, i: usize) -> f64 {
-        match (t, i) {
-            (Trait::GrowthRate, 0) => 1.0,
-            (Trait::Reflectance, 1) => 0.5,
-            (Trait::Reflectance, 2) => 0.5,
-            (Trait::DroughtTolerance, 2) => 1.0,
-            (Trait::Fecundity, 0) => 0.7,
-            (Trait::Fecundity, 1) => 0.3,
-            (Trait::KillSwitchLinkage, 2) => 1.0,
-            _ => 0.0,
+        // Each trait is anchored on its OWN flat genome parameter (decoupled): trait value == that parameter's
+        // unit scalar. So an edit to parameter k moves exactly trait k — independent, continuous variation.
+        let anchor = match t {
+            Trait::GrowthRate => 0,
+            Trait::Stature => 1,
+            Trait::Branchiness => 2,
+            Trait::LeafSize => 3,
+            Trait::LeafHue => 4,
+            Trait::Reflectance => 5,
+            Trait::Fecundity => 6,
+            Trait::DroughtTolerance => 7,
+            Trait::KillSwitchLinkage => 8,
+        };
+        if i == anchor {
+            1.0
+        } else {
+            0.0
         }
     }
 }

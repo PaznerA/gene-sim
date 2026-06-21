@@ -104,7 +104,7 @@ fn per_gen_csv_has_header_and_one_row_per_generation() {
     let header = lines.next().expect("empty per_gen.csv");
     assert_eq!(
         header,
-        "run_index,generation,population_size,allele_freq,growth_rate,reflectance,drought_tolerance,fecundity,kill_switch_linkage",
+        "run_index,generation,population_size,allele_freq,growth_rate,stature,branchiness,leaf_size,leaf_hue,reflectance,fecundity,drought_tolerance,kill_switch_linkage",
         "unexpected per_gen.csv header"
     );
 
@@ -116,10 +116,10 @@ fn per_gen_csv_has_header_and_one_row_per_generation() {
         data.len()
     );
 
-    // Each row: 9 fields; run_index column is the selected index (3); generation column is 1..=generations.
+    // Each row: 13 fields (4 base + 9 traits); run_index = the selected index (3); generation = 1..=generations.
     for (i, line) in data.iter().enumerate() {
         let cols: Vec<&str> = line.split(',').collect();
-        assert_eq!(cols.len(), 9, "row {i} has wrong column count: {line:?}");
+        assert_eq!(cols.len(), 13, "row {i} has wrong column count: {line:?}");
         assert_eq!(cols[0], "3", "row {i} run_index column wrong: {line:?}");
         assert_eq!(
             cols[1],

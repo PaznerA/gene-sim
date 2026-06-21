@@ -803,16 +803,18 @@ mod tests {
         // heritable ThermalTol — a 4th spawn draw, folded into the hash — and TemperatureMatchModifier weights
         // selection by the world climate. At the default TEMPERATE env the modifier is selection-neutral, so the
         // re-pin captured only the structural change: the extra spawn draw + ThermalTol in the hash);
-        // now `49ee…1cc2` after ADR-013 F0b (Energy migrated `f64`→`i64`, the joule-currency precursor). Energy
-        // is decorative w.r.t. selection (drives no fitness), and metabolism still draws exactly one `next_u64`
-        // per organism, so the RNG stream + allele_freq are UNCHANGED — the re-pin captures only Energy's changed
-        // representation in `hash_world` (`as u64` vs `to_bits`) + its seeded/metabolized integer values.
+        // `49ee…1cc2` after ADR-013 F0b (Energy migrated `f64`→`i64`, the joule-currency precursor; decorative,
+        // so allele_freq was UNCHANGED — only Energy's hash representation + integer values changed);
+        // now `f795…acd5` after the richer-genome/traits expansion (sample_genome 3→9 parameters, 9 decoupled
+        // traits for distinct specimen variants). `GrowthRate` still anchors on `p0`=0.6 so `BaseGrowthRate` →
+        // selection → allele_freq are UNCHANGED; the re-pin captures only the genome `parameter_count` folded
+        // into `hash_world`. (Phenotype/expression is interim; ADR-013 F2 re-expresses the genome as a Strategy.)
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x49ee_0f17_6852_1cc2);
+        assert_eq!(run_headless(&cfg).hash, 0xf795_eac4_112f_acd5);
     }
 
     #[test]
