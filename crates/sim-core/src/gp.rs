@@ -59,6 +59,27 @@ impl Trait {
         Trait::DroughtTolerance,
         Trait::KillSwitchLinkage,
     ];
+
+    /// The trait's stable `snake_case` column name (CSV headers, JSON keys). Exhaustive — a new variant must add
+    /// its name here. The 9 plant names match the historical per-gen CSV header (so the plant CSV is unchanged).
+    #[must_use]
+    pub fn snake_name(self) -> &'static str {
+        match self {
+            Trait::GrowthRate => "growth_rate",
+            Trait::Stature => "stature",
+            Trait::Branchiness => "branchiness",
+            Trait::LeafSize => "leaf_size",
+            Trait::LeafHue => "leaf_hue",
+            Trait::Reflectance => "reflectance",
+            Trait::Fecundity => "fecundity",
+            Trait::DroughtTolerance => "drought_tolerance",
+            Trait::KillSwitchLinkage => "kill_switch_linkage",
+            Trait::GlucoseUptake => "glucose_uptake",
+            Trait::RespirationMode => "respiration_mode",
+            Trait::AcetateOverflow => "acetate_overflow",
+            Trait::FermentationCapacity => "fermentation_capacity",
+        }
+    }
 }
 
 /// An expressed phenotype: an **ordered** list of `(Trait, value)` pairs, each value clamped to `[0, 1]`.

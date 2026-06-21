@@ -14,7 +14,7 @@ use crispr::{default_cas_variants, EditOutcome, GuideSequence, RegionEditOutcome
 use genome::spec::BuiltSpecies;
 use genome::LocusId;
 use harness::{Action, EditAction, Env, GeneSimEnv};
-use sim_core::gp::{trait_map_for, OntologyMap};
+use sim_core::gp::{trait_map_for, GenotypePhenotypeMap, OntologyMap, WeightedSumMap};
 use sim_core::{
     derive_seed, run_headless, run_headless_with, EnvParams, Observation, RunStats, SimConfig,
     Simulation, Trait,
@@ -277,7 +277,14 @@ fn main() -> ExitCode {
     }
     println!("combined_hash={combined:016x}");
 
-    match write_run_artifacts(&args, &indices, &results, combined, &per_gen) {
+    match write_run_artifacts(
+        &args,
+        &indices,
+        &results,
+        combined,
+        &per_gen,
+        &per_gen_header(species.as_ref()),
+    ) {
         Ok(dir) => println!("wrote {}", dir.display()),
         Err(e) => {
             eprintln!("warning: could not write run artifacts: {e}");
@@ -571,7 +578,9 @@ fn combine_hashes(hashes: impl Iterator<Item = u64>) -> u64 {
     h.finish()
 }
 
-/// CSV header for the per-generation columnar stats (SPEC §5). Fixed, deterministic column order.
+/// The historical PLANT per-gen CSV header (SPEC §5) — kept as the byte-identical reference the unit test pins
+/// `per_gen_header(None)` against. The live header is now derived per-species by [`per_gen_header`].
+#[cfg(test)]
 const PER_GEN_HEADER: &str = "run_index,generation,population_size,allele_freq,growth_rate,stature,branchiness,leaf_size,leaf_hue,reflectance,fecundity,drought_tolerance,kill_switch_linkage";
 
 /// Drive the stepwise [`Simulation`] for run `i`, advancing ONE generation at a time and calling
@@ -593,32 +602,43 @@ fn collect_per_gen_csv(i: u32, cfg: &SimConfig, species: Option<&BuiltSpecies>) 
         ),
         None => Simulation::reset(cfg),
     };
-    // One data row per generation (generations 1..=cfg.generations), deterministic order.
+    // One data row per generation (generations 1..=cfg.generations), deterministic order. The trait columns are
+    // the SPECIES' expressed traits in phenotype order — the plant's 9 (`Trait::ALL`) or E. coli's 5 microbe
+    // traits — matching `per_gen_header`. Emitting `phenotype.values` directly keeps the plant CSV byte-identical
+    // (same traits, same order, same `f64` Display as the old named-field row).
     let mut body = String::new();
     for _ in 0..cfg.generations {
         sim.step(1);
         let o = sim.observe();
-        let p = &o.phenotype;
-        // Trait values in canonical Trait::ALL order; `0.0` for any (shouldn't happen) missing trait.
-        let _ = writeln!(
-            body,
-            "{run},{gen},{pop},{af},{gr},{st},{br},{ls},{lh},{refl},{fec},{dt},{ksl}",
+        let mut row = format!(
+            "{run},{gen},{pop},{af}",
             run = i,
             gen = o.generation,
             pop = o.population_size,
             af = o.allele_freq,
-            gr = p.get(Trait::GrowthRate).unwrap_or(0.0),
-            st = p.get(Trait::Stature).unwrap_or(0.0),
-            br = p.get(Trait::Branchiness).unwrap_or(0.0),
-            ls = p.get(Trait::LeafSize).unwrap_or(0.0),
-            lh = p.get(Trait::LeafHue).unwrap_or(0.0),
-            refl = p.get(Trait::Reflectance).unwrap_or(0.0),
-            fec = p.get(Trait::Fecundity).unwrap_or(0.0),
-            dt = p.get(Trait::DroughtTolerance).unwrap_or(0.0),
-            ksl = p.get(Trait::KillSwitchLinkage).unwrap_or(0.0),
         );
+        for (_, v) in &o.phenotype.values {
+            let _ = write!(row, ",{v}");
+        }
+        let _ = writeln!(body, "{row}");
     }
     body
+}
+
+/// The per-generation CSV header for a run: the four base columns plus one column per trait the species
+/// EXPRESSES (in phenotype order — the same order [`collect_per_gen_csv`] emits values). The default plant
+/// yields exactly [`PER_GEN_HEADER`] (so its CSV is unchanged); E. coli yields its 5 microbe-trait columns.
+fn per_gen_header(species: Option<&BuiltSpecies>) -> String {
+    let pheno = match species {
+        Some(b) => OntologyMap::new(trait_map_for(&b.key)).express(&b.genome),
+        None => WeightedSumMap.express(&genome::sample_genome()),
+    };
+    let mut h = String::from("run_index,generation,population_size,allele_freq");
+    for (t, _) in &pheno.values {
+        h.push(',');
+        h.push_str(t.snake_name());
+    }
+    h
 }
 
 /// Drive a fresh stepwise [`Simulation`] for run `i` and write a compact per-cell render snapshot
@@ -808,6 +828,7 @@ fn write_run_artifacts(
     results: &[RunStats],
     combined: u64,
     per_gen: &[String],
+    per_gen_header: &str,
 ) -> std::io::Result<PathBuf> {
     let run_id = match args.run_index {
         Some(i) => format!(
@@ -867,8 +888,8 @@ fn write_run_artifacts(
     // Per-generation columnar stats (SPEC §5), only when --per-gen-stats was set. One header + one row
     // per generation per run, concatenated in stable run-index order (the Parquet step aggregates these).
     if !per_gen.is_empty() {
-        let mut csv = String::with_capacity(PER_GEN_HEADER.len() + 1);
-        csv.push_str(PER_GEN_HEADER);
+        let mut csv = String::with_capacity(per_gen_header.len() + 1);
+        csv.push_str(per_gen_header);
         csv.push('\n');
         for rows in per_gen {
             csv.push_str(rows);
@@ -877,4 +898,30 @@ fn write_run_artifacts(
     }
 
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_gen_header_plant_matches_const() {
+        // The default (plant) per-gen header must stay byte-identical to the historical PER_GEN_HEADER, so the
+        // plant CSV is unchanged — the species-aware header only ADDS the right columns for a non-plant species.
+        assert_eq!(per_gen_header(None), PER_GEN_HEADER);
+    }
+
+    #[test]
+    fn per_gen_header_ecoli_has_microbe_columns() {
+        // E. coli's per-gen header carries its 5 microbe traits (growth + the four decorative), in map order.
+        let built = harness::species::load_species_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/ecoli.json"
+        ))
+        .expect("ecoli loads");
+        assert_eq!(
+            per_gen_header(Some(&built)),
+            "run_index,generation,population_size,allele_freq,growth_rate,glucose_uptake,respiration_mode,acetate_overflow,fermentation_capacity"
+        );
+    }
 }
