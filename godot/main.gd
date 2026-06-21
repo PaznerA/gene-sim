@@ -336,6 +336,10 @@ func _on_menu_start(cfg: Dictionary) -> void:
 		float(cfg.get("temp", 0.5)),
 		int(cfg.get("season", 0)),
 	)
+	# ADR-017: run the selected species (e.g. "ecoli") before reset; "" keeps the abstract plant.
+	var species_stem: String = String(cfg.get("species", ""))
+	if not _live.set_species(species_stem):
+		push_warning("species '%s' failed to load; using the default plant" % species_stem)
 	_do_reset(_seed)
 	# Mission is a MENU choice now (off by default = free-play sandbox). Apply it + (re)activate its UI on Start;
 	# the --mission CLI flag is the headless/scripted equivalent (set in _setup_live, overridden here).

@@ -10,6 +10,8 @@ extends CanvasLayer
 signal start_run(cfg)  # { seed:int, lat:float, lon:float, temp:float, season:int, entities:int, mission:bool }
 
 const SEASONS := ["Spring", "Summer", "Autumn", "Winter"]
+# Species the run can use (ADR-017). [label, file stem under data/species/]; "" = the default abstract plant.
+const SPECIES := [["Plant (abstract)", ""], ["E. coli K-12 core", "ecoli"]]
 
 var _live: Object = null
 var _seed: int = 42
@@ -28,6 +30,7 @@ var _temp_val: Label = null
 var _ent_val: Label = null
 var _season_btn: Button = null
 var _mission_chk: CheckBox = null
+var _species_btn: OptionButton = null
 var _preview: Label = null
 
 
@@ -137,6 +140,14 @@ func _build() -> void:
 	next.pressed.connect(_on_season_next)
 	season_row.add_child(next)
 	col.add_child(_labeled("Season", season_row))
+
+	# --- SPECIES (ADR-017): the abstract plant (default) or the real E. coli K-12 core genome (136 genes).
+	_species_btn = OptionButton.new()
+	for i in SPECIES.size():
+		_species_btn.add_item(SPECIES[i][0], i)
+	_species_btn.selected = 0
+	_species_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	col.add_child(_labeled("Species", _species_btn))
 
 	# --- MISSION toggle: off by default = free-play sandbox; on = the suppress-the-zone challenge.
 	_mission_chk = CheckBox.new()
@@ -262,6 +273,9 @@ func _on_start() -> void:
 		# Empty/garbage field: fall back to the last seed but write it back so the run uses exactly what the
 		# field now shows (no silent "why didn't my seed take" surprise).
 		_seed_edit.text = str(seed_val)
+	var species_stem: String = ""
+	if _species_btn != null:
+		species_stem = SPECIES[_species_btn.selected][1]
 	start_run.emit(
 		{
 			"seed": seed_val,
@@ -271,6 +285,7 @@ func _on_start() -> void:
 			"season": _season,
 			"entities": int(_entities.value),
 			"mission": _mission_chk.button_pressed,
+			"species": species_stem,
 		}
 	)
 	queue_free()

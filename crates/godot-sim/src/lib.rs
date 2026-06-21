@@ -57,6 +57,9 @@ struct LiveSim {
     /// Ordered journal of the session's actions (Advance coalesced) — the SAVED PROGRESS. Replaying
     /// `reset(seed)` + this journal restores the exact session deterministically (inv #3).
     journal: Vec<Action>,
+    /// The species the next `reset` runs (ADR-017 "RUN E. coli"). `None` = the default plant; `Some` runs a
+    /// loaded JSON `SpeciesSpec` (e.g. E. coli) through its per-species trait map. Set via `set_species`.
+    species: Option<genome::spec::BuiltSpecies>,
     base: Base<RefCounted>,
 }
 
@@ -69,6 +72,7 @@ impl IRefCounted for LiveSim {
             env_params: EnvParams::default(),
             seed: 0,
             journal: Vec::new(),
+            species: None,
             base,
         }
     }
@@ -103,6 +107,33 @@ impl LiveSim {
         };
     }
 
+    /// Select the SPECIES the next `reset` runs (ADR-017 "RUN E. coli"). `name` is a file stem under
+    /// `data/species/` (e.g. `"ecoli"` → `data/species/ecoli.json`); an EMPTY name clears back to the default
+    /// plant. Loads + validates the JSON `SpeciesSpec` in the core (inv #2 — biology stays in Rust); returns
+    /// `true` on success (`false` + a Godot error on a missing/invalid file). Call before `reset`.
+    #[func]
+    fn set_species(&mut self, name: GString) -> bool {
+        let name = name.to_string();
+        if name.is_empty() {
+            self.species = None;
+            return true;
+        }
+        let path = format!("data/species/{name}.json");
+        match harness::species::load_species_file(&path) {
+            Ok(built) => {
+                if built.entity_count > 0 {
+                    self.entity_count = built.entity_count;
+                }
+                self.species = Some(built);
+                true
+            }
+            Err(e) => {
+                godot_error!("LiveSim::set_species({name}): {e}");
+                false
+            }
+        }
+    }
+
     /// CORE-computed climate preview for the main menu (ADR-012 E4): the `{day_length, insolation, temperature}`
     /// the given params would produce (all `[0,1]`). The menu DISPLAYS these — it never computes climate itself
     /// (inv #2: biology stays in the core). Pure: builds a `ClimateField` off the params, touches no run state.
@@ -131,6 +162,9 @@ impl LiveSim {
     fn reset(&mut self, seed: i64) -> VarDictionary {
         let mut env = GeneSimEnv::new(self.entity_count);
         env.set_environment(self.env_params); // build the world under the player's climate (ADR-012)
+        if let Some(built) = &self.species {
+            env.set_species(built.clone()); // ADR-017: run the selected species (e.g. E. coli) instead of plant
+        }
         // `seed` is the master seed; reinterpret the i64 bits as u64 so the full 64-bit space is usable
         // from GDScript (which has no native u64) without changing the deterministic stream.
         let obs = env.reset(seed as u64);

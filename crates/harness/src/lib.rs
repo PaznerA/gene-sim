@@ -28,8 +28,10 @@ use crispr::{
     DefaultOffTargetScore, DefaultOnTargetScore, Edit, EditOutcome, EditThresholds, GuideSequence,
     RegionEditOutcome,
 };
+use genome::spec::BuiltSpecies;
 use genome::LocusId;
 use serde::{Deserialize, Serialize};
+use sim_core::gp::{trait_map_for, OntologyMap};
 use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod campaign;
@@ -156,6 +158,9 @@ pub struct GeneSimEnv {
     last_edit: Option<EditOutcome>,
     /// Outcome + covered-organism count of the most recent `ApplyEditRegion` (ADR-011 S-D).
     last_region_edit: Option<(RegionEditOutcome, u32)>,
+    /// The species the **next** `reset` runs (ADR-017 "RUN E. coli"). `None` = the default plant genome +
+    /// map (byte-identical). `Some(built)` runs `built.genome` through `trait_map_for(built.key)`.
+    species: Option<BuiltSpecies>,
 }
 
 impl GeneSimEnv {
@@ -174,6 +179,7 @@ impl GeneSimEnv {
             thresholds: EditThresholds::default(),
             last_edit: None,
             last_region_edit: None,
+            species: None,
         }
     }
 
@@ -181,6 +187,18 @@ impl GeneSimEnv {
     /// progress. The renderer/CLI feeds this from the main menu; default is the neutral world.
     pub fn set_environment(&mut self, env: EnvParams) {
         self.env = env;
+    }
+
+    /// Set the species the **next** `reset` runs (ADR-017 "RUN E. coli"). The renderer/menu feeds a
+    /// [`BuiltSpecies`] (loaded via [`species::load_species_file`]); the env runs its genome through the
+    /// per-species trait map (E. coli → gltA growth) and adopts its niche `entity_count` (when non-zero). Pass
+    /// the default species (or never call this) to keep the historical plant run. Does not disturb a run in
+    /// progress.
+    pub fn set_species(&mut self, built: BuiltSpecies) {
+        if built.entity_count > 0 {
+            self.entity_count = built.entity_count;
+        }
+        self.species = Some(built);
     }
 
     /// The outcome of the most recent [`Action::ApplyEdit`], if any (for inspection / tests).
@@ -272,7 +290,16 @@ impl Env for GeneSimEnv {
             entity_count: self.entity_count,
         };
         // Build the world under the player's climate (ADR-012 Phase E; default env = byte-identical to before).
-        let mut sim = Simulation::reset_with_env(&cfg, &self.env);
+        // With a selected species (ADR-017), run ITS genome through ITS trait map; otherwise the default plant.
+        let mut sim = match &self.species {
+            Some(b) => Simulation::reset_with_genome_and_map(
+                &cfg,
+                &self.env,
+                b.genome.clone(),
+                OntologyMap::new(trait_map_for(&b.key)),
+            ),
+            None => Simulation::reset_with_env(&cfg, &self.env),
+        };
         let obs = sim.observe();
         self.sim = Some(sim);
         obs
@@ -375,6 +402,36 @@ mod tests {
         assert!(!r.done);
         // reward is defined as the allele frequency.
         assert_eq!(r.reward, r.obs.allele_freq);
+    }
+
+    #[test]
+    fn set_species_runs_ecoli_off_gltacitrate() {
+        // ADR-017: GeneSimEnv::set_species runs the E. coli genome through its trait map — population from the
+        // niche (800), GrowthRate from gltA wild-type (1.0) — while a default env (no set_species) stays plant.
+        use sim_core::Trait;
+        let built = crate::species::load_species_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/ecoli.json"
+        ))
+        .expect("ecoli loads");
+
+        let mut env = GeneSimEnv::new(500);
+        env.set_species(built);
+        let o = env.reset(7);
+        assert_eq!(
+            o.population_size, 800,
+            "E. coli niche entity_count governs the population"
+        );
+        assert_eq!(
+            o.phenotype.get(Trait::GrowthRate),
+            Some(1.0),
+            "E. coli GrowthRate comes from gltA wild-type"
+        );
+
+        let mut plant = GeneSimEnv::new(500);
+        let op = plant.reset(7);
+        assert_eq!(op.population_size, 500);
+        assert!((op.phenotype.get(Trait::GrowthRate).unwrap() - 0.6).abs() < 1e-9);
     }
 
     #[test]
