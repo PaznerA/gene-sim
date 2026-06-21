@@ -82,14 +82,15 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
     + `TraitBinding` + `OntologyMap`); `WeightedSumMap` = thin wrapper over `default_plant_trait_map` so the plant
     expresses BYTE-IDENTICALLY (re-key proven hash-neutral by the unchanged pin). Unblocks microbe species.
     *(Plan: `docs/llm/proposals/ecoli-genome-f2-draft.md` — F2 verified hash-neutral, not the feared re-pin.)*
-  - [ ] **Next — the real E. coli genome (all hash-neutral):**
-    - **B-1 data bake** — `scripts/bake_ecoli_species.py` (pinned NCBI `GCF_000005845.2` CDS + BiGG `e_coli_core`
-      roster + UniProt GO) → `data/species/ecoli.json`: 136 per-gene loci (sorted by b-number, real CDS, so_term
-      704, curated GO MF go_refs, one Numeric activity param). BiGG GPR/stoichiometry → a Ring-1 sidecar (keeps
-      `ecoli.json` license-clean). + a `shipped_ecoli_species_loads` gate test.
-    - **F2-2** — append microbe `Trait` variants (GlucoseUptake, RespirationMode, AcetateOverflow,
-      FermentationCapacity) — NOT in `Trait::ALL` (that stays the 9 plant render order).
-    - **B-2** — the E. coli per-species `TraitMap` (in-core const, `ByGoAnchor` bindings to the 5 microbe traits).
+  - [x] **B-1 data bake** — `scripts/bake_ecoli_species.py` (pinned BiGG `e_coli_core` roster × real NCBI
+    `GCF_000005845.2` CDS × curated GO) → `data/species/ecoli.json`: **136 real genes, 171,723 bp real K-12 CDS**,
+    pure ACGT, id==index by b-number, so_term 704, one Numeric activity param. Gate test `shipped_ecoli_species_loads`.
+  - [x] **F2-2** — microbe `Trait` variants (GlucoseUptake, RespirationMode, AcetateOverflow, FermentationCapacity),
+    NOT in `Trait::ALL`. **B-2** — `gp::ecoli_trait_map` (`ByGoAnchor` → gltA/ptsG/pflB/pta/ldhA). Gate test
+    `ecoli_genome_expresses_microbe_traits`: the real 136-gene genome expresses all 5 microbe traits. Hash-neutral.
+  - [ ] **Next — RUN E. coli:** per-species trait-map SELECTION (associate a `TraitMap` with a `BuiltSpecies`, so
+    `reset_with_genome` expresses E. coli via `ecoli_trait_map` not the plant map) — the wire to actually simulate
+    E. coli. Then the KO edit → microbe-trait change is visible. (Couples to multi-species / the species registry.)
   - [ ] Later: S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2/`oracle-fba`
     KO-table bake · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7 decomposer.
 

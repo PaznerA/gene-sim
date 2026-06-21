@@ -29,6 +29,18 @@ pub enum Trait {
     DroughtTolerance,
     /// CRISPR kill-switch linkage (a discrete bool trait).
     KillSwitchLinkage,
+
+    // ── Microbe traits (ADR-017 F2-2) — the E. coli observable phenotypes, expressed via the E. coli
+    // [`ecoli_trait_map`]. Deliberately NOT in [`Trait::ALL`] (that stays the 9 plant render/CSV order); a
+    // microbe species expresses these through its own `TraitMap` instead.
+    /// Glucose uptake capacity (PTS system) — microbe.
+    GlucoseUptake,
+    /// Respiration-mode lean (aerobic ↔ fermentative) — microbe.
+    RespirationMode,
+    /// Acetate overflow — the Layer-3 detritus/mineralization tap — microbe.
+    AcetateOverflow,
+    /// Fermentation capacity (lactate / ethanol) — microbe.
+    FermentationCapacity,
 }
 
 impl Trait {
@@ -161,6 +173,27 @@ pub fn default_plant_trait_map() -> TraitMap {
         b(Trait::Fecundity, 2, 0),
         b(Trait::DroughtTolerance, 3, 0),
         b(Trait::KillSwitchLinkage, 3, 1),
+    ])
+}
+
+/// The E. coli per-species [`TraitMap`] (ADR-017 B-2): the 5 microbe traits bound by ONTOLOGY (`ByGoAnchor`) to
+/// the metabolic anchor genes in `data/species/ecoli.json`, each reading that gene's activity parameter (P0,
+/// `1.0`=wild-type). A knockout edit (activity→0) drives the bound trait to 0. `GrowthRate` — the only
+/// selection-driving trait — anchors on the TCA backbone gene `gltA`. Ordered (inv #3); the GO ids match the
+/// curated `go_refs` baked into ecoli.json by `scripts/bake_ecoli_species.py`.
+#[must_use]
+pub fn ecoli_trait_map() -> TraitMap {
+    let b = |t, go| TraitBinding {
+        trait_: t,
+        locus: LocusSelector::ByGoAnchor(GoTermId(go)),
+        param: ParamId(0),
+    };
+    TraitMap(vec![
+        b(Trait::GrowthRate, 4108), // gltA — citrate synthase (TCA/growth backbone)
+        b(Trait::GlucoseUptake, 8982), // ptsG — PTS glucose transporter
+        b(Trait::RespirationMode, 8861), // pflB — pyruvate formate-lyase (fermentation marker)
+        b(Trait::AcetateOverflow, 8959), // pta  — phosphate acetyltransferase (acetate overflow)
+        b(Trait::FermentationCapacity, 8720), // ldhA — D-lactate dehydrogenase
     ])
 }
 

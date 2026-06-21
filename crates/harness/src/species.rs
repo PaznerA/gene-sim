@@ -63,4 +63,28 @@ mod tests {
             "every E. coli locus carries a real CDS"
         );
     }
+
+    #[test]
+    fn ecoli_genome_expresses_microbe_traits() {
+        // B-2 end-to-end: the REAL 136-gene E. coli genome, expressed through its ByGoAnchor `ecoli_trait_map`,
+        // yields the 5 microbe traits. Wild-type activity (1.0) on every anchor gene → each trait expresses 1.0;
+        // this proves the ontology bindings resolve against the baked `go_refs` (ADR-017 F2 + B-2).
+        use sim_core::gp::{ecoli_trait_map, GenotypePhenotypeMap, OntologyMap, Trait};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/ecoli.json");
+        let built = load_species_file(path).expect("data/species/ecoli.json should load");
+        let pheno = OntologyMap::new(ecoli_trait_map()).express(&built.genome);
+        for t in [
+            Trait::GrowthRate,
+            Trait::GlucoseUptake,
+            Trait::RespirationMode,
+            Trait::AcetateOverflow,
+            Trait::FermentationCapacity,
+        ] {
+            assert_eq!(
+                pheno.get(t),
+                Some(1.0),
+                "{t:?} should express wild-type 1.0"
+            );
+        }
+    }
 }
