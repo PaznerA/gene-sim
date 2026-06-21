@@ -46,7 +46,9 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   ADRs.** Full plan in `docs/llm/proposals/ecology-substrate-draft.md`; ADR in DECISIONS.md. 10 phases, 6+ re-pins:
   - [x] **F-1** — `crates/sim-core/src/fixed.rs` deterministic largest-remainder apportionment contract (the
     integer-division backbone; conserves the total exactly). Hash-neutral, gate-green.
-  - [ ] **F0a** Ledger + `ledger_closes` invariant (hash-neutral) · **F0b** `f64→i64` migration (re-pin).
+  - [x] **F0a** — `crates/sim-core/src/ledger.rs` conserved-energy `Ledger` + `ledger_closes` invariant +
+    `Simulation::ledger()` accessor, inserted at reset. Hash-neutral, gate-green.
+  - [ ] **F0b** `f64→i64` energy migration (FIRST re-pin) — next.
   - [ ] **F1** dynamic resource pools (off-stream) · **F2** genome→Strategy allocation budget (re-pin).
   - [ ] **F3** 🛑 real metabolism + emergent births/deaths — breaks ADR-005 (re-pin; **needs the x86_64+aarch64 CI
     matrix gate FIRST**) · **F4** multi-species (R3 spine) + trophic web + emergent `FlowMatrix` (Rel re-ground).
