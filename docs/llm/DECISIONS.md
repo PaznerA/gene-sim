@@ -507,6 +507,79 @@ only invariant-touching step (climate→selection coupling) is a single ledgered
 
 ---
 
+## ADR-013 — Ecology substrate: a conserved fixed-point "joule" economy (CHEMOSTAT-J), the foundational epic
+
+**Status: ACCEPTED (human sign-off 2026-06-21) — IN PROGRESS.** Supersedes **ADR-005** (constant-N /
+no-extinction). Re-grounds the R3 multi-species, Rel relations, and Phase-T trait DRAFTS (now folded in as
+phases, not separate ADRs — see `docs/llm/proposals/`). Designed by the bold/anti-safe `ecology-substrate-design`
+workflow (18 agents) + adversarial pressure-test; full draft in `docs/llm/proposals/ecology-substrate-draft.md`.
+This is a **stop-the-line, multi-week, multi-crate rewrite with 6+ deliberate re-pins** — the human explicitly
+rejected the safe incremental path ("be on the edge") and approved the honest cost.
+
+### Context
+Today selection (`crates/sim-core/src/lib.rs:218`) is an abstract constant-N Wright-Fisher pool that multiplies
+a per-individual `fitness` weight by `[0.5,1.5]` static-field match factors. Organisms never INTERACT — they
+react independently to frozen `SoilField`/`ClimateField`; `Energy` is decorative; `gp.rs` expresses 5 standalone
+scalars (3 dead) with no trade-offs and no trophic role; constant-N (ADR-005) makes extinction impossible. That
+is the shortcut. The user mandates a foundation organisms genuinely interact THROUGH.
+
+### Decision
+Adopt **CHEMOSTAT-J**: one conserved fixed-point energy/mass currency — the `i64` "joule" `J` (the unit IS the
+quantum, no float scale) — as the substrate spine. Every load-bearing quantity (per-cell resource pools,
+per-organism stores, biomass, trophic transfers, chemical concentrations, reproduction endowments) is `J` over a
+global LEDGER conserved exactly modulo **three named, audited taps**: INFLUX (solar minted/tick), RESPIRATION/LOSS
+(maintenance + trophic-efficiency dissipation), OVERFLOW (the explicit sink for cap-saturation, so no quantum is
+ever silently destroyed). **"Fitness" is deleted as a stored input and re-emerges only as a MEASUREMENT** (realized
+lineage net-J). The four pillars are four classes of `J` transfer over the one ledger:
+1. resource/metabolic pools (dynamic, depletable, regenerating); 2. genome→**allocation budget** `[u16;5]` summing
+to 1000 permille + trophic role (autotroph/heterotroph/mixotroph/decomposer); 3. trophic web (energy transfers →
+emergent `FlowMatrix` = relations); 4. chemical/signal diffusion field.
+
+`selection()`, `fitness()`, the `[0.5,1.5]` band + `0.05` floor, the no-op `metabolism()`, the 5-scalar
+`WeightedSumMap`, and `unit_f64` are DELETED from the sim path, replaced by a fixed-order pipeline:
+`influx → diffuse/decay chem → emit → metabolism(uptake/convert) → trophic_transfer → maintenance →
+reproduce_or_die → measure_relations`. **Population becomes a free variable; extinction is permitted and desired.**
+
+**Human-approved keystone sign-offs (2026-06-21):**
+- **Full commit** to CHEMOSTAT-J as the foundation, accepting the multi-week / 6+ re-pin / red-for-weeks cost.
+- **Extinction approved** — supersede ADR-005, delete constant-N + the positivity band/floor (the irreversible
+  policy break, gated at phase F3).
+- **Cross-platform determinism gate** — stand up an **x86_64 + aarch64 CI matrix as a HARD gate before F3**
+  (today's single-target CI silently blesses `f64` divergence; the "determinism as a property of the `i64` type"
+  thesis must be proven on two arches before selection becomes resource-driven).
+- Recommended defaults adopted: this is **ADR-013** (next free accepted number; the 013/014/015 draft *numbers*
+  are retired, their content re-grounded as F-phases); genome `f64` stays ON DISK and is converted to integer at
+  expression via a single audited chokepoint (`fixed::to_unit_u16`); trophic contention resolves against a
+  **frozen start-of-tick prey snapshot**; start with a **minimal resource-channel inventory** and grow it.
+
+### Determinism contract (invariant #3, hardened by the adversarial pass)
+All pools/metabolism/diffusion/transfers are **integer / fixed-point**, ordered, bit-reproducible. One canonical
+det-rounding module — **`crates/sim-core/src/fixed.rs` (phase F-1, LANDED)** — owns every division as
+largest-remainder apportionment (floor + leftover to largest remainder, **ties to the lowest index**),
+**conserving the total exactly**; it is reused by the budget simplex, diffusion remainders, and trophic division.
+A semantic **`ledger_closes`** invariant (Σ all `J` == initial + influx − respired − overflow each tick) is a gate
+STRONGER than the bit-hash. Every order-dependent pass collects into a Vec sorted by `(cell, SpeciesId, OrgId)`
+before iterating (never `HashMap`/Query order). Each structural phase deliberately re-pins
+`determinism_hash_is_pinned` (currently `0x9fad_2c9f_d298_f73a`) per the ADR-011 procedure.
+
+### Epic phases (10; see the proposal for full per-phase detail)
+`F-1` fixed-point apportionment contract (`fixed.rs`) — **LANDED, hash-neutral** ·
+`F0a` Ledger + `ledger_closes` scaffolding (hash-neutral) · `F0b` `f64→i64` type migration (re-pin) ·
+`F1` dynamic resource pools, off-stream (near hash-neutral) · `F2` genome→Strategy allocation budget (re-pin) ·
+**`F3` 🛑 real metabolism + emergent births/deaths — breaks ADR-005 (re-pin; needs the multi-arch CI gate first)** ·
+`F4` multi-species container (R3 spine) + trophic web + emergent `FlowMatrix` (Rel re-ground; re-pin) ·
+`F5` chemical/signal diffusion field (re-pin) · `F6` emergent measurements + relations VIEW (mostly neutral) ·
+`F7` Godot UI LAST (read-only render of pools/energy/FlowMatrix/chem; build-order Stage 4).
+
+### Consequences
++ Organisms genuinely interact through one conserved economy; competition, extinction, and relations EMERGE.
++ Traits become budget allocations with real trade-offs (Phase T dissolves). + Determinism becomes a property of
+the integer type, proven on two arches. − A long red period, 6+ re-pins, every replay/golden artifact regenerated
+per re-pin, a GSS2→GSS3 snapshot break, and `ParamValue::Numeric` `f64` converted at a load-time chokepoint.
+− ADR-005's no-extinction guarantee is gone (intended). The first phase (`fixed.rs`) is in and gate-green.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

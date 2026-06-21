@@ -37,3 +37,7 @@ __pycache__/
 /build/
 /dist/
 /debroot/
+
+# Claude Code session runtime (scheduled-task lock/state) — not project source
+/.claude/scheduled_tasks.lock
+/.claude/scheduled_tasks.json

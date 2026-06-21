@@ -40,22 +40,19 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   (needs Apple signing/notarization). Verified green via `workflow_dispatch` dry-run before tagging; the tag
   push ran the `publish` job → https://github.com/PaznerA/gene-sim/releases/tag/v0.1.0-beta
 
-- [ ] **Phase R3 — multi-species** 🛑 (core, own ADR + human sign-off — like ADR-011). Multiple species competing
-  across regions: rewrites `selection` (per-species sub-populations), the snapshot (per-species channels), the
-  genome wiring (per-species genomes), region/species edits routed to a chosen species (inv #6 still species/
-  region-granular). Determinism RE-PIN. **UI: each species gets its own PAGE in the specimen view with a TABLE
-  of its trees** (the incremental specimen log from Phase S, per species).
-  - *Workflow:* understand (current single-species selection/snapshot/genome) → design (species model + ADR)
-    → implement slices (each gate-green, re-pin where flagged) → adversarial review.
-
-- [ ] **Phase Rel — relations view (synergy / parasites / predators), vector-DB backed** (core + UI). A NEW view
-  for inter-species/inter-lineage RELATIONS — mutualism, parasitism, predation — with a **vector DB** to index
-  genome/phenotype embeddings (similarity, lineage neighbourhoods). Likely a process-boundary service (inv #1:
-  any GPL/external DB stays a subprocess, never linked). *Workflow:* research (vector-DB options at the process
-  boundary) → design (relation model + ADR) → implement → review.
-
-- [ ] **Phase T — more traits under selection** (folds into E/R3). Beyond `Genotype` + `DroughtTol`: more
-  environment↔phenotype couplings behind the `EnvironmentModifier` seam (inv #5). Determinism RE-PIN if shipped.
+- [~] **ADR-013 — Ecology substrate (CHEMOSTAT-J): the foundational joule-economy epic** 🛑 (ACCEPTED 2026-06-21,
+  IN PROGRESS). Replaces the abstract Wright-Fisher core with a conserved `i64`-joule economy organisms interact
+  THROUGH; supersedes ADR-005 (extinction approved); **re-grounds R3 / Rel / Phase-T as phases, not separate
+  ADRs.** Full plan in `docs/llm/proposals/ecology-substrate-draft.md`; ADR in DECISIONS.md. 10 phases, 6+ re-pins:
+  - [x] **F-1** — `crates/sim-core/src/fixed.rs` deterministic largest-remainder apportionment contract (the
+    integer-division backbone; conserves the total exactly). Hash-neutral, gate-green.
+  - [ ] **F0a** Ledger + `ledger_closes` invariant (hash-neutral) · **F0b** `f64→i64` migration (re-pin).
+  - [ ] **F1** dynamic resource pools (off-stream) · **F2** genome→Strategy allocation budget (re-pin).
+  - [ ] **F3** 🛑 real metabolism + emergent births/deaths — breaks ADR-005 (re-pin; **needs the x86_64+aarch64 CI
+    matrix gate FIRST**) · **F4** multi-species (R3 spine) + trophic web + emergent `FlowMatrix` (Rel re-ground).
+  - [ ] **F5** chemical/signal diffusion field · **F6** emergent measurements + relations VIEW · **F7** Godot UI (last).
+  - Target: ≥2× more environment/resource "variables" than today (beyond sun + temperature) before the post-impl
+    revision (stronger autonomous e2e testing + deeper algo/rand-param simulation in CI + roadmap).
 
 Sequencing: U + S + E done. Next **BETA tag** (v0.1.0-beta; extend `release.yml` to ship installable .exe/.dmg/
 .deb per the review's release-readiness findings) →
