@@ -52,19 +52,29 @@ if [ -n "$GPL" ]; then
   exit 1
 fi
 
-# (B) oracle-slim must have no normal/build deps (dev-deps for its own tests are allowed).
-OS_DEPS="$(printf '%s' "$META" | jq -r '
-  .packages[]
-  | select(.name == "oracle-slim")
-  | [ .dependencies[] | select(.kind == null or .kind == "build") ]
-  | length')"
+# (B) Every PROCESS-BOUNDARY crate must have no normal/build deps (dev-deps for its own tests are allowed) —
+# belt-and-suspenders for (A): a dependency-free crate cannot link a GPL (or any) library, only shell out. Add
+# new boundary subprocess crates to this list as they land (ADR-017: oracle-fba for the E. coli FBA KO-table,
+# relations-index for the vector-DB sidecar). Crates not yet present are skipped (logged, not failed).
+BOUNDARY_CRATES="oracle-slim oracle-fba relations-index"
+boundary_fail=0
+for crate in $BOUNDARY_CRATES; do
+  present="$(printf '%s' "$META" | jq -r --arg c "$crate" '[.packages[] | select(.name == $c)] | length')"
+  if [ "${present:-0}" = "0" ]; then
+    echo "LICENSE: boundary crate '$crate' not present yet — skipping (enforced once the crate lands)."
+    continue
+  fi
+  deps="$(printf '%s' "$META" | jq -r --arg c "$crate" '
+    .packages[] | select(.name == $c)
+    | [ .dependencies[] | select(.kind == null or .kind == "build") ] | length')"
+  if [ "${deps:-0}" != "0" ]; then
+    echo "LICENSE FAIL (invariant #1): crates/$crate has ${deps} normal/build dependency(ies); a process-boundary crate must carry NONE." >&2
+    printf '%s' "$META" | jq -r --arg c "$crate" '
+      .packages[] | select(.name==$c)
+      | .dependencies[] | select(.kind == null or .kind == "build") | "  - \(.name)"' >&2
+    boundary_fail=1
+  fi
+done
+[ "$boundary_fail" = "0" ] || exit 1
 
-if [ "${OS_DEPS:-0}" != "0" ]; then
-  echo "LICENSE FAIL (invariant #1): crates/oracle-slim has ${OS_DEPS} normal/build dependency(ies); it must carry NONE." >&2
-  printf '%s' "$META" | jq -r '
-    .packages[] | select(.name=="oracle-slim")
-    | .dependencies[] | select(.kind == null or .kind == "build") | "  - \(.name)"' >&2
-  exit 1
-fi
-
-echo "LICENSE OK: no GPL crate in the dependency tree; crates/oracle-slim is dependency-free (shells out only)."
+echo "LICENSE OK: no GPL crate in the dependency tree; all present process-boundary crates are dependency-free (shell out only)."
