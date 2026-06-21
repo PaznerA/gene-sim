@@ -150,6 +150,10 @@ jobs:
           # The game + its GDExtension lib live together; the binary auto-loads the sibling libgodot_sim.so.
           cp build/gene-sim.x86_64 "$root/opt/gene-sim/gene-sim.x86_64"
           cp build/libgodot_sim.so "$root/opt/gene-sim/libgodot_sim.so"
+          # Species data must sit BESIDE the binary so LiveSim::set_species resolves it in the shipped build
+          # (the cwd is not the repo root there) — the "RUN E. coli" feature needs data/species/*.json (ADR-017).
+          mkdir -p "$root/opt/gene-sim/data/species"
+          cp data/species/*.json "$root/opt/gene-sim/data/species/"
           chmod 755 "$root/opt/gene-sim/gene-sim.x86_64"
           cat > "$root/usr/bin/gene-sim" <<'EOF'
           #!/bin/sh
@@ -239,6 +243,9 @@ jobs:
           /tmp/godot/godot.exe --headless --path godot --import 2>/dev/null || true
           /tmp/godot/godot.exe --headless --path godot --export-release "Windows Desktop" "$(pwd)/build/gene-sim.exe"
           [ -f build/godot_sim.dll ] || cp crates/godot-sim/target/release/godot_sim.dll build/godot_sim.dll
+          # Species data beside the .exe so LiveSim::set_species resolves it in the shipped build ("RUN E. coli").
+          mkdir -p build/data/species
+          cp data/species/*.json build/data/species/
           ls -la build
           test -f build/gene-sim.exe
 

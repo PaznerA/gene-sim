@@ -88,9 +88,19 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   - [x] **F2-2** — microbe `Trait` variants (GlucoseUptake, RespirationMode, AcetateOverflow, FermentationCapacity),
     NOT in `Trait::ALL`. **B-2** — `gp::ecoli_trait_map` (`ByGoAnchor` → gltA/ptsG/pflB/pta/ldhA). Gate test
     `ecoli_genome_expresses_microbe_traits`: the real 136-gene genome expresses all 5 microbe traits. Hash-neutral.
-  - [ ] **Next — RUN E. coli:** per-species trait-map SELECTION (associate a `TraitMap` with a `BuiltSpecies`, so
-    `reset_with_genome` expresses E. coli via `ecoli_trait_map` not the plant map) — the wire to actually simulate
-    E. coli. Then the KO edit → microbe-trait change is visible. (Couples to multi-species / the species registry.)
+  - [x] **RUN E. coli** — per-species trait-map SELECTION: `Simulation` stores a `gp::OntologyMap`, set at reset +
+    reused by all 3 express sites; `reset_with_genome_and_map` + `run_headless_with` + `gp::trait_map_for(key)`;
+    default delegates `default_plant_trait_map` (byte-identical). Boundary: harness `--species <file>`,
+    `GeneSimEnv::set_species`, `LiveSim::set_species` + a menu Species dropdown. **E. coli runs deterministically
+    off gltA (GrowthRate 1.0), pop 800 from the niche, own hash; default pinned literal unchanged.** Designed +
+    adversarially verified (run-ecoli-mapseam-design wf, 3/3 claims HOLD); plan `ecoli-genome-f2-draft.md`.
+    - Adversarial code review (run-ecoli-review wf, 4 confirmed — no determinism regressions) → all FIXED:
+      shipped-build species path (exe-dir fallback in `LiveSim::set_species` + `release.yml` stages
+      `data/species/` beside the binary); the live CRISPR edit picker is now SPECIES-AWARE (`loci()` returns the
+      active genome + `_populate_locus_picker` refreshes after a species change); `set_species("")` restores the
+      pre-species entity_count; the microbe specimen view warns (plant-shaped placeholder).
+    *(Remaining follow-ups: a microbe GLYPH for the specimen view (now a flagged plant placeholder); observe/CSV
+    are plant-shaped for microbes — only growth_rate is meaningful.)*
   - [ ] Later: S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2/`oracle-fba`
     KO-table bake · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7 decomposer.
 

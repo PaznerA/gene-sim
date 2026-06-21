@@ -129,6 +129,9 @@ var _brush_button: Button
 # deadline (the brush lowers allele, selection raises it → a tug-of-war). Renderer-side game rules over the
 # core-exported snapshot (inv #2 — no biology computed here); not part of the determinism hash.
 var _mission_on: bool = false
+# The active species file stem (ADR-017): "" = abstract plant; non-empty (e.g. "ecoli") = a loaded species whose
+# specimen view has no L-system plant body (the in-game specimen view is plant-shaped — a documented follow-up).
+var _species_stem: String = ""
 var _mission_zone: Vector2i = Vector2i(8, 8)  # target world cell (disc centre)
 var _mission_radius: int = 6
 var _mission_target: float = 0.40  # win when the zone's mean allele_freq drops to/below this
@@ -340,7 +343,10 @@ func _on_menu_start(cfg: Dictionary) -> void:
 	var species_stem: String = String(cfg.get("species", ""))
 	if not _live.set_species(species_stem):
 		push_warning("species '%s' failed to load; using the default plant" % species_stem)
+		species_stem = ""
+	_species_stem = species_stem
 	_do_reset(_seed)
+	_populate_locus_picker()  # refresh the edit-target picker for the new species' genome (ADR-017)
 	# Mission is a MENU choice now (off by default = free-play sandbox). Apply it + (re)activate its UI on Start;
 	# the --mission CLI flag is the headless/scripted equivalent (set in _setup_live, overridden here).
 	_mission_on = bool(cfg.get("mission", false))
@@ -438,6 +444,19 @@ func _live_advance() -> void:
 ## Live-mode CRISPR intervention UI (P6): pick a Cas variant / locus / guide and Inject. The renderer only
 ## REQUESTS the edit (LiveSim.apply_edit) — the core applies it (authoritative PAM/score/gate stay in crispr,
 ## inv #2); the species-granular EditAction carries no organism handle (inv #6). Hidden unless --live.
+## Repopulate the locus target picker from the ACTIVE species genome (ADR-017). Called at UI build AND after a
+## species change/reset, so the offered targets always match the genome `apply_edit` resolves against — E. coli's
+## 136 real genes, not the plant baseline (otherwise an edit lands on a mislabeled locus).
+func _populate_locus_picker() -> void:
+	if _live == null or _locus_picker == null:
+		return
+	_locus_picker.clear()
+	_locus_ids.clear()
+	for l in _live.loci():
+		_locus_picker.add_item(str((l as Dictionary).get("name", "locus")))
+		_locus_ids.append(int((l as Dictionary).get("id", 0)))
+
+
 func _build_intervention_ui(ui: CanvasLayer) -> void:
 	var body := _dark_panel(0.55)
 	body.custom_minimum_size = Vector2(262, 0)
@@ -489,9 +508,7 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 		for v in _live.cas_variants():
 			_cas_picker.add_item(str((v as Dictionary).get("name", "cas")))
 			_cas_ids.append(int((v as Dictionary).get("id", 0)))
-		for l in _live.loci():
-			_locus_picker.add_item(str((l as Dictionary).get("name", "locus")))
-			_locus_ids.append(int((l as Dictionary).get("id", 0)))
+		_populate_locus_picker()
 
 	var fs := _field_screen_size()
 	_intervention_panel = PanelChrome.new()
@@ -1355,6 +1372,10 @@ func _set_view_mode(m: int) -> void:
 	if _specimen_panel != null:
 		_specimen_panel.set_active(m == 1)
 	if m == 1:
+		if _species_stem != "":
+			# ADR-017 follow-up: a microbe (e.g. E. coli) has no L-system plant body; the specimen view renders a
+			# plant-shaped placeholder (only growth_rate is meaningful). Flag it rather than mislead silently.
+			push_warning("specimen view: '%s' is a microbe — plant-shaped placeholder (microbe glyph is a follow-up)" % _species_stem)
 		_refresh_live_specimens()  # in --live there is no specimens.json — build one from the live genome
 		_render_specimens()  # also repopulates the picker
 		_update_trait_readout()

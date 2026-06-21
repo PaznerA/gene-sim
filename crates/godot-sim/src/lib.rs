@@ -38,6 +38,20 @@ const DEFAULT_ENTITY_COUNT: u32 = 1000;
 /// Generations advanced per `step(0)` / used to clamp negative inputs to a sane, deterministic value.
 const NO_NEGATIVE: i64 = 0;
 
+/// Resolve a species file `name` to an existing path, trying the process working dir first (dev / `run.sh`,
+/// which runs from the repo root) then the directory beside the executable (shipped builds stage
+/// `data/species/` next to the binary). Returns `None` if neither exists. This is what makes "RUN E. coli"
+/// work in a packaged build, where the cwd is not the repo root.
+fn resolve_species_path(name: &str) -> Option<std::path::PathBuf> {
+    let rel = format!("data/species/{name}.json");
+    let cwd = std::path::PathBuf::from(&rel);
+    if cwd.is_file() {
+        return Some(cwd);
+    }
+    let beside = std::env::current_exe().ok()?.parent()?.join(&rel);
+    beside.is_file().then_some(beside)
+}
+
 /// `LiveSim` — the one Godot node the live-sim feature exposes (ADR-010).
 ///
 /// A thin `RefCounted` wrapper over [`harness::GeneSimEnv`]. GDScript drives it with
@@ -60,6 +74,9 @@ struct LiveSim {
     /// The species the next `reset` runs (ADR-017 "RUN E. coli"). `None` = the default plant; `Some` runs a
     /// loaded JSON `SpeciesSpec` (e.g. E. coli) through its per-species trait map. Set via `set_species`.
     species: Option<genome::spec::BuiltSpecies>,
+    /// The `entity_count` before a species' niche overrode it, so clearing the species (`set_species("")`)
+    /// restores the player's count instead of leaving the microbe's stale.
+    entity_count_before_species: Option<u32>,
     base: Base<RefCounted>,
 }
 
@@ -73,6 +90,7 @@ impl IRefCounted for LiveSim {
             seed: 0,
             journal: Vec::new(),
             species: None,
+            entity_count_before_species: None,
             base,
         }
     }
@@ -115,13 +133,23 @@ impl LiveSim {
     fn set_species(&mut self, name: GString) -> bool {
         let name = name.to_string();
         if name.is_empty() {
+            // Clear back to the default plant, restoring the player's pre-species population.
+            if let Some(prev) = self.entity_count_before_species.take() {
+                self.entity_count = prev;
+            }
             self.species = None;
             return true;
         }
-        let path = format!("data/species/{name}.json");
+        let Some(path) = resolve_species_path(&name) else {
+            godot_error!(
+                "LiveSim::set_species({name}): data/species/{name}.json not found (looked in the working dir and beside the executable)"
+            );
+            return false;
+        };
         match harness::species::load_species_file(&path) {
             Ok(built) => {
                 if built.entity_count > 0 {
+                    self.entity_count_before_species.get_or_insert(self.entity_count);
                     self.entity_count = built.entity_count;
                 }
                 self.species = Some(built);
@@ -398,12 +426,19 @@ impl LiveSim {
         arr
     }
 
-    /// The species-genome loci as `[{id, name}, ...]` for the intervention UI's target picker (ids + names
-    /// only). From `genome::sample_genome` (the species baseline).
+    /// The ACTIVE species-genome loci as `[{id, name}, ...]` for the intervention UI's target picker (ids +
+    /// names only) — the SELECTED species when one is set (e.g. E. coli's 136 real genes), else the default
+    /// plant baseline. The picker must be repopulated from this after `set_species`/`reset` so an edit targets
+    /// the genome `apply_edit` actually resolves against (ADR-017).
     #[func]
     fn loci(&self) -> VarArray {
+        let default = genome::sample_genome();
+        let loci = match &self.species {
+            Some(b) => &b.genome.loci,
+            None => &default.loci,
+        };
         let mut arr = VarArray::new();
-        for l in genome::sample_genome().loci {
+        for l in loci {
             let mut d = VarDictionary::new();
             d.set("id", i64::from(l.id.0));
             d.set("name", l.name.as_str());
