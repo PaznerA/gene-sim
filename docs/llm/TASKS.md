@@ -7,23 +7,24 @@
 
 ---
 
-## ▶️ CONTINUATION ROADMAP (post-merge 2026-06-22 — `main` @ `81ef89e`)
+## ▶️ CONTINUATION ROADMAP (post-merge 2026-06-22 — `main` @ `1f42508`)
 
 The CHEMOSTAT-J ecology is REAL and MERGED: F3/F4/F3.4 re-pins (hash `0xf795 → 0x272a → 0x42fe → 0x4e4d`),
 all proven byte-identical on x86_64 + aarch64 by the CI multi-ISA matrix (`assert-isa-match` green). The sim is
 now a deterministic multi-species joule economy — plant + E. coli(decomposer) reach a stable coexistence. Next,
 in priority order (🔁 = deliberate re-pin, EXECUTED not staged — see the F3/F4/F3.4 precedent):
 
-1. **F1b / F7 — visualise the joule economy** (hash-neutral renderer, inv #2). Snapshot GSS2→GSS3 + in-game
-   overlays for the live pools (light/free_nutrient/detritus) + per-org energy/biomass; richer FlowMatrix labels
-   on the already-live Relations heatmap. Makes the new ecology legible. **← first actionable slice.**
+1. ✅ **DONE** — **visualise the joule economy** (`d251e1f`): GSS2→GSS3 + live pool overlays (light/free_nutrient/
+   detritus) through the layer picker; hash-neutral (snapshot off-hash). *(Follow-up: per-org energy/biomass plane +
+   richer FlowMatrix labels — minor.)*
 2. **Re-author the intro campaign for F3 energetics** — `shipped_intro_campaign_is_solvable` is `#[ignore]`d (its
    solution journals assumed the deleted Genotype Wright-Fisher selection). Redefine the win condition around the
    energy/population dynamics; un-ignore.
-3. **ADR-017 S6 — wire the OVERSIGHT loop for real** 🔁 — design (S4/S5) + inert Actions are landed. Implement the
-   harness CreditLedger (earn), `crates/oracle-fba` (quantize-before-return, mirrors oracle-slim, inv #1), the
-   due_epoch firewall, and the load-bearing `EcoliEditModifier`. **GATED by the data-licensing ruling** (BiGG
-   `e_coli_core`/`iML1515` UCSD non-commercial vs inv #1 — needs a human call: frozen-table-only boundary crate? 🛑).
+3. ✅ **DONE** — **OVERSIGHT earned-edit loop** (ADR-018 licensing `ec56133`; Slice A `e7f49bc` + Slice B `4e36d34`):
+   real-FBA KO table (cobrapy/e_coli_core), `oracle-fba` boundary crate (inv #1), harness CreditLedger, due_epoch
+   firewall (no wall-clock leak), and the `EcoliEditModifier` — a committed edit ripples (gltA KO → ↓decomposer →
+   ↓FlowMatrix edge → ↓plant via F4). HASH-NEUTRAL (identity/neutral-gated → no re-pin). *(Follow-up: an in-game
+   OVERSIGHT UI to earn/spend/trigger edits; a richer KO table beyond the 5 anchor genes.)*
 4. **ADR-013 F5 — chemical/signal diffusion field** 🔁 (toxin/kin/alarm; double-buffered, Σ-conserved; GSS3 bump) →
    allelopathy / chemotaxis / kin-selection emerge on top of the trophic web.
 5. **ADR-017 S8 — relations vector-DB sidecar** (sqlite-vec at the process boundary, inv #1; view-only ANN overlay
