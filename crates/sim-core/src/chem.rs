@@ -277,6 +277,23 @@ impl KinProvenance {
             0
         }
     }
+
+    /// Grow to `new_s ≥ s` species for `cells` cells (ADR-019: a `RegionInoculate` may register a new species
+    /// mid-run), re-laying the flat `[cell*s + species]` layout so every existing cell's kin block is preserved
+    /// and the new species columns start zero. A no-op if `new_s <= s`. Only ever called on an inoculated run.
+    pub(crate) fn grow_to(&mut self, cells: usize, new_s: usize) {
+        if new_s <= self.s {
+            return;
+        }
+        let mut kin = vec![0i64; cells * new_s];
+        for c in 0..cells {
+            for sp in 0..self.s {
+                kin[c * new_s + sp] = self.kin[c * self.s + sp];
+            }
+        }
+        self.s = new_s;
+        self.kin = kin;
+    }
 }
 
 /// **RESET CHEM SCRATCH** (ADR-013 F5) — zero the reused double-buffer scratch plane at the START of every

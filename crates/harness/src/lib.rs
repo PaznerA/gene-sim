@@ -170,6 +170,29 @@ pub enum Action {
         /// (the single `growth_ratio_q` factor is the wire this slice lands).
         exchange_deltas: Vec<(u16, i16)>,
     },
+
+    /// **CONTAMINATION / IMMIGRATION (ADR-019 S1 — the SP-3-deferred seed/inoculate tool).** Drop a baked
+    /// contaminant `SpeciesSpec` (resolved by `species_key`, the `data/species/<key>.json` file stem) onto the
+    /// substrate: spawn `count` organisms inside the `region` disc, each endowed with `endow_j` joules MINTED
+    /// from a NAMED `immigration` influx tap (conserved — the arrival is accounted, never conjured). RNG-FREE
+    /// (deterministic cell-fill placement, OrgIds from the monotonic `NextOrgId`), region-scoped (cells, never
+    /// an organism — inv #6), journaled into `actions.ndjson` so a contaminated run replays bit-identically.
+    ///
+    /// Establish / displace / die-out is NOT coded — it EMERGES from the ADR-013 metabolism→trophic→
+    /// reproduce_or_die joule economy (a poorly-adapted immigrant starves; a well-adapted one out-harvests the
+    /// resident). At `step` the contaminant species is registered into the running roster (if new) and the
+    /// orgs are spawned. Externally-tagged serde-additive: every EXISTING `actions.ndjson` line is unchanged,
+    /// so the pinned config (which issues no `RegionInoculate`) keeps `0x47a0_3c8f_6701_f240`.
+    RegionInoculate {
+        /// The contaminant species key (== the `data/species/<key>.json` file stem) to inoculate.
+        species_key: String,
+        /// The disc region (cells, centre + radius) the propagule lands in — inv #6 (no organism handle).
+        region: RegionSpec,
+        /// Number of organisms to spawn.
+        count: u32,
+        /// Per-organism starting joule reserve, MINTED from the `immigration` ledger tap (conserved).
+        endow_j: i64,
+    },
 }
 
 /// A spatial brush region for [`Action::ApplyEditRegion`]: a disc of world cells (centre + radius). Serde so
@@ -227,6 +250,29 @@ pub struct GeneSimEnv {
     /// The species the **next** `reset` runs (ADR-017 "RUN E. coli"). `None` = the default plant genome +
     /// map (byte-identical). `Some(built)` runs `built.genome` through `trait_map_for(built.key)`.
     species: Option<BuiltSpecies>,
+    /// Available CONTAMINANT species, keyed by `species_key` (ADR-019 S1 — the loaded consortium). The
+    /// boundary (renderer/CLI) loads each baked `SpeciesSpec` JSON into a [`BuiltSpecies`] and registers it
+    /// here so a journaled [`Action::RegionInoculate`] can resolve its key to a genome at `step`. Empty by
+    /// default → the pinned config never inoculates (an unresolved key is a logged no-op, not a panic). An
+    /// ordered `Vec`, never a `HashMap` iterated in sim logic (inv #3).
+    consortium: Vec<BuiltSpecies>,
+    /// The CONTAINMENT knob the **next** `reset` builds its immigration schedule under (ADR-019 S2). Default
+    /// [`sim_core::ContainmentLevel::Sealed`] (OFF) → an empty schedule → the pinned config issues no events
+    /// (hash-neutral). Paired with [`consortium_config`](Self::set_containment) below.
+    containment: sim_core::ContainmentLevel,
+    /// The consortium config (menu set + pressure params) the schedule draws from (ADR-019 S2). Default empty
+    /// → no events regardless of the knob.
+    consortium_config: sim_core::ConsortiumConfig,
+    /// The expanded `(due_epoch, RegionInoculate)` schedule for the CURRENT run, sorted by `due_epoch` (built
+    /// at `reset` off the off-stream `IMMG_STREAM_BASE` family — ZERO `SimRng` draws). Drained in order as the
+    /// env advances generations; each fired event is journaled like a hand-issued action. Empty when the knob
+    /// is Sealed (the default) — so the pinned config carries an empty schedule.
+    schedule: Vec<sim_core::ScheduledInoculation>,
+    /// How many of `schedule`'s events have already fired (the drain cursor). Reset to `0` at `reset`.
+    schedule_cursor: usize,
+    /// Cumulative generations advanced since `reset` (the Tick clock the schedule fires against). The env
+    /// advances via `Action::Advance`, so this mirrors the core's generation counter for schedule timing.
+    generation: u64,
 }
 
 impl GeneSimEnv {
@@ -246,6 +292,96 @@ impl GeneSimEnv {
             last_edit: None,
             last_region_edit: None,
             species: None,
+            consortium: Vec::new(),
+            containment: sim_core::ContainmentLevel::default(),
+            consortium_config: sim_core::ConsortiumConfig::default(),
+            schedule: Vec::new(),
+            schedule_cursor: 0,
+            generation: 0,
+        }
+    }
+
+    /// Set the CONTAINMENT knob + consortium config the **next** `reset` builds its immigration schedule under
+    /// (ADR-019 S2). The schedule expands at `reset` off the off-stream `IMMG_STREAM_BASE` family (ZERO
+    /// `SimRng` draws), so this is hash-neutral while `level` is [`Sealed`](sim_core::ContainmentLevel::Sealed)
+    /// (the default → an empty schedule). The boundary loads the named consortium species as contaminants (see
+    /// [`register_contaminant`](Self::register_contaminant)) so a scheduled event can resolve its key. Does not
+    /// disturb a run in progress.
+    pub fn set_containment(
+        &mut self,
+        level: sim_core::ContainmentLevel,
+        config: sim_core::ConsortiumConfig,
+    ) {
+        self.containment = level;
+        self.consortium_config = config;
+    }
+
+    /// The CURRENT run's expanded immigration schedule (ADR-019 S2 — for the panel + tests). Read-only.
+    #[must_use]
+    pub fn immigration_schedule(&self) -> &[sim_core::ScheduledInoculation] {
+        &self.schedule
+    }
+
+    /// Cumulative generations advanced since `reset` (the Tick clock the immigration schedule fires against).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The cumulative `J` minted into the run via the `immigration` tap so far (ADR-019 — for the panel +
+    /// tests). `0` on a run that never inoculated. Panics if called before `reset`.
+    #[must_use]
+    pub fn immigration_minted(&self) -> i64 {
+        self.sim
+            .as_ref()
+            .expect("GeneSimEnv::immigration_minted called before reset")
+            .ledger()
+            .immigration
+    }
+
+    /// Drain every scheduled inoculation whose `due_epoch < up_to_generation` (ADR-019 S2), advancing the
+    /// schedule cursor, and return them as journaled [`Action::RegionInoculate`]s in schedule order. The
+    /// DRIVER (renderer/oversight/replay loop) calls this around its `Advance` cadence and JOURNALS + `step`s
+    /// each returned action — so a scheduled arrival is byte-identical to a hand-fired one and a contaminated
+    /// run replays from `actions.ndjson` alone (the schedule is a SOURCE of journaled actions, never a hidden
+    /// side-effect inside `step`). Tick-clocked: `due_epoch` is a generation count, never wall-clock. Returns
+    /// an empty `Vec` for a Sealed run (empty schedule). The cursor only advances forward (idempotent across a
+    /// monotonically rising `up_to_generation`).
+    #[must_use]
+    pub fn drain_due_inoculations(&mut self, up_to_generation: u64) -> Vec<Action> {
+        let mut out = Vec::new();
+        while self.schedule_cursor < self.schedule.len() {
+            let due = &self.schedule[self.schedule_cursor];
+            if u64::from(due.due_epoch) >= up_to_generation {
+                break; // schedule is sorted by due_epoch — nothing further is due yet
+            }
+            out.push(Action::RegionInoculate {
+                species_key: due.event.species_key.clone(),
+                region: RegionSpec {
+                    cx: due.event.region.cx,
+                    cy: due.event.region.cy,
+                    radius: due.event.region.radius,
+                },
+                count: due.event.count,
+                endow_j: due.event.endow_j,
+            });
+            self.schedule_cursor += 1;
+        }
+        out
+    }
+
+    /// Register a CONTAMINANT species (ADR-019 S1) so a journaled [`Action::RegionInoculate`] keyed on its
+    /// `built.key` can resolve a genome at `step`. The boundary loads the baked `SpeciesSpec` JSON (via
+    /// [`species::load_species_file`] / [`species::build_species_from_str`]) and hands the [`BuiltSpecies`]
+    /// here. Re-registering the same key REPLACES the prior built (the latest wins); the order of distinct
+    /// keys is insertion order (an ordered `Vec`, inv #3). Does not disturb a run in progress — it only seeds
+    /// the resolver the NEXT inoculation reads. The default env has an empty consortium → the pinned config
+    /// never inoculates.
+    pub fn register_contaminant(&mut self, built: BuiltSpecies) {
+        if let Some(slot) = self.consortium.iter_mut().find(|b| b.key == built.key) {
+            *slot = built;
+        } else {
+            self.consortium.push(built);
         }
     }
 
@@ -378,6 +514,44 @@ impl GeneSimEnv {
             );
     }
 
+    /// Apply a journaled [`Action::RegionInoculate`] (ADR-019 S1): resolve the contaminant `species_key` to a
+    /// registered [`BuiltSpecies`], register it into the running roster (idempotent — no duplicate), then spawn
+    /// `count` orgs RNG-FREE into the region disc with J minted from the `immigration` tap. An UNRESOLVED key
+    /// (the consortium was never loaded) is a clean NO-OP — never a panic — so a journaled stream stays robust.
+    /// Establish/displace/die-out then EMERGES from the ADR-013 economy; nothing is scripted here.
+    fn step_region_inoculate(
+        &mut self,
+        species_key: &str,
+        region: RegionSpec,
+        count: u32,
+        endow_j: i64,
+    ) {
+        // Resolve + clone the built out of the consortium first so the `sim` borrow below is independent.
+        let resolved = self
+            .consortium
+            .iter()
+            .find(|b| b.key == species_key)
+            .cloned();
+        let Some(built) = resolved else {
+            self.last_edit = None;
+            return; // unresolved key → no-op (the consortium was never loaded)
+        };
+        let sim = self
+            .sim
+            .as_mut()
+            .expect("GeneSimEnv::step called before reset");
+        let role = sim_core::gp::role_from_override(built.trophic_role.as_deref(), &built.key);
+        let sid = sim.register_species(
+            built.name,
+            built.key.clone(),
+            built.genome,
+            OntologyMap::new(trait_map_for(&built.key)),
+            role,
+        );
+        sim.region_inoculate(sid, region.to_region(), count, endow_j);
+        self.last_edit = None;
+    }
+
     /// The deterministic [`sim_core::RunStats`] of the episode so far — its `hash` is the bit-identical
     /// replay artifact (SPEC §6). Folds in the same final RNG word as the one-shot path, so it must be
     /// called once at the **end** of an episode (panics if called before `reset`).
@@ -438,10 +612,55 @@ impl Env for GeneSimEnv {
         };
         let obs = sim.observe();
         self.sim = Some(sim);
+        // ADR-019 S2: EXPAND the containment-knob immigration schedule for THIS run, off the off-stream
+        // `IMMG_STREAM_BASE` family (ZERO `SimRng` draws). Sealed (the default) → an empty schedule → the
+        // pinned config carries no events (hash-neutral). The world grid is `RESOURCE_DIMS` (the disc-bound).
+        let (ww, wh) = sim_core::resource::RESOURCE_DIMS;
+        self.schedule = sim_core::immigration::expand_schedule(
+            seed,
+            self.containment,
+            &self.consortium_config,
+            ww,
+            wh,
+        );
+        self.schedule_cursor = 0;
+        self.generation = 0;
         obs
     }
 
     fn step(&mut self, action: Action) -> StepResult<Observation> {
+        // ADR-019 S1: RegionInoculate is dispatched FIRST because it reads BOTH `self.consortium` (the loaded
+        // contaminant resolver) and `self.sim` — borrowing them through one `&mut self.sim` local would
+        // conflict. Handling it here keeps the rest of the match on a single `sim` borrow unchanged.
+        if let Action::RegionInoculate {
+            species_key,
+            region,
+            count,
+            endow_j,
+        } = &action
+        {
+            self.step_region_inoculate(species_key, *region, *count, *endow_j);
+            let obs = self
+                .sim
+                .as_mut()
+                .expect("GeneSimEnv::step called before reset")
+                .observe();
+            let reward = Self::reward_of(&obs);
+            return StepResult {
+                obs,
+                reward,
+                done: false,
+            };
+        }
+
+        // ADR-019 S2: track the cumulative generation the schedule fires against (the Tick clock). Captured
+        // before the `sim` borrow so it can be folded in after the borrow ends.
+        let advance_by = if let Action::Advance(n) = &action {
+            *n
+        } else {
+            0
+        };
+
         let variants = &self.variants;
         let (on, off, thresholds) = (&self.on, &self.off, &self.thresholds);
         let sim = self
@@ -522,10 +741,18 @@ impl Env for GeneSimEnv {
                     sim_core::EditEffect::Knockout,
                 );
             }
+            // ADR-019 S1: RegionInoculate is dispatched ABOVE (it reads self.consortium + self.sim together);
+            // it can never reach this match arm. The `unreachable!` documents that + keeps the match total.
+            Action::RegionInoculate { .. } => {
+                unreachable!("RegionInoculate dispatched before the sim borrow")
+            }
         }
 
         let obs = sim.observe();
         let reward = Self::reward_of(&obs);
+        // Advance the schedule's Tick clock after the `sim` borrow ends (ADR-019 S2 — `advance_by` is 0 for a
+        // non-Advance action). The schedule itself is drained by the driver via `drain_due_inoculations`.
+        self.generation += advance_by;
         StepResult {
             obs,
             reward,
@@ -720,6 +947,16 @@ mod tests {
                 growth_ratio_q: _,
                 exchange_deltas: _,
             } => {}
+            // ADR-019 S1: RegionInoculate targets a SPECIES (`species_key`) + a CELL region (`region`) — never
+            // a per-organism handle, so the contamination tool stays at the operator/species granularity
+            // ceiling (inv #6). The destructure names every field so a future organism-handle field would stop
+            // this compiling and force a review.
+            Action::RegionInoculate {
+                species_key: _,
+                region: RegionSpec { .. },
+                count: _,
+                endow_j: _,
+            } => {}
         }
     }
 
@@ -841,6 +1078,188 @@ mod tests {
             gen_before,
             "inert oversight actions must not advance the sim"
         );
+    }
+
+    // ── ADR-019 contamination & immigration ────────────────────────────────────────────────────────────
+
+    /// A synthetic CONTAMINANT [`BuiltSpecies`] (key `"contaminant"`, decomposer role) built off the wired
+    /// sample genome — no data-agent JSON needed for the harness-level wiring tests.
+    fn contaminant_built() -> BuiltSpecies {
+        use genome::spec::SpeciesSpec;
+        let mut spec =
+            SpeciesSpec::from_genome(&genome::sample_genome(), "contaminant", "Contaminant");
+        spec.niche.trophic_role = Some("decomposer".to_string());
+        spec.build().expect("contaminant builds")
+    }
+
+    fn inoculate_action() -> Action {
+        Action::RegionInoculate {
+            species_key: "contaminant".to_string(),
+            region: RegionSpec {
+                cx: 16,
+                cy: 16,
+                radius: 6,
+            },
+            count: 10,
+            endow_j: 800_000,
+        }
+    }
+
+    #[test]
+    fn region_inoculate_action_round_trips_through_serde_back_compat() {
+        // ADR-019 S1: the new externally-tagged variant round-trips, and a pre-ADR-019 line still parses
+        // unchanged (the additive-serde discipline that keeps existing actions.ndjson byte-identical).
+        let inoc = inoculate_action();
+        let j = serde_json::to_string(&inoc).unwrap();
+        assert!(j.starts_with("{\"RegionInoculate\":"), "tag wrong: {j}");
+        assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), inoc);
+        // Back-compat: an existing Advance line is unaffected by adding the variant.
+        assert_eq!(
+            serde_json::from_str::<Action>("{\"Advance\":10}").unwrap(),
+            Action::Advance(10)
+        );
+    }
+
+    #[test]
+    fn region_inoculate_conserves_j_and_is_replay_reproducible() {
+        // ADR-019 S1: a journaled RegionInoculate (resolved against a loaded contaminant) lifts the immigration
+        // tap and is replay-reproducible — the SAME (seed, register, inoculate, advance) yields an identical
+        // hash. An UNRESOLVED key (no contaminant loaded) is a clean no-op (J unchanged).
+        let run = |load: bool| -> (i64, u64) {
+            let mut env = GeneSimEnv::new(300);
+            if load {
+                env.register_contaminant(contaminant_built());
+            }
+            env.reset(2024);
+            env.step(inoculate_action());
+            let immig = env.immigration_minted();
+            env.step(Action::Advance(20));
+            (immig, env.run_stats().hash)
+        };
+        let (immig_loaded, hash_a) = run(true);
+        let (immig_unloaded, _hash_b) = run(false);
+        assert!(
+            immig_loaded > 0,
+            "a resolved inoculation mints from the immigration tap"
+        );
+        assert_eq!(
+            immig_unloaded, 0,
+            "an unresolved key is a clean no-op (nothing minted)"
+        );
+        // Replay-reproducible: the SAME loaded sequence reproduces the hash bit-for-bit.
+        let (_immig2, hash_a2) = run(true);
+        assert_eq!(
+            hash_a, hash_a2,
+            "an inoculated run must replay bit-identically"
+        );
+    }
+
+    #[test]
+    fn containment_schedule_is_identical_for_same_seed_knob_config() {
+        // ADR-019 S2: the schedule is a PURE function of (seed, ContainmentLevel, ConsortiumConfig) — expanded
+        // off the off-stream IMMG family with ZERO SimRng draws. Same inputs → identical schedule; a different
+        // seed diverges.
+        let cfg = sim_core::ConsortiumConfig {
+            species_keys: vec!["bacillus".to_string(), "pseudomonas".to_string()],
+            radius: 4,
+            endow_j: 500_000,
+            horizon: 100,
+        };
+        let schedule = |seed: u64| -> Vec<sim_core::ScheduledInoculation> {
+            let mut env = GeneSimEnv::new(200);
+            env.set_containment(sim_core::ContainmentLevel::Lab, cfg.clone());
+            env.reset(seed);
+            env.immigration_schedule().to_vec()
+        };
+        assert!(!schedule(7).is_empty(), "Lab containment schedules events");
+        assert_eq!(
+            schedule(7),
+            schedule(7),
+            "same seed+knob+config → identical schedule"
+        );
+        assert_ne!(schedule(7), schedule(8), "a different seed must diverge");
+    }
+
+    #[test]
+    fn default_containment_is_sealed_and_schedule_empty() {
+        // The default (Sealed) → an EMPTY schedule → the env issues no immigration events (hash-neutral path).
+        let mut env = GeneSimEnv::new(200);
+        env.reset(42);
+        assert!(
+            env.immigration_schedule().is_empty(),
+            "default Sealed containment must carry no scheduled events"
+        );
+        // Draining at any generation yields nothing.
+        assert!(env.drain_due_inoculations(1000).is_empty());
+    }
+
+    #[test]
+    fn inoculation_system_is_hash_neutral_when_inert() {
+        // ADR-019 hash-neutrality: a run that issues NO RegionInoculate (and whose containment is the default
+        // Sealed) is byte-identical to a plain run — the new Action is inert until invoked, the immigration tap
+        // is zero at rest, and the empty schedule fires nothing. Registering a contaminant that is never
+        // inoculated is ALSO inert (it only seeds the resolver). Mirrors the SP-3 inert-until-invoked argument.
+        let plain = || {
+            let mut env = GeneSimEnv::new(400);
+            env.reset(13_679_457_532_755_275_413);
+            env.step(Action::Advance(40));
+            env.run_stats().hash
+        };
+        let with_inert_consortium = || {
+            let mut env = GeneSimEnv::new(400);
+            // Load a contaminant + arm the knob, but Sealed → empty schedule, and never fire an action.
+            env.register_contaminant(contaminant_built());
+            env.set_containment(
+                sim_core::ContainmentLevel::Sealed,
+                sim_core::ConsortiumConfig::default_mode_a(),
+            );
+            env.reset(13_679_457_532_755_275_413);
+            assert!(
+                env.immigration_schedule().is_empty(),
+                "Sealed → empty schedule"
+            );
+            env.step(Action::Advance(40));
+            assert_eq!(
+                env.immigration_minted(),
+                0,
+                "no inoculation → zero immigration tap"
+            );
+            env.run_stats().hash
+        };
+        assert_eq!(
+            plain(),
+            with_inert_consortium(),
+            "an inert (un-invoked) contamination system must not move the run hash"
+        );
+    }
+
+    #[test]
+    fn scheduled_events_drain_at_their_epochs_in_order() {
+        // ADR-019 S2: the schedule is drained as the env advances — every event whose due_epoch has passed is
+        // returned as a journaled RegionInoculate, in schedule order, exactly once.
+        let cfg = sim_core::ConsortiumConfig {
+            species_keys: vec!["bacillus".to_string()],
+            radius: 3,
+            endow_j: 400_000,
+            horizon: 50,
+        };
+        let mut env = GeneSimEnv::new(200);
+        env.set_containment(sim_core::ContainmentLevel::Open, cfg);
+        env.reset(99);
+        let total = env.immigration_schedule().len();
+        assert!(total > 0);
+        // Drain progressively; each event fires once, in due_epoch order, never before its epoch.
+        let mut fired = 0usize;
+        for gen in 1..=50u64 {
+            let due = env.drain_due_inoculations(gen);
+            for a in &due {
+                assert!(matches!(a, Action::RegionInoculate { .. }));
+            }
+            fired += due.len();
+        }
+        assert_eq!(fired, total, "every scheduled event drains exactly once");
+        // Draining again past the end yields nothing (the cursor is exhausted).
+        assert!(env.drain_due_inoculations(10_000).is_empty());
     }
 
     #[cfg(feature = "proptest")]

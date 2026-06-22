@@ -366,6 +366,12 @@ impl<O: Oracle> OversightEpisode<O> {
                     journal.push(action.clone());
                     self.env.step(action.clone());
                 }
+                Action::RegionInoculate { .. } => {
+                    // ADR-019 S1: a journaled inoculation passes straight through (journal + step), like an edit
+                    // — it draws no `SimRng` (RNG-free placement), so it is replay-exact in this transcript.
+                    journal.push(action.clone());
+                    self.env.step(action.clone());
+                }
             }
         }
 

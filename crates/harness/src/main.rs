@@ -518,6 +518,18 @@ fn write_episode_snapshots_and_injections(
             os @ (Action::RequestEcoliEdit { .. } | Action::CommitEcoliImpact { .. }) => {
                 env.step(os.clone());
             }
+            // ADR-019 S1: a journaled inoculation steps through and stamps a timeline marker at the current
+            // cumulative generation (the contamination event landed "now", between Advance blocks). RNG-free.
+            Action::RegionInoculate {
+                species_key, count, ..
+            } => {
+                env.step(action.clone());
+                injections.push((
+                    generation,
+                    format!("inoculate {count}× {species_key}"),
+                    true,
+                ));
+            }
         }
     }
 

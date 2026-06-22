@@ -69,6 +69,24 @@ impl FlowMatrix {
         self.s
     }
 
+    /// Grow the matrix to `new_s ≥ s` species, preserving the existing block (ADR-019: a `RegionInoculate` may
+    /// register a new contaminant species mid-run). Re-laid row-major into the larger `new_s × new_s` grid; new
+    /// rows/cols start zero. A no-op if `new_s <= s`. Only ever called on an inoculated run (the pinned config
+    /// never inoculates → the matrix dimension is unchanged → hash-neutral).
+    pub(crate) fn grow_to(&mut self, new_s: usize) {
+        if new_s <= self.s {
+            return;
+        }
+        let mut j = vec![0i64; new_s * new_s];
+        for r in 0..self.s {
+            for c in 0..self.s {
+                j[r * new_s + c] = self.j[r * self.s + c];
+            }
+        }
+        self.s = new_s;
+        self.j = j;
+    }
+
     /// The flat row-major `s*s` net-J slice (read-only; the renderer's `flow_matrix()` contract).
     #[must_use]
     pub fn flat(&self) -> &[i64] {
@@ -138,6 +156,27 @@ impl PoolProvenance {
     /// Record a free_nutrient mint by `species` into `cell` (decomposer mineralization).
     pub(crate) fn deposit_nutrient(&mut self, cell: usize, species: usize, amount: i64) {
         Self::deposit(&mut self.nutrient_by_species, self.s, cell, species, amount);
+    }
+
+    /// Grow to `new_s ≥ s` species for `cells` cells (ADR-019: a `RegionInoculate` may register a new species
+    /// mid-run), re-laying the two flat `[cell*s + species]` planes so every existing cell block is preserved
+    /// and new species columns start zero. A no-op if `new_s <= s`. Only ever called on an inoculated run.
+    pub(crate) fn grow_to(&mut self, cells: usize, new_s: usize) {
+        if new_s <= self.s {
+            return;
+        }
+        let regrow = |old: &[i64], olds: usize| -> Vec<i64> {
+            let mut v = vec![0i64; cells * new_s];
+            for c in 0..cells {
+                for sp in 0..olds {
+                    v[c * new_s + sp] = old[c * olds + sp];
+                }
+            }
+            v
+        };
+        self.detritus_by_species = regrow(&self.detritus_by_species, self.s);
+        self.nutrient_by_species = regrow(&self.nutrient_by_species, self.s);
+        self.s = new_s;
     }
 
     /// Withdraw `withdrawn` (>0) J of a pool from `cell`, apportioning it over the species that composed that
