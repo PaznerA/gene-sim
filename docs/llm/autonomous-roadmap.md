@@ -31,6 +31,13 @@ a **fast abstract plant/animal 30 FPS sim** + a **deep real E. coli earned-edit 
    from CLAUDE.md/Bash rules). **Never push, never touch `main`.** The human reviews the branch in the morning.
 5. **No user input.** Do not call AskUserQuestion or EnterPlanMode. If genuinely blocked, log a
    `BLOCKED:` line in the progress log (§4) and proceed to the next item.
+6. **NO HARDCODED BALANCE — open system** (added 2026-06-22 per [[no-hardcoded-balance-open-system]]). Do NOT
+   tune/special-case the ecosystem toward a forced equilibrium — that's anti-simulation. Real systems are OPEN;
+   contamination/immigration is the natural recovery; **emergent crashes/extinctions are valid outcomes, not bugs
+   to tune away.** BUILD FEATURES (mechanics, UI, data, real biology like Bdellovibrio dormancy as a *feature*),
+   not stability fudges. Correcting a genuine MODEL ERROR (e.g. an obligate decomposer that can't pay its upkeep)
+   is OK; forcing coexistence is not. If a slice's success criterion is "make species X persist/coexist," STOP —
+   that's the trap; reframe to "add the real mechanic + accept the emergent dynamics."
 
 ---
 
@@ -174,3 +181,47 @@ from the first unchecked item:
   the load-bearing EcoliEditModifier wire (S6 re-pin).
 - ADR-017 S8 relations vector-DB sidecar (sqlite-vec, view-only) over the now-live FlowMatrix.
 - A 3rd species (predator / Bdellovibrio) for a fuller trophic web (FlowMatrix gains real off-diagonals).
+
+---
+
+## 7. MIDNIGHT SESSION — fires 2026-06-23 00:02 CEST (the "big autonomous session per the roadmap")
+
+State at hand-off: `main` @ `70067af`, pinned literal **`0x47a0_3c8f_6701_f240`**. LANDED: the full CHEMOSTAT-J
+ecology (F3/F4/F3.4/F5, 3 species + 4 trophic flows + chem), OVERSIGHT earned-edit loop, relations sidecar,
+perf, the Bdellovibrio predator, and the **ADR-019 contamination CORE** (immigration mechanic + Mycoplasma/
+Bacillus). Design drafts on main: contamination (ADR-019), rendering/platform, SP-4 codex.
+
+**Branch + merge:** branch `auto/midnight-2026-06-23` from main. Use the **push → CI multi-ISA → merge** pattern
+(NOT the old never-push): commit each green slice; per logical batch, push the branch, `gh workflow run ci.yml
+--ref auto/midnight-2026-06-23`, wait for `assert-isa-match` green, then `git merge --no-ff … -F <msgfile>`
+(message via a FILE — backticks in `-m "…"` trigger a bash command-substitution bug) + push main. Hash-neutral
+slices can batch; each re-pin must pass multi-ISA CI before main.
+
+**Guardrails:** all of §0 — ESPECIALLY **#6 NO HARDCODED BALANCE** (build features, accept emergent
+crashes/extinctions; the contamination open system IS the frame). Re-pins executed (§0.1) + multi-ISA-validated.
+
+**Queue** (SANDBOX & PRESENTATION phase; author each workflow on the spot from its proposal/draft, then run →
+gate → commit; respect dependencies; on resume, restart from the first unchecked item):
+
+- [ ] 1. **SP-3 intervention panel** (hash-neutral) — 5 tools (CRISPR + PCR faithful-clones + Antibiotic-cull +
+  Nutrient-feed + Toxin-spike) + timeline markers. **Workflow ALREADY AUTHORED:** `sp3-intervention-panel-impl`.
+  The gateway (contamination's seed brush reuses it).
+- [ ] 2. **Contamination S3 renderer** (hash-neutral) — godot panel: ContainmentLevel slider + consortium menu +
+  a seed/inoculate brush issuing `RegionInoculate` + immigration event markers (reads the LiveSim inoculate/
+  set_containment/fire_due exports already in core; reuses SP-3 brush/markers). Draft §6 S3.
+- [ ] 3. **Remaining contaminant bakes** (hash-neutral data) — Pseudomonas PAO1, Staph epidermidis, Cutibacterium,
+  Aspergillus niger, Penicillium (real NCBI, the `bake_mycoplasma/bacillus_species.py` convention) → completes the
+  default consortium. Draft §5.
+- [ ] 4. **SP-2 sandbox composer** (hash-neutral) — compose a run (roster/env/starting-pop/edits) → run + observe;
+  the `SpeciesSpec` JSON is the vehicle. Design + impl.
+- [ ] 5. **SP-4 codex UI** (hash-neutral) — inspect/tooltip/codex panel surfacing `sp4-codex-content-draft.md`.
+- [ ] 6. **Contamination S4 — spore/dormancy reservoir** (🔁 RE-PIN) — vegetative-cull-leaves-a-regerminating-
+  reservoir (real Bacillus-spore biology, NOT a balance fudge). Draft §5.4.
+- [ ] 7. **Contamination S5 — Mode B obligate symbionts** (🔁 RE-PIN) — `ObligateSymbiont` role + host-coupling
+  FlowMatrix edge + host-required inoculation + environment-layer cull-immunity; bake Carsonella + Syn3.0. Draft §5.5.
+- [ ] 8. **(if time) Predator dormancy + decomposer recalibration — OPEN-system** (🔁 RE-PIN, real mechanics NOT
+  balance per §0.6): genuine Bdellovibrio host-independent dormancy as a *feature*; recalibrate decomposer upkeep
+  only if a genuine model error — accept the emergent dynamics (re-immigration is the recovery, not a refuge fudge).
+
+After the queue: plan the next session (the UE5/web renderer from `rendering-platform-architecture-draft.md`,
+remaining open-system work). Append all results to §4.
