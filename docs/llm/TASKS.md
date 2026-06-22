@@ -7,6 +7,36 @@
 
 ---
 
+## ▶️ CONTINUATION ROADMAP (post-merge 2026-06-22 — `main` @ `81ef89e`)
+
+The CHEMOSTAT-J ecology is REAL and MERGED: F3/F4/F3.4 re-pins (hash `0xf795 → 0x272a → 0x42fe → 0x4e4d`),
+all proven byte-identical on x86_64 + aarch64 by the CI multi-ISA matrix (`assert-isa-match` green). The sim is
+now a deterministic multi-species joule economy — plant + E. coli(decomposer) reach a stable coexistence. Next,
+in priority order (🔁 = deliberate re-pin, EXECUTED not staged — see the F3/F4/F3.4 precedent):
+
+1. **F1b / F7 — visualise the joule economy** (hash-neutral renderer, inv #2). Snapshot GSS2→GSS3 + in-game
+   overlays for the live pools (light/free_nutrient/detritus) + per-org energy/biomass; richer FlowMatrix labels
+   on the already-live Relations heatmap. Makes the new ecology legible. **← first actionable slice.**
+2. **Re-author the intro campaign for F3 energetics** — `shipped_intro_campaign_is_solvable` is `#[ignore]`d (its
+   solution journals assumed the deleted Genotype Wright-Fisher selection). Redefine the win condition around the
+   energy/population dynamics; un-ignore.
+3. **ADR-017 S6 — wire the OVERSIGHT loop for real** 🔁 — design (S4/S5) + inert Actions are landed. Implement the
+   harness CreditLedger (earn), `crates/oracle-fba` (quantize-before-return, mirrors oracle-slim, inv #1), the
+   due_epoch firewall, and the load-bearing `EcoliEditModifier`. **GATED by the data-licensing ruling** (BiGG
+   `e_coli_core`/`iML1515` UCSD non-commercial vs inv #1 — needs a human call: frozen-table-only boundary crate? 🛑).
+4. **ADR-013 F5 — chemical/signal diffusion field** 🔁 (toxin/kin/alarm; double-buffered, Σ-conserved; GSS3 bump) →
+   allelopathy / chemotaxis / kin-selection emerge on top of the trophic web.
+5. **ADR-017 S8 — relations vector-DB sidecar** (sqlite-vec at the process boundary, inv #1; view-only ANN overlay
+   on the now-live MEASURED FlowMatrix). The "vector-DB relations" leg of the vision.
+6. **3rd species — predator (Bdellovibrio)** 🔁 — a true heterotroph predator gives the FlowMatrix real
+   off-diagonals (predation), completing plant→microbe→predator. Pin the InteractionKernel contention semantics first.
+7. **Balance & playtest** — tune the coexistence for gameplay (now plant ~6600 / decomposer ~1450); add a slow
+   abiotic nutrient-weathering influx if a sustained single-species default is wanted (ADR-013 F3.4 "Open").
+
+Full provenance of the merged night in `docs/llm/autonomous-roadmap.md` §4.
+
+---
+
 ## 🗺️ SESSION ROADMAP — multi-agent (workflow-orchestrated)
 
 The current session's arc + how each phase is driven by Workflow orchestration (design → implement → review).
@@ -55,15 +85,23 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   - [x] **F1 (core)** — `crates/sim-core/src/resource.rs` `ResourceField` (light/free_nutrient/detritus) seeded
     OFF-stream (disjoint `RESOURCE_STREAM_BASE`), inserted at reset but UNWIRED. Hash-neutral, gate-green.
     *(F1b: snapshot channels GSS2→GSS3 + renderer overlay to VISUALISE the pools — follow-up.)*
-  - [ ] **F2** genome→Strategy allocation budget (re-pin).
-  - [ ] **F3** 🛑 real metabolism + emergent births/deaths — breaks ADR-005 (re-pin; **needs the x86_64+aarch64 CI
-    matrix gate FIRST**) · **F4** multi-species (R3 spine) + trophic web + emergent `FlowMatrix` (Rel re-ground).
-    - 🎯 **DIRECTION (user 2026-06-21):** soil/resource params (esp. **nutrient**) become a FUNCTION of nearby
-      organisms (not static) — depletion/production via metabolism (F3). The **first multi-species ecosystem** is
-      **soil MICROORGANISMS** (a decomposer species) coupled to plants through the dynamic nutrient/detritus
-      layer: plants draw nutrient + shed detritus, microbes turn detritus → free nutrient. (Folds F3 + F4 + the
-      multi-species/relations prep into one concrete target; see the `multispecies-relations-prep` workflow.)
-  - [ ] **F5** chemical/signal diffusion field · **F6** emergent measurements + relations VIEW · **F7** Godot UI (last).
+  - [x] **F2** genome→`Strategy{budget[5],TrophicRole,affinity}` — expressed per-species, cached UNWIRED in
+    `SpeciesEntry` (first caller of `fixed.rs` apportion). **HASH-NEUTRAL** (unread by selection), not the feared
+    re-pin. Gate-green (`42dea23`).
+  - [x] **F3** 🛑 real metabolism + energy-funded births/deaths replacing constant-N Wright-Fisher (population
+    EMERGENT; PoolStock `i64` uptake→convert→excrete RNG-free; Biomass+Age; carcass→detritus; ledger closes every
+    tick; OrgId→u64; MaxPopulation guard). **RE-PIN `0xf795…acd5 → 0x272a_9b4a_7023_0cf5`.** Multi-ISA CI gate built
+    FIRST. Gate-green (`3f9ad39`).
+  - [x] **F4** the obligate plant→detritus→**E.coli(decomposer)**→free_nutrient loop (free_nutrient influx deleted →
+    endogenous; E. coli re-roled Decomposer via `niche.trophic_role`; Liebig soft co-limitation) + emergent MEASURED
+    `FlowMatrix` (S×S, row-sum==0) folded into hash + read-only `LiveSim::flow_matrix()`. **RE-PIN
+    `→ 0x42fe_54f2_f6d8_360d`.** Gate-green (`796d7e6`). The DIRECTION (soil microbes close the nutrient cycle) — DELIVERED.
+  - [x] **F3.4** chemostat tuning → a healthy plant+decomposer COEXISTENCE equilibrium (decomposer raises plant
+    carrying capacity ~3.5×; a decomposer-less monoculture correctly runs down = emergent ecology). **RE-PIN
+    `→ 0x4e4d_0520_722a_a069`.** ADR-013 F3.4 in DECISIONS.md. Gate-green (`acb2bb9`). **All 3 re-pins MULTI-ISA
+    VALIDATED (x86_64==aarch64, `assert-isa-match` green) + MERGED to main `81ef89e`.**
+  - [~] **F6 relations VIEW** — the Relations `FlowMatrix` heatmap (3rd view mode) + per-species panels are LIVE
+    (`64a7c9c`, `f799dcc`). **F5** chemical/signal diffusion field · **F1b/F7** Godot pools/energy overlay — pending (continuation #1/#4).
   - Target: ≥2× more environment/resource "variables" than today (beyond sun + temperature) before the post-impl
     revision (stronger autonomous e2e testing + deeper algo/rand-param simulation in CI + roadmap).
 
