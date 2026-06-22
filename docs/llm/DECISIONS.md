@@ -319,6 +319,10 @@ R1.0 ships the **substrate only, provably hash-neutral, no coupling**:
 - `CHEM_STREAM_BASE` `0x0043_4845_4D00_0000` ("CHEM") — RESERVED for future abiotic/seeded chem-field variation
   (ADR-013 F5). **NOT yet derived** — F5 chem is ENDOGENOUS (organism-emitted, seeded all-zero), so it draws
   ZERO `derive_seed`/`SimRng`; the base is reserved here to keep the disjoint-stream discipline future-proof.
+- `IMMG_STREAM_BASE` `0x0049_4D4D_4700_0000` ("IMMG") — contamination/immigration SCHEDULE (ADR-019 S2): the
+  `ContainmentLevel` knob expands into a sorted `Vec` of journaled `RegionInoculate` events off this family
+  (5 `derive_seed` words per event: species index, due_epoch, cx, cy, count). ZERO `SimRng` draws — the schedule
+  never reorders the spawn stream. Empty (no words drawn) when the knob is Sealed (the default) → hash-neutral.
 - Future spatial/substrate phases must reserve new disjoint ranges here before use.
 
 ---
@@ -731,6 +735,49 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
   badge distinct from the MEASURED FlowMatrix) grounded in real F4 flows; bit-reproducible, hash-neutral; the
   core dependency graph stays clean (only godot-sim depends on `relations-index`).
 - **−** The sqlite-vec scale path is deferred (scaffolded only); the in-Rust `InRustIndex` is the sole CI/gate path.
+
+---
+
+## ADR-019 — Contamination & immigration: deterministic journaled inoculation + the containment knob (S1+S2)
+
+- **Date:** 2026-06-22
+- **Status:** Accepted (S1+S2 CORE; HASH-NEUTRAL). Builds on ADR-013 (joule ledger) + the SP-3 region-Action
+  precedent. S0 data bakes (the contaminant `SpeciesSpec` JSONs), S3 renderer panel, and the S4/S5 re-pin phases
+  (spore-dormancy, Mode-B obligate symbionts) are separate, later slices.
+- **Context:** the world had no *arrivals* mechanism. Contamination is the verified default state of reality
+  (the clean-room frame): lower the guard and the consortium that flies in wins by default unless the residents
+  already hold the niche. ADR-013's conserved joule economy already produces establish/displace/die from the
+  pool contention — this epic supplies only the arrivals; nothing is scripted.
+- **Decision (S1):** one journaled, RNG-FREE, conserved region Action — `Action::RegionInoculate { species_key,
+  region, count, endow_j }` (externally-tagged serde-additive; existing `actions.ndjson` unchanged). A
+  deterministic core spawn (`Simulation::region_inoculate`) lays `count` orgs into the region disc in canonical
+  `(cell_index, slot)` order (round-robin across in-region cells), OrgIds from the monotonic `NextOrgId`, ZERO
+  `SimRng` draws (heritable traits seed at a constant `0.5`, not a draw). Each org's starting J = `endow_j`
+  MINTED from a NEW named `immigration` ledger tap (a SECOND source distinct from `influx`); `ledger_closes`
+  extends to `Σlive == initial + influx + immigration − respired − overflow − chem_decay`. A contaminant species
+  not yet in the roster is registered lazily (`Simulation::register_species`), growing every species-indexed
+  resource (`EditModifierRes`, `FlowMatrix`, `PoolProvenance`, `KinProvenance`).
+- **Decision (S2):** a `ContainmentLevel` knob (ISO-14644-1 ladder: Sealed/Clean/Lab/Open; default **Sealed/OFF**)
+  that deterministically EXPANDS at run start — off a NEW off-stream `IMMG_STREAM_BASE` (ASCII "IMMG") `derive_seed`
+  family, ZERO `SimRng` draws (the soil/resource off-stream precedent) — into a sorted `Vec` of journaled
+  `(due_epoch, RegionInoculate)` events drawn from a configurable `ConsortiumConfig` (the menu set of species
+  keys). The schedule is a pure function of `(master_seed, level, config)`; events fire at their epochs
+  (Tick-clocked, never wall-clock), drained by the driver as journaled `RegionInoculate`s so a contaminated run
+  replays from `actions.ndjson` alone.
+- **Determinism / hash:** HASH-NEUTRAL — the new Action is inert until invoked, the `immigration` tap is zero at
+  rest and is NOT folded into `hash_world` (it reaches the hash only through its coupling effect on the already-
+  hashed Energy/Biomass, like soil/climate/EditModifier), the knob defaults Sealed → an empty schedule, and a
+  registered-but-uninoculated contaminant only seeds the resolver. The pinned literal `0x47a0_3c8f_6701_f240` is
+  **UNCHANGED** (`determinism_hash_is_pinned` green, byte-identical; the harness `inoculation_system_is_hash_neutral_when_inert`
+  cross-checks the env path). A run that *does* inoculate grows the `FlowMatrix` dimension (a hashed input) — but
+  that is reachable only off the pinned config, so it is hash-neutral there.
+- **Invariants:** #2 — all biology stays in the core (the spawn/registration/ledger live in `sim-core`; GDScript
+  only issues the Action via `LiveSim::inoculate`/`set_containment`); #3 — RNG-free placement / single off-stream
+  family, ordered `(cell, SpeciesId, OrgId)` collections, no `HashMap` in sim logic; #6 — immigration is a
+  species/region operator event, never per-organism (the `RegionInoculate` carries no organism handle). #1/#7
+  untouched. **Establish/displace/die-out is NOT coded — it EMERGES** (the `adr019_well_adapted_establishes_…`
+  test: a well-adapted decomposer out-harvests the conserved detritus and establishes; a near-inert one cannot
+  cover maintenance and dies out — decided by the ledger, not a script).
 
 ---
 

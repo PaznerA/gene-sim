@@ -4,6 +4,25 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### ADR-019 — contamination & immigration CORE (feat, S1+S2, HASH-NEUTRAL)
+The SP-3-deferred seed/inoculate tool, promoted into the clean-room epic: deterministic, journaled arrivals.
+- **S1** `Action::RegionInoculate { species_key, region, count, endow_j }` (serde-additive — existing
+  `actions.ndjson` unchanged) + `Simulation::region_inoculate` / `register_species`: spawn `count` orgs of a
+  baked `SpeciesSpec` into the region disc, RNG-FREE deterministic cell-fill in `(cell_index, slot)` order,
+  OrgIds from `NextOrgId`. Each org's starting J is MINTED from a NEW named `immigration` ledger tap;
+  `ledger_closes` extends to `Σlive == initial + influx + immigration − respired − overflow − chem_decay`.
+  Journaled into replay so a contaminated run replays bit-identically.
+- **S2** `ContainmentLevel` knob (ISO-14644 ladder; default **Sealed/OFF**) + `ConsortiumConfig` (the menu set)
+  expand at run start — off a NEW off-stream `IMMG_STREAM_BASE` ("IMMG") `derive_seed` family, ZERO `SimRng`
+  draws — into a sorted `Vec` of journaled `(due_epoch, RegionInoculate)` events, fired at their epochs
+  (Tick-clocked). `GeneSimEnv::set_containment` / `drain_due_inoculations`; `LiveSim::inoculate` /
+  `set_containment` / `register_contaminant_json` / `fire_due_inoculations` expose it for the later panel.
+- **Emergent, not scripted:** establish/displace/die-out emerges from the ADR-013 metabolism→trophic→
+  reproduce_or_die economy (the open-system test: a well-adapted decomposer establishes, a near-inert one dies,
+  decided by the ledger).
+- **HASH-NEUTRAL:** Action inert until invoked, `immigration` tap zero at rest (not folded into `hash_world`),
+  knob default Sealed → empty schedule. Pinned literal `0x47a0_3c8f_6701_f240` **UNCHANGED**.
+
 ## [0.1.0-beta] — 2026-06-20
 First public beta — a coherent playable build. Released via `release.yml`: installable **Linux `.deb`** +
 **Windows `.zip`** (`gene-sim.exe` + `godot_sim.dll`) attached to the GitHub Release, plus per-OS dev bundles

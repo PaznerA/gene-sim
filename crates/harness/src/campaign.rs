@@ -216,6 +216,12 @@ pub fn evaluate(scenario: &Scenario, actions: &[Action]) -> ScenarioResult {
             os @ (Action::RequestEcoliEdit { .. } | Action::CommitEcoliImpact { .. }) => {
                 env.step(os.clone());
             }
+            // ADR-019 S1: a journaled inoculation steps through from the journal (RNG-free placement). A campaign
+            // journal carrying a contamination event therefore replays it; the consortium resolver is seeded on
+            // the env by the boundary before replay (an unresolved key is a clean no-op).
+            inoc @ Action::RegionInoculate { .. } => {
+                env.step(inoc.clone());
+            }
         }
     }
 

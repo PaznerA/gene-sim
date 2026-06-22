@@ -558,6 +558,128 @@ impl LiveSim {
         }
     }
 
+    /// Register a CONTAMINANT species from its `SpeciesSpec` JSON TEXT (`res://` boundary, ADR-019 S1): the
+    /// renderer reads the bytes via `FileAccess(res://data/species/<key>.json)` and passes the string; the core
+    /// does zero file I/O (inv #2/#4). A subsequent [`inoculate`](Self::inoculate) (or a scheduled event) keyed
+    /// on the built `key` resolves this genome. Returns `true` on success (`false` + a `godot_error!` on
+    /// invalid/un-buildable JSON). Call before the inoculation that references it.
+    #[func]
+    fn register_contaminant_json(&mut self, json: GString) -> bool {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::register_contaminant_json called before reset()");
+            return false;
+        };
+        match harness::species::build_species_from_str(&json.to_string()) {
+            Ok(built) => {
+                env.register_contaminant(built);
+                true
+            }
+            Err(e) => {
+                godot_error!("LiveSim::register_contaminant_json: {e}");
+                false
+            }
+        }
+    }
+
+    /// Fire a CONTAMINATION / IMMIGRATION event (ADR-019 S1 — the SP-3-deferred seed/inoculate tool): spawn
+    /// `count` organisms of the contaminant `species_key` (must be registered via
+    /// [`register_contaminant_json`](Self::register_contaminant_json)) inside the disc `(cx, cy, radius)`, each
+    /// endowed with `endow_j` joules MINTED from the `immigration` ledger tap (conserved). RNG-free, journaled
+    /// for save/load (inv #3). Cell-scoped, no organism handle (inv #6); establish/displace/die emerges from
+    /// the core economy — GDScript only issues the Action (inv #2). Returns the cumulative immigration-tap J.
+    #[func]
+    fn inoculate(
+        &mut self,
+        species_key: GString,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+        count: i64,
+        endow_j: i64,
+    ) -> i64 {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::inoculate called before reset()");
+            return 0;
+        };
+        let action = Action::RegionInoculate {
+            species_key: species_key.to_string(),
+            region: RegionSpec {
+                cx: cx.max(0) as u32,
+                cy: cy.max(0) as u32,
+                radius: radius.max(0) as u32,
+            },
+            count: count.max(0) as u32,
+            endow_j: endow_j.max(0),
+        };
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load (disjoint field borrow from `env`)
+        self.env
+            .as_ref()
+            .map(|e| e.immigration_minted())
+            .unwrap_or(0)
+    }
+
+    /// Set the CONTAINMENT knob + consortium config the **next** `reset` builds its immigration schedule under
+    /// (ADR-019 S2). `level`: `0` Sealed (OFF, the default) · `1` Clean · `2` Lab · `3` Open. `species_keys` is
+    /// the consortium menu (kebab keys the renderer also registers as contaminants); `radius`/`endow_j`/
+    /// `horizon` are the pressure parameters. Hash-neutral while `level == 0` (empty schedule). Stores config
+    /// only — the schedule expands deterministically at `reset` off the off-stream IMMG family (inv #3).
+    #[func]
+    fn set_containment(
+        &mut self,
+        level: i64,
+        species_keys: PackedStringArray,
+        radius: i64,
+        endow_j: i64,
+        horizon: i64,
+    ) {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::set_containment called before reset() — call it, then reset()");
+            return;
+        };
+        let lvl = match level {
+            1 => sim_core::ContainmentLevel::Clean,
+            2 => sim_core::ContainmentLevel::Lab,
+            3 => sim_core::ContainmentLevel::Open,
+            _ => sim_core::ContainmentLevel::Sealed,
+        };
+        let keys: Vec<String> = species_keys
+            .to_vec()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        env.set_containment(
+            lvl,
+            sim_core::ConsortiumConfig {
+                species_keys: keys,
+                radius: radius.max(0) as u32,
+                endow_j: endow_j.max(0),
+                horizon: horizon.max(0) as u32,
+            },
+        );
+    }
+
+    /// Drain every scheduled immigration event whose epoch has passed at the CURRENT generation (ADR-019 S2),
+    /// firing each as a journaled `RegionInoculate` (the schedule is a SOURCE of journaled actions, so a
+    /// scheduled arrival is byte-identical to a hand-fired one and save/load reproduces it). The GDScript live
+    /// loop calls this once per advance tick. Returns how many events fired this call.
+    #[func]
+    fn fire_due_inoculations(&mut self) -> i64 {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::fire_due_inoculations called before reset()");
+            return 0;
+        };
+        let current_gen = env.generation();
+        let due = env.drain_due_inoculations(current_gen + 1);
+        let n = due.len() as i64;
+        for action in due {
+            let env = self.env.as_mut().expect("env present");
+            env.step(action.clone());
+            self.journal.push(action); // record for save/load
+        }
+        n
+    }
+
     /// The Cas-variant table as `[{id, name}, ...]` so the intervention UI can offer real choices (ids +
     /// names only — no biology in GDScript; the table is data, SPEC §4). From `crispr::default_cas_variants`.
     #[func]

@@ -46,7 +46,7 @@ mod tests {
         // are the SAME parse/validate path: building from the shipped JSON TEXT must yield a BuiltSpecies
         // identical (key, entity_count, genome, …) to loading the file. This locks the two byte SOURCES in
         // sync so the gate catches any drift between the renderer's res:// path and the harness CLI path.
-        for stem in ["default", "ecoli", "bdellovibrio"] {
+        for stem in ["default", "ecoli", "bdellovibrio", "mycoplasma", "bacillus"] {
             let path = format!(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/{}.json"),
                 stem
@@ -144,6 +144,79 @@ mod tests {
             pheno.get(Trait::PredationCapacity),
             Some(1.0),
             "PredationCapacity expresses off the lytic attack-machinery anchor (the hit/attack lever)"
+        );
+    }
+
+    #[test]
+    fn shipped_mycoplasma_species_loads() {
+        // ADR-019 S0 (Mode A contaminant): the baked real Mycoplasma genitalium G37 genome
+        // (scripts/bake_mycoplasma_species.py: curated glycolysis + MgPa cytadherence roster × real NCBI
+        // GCF_000027325.1 CDS) must load + build. Data-not-code: the gate catches a broken or incomplete re-bake.
+        // The niche declares the HETEROTROPH role (the host/serum-dependent filter-passing parasite); it resolves
+        // through gp::role_from_override → Heterotroph. The contaminant is inert DATA on disk (hash-neutral): no
+        // sim-core TraitMap binds it in S0, so every locus ships with empty go_refs (like the non-anchor
+        // bdellovibrio loci) — only role + a non-empty CDS roster are asserted here.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/mycoplasma.json"
+        );
+        let built = load_species_file(path).expect("data/species/mycoplasma.json should load");
+        assert_eq!(built.key, "mycoplasma");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("heterotroph"),
+            "the niche declares the heterotroph role (data-driven gp::role_from_override → Heterotroph)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Heterotroph,
+            "the declared override must resolve to Heterotroph at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated contaminant roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Mycoplasma locus carries a real CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_bacillus_species_loads() {
+        // ADR-019 S0 (Mode A contaminant): the baked real Bacillus subtilis 168 genome
+        // (scripts/bake_bacillus_species.py: curated TCA + sporulation/germination roster × real NCBI
+        // GCF_000009045.1 CDS) must load + build. Data-not-code: the gate catches a broken or incomplete re-bake.
+        // The niche declares the DECOMPOSER role (the endospore-forming generalist saprophyte); it resolves
+        // through gp::role_from_override → Decomposer. The contaminant is inert DATA on disk (hash-neutral): no
+        // sim-core TraitMap binds it in S0, so every locus ships with empty go_refs.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/bacillus.json"
+        );
+        let built = load_species_file(path).expect("data/species/bacillus.json should load");
+        assert_eq!(built.key, "bacillus");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("decomposer"),
+            "the niche declares the decomposer role (data-driven gp::role_from_override → Decomposer)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Decomposer,
+            "the declared override must resolve to Decomposer at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated contaminant roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Bacillus locus carries a real CDS"
         );
     }
 

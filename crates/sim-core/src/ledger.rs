@@ -1,12 +1,14 @@
 //! The conserved-energy LEDGER of the joule economy (ADR-013 CHEMOSTAT-J, phase **F0a** — scaffolding).
 //!
-//! Every joule (`J`, an `i64` quantum) in the substrate is conserved EXACTLY modulo **four named taps**:
-//! INFLUX (solar minted per tick), RESPIRED (maintenance + trophic-efficiency loss), OVERFLOW (the explicit
-//! sink for any cap-saturation event, so saturating arithmetic can never *silently* destroy a quantum), and
-//! CHEM_DECAY (ADR-013 F5 — the chemical/signal field's dissipation, the only chem sink; kept independently
-//! named so chem dissipation stays attributable and `respired`'s meaning stays clean). The invariant
-//! **`ledger_closes`** — `Σ(all live J) == initial_total + influx − respired − overflow − chem_decay` — is a
-//! SEMANTIC gate stronger than the bit-hash; the metabolism/pool/chem phases (F0b/F1/F3/F5) assert it every tick.
+//! Every joule (`J`, an `i64` quantum) in the substrate is conserved EXACTLY modulo **five named taps**:
+//! INFLUX (solar minted per tick), IMMIGRATION (ADR-019 — J minted with an inoculated/contaminant organism's
+//! starting reserve; a SECOND source distinct from solar so an arrival is independently attributable and never
+//! conjured), RESPIRED (maintenance + trophic-efficiency loss), OVERFLOW (the explicit sink for any
+//! cap-saturation event, so saturating arithmetic can never *silently* destroy a quantum), and CHEM_DECAY
+//! (ADR-013 F5 — the chemical/signal field's dissipation, the only chem sink; kept independently named so chem
+//! dissipation stays attributable and `respired`'s meaning stays clean). The invariant **`ledger_closes`** —
+//! `Σ(all live J) == initial_total + influx + immigration − respired − overflow − chem_decay` — is a SEMANTIC
+//! gate stronger than the bit-hash; the metabolism/pool/chem phases (F0b/F1/F3/F5) assert it every tick.
 //!
 //! At **F0a** the ledger is present and inserted as a resource, but no system moves `J` yet (energy is still
 //! `f64`, no pools exist), so it closes trivially against an initial total of 0. Adding it is **hash-neutral**
@@ -22,6 +24,11 @@ pub struct Ledger {
     pub initial_total: i64,
     /// Cumulative `J` minted into the world (solar influx).
     pub influx: i64,
+    /// Cumulative `J` minted into the world as an IMMIGRATION endowment (ADR-019): an inoculated/contaminant
+    /// organism's starting reserve, MINTED here at spawn (not transferred from a parent like a birth). A SECOND
+    /// source distinct from `influx` so an arrival is independently attributable. Zero on a run that issues no
+    /// `RegionInoculate` (the pinned plant config) → byte-identical to the pre-ADR-019 ledger.
+    pub immigration: i64,
     /// Cumulative `J` dissipated as maintenance + trophic inefficiency.
     pub respired: i64,
     /// Cumulative `J` routed to the overflow sink on cap-saturation — never silently lost.
@@ -33,10 +40,14 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// The `J` the books say should currently be live: `initial + influx − respired − overflow − chem_decay`.
+    /// The `J` the books say should currently be live: `initial + influx + immigration − respired − overflow −
+    /// chem_decay`.
     #[must_use]
     pub fn expected_total(&self) -> i64 {
-        self.initial_total + self.influx - self.respired - self.overflow - self.chem_decay
+        self.initial_total + self.influx + self.immigration
+            - self.respired
+            - self.overflow
+            - self.chem_decay
     }
 
     /// The `ledger_closes` conservation invariant: does the actually-measured live `J` equal what the taps
@@ -104,13 +115,14 @@ pub fn assert_ledger_closes(ledger: &Ledger, live: &LiveTotal) {
     assert!(
         measured == expected,
         "ledger_closes VIOLATED: measured live J = {measured} (pools={} + energy={} + biomass={} + chem={}) \
-         != expected {expected} (initial={} + influx={} − respired={} − overflow={} − chem_decay={}); leak of {} J",
+         != expected {expected} (initial={} + influx={} + immigration={} − respired={} − overflow={} − chem_decay={}); leak of {} J",
         live.pools,
         live.energy,
         live.biomass,
         live.chem,
         ledger.initial_total,
         ledger.influx,
+        ledger.immigration,
         ledger.respired,
         ledger.overflow,
         ledger.chem_decay,
@@ -136,6 +148,7 @@ mod tests {
         let l = Ledger {
             initial_total: 1000,
             influx: 300,
+            immigration: 0,
             respired: 120,
             overflow: 30,
             chem_decay: 10,
@@ -146,6 +159,32 @@ mod tests {
             !l.closes(1139),
             "a single lost quantum must break the books"
         );
+    }
+
+    #[test]
+    fn immigration_tap_conserves() {
+        // ADR-019: 1000 seeded, +300 solar influx, +500 immigration endowment, −120 respired → 1680 live. The
+        // immigration tap is a SECOND source distinct from influx so an arrival is independently attributable.
+        let l = Ledger {
+            initial_total: 1000,
+            influx: 300,
+            immigration: 500,
+            respired: 120,
+            overflow: 0,
+            chem_decay: 0,
+        };
+        assert_eq!(l.expected_total(), 1680);
+        assert!(l.closes(1680));
+        assert!(
+            !l.closes(1681),
+            "a conjured immigrant quantum must break the books"
+        );
+        // A run that never inoculates (immigration == 0) is byte-identical to the pre-ADR-019 ledger math.
+        let no_immig = Ledger {
+            immigration: 0,
+            ..l
+        };
+        assert_eq!(no_immig.expected_total(), 1180);
     }
 
     #[test]
@@ -168,6 +207,7 @@ mod tests {
         let l = Ledger {
             initial_total: 1000,
             influx: 300,
+            immigration: 0,
             respired: 120,
             overflow: 30,
             chem_decay: 0,

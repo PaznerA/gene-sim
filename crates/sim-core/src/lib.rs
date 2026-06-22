@@ -24,6 +24,7 @@ pub mod climate;
 pub mod det;
 pub mod fixed;
 pub mod gp;
+pub mod immigration;
 pub mod ledger;
 pub mod resource;
 pub mod signature;
@@ -34,6 +35,9 @@ pub mod trophic;
 pub use climate::EnvParams;
 pub use det::derive_seed;
 pub use gp::{GenotypePhenotypeMap, Phenotype, Trait, WeightedSumMap};
+pub use immigration::{
+    ConsortiumConfig, ContainmentLevel, InoculationEvent, InoculationRegion, ScheduledInoculation,
+};
 pub use snapshot::{GridSnapshot, CHANNEL_COUNT, SNAPSHOT_MAGIC};
 
 // Re-export the exact `ChaCha8Rng` the core threads, so dependents (e.g. the harness env) draw the
@@ -200,6 +204,14 @@ impl EditModifierRes {
             .get(sid as usize)
             .copied()
             .unwrap_or(EDIT_FACTOR_NEUTRAL_Q)
+    }
+
+    /// Grow to `new_len ≥ len` species (ADR-019: a `RegionInoculate` may register a new species mid-run); new
+    /// slots start NEUTRAL (`1000`). A no-op if `new_len <= len`. Only ever called on an inoculated run.
+    fn grow_to(&mut self, new_len: usize) {
+        if new_len > self.factor_q.len() {
+            self.factor_q.resize(new_len, EDIT_FACTOR_NEUTRAL_Q);
+        }
     }
 }
 
@@ -2202,6 +2214,157 @@ impl Simulation {
     #[must_use]
     pub fn species_edit_factor_q(&self, sid: SpeciesId) -> u16 {
         self.world.resource::<EditModifierRes>().factor_q(sid.0)
+    }
+
+    /// The [`SpeciesId`] of the registry entry whose `key` matches `key`, if any (ordered scan, never a
+    /// `HashMap` — inv #3). Used by [`region_inoculate`](Self::region_inoculate) to spawn into an
+    /// already-registered species slot, and by the renderer/tests to find a contaminant after inoculation.
+    #[must_use]
+    pub fn species_id_for_key(&self, key: &str) -> Option<SpeciesId> {
+        self.world
+            .resource::<SpeciesRegistry>()
+            .entries
+            .iter()
+            .position(|e| e.key == key)
+            .map(|i| SpeciesId(i as u16))
+    }
+
+    /// Register a NEW species into the running registry from a built genome + map + role (ADR-019), returning
+    /// its fresh [`SpeciesId`]; if a species with `key` is already registered, returns its existing id (no
+    /// duplicate). Resizes every species-indexed resource (the `EditModifierRes`, the `FlowMatrix`, the
+    /// `PoolProvenance` + `KinProvenance`) so the new ordinal has a valid slot in each. Draws ZERO `SimRng`
+    /// (the cached `Strategy` is a pure expression, like every roster entry). NOT called by the pinned config →
+    /// the registry length / hashed FlowMatrix dimension are unchanged there (hash-neutral). The cached
+    /// `Strategy` is unread until the inoculated orgs metabolize.
+    pub fn register_species(
+        &mut self,
+        name: String,
+        key: String,
+        genome: Genome,
+        gp_map: gp::OntologyMap,
+        role: gp::TrophicRole,
+    ) -> SpeciesId {
+        if let Some(sid) = self.species_id_for_key(&key) {
+            return sid; // already registered — never duplicate a species
+        }
+        let base_growth = gp_map
+            .express(&genome)
+            .get(Trait::GrowthRate)
+            .unwrap_or(0.5);
+        // Express the ecological Strategy ONCE (the reset_with_roster precedent) — pure, ZERO SimRng.
+        let strategy = gp::express_strategy(&gp_map, &genome, role);
+        let entry = SpeciesEntry {
+            name,
+            key,
+            genome,
+            gp_map,
+            base_growth,
+            target_pop: 0, // a contaminant has no reset spawn; it arrives only via region_inoculate
+            strategy,
+        };
+        let new_len = {
+            let mut reg = self.world.resource_mut::<SpeciesRegistry>();
+            reg.entries.push(entry);
+            reg.entries.len()
+        };
+        // Resize every species-indexed resource so the new ordinal addresses a valid slot in each.
+        let cells = {
+            let pools = self.world.resource::<PoolStock>();
+            (pools.width as usize) * (pools.height as usize)
+        };
+        self.world
+            .resource_mut::<EditModifierRes>()
+            .grow_to(new_len);
+        self.world
+            .resource_mut::<trophic::FlowMatrix>()
+            .grow_to(new_len);
+        self.world
+            .resource_mut::<trophic::PoolProvenance>()
+            .grow_to(cells, new_len);
+        self.world
+            .resource_mut::<chem::KinProvenance>()
+            .grow_to(cells, new_len);
+        SpeciesId((new_len - 1) as u16)
+    }
+
+    /// **REGION INOCULATE** (ADR-019 S1) — the SP-3-deferred seed/inoculate tool: spawn `count` organisms of an
+    /// already-registered species `sid` inside the `region` disc, each endowed with `endow_j` joules MINTED from
+    /// the named `immigration` ledger tap (conserved — a contaminant's arrival is accounted, never conjured).
+    ///
+    /// **Determinism (inv #3):** RNG-FREE. Placement is a deterministic cell-fill — the in-region cells are
+    /// enumerated in `cell_index` (`y*width + x`) order, and the `count` organisms are laid into them in
+    /// `(cell_index, slot)` order (round-robin across cells so a small propagule still spreads), with OrgIds
+    /// minted in order from the monotonic [`NextOrgId`]. ZERO `next_u64` draws → the spawn stream is unchanged.
+    /// Returns the number of organisms actually spawned (`0` if the disc covers no grid cell).
+    ///
+    /// **Granularity (inv #6):** `region` targets CELLS (no organism handle); the species/region pair is an
+    /// operator-level event, never per-organism agency. **Emergence:** establish/displace/die-out is NOT coded
+    /// — the spawned orgs metabolize, compete for the conserved pools, and reproduce or starve under the
+    /// existing ADR-013 economy.
+    ///
+    /// The child carries the SAME spawn-component shape as a birth (Energy/Biomass/Age/Genotype/DroughtTol/
+    /// ThermalTol/Position/Species): `endow_j` splits into a seed `Biomass` ([`OFFSPRING_SEED_BIOMASS`], clamped
+    /// to `endow_j`) and the residual `Energy`, so it enters the economy as a viable fresh organism. The
+    /// heritable f64 traits seed at a neutral `0.5` (RNG-free — a deterministic constant, not a draw), so the
+    /// inoculation adds no `SimRng` word. A no-op for an out-of-range `sid` (defensive).
+    pub fn region_inoculate(
+        &mut self,
+        sid: SpeciesId,
+        region: Region,
+        count: u32,
+        endow_j: i64,
+    ) -> u32 {
+        if count == 0 || endow_j <= 0 {
+            return 0;
+        }
+        let species_count = self.world.resource::<SpeciesRegistry>().entries.len();
+        if sid.0 as usize >= species_count {
+            return 0; // not registered — defensive no-op
+        }
+        let (width, height) = {
+            let pools = self.world.resource::<PoolStock>();
+            (pools.width, pools.height)
+        };
+        // Enumerate the in-region cells in canonical cell_index (y*width + x) order — RNG-free placement.
+        let mut cells: Vec<(u32, u32)> = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if region.contains(x, y) {
+                    cells.push((x, y));
+                }
+            }
+        }
+        if cells.is_empty() {
+            return 0; // the disc covers no grid cell
+        }
+        // Split endow_j into a seed Biomass (carved out, clamped) + the residual Energy — CONSERVED (Σ == endow_j).
+        let seed_biomass = OFFSPRING_SEED_BIOMASS.min(endow_j);
+        let seed_energy = endow_j - seed_biomass;
+        // Mint count·endow_j into the world via the immigration tap (the conserved arrival accounting).
+        self.world.resource_mut::<ledger::Ledger>().immigration += endow_j * i64::from(count);
+        // Spawn count orgs round-robin across the in-region cells in (cell_index, slot) order; OrgIds monotonic.
+        for slot in 0..count {
+            let (x, y) = cells[(slot as usize) % cells.len()];
+            let org = {
+                let mut next = self.world.resource_mut::<NextOrgId>();
+                let id = next.0;
+                next.0 += 1;
+                id
+            };
+            self.world.spawn((
+                OrgId(org),
+                Energy(seed_energy),
+                Biomass(seed_biomass),
+                Age(0),
+                // Heritable traits seed at a neutral 0.5 — a deterministic CONSTANT, not a SimRng draw (inv #3).
+                Genotype(0.5),
+                DroughtTol(0.5),
+                ThermalTol(0.5),
+                Position { x, y },
+                Species(sid),
+            ));
+        }
+        count
     }
 
     /// The run's conserved-energy [`Ledger`](ledger::Ledger) (ADR-013 F0a; read-only copy). Empty until the
@@ -4760,6 +4923,178 @@ mod tests {
             "the obligate-loop ledger must close: live {} vs expected {}",
             live.sum(),
             sim.ledger().expected_total()
+        );
+    }
+
+    /// Measure the live `J` total of a sim (the four conserved buckets) — the `ledger_closes` left side.
+    fn measure_live(sim: &mut Simulation) -> ledger::LiveTotal {
+        let pools = sim.world.resource::<PoolStock>().total();
+        let chem = sim.world.resource::<chem::ChemField>().total();
+        let (mut e, mut b) = (0i64, 0i64);
+        for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
+            e += energy.0;
+            b += biomass.0;
+        }
+        ledger::LiveTotal {
+            pools,
+            energy: e,
+            biomass: b,
+            chem,
+        }
+    }
+
+    /// Register a synthetic contaminant DECOMPOSER species and return its `SpeciesId`. `activity` drives every
+    /// decomposer anchor (0.9 = well-adapted/vigorous, ~0.0 = poorly-adapted) so the open-system test decides
+    /// establish-vs-die by the LEDGER, not by a script.
+    fn register_contaminant_decomposer(
+        sim: &mut Simulation,
+        key: &str,
+        activity: f64,
+    ) -> SpeciesId {
+        sim.register_species(
+            key.to_string(),
+            key.to_string(),
+            anchor_genome(activity),
+            anchor_map(&[
+                Trait::GlucoseUptake,
+                Trait::AcetateOverflow,
+                Trait::GrowthRate,
+                Trait::FermentationCapacity,
+                Trait::RespirationMode,
+            ]),
+            gp::TrophicRole::Decomposer,
+        )
+    }
+
+    #[test]
+    fn adr019_region_inoculate_conserves_j_and_ledger_closes() {
+        // ADR-019 S1: a RegionInoculate MINTS its endowment from the `immigration` tap — Σlive J rises by
+        // EXACTLY count·endow_j, the immigration tap records EXACTLY that, and ledger_closes holds.
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let before_live = measure_live(&mut sim).sum();
+        let before_immig = sim.ledger().immigration;
+        let sid = register_contaminant_decomposer(&mut sim, "bacillus", 0.9);
+        let count = 12u32;
+        let endow_j = 1_000_000i64;
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 6,
+        };
+        let spawned = sim.region_inoculate(sid, region, count, endow_j);
+        assert_eq!(spawned, count, "every requested organism is placed");
+        let minted = endow_j * i64::from(count);
+        assert_eq!(
+            sim.ledger().immigration - before_immig,
+            minted,
+            "the immigration tap records exactly count·endow_j"
+        );
+        let after_live = measure_live(&mut sim).sum();
+        assert_eq!(
+            after_live - before_live,
+            minted,
+            "live J rises by exactly the minted endowment (conserved, never conjured)"
+        );
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold right after an inoculation: live {} vs expected {}",
+            live.sum(),
+            sim.ledger().expected_total()
+        );
+        // And it KEEPS closing as the inoculated orgs metabolize (the per-tick assert is the in-chain guard;
+        // this confirms the named tap composes with the existing taps over a real run).
+        sim.step(20);
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must keep holding after the inoculated orgs metabolize"
+        );
+    }
+
+    #[test]
+    fn adr019_region_inoculate_is_replay_reproducible_rng_free() {
+        // ADR-019 S1: the inoculation is RNG-FREE + deterministic — two identical (seed, inoculate, advance)
+        // sequences produce byte-identical hashes. (Placement is an off-stream cell-fill; no `next_u64`.)
+        let cfg = SimConfig {
+            seed: 77,
+            generations: 0,
+            entity_count: 300,
+        };
+        let region = Region {
+            cx: 10,
+            cy: 20,
+            radius: 5,
+        };
+        let run = || {
+            let mut sim = Simulation::reset(&cfg);
+            let sid = register_contaminant_decomposer(&mut sim, "pseudomonas", 0.8);
+            sim.region_inoculate(sid, region, 9, 800_000);
+            sim.step(15);
+            sim.run_stats().hash
+        };
+        assert_eq!(
+            run(),
+            run(),
+            "an inoculated run must replay bit-identically"
+        );
+    }
+
+    #[test]
+    fn adr019_well_adapted_establishes_poorly_adapted_dies_decided_by_the_ledger() {
+        // THE open-system headline (ADR-019): two identical inoculations into the SAME plant+decomposer world,
+        // differing ONLY in the contaminant's metabolic activity (its anchor gene). The WELL-ADAPTED immigrant
+        // out-harvests the conserved detritus pool → funds offspring → ESTABLISHES (population ends ABOVE its
+        // inoculum). The POORLY-ADAPTED one cannot cover maintenance → starves → DIES OUT (population integrates
+        // toward zero). NOTHING is scripted: the divergence is decided entirely by the ADR-013 joule economy.
+        let cfg = SimConfig {
+            seed: 54,
+            generations: 120,
+            entity_count: 600,
+        };
+        let inoculum = 40u32;
+        // Endow each immigrant BELOW the reproduction threshold (REPRO_THRESHOLD = 300k) so it CANNOT fund
+        // offspring from its arrival reserve alone — it must EARN its keep by harvesting the conserved pools.
+        // This is what makes establish-vs-die a LEDGER decision: a well-adapted decomposer out-harvests
+        // detritus and grows; a near-inert one (zero detritus affinity) cannot eat and starves to extinction.
+        let endow_j = 200_000i64;
+        let run = |activity: f64| -> usize {
+            // A live plant+decomposer obligate loop (a standing detritus→free_nutrient economy to invade).
+            let mut sim =
+                Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+            // Let the resident loop warm up so there is a real niche to contest.
+            sim.step(20);
+            let sid = register_contaminant_decomposer(&mut sim, "contaminant", activity);
+            let placed = sim.region_inoculate(
+                sid,
+                Region {
+                    cx: 16,
+                    cy: 16,
+                    radius: 10,
+                },
+                inoculum,
+                endow_j,
+            );
+            assert_eq!(placed, inoculum, "the full propagule lands");
+            sim.step(150);
+            species_pop(&mut sim, sid.ordinal())
+        };
+        let established = run(0.9); // well-adapted: a vigorous decomposer
+        let died_out = run(0.0); // poorly-adapted: a near-inert decomposer
+        assert!(
+            died_out < inoculum as usize,
+            "a poorly-adapted immigrant must DIE OUT (ended {died_out} < inoculum {inoculum}) — \
+             decided by the ledger, not scripted"
+        );
+        assert!(
+            established > died_out,
+            "a well-adapted immigrant must out-establish a poorly-adapted one (well {established} vs poor \
+             {died_out})"
         );
     }
 
