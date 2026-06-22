@@ -77,6 +77,13 @@ struct LiveSim {
     /// The `entity_count` before a species' niche overrode it, so clearing the species (`set_species("")`)
     /// restores the player's count instead of leaving the microbe's stale.
     entity_count_before_species: Option<u32>,
+    /// The CONTAINMENT knob + consortium config the **next** `reset` builds its immigration schedule under
+    /// (ADR-019 S2/S3). Stored on the BINDING (not just the env) so `reset` — which builds a FRESH `GeneSimEnv`
+    /// — re-applies it before the harness expands the schedule. `None` = Sealed/OFF (the default → empty
+    /// schedule → hash-neutral). This is pure config FORWARDING (no biology): the level + `ConsortiumConfig` are
+    /// handed verbatim to `harness::GeneSimEnv::set_containment`, which expands the journaled schedule in the
+    /// core off the off-stream IMMG family. Set via [`set_containment`](Self::set_containment).
+    containment: Option<(sim_core::ContainmentLevel, sim_core::ConsortiumConfig)>,
     base: Base<RefCounted>,
 }
 
@@ -91,6 +98,7 @@ impl IRefCounted for LiveSim {
             journal: Vec::new(),
             species: None,
             entity_count_before_species: None,
+            containment: None,
             base,
         }
     }
@@ -235,6 +243,13 @@ impl LiveSim {
         env.set_environment(self.env_params); // build the world under the player's climate (ADR-012)
         if let Some(built) = &self.species {
             env.set_species(built.clone()); // ADR-017: run the selected species (e.g. E. coli) instead of plant
+        }
+        // ADR-019 S2/S3: re-apply the stored containment knob + consortium config so THIS fresh env expands the
+        // SAME deterministic immigration schedule (the harness expands it inside `env.reset`, off the off-stream
+        // IMMG family — zero SimRng draws). Pure config forwarding, no biology (inv #2). Sealed/None (the default)
+        // → no call → empty schedule → hash-neutral (the pinned literal is untouched).
+        if let Some((level, config)) = &self.containment {
+            env.set_containment(*level, config.clone());
         }
         // `seed` is the master seed; reinterpret the i64 bits as u64 so the full 64-bit space is usable
         // from GDScript (which has no native u64) without changing the deterministic stream.
@@ -771,10 +786,12 @@ impl LiveSim {
     }
 
     /// Set the CONTAINMENT knob + consortium config the **next** `reset` builds its immigration schedule under
-    /// (ADR-019 S2). `level`: `0` Sealed (OFF, the default) · `1` Clean · `2` Lab · `3` Open. `species_keys` is
-    /// the consortium menu (kebab keys the renderer also registers as contaminants); `radius`/`endow_j`/
-    /// `horizon` are the pressure parameters. Hash-neutral while `level == 0` (empty schedule). Stores config
-    /// only — the schedule expands deterministically at `reset` off the off-stream IMMG family (inv #3).
+    /// (ADR-019 S2/S3). `level`: `0` Sealed (OFF, the default) · `1` Clean · `2` Lab · `3` Open. `species_keys`
+    /// is the consortium menu (kebab keys the renderer also registers as contaminants); `radius`/`endow_j`/
+    /// `horizon` are the pressure parameters. Hash-neutral while `level == 0` (empty schedule). Stores the config
+    /// on the BINDING (so the next `reset` — which builds a fresh env — re-applies it) AND forwards it to the
+    /// live env if one exists; the schedule expands deterministically at `reset` off the off-stream IMMG family
+    /// (inv #3). Call it, then `reset()` to derive the schedule. Pure config storage — no biology (inv #2).
     #[func]
     fn set_containment(
         &mut self,
@@ -784,10 +801,6 @@ impl LiveSim {
         endow_j: i64,
         horizon: i64,
     ) {
-        let Some(env) = self.env.as_mut() else {
-            godot_error!("LiveSim::set_containment called before reset() — call it, then reset()");
-            return;
-        };
         let lvl = match level {
             1 => sim_core::ContainmentLevel::Clean,
             2 => sim_core::ContainmentLevel::Lab,
@@ -799,15 +812,18 @@ impl LiveSim {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        env.set_containment(
-            lvl,
-            sim_core::ConsortiumConfig {
-                species_keys: keys,
-                radius: radius.max(0) as u32,
-                endow_j: endow_j.max(0),
-                horizon: horizon.max(0) as u32,
-            },
-        );
+        let config = sim_core::ConsortiumConfig {
+            species_keys: keys,
+            radius: radius.max(0) as u32,
+            endow_j: endow_j.max(0),
+            horizon: horizon.max(0) as u32,
+        };
+        // Forward to a live env (no-op effect until the next reset re-expands the schedule)...
+        if let Some(env) = self.env.as_mut() {
+            env.set_containment(lvl, config.clone());
+        }
+        // ...and persist on the binding so `reset`'s fresh GeneSimEnv re-applies it before the schedule expands.
+        self.containment = Some((lvl, config));
     }
 
     /// Drain every scheduled immigration event whose epoch has passed at the CURRENT generation (ADR-019 S2),

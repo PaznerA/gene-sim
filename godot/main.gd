@@ -189,6 +189,7 @@ const TOOL_PCR := 1
 const TOOL_ANTIBIOTIC := 2
 const TOOL_NUTRIENT := 3
 const TOOL_TOXIN := 4
+const TOOL_INOCULATE := 5  # ADR-019 S3: the seed/inoculate brush — drops a baked contaminant at the painted disc
 # Per-tool brush tint (the painted disc COLOUR signals which tool will land WHERE) — mirrors timeline.gd::TOOL_STYLE.
 const TOOL_TINTS := [
 	Color(0.42, 0.9, 0.46, 0.30),   # CRISPR green
@@ -196,9 +197,10 @@ const TOOL_TINTS := [
 	Color(0.95, 0.42, 0.42, 0.30),  # Antibiotic red
 	Color(0.95, 0.78, 0.32, 0.30),  # Nutrient amber
 	Color(0.74, 0.46, 0.95, 0.30),  # Toxin violet
+	Color(0.62, 0.85, 0.38, 0.30),  # Inoculate biohazard-lime (ADR-019 contamination)
 ]
 # The `tool` string each marker carries (timeline.gd keys its colour/glyph off these).
-const TOOL_KEYS := ["crispr", "pcr", "cull", "nutrient", "toxin"]
+const TOOL_KEYS := ["crispr", "pcr", "cull", "nutrient", "toxin", "inoculate"]
 var _active_tool: int = TOOL_CRISPR
 var _tool_buttons: Array = []  # the 5 palette toggle Buttons (radio via a shared ButtonGroup)
 var _tool_panels: Array = []   # the 5 per-tool param sub-VBoxes (only the active one is visible)
@@ -216,6 +218,27 @@ var _nutrient_amount: SpinBox
 # Toxin params
 var _toxin_channel: OptionButton
 var _toxin_amount: SpinBox
+# Inoculate (ADR-019 S3 contamination seed) params: which baked contaminant to drop + the per-disc dose. The
+# species KEYS the picker/menu offer (kebab file stems under res://data/species/ that bake a contaminant
+# SpeciesSpec). Discovered at UI build so a new bake lights up automatically (no biology in GDScript — these
+# are just file stems; the core builds the genome from the JSON bytes, inv #2).
+const CONTAMINANT_KEYS := ["mycoplasma", "bacillus"]
+var _inoc_species: OptionButton  # the contaminant the seed brush drops (and a fired schedule references)
+var _inoc_count: SpinBox         # organisms per inoculation disc
+var _inoc_endow: SpinBox         # joules per inoculated organism (minted from the core's `immigration` tap)
+var _registered_contaminants: Dictionary = {}  # key:String → true once register_contaminant_json succeeded this run
+# ContainmentLevel knob (ADR-019 S3, the ISO-14644 ladder) + consortium menu. The level + the checked consortium
+# keys + the pressure params are pushed to the core via set_containment BEFORE reset, which deterministically
+# expands them into a journaled immigration schedule off the off-stream IMMG family (zero SimRng draws, inv #3).
+# Default Sealed (level 0) → empty schedule → hash-neutral. GDScript only moves the level + keys + bytes (inv #2).
+const CONTAINMENT_LABELS := ["🔒 Sealed (ISO 5 / OFF)", "Clean (ISO 7)", "Lab (ISO 8)", "☣ Open (room air)"]
+var _containment_level: int = 0  # 0 Sealed · 1 Clean · 2 Lab · 3 Open (mirrors sim_core::ContainmentLevel)
+var _containment_selector: OptionButton
+var _consortium_checks: Dictionary = {}  # key:String → CheckBox (the consortium menu; checked keys ride the schedule)
+var _containment_radius: int = 5         # schedule inoculation disc radius (cells)
+var _containment_endow: SpinBox          # per-immigrant J for the scheduled events
+var _containment_horizon: int = 400      # generations the schedule spans
+var _containment_panel: Control
 # Gamification (ADR-011 S-G2): a mission to SUPPRESS allele frequency in a target zone under a budget +
 # deadline (the brush lowers allele, selection raises it → a tug-of-war). Renderer-side game rules over the
 # core-exported snapshot (inv #2 — no biology computed here); not part of the determinism hash.
@@ -319,9 +342,10 @@ func _ready() -> void:
 	if _live != null and _has_flag("--brush"):  # optional: show + fire one demo brush stroke for --shot
 		_live.step(20)
 		_publish_frame()
-		# --tool <crispr|pcr|cull|nutrient|toxin>: pick the palette tool to demo (SP-3.6 per-tool smoke); default CRISPR.
+		# --tool <crispr|pcr|cull|nutrient|toxin|inoculate>: pick the palette tool to demo (SP-3.6/ADR-019 per-tool
+		# smoke); default CRISPR.
 		var tool_arg := _arg_value("--tool")
-		if tool_arg != "" and _tool_buttons.size() == 5:
+		if tool_arg != "" and _tool_buttons.size() == TOOL_KEYS.size():
 			var ti: int = maxi(0, TOOL_KEYS.find(tool_arg))
 			_tool_buttons[ti].set_pressed_no_signal(true)
 			_select_tool(ti)
@@ -571,6 +595,7 @@ func _process(delta: float) -> void:
 		_step_carry = 0.0  # drop the backlog rather than chase it
 	for _i in steps:
 		_live.step(LIVE_STEP)
+		_fire_due_immigration()  # ADR-019 S3: drain the deterministic schedule's events DUE at this gen + mark them
 	# Render: throttle the heavy snapshot+parse+redraw to RENDER_HZ, decoupled from the step rate.
 	_render_carry += delta
 	if steps > 0 and _render_carry >= 1.0 / RENDER_HZ:
@@ -607,6 +632,27 @@ func _publish_frame() -> void:
 	_show(_snaps.size() - 1)
 	if _view_mode == VIEW_RELATIONS:
 		_refresh_relations()  # the FlowMatrix is per-generation — repaint the heatmap each render tick in Relations
+
+
+## Drain the deterministic immigration schedule's events that are DUE at the current generation (ADR-019 S3): the
+## core's fire_due_inoculations fires + journals each scheduled RegionInoculate (byte-identical to a hand-fired one,
+## so save/load replay reproduces it). When ≥1 fired this tick we drop ONE immigration timeline marker at the
+## current generation so a scheduled arrival is legible on the timeline just like a manual seed. Read-only w.r.t.
+## biology (inv #2): GDScript only asks the core to advance its own journaled schedule + draws a marker; the core
+## owns the schedule, the spawn, and the conserved `immigration` tap. No-op when the cdylib lacks the export
+## (forward-compat probe, mirroring observe_species/flow_matrix) or the schedule is empty (default Sealed).
+func _fire_due_immigration() -> void:
+	if _live == null or not _live.has_method("fire_due_inoculations"):
+		return
+	var fired: int = int(_live.fire_due_inoculations())
+	if fired <= 0:
+		return
+	var gen := int(_live.observe().get("generation", 0)) if _live.has_method("observe") else 0
+	_record_tool_outcome(TOOL_INOCULATE, {
+		"applied": true,
+		"detail": "🦠 schedule fired ×%d (gen %d)" % [fired, gen],
+		"generation": gen,
+	})
 
 
 ## Live-mode CRISPR intervention UI (P6): pick a Cas variant / locus / guide and Inject. The renderer only
@@ -647,6 +693,7 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 		{"glyph": "💊", "name": "Antibiotic", "tip": "Cull a species in the region"},
 		{"glyph": "🌱", "name": "Nutrient", "tip": "Feed a pool plane (light/nutrient/detritus)"},
 		{"glyph": "☣", "name": "Toxin", "tip": "Spike the chem field (toxin/kin/alarm)"},
+		{"glyph": "🦠", "name": "Inoculate", "tip": "Seed a contaminant at the region (ADR-019 — POSITION MATTERS)"},
 	]
 	_tool_buttons.clear()
 	for i in tool_specs.size():
@@ -665,12 +712,13 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 	var params_stack := VBoxContainer.new()
 	col.add_child(params_stack)
 	_tool_panels.clear()
-	_tool_panels.resize(5)
+	_tool_panels.resize(6)
 	_tool_panels[TOOL_CRISPR] = _build_crispr_params()
 	_tool_panels[TOOL_PCR] = _build_pcr_params()
 	_tool_panels[TOOL_ANTIBIOTIC] = _build_cull_params()
 	_tool_panels[TOOL_NUTRIENT] = _build_nutrient_params()
 	_tool_panels[TOOL_TOXIN] = _build_toxin_params()
+	_tool_panels[TOOL_INOCULATE] = _build_inoculate_params()
 	for p in _tool_panels:
 		params_stack.add_child(p)
 
@@ -704,6 +752,101 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 	_intervention_panel = PanelChrome.new()
 	_intervention_panel.setup("🧪 INTERVENE", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 70.0), _pill_rail)
 	_intervention_panel.set_active(_live != null)
+
+
+## The CONTAINMENT panel (ADR-019 S3): the ISO-14644 ContainmentLevel ladder selector + the consortium menu
+## (which baked contaminants ride the deterministic immigration schedule) + the schedule pressure params. Dirtier
+## level → more contamination pressure; the schedule itself is derived IN THE CORE off the off-stream IMMG family
+## (zero SimRng draws, inv #3) and journaled, so it replays. GDScript here only collects the level + checked keys +
+## ints and pushes them to LiveSim.set_containment before reset — biology stays in the core (inv #2). Default
+## Sealed → empty schedule → hash-neutral. The pinned literal 0x47a0_3c8f_6701_f240 is untouched (renderer-only).
+func _build_contamination_ui(ui: CanvasLayer) -> void:
+	var body := _dark_panel(0.55)
+	body.custom_minimum_size = Vector2(260, 0)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 5)
+	body.add_child(col)
+
+	# ContainmentLevel ladder selector (ISO 14644: Sealed/OFF → Clean → Lab → Open/dirty). Dirtier = more pressure.
+	var lvl_row := HBoxContainer.new()
+	lvl_row.add_child(_dim_label("Containment:"))
+	_containment_selector = OptionButton.new()
+	for label in CONTAINMENT_LABELS:
+		_containment_selector.add_item(label)
+	_containment_selector.select(_containment_level)
+	_containment_selector.item_selected.connect(_on_containment_level_selected)
+	lvl_row.add_child(_containment_selector)
+	col.add_child(lvl_row)
+
+	# Consortium menu: one CheckBox per baked contaminant key. Checked keys ride the schedule (registered with the
+	# core at reset). These are just file stems — no biology in GDScript (inv #2).
+	col.add_child(_dim_label("Consortium (schedule):"))
+	_consortium_checks.clear()
+	for key in CONTAMINANT_KEYS:
+		var cb := CheckBox.new()
+		cb.text = key
+		cb.tooltip_text = "Include %s in the deterministic immigration schedule" % key
+		col.add_child(cb)
+		_consortium_checks[key] = cb
+
+	# Schedule pressure: per-immigrant J endowment (radius + horizon are fixed defaults; the level scales frequency
+	# in the core). The disc/horizon stay constant so the level is the single legible knob.
+	var ej_row := HBoxContainer.new()
+	ej_row.add_child(_dim_label("Endow J:"))
+	_containment_endow = _make_spin(1000, 100000000, 1000, 120000)
+	ej_row.add_child(_containment_endow)
+	col.add_child(ej_row)
+
+	# Apply: push the current level + consortium + params to the core (stored on the binding so reset re-applies
+	# it), then RE-RESET so the schedule re-expands deterministically from (seed, level, consortium). The handler
+	# is _on_apply_containment_pressed.
+	var apply_btn := Button.new()
+	apply_btn.text = "Apply + reset schedule"
+	apply_btn.tooltip_text = "Re-derive the deterministic immigration schedule from seed + level + consortium"
+	apply_btn.pressed.connect(_on_apply_containment_pressed)
+	col.add_child(apply_btn)
+
+	var fs := _field_screen_size()
+	_containment_panel = PanelChrome.new()
+	_containment_panel.setup("🦠 CONTAMINATION", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 320.0), _pill_rail)
+	_containment_panel.set_active(_live != null)
+
+
+## The ContainmentLevel selector hook: store the level (0 Sealed · 1 Clean · 2 Lab · 3 Open). The schedule is only
+## (re)derived on Apply (a reset is required to re-expand it deterministically), so this just records the choice.
+func _on_containment_level_selected(idx: int) -> void:
+	_containment_level = clampi(idx, 0, CONTAINMENT_LABELS.size() - 1)
+
+
+## Apply the containment config + re-derive the immigration schedule (ADR-019 S3). set_containment stores the level
+## + consortium config on the live env, and the schedule expands deterministically at reset off the off-stream IMMG
+## family; so we push the config, then re-reset from the SAME seed (inv #3 — same seed + level + consortium →
+## identical schedule). Registers each checked contaminant first so a fired schedule event can resolve its key.
+func _on_apply_containment_pressed() -> void:
+	if _live == null or not _live.has_method("set_containment"):
+		_flash_status("✗ Containment unsupported by this build", false)
+		return
+	# Collect the checked consortium keys whose res:// JSON exists (file-existence check only — the core does the
+	# real serde/build at register time; no biology in GDScript, inv #2).
+	var keys := PackedStringArray()
+	for key in CONTAMINANT_KEYS:
+		var cb: CheckBox = _consortium_checks.get(key, null)
+		if cb != null and cb.button_pressed:
+			if FileAccess.file_exists("res://data/species/%s.json" % key):
+				keys.append(key)
+			else:
+				push_warning("contaminant '%s' skipped (res:// JSON missing)" % key)
+	var endow := int(_containment_endow.value) if _containment_endow != null else 0
+	# Push the config (stored on the binding so reset re-applies it), then re-reset so the schedule re-expands
+	# deterministically from (seed, level, consortium) off the off-stream IMMG family (inv #3).
+	_live.set_containment(_containment_level, keys, _containment_radius, endow, _containment_horizon)
+	_do_reset(_seed)
+	# The fresh reset rebuilt the core env (empty consortium) + cleared the registry. Register the consortium NOW
+	# so a fired schedule event (or a post-reset manual seed) can resolve its key against a loaded genome.
+	for key in keys:
+		_ensure_contaminant_registered(str(key))
+	var lvl_name := str(CONTAINMENT_LABELS[_containment_level]) if _containment_level < CONTAINMENT_LABELS.size() else "?"
+	_flash_status("🦠 containment → %s · %d in consortium" % [lvl_name, keys.size()], true)
 
 
 ## CRISPR param sub-panel: the EXISTING Cas / Locus / Guide pickers verbatim (fires Action::ApplyEditRegion).
@@ -817,6 +960,35 @@ func _build_toxin_params() -> VBoxContainer:
 	_toxin_amount = _make_spin(1000, 100000000, 1000, 500000)
 	r2.add_child(_toxin_amount)
 	col.add_child(r2)
+	return col
+
+
+## Inoculate (ADR-019 S3 contamination seed) param sub-panel: which baked contaminant to drop + the per-disc
+## organism count + per-organism J endowment (fires LiveSim.inoculate, J minted from the core's `immigration`
+## tap). The species picker offers the kebab contaminant keys; on dispatch the JSON is lazily registered via
+## register_contaminant_json (the res:// boundary, inv #2). Biology stays in the core — this is just file stems +
+## ints. POSITION MATTERS: the brush cell becomes the RegionInoculate disc centre.
+func _build_inoculate_params() -> VBoxContainer:
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Contaminant:"))
+	_inoc_species = OptionButton.new()
+	for key in CONTAMINANT_KEYS:
+		_inoc_species.add_item(key)
+		_inoc_species.set_item_metadata(_inoc_species.item_count - 1, key)
+	r1.add_child(_inoc_species)
+	col.add_child(r1)
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Count:"))
+	_inoc_count = _make_spin(1, 256, 1, 12)
+	r2.add_child(_inoc_count)
+	col.add_child(r2)
+	var r3 := HBoxContainer.new()
+	r3.add_child(_dim_label("Endow J:"))
+	_inoc_endow = _make_spin(1000, 100000000, 1000, 150000)
+	r3.add_child(_inoc_endow)
+	col.add_child(r3)
 	return col
 
 
@@ -1000,6 +1172,64 @@ func _apply_active_tool() -> void:
 			var ch2 := _toxin_channel.selected if _toxin_channel != null else 0
 			var amt2 := int(_toxin_amount.value) if _toxin_amount != null else 0
 			_record_tool_outcome(TOOL_TOXIN, _live.toxin(ch2, cx, cy, r, amt2))
+		TOOL_INOCULATE:
+			if not _live.has_method("inoculate"):
+				_flash_status("✗ Inoculate unsupported by this build", false)
+				return
+			_inoculate_at(cx, cy, r)
+
+
+## Issue ONE manual RegionInoculate at the painted disc (ADR-019 S3): lazily register the selected contaminant
+## SpeciesSpec (res:// JSON bytes → core, inv #2), then fire LiveSim.inoculate (J minted from the `immigration`
+## tap, conserved, journaled). Records a per-tool timeline marker so a manual seed shows on the timeline exactly
+## like a fired schedule event. POSITION MATTERS: (cx, cy, r) is the disc the core spawns into. Returns nothing —
+## establish/displace/die emerges from the core economy (this only supplies the arrival).
+func _inoculate_at(cx: int, cy: int, r: int) -> void:
+	var key := _inoc_selected_key()
+	if key == "" or not _ensure_contaminant_registered(key):
+		_flash_status("✗ contaminant '%s' could not be registered" % key, false)
+		return
+	var cnt := int(_inoc_count.value) if _inoc_count != null else 1
+	var endow := int(_inoc_endow.value) if _inoc_endow != null else 0
+	var minted: int = int(_live.inoculate(key, cx, cy, r, cnt, endow))
+	var gen := int(_live.observe().get("generation", 0)) if _live.has_method("observe") else 0
+	_record_tool_outcome(TOOL_INOCULATE, {
+		"applied": cnt > 0,
+		"detail": "🦠 %s ×%d @ (%d,%d) r%d · tap %d J" % [key, cnt, cx, cy, r, minted],
+		"generation": gen,
+	})
+
+
+## The contaminant file-stem currently selected in the seed-brush picker ("" if none). Pure read.
+func _inoc_selected_key() -> String:
+	if _inoc_species == null or _inoc_species.selected < 0:
+		return ""
+	return str(_inoc_species.get_item_metadata(_inoc_species.selected))
+
+
+## Lazily register a contaminant's SpeciesSpec with the core so a later inoculate (manual OR a fired schedule
+## event) can resolve its `species_key` (ADR-019 S1/S3). Reads the res:// JSON bytes and hands them to
+## LiveSim.register_contaminant_json — the res:// boundary (inv #2/#4): GDScript moves only the inert string, the
+## core does serde + SpeciesSpec::build. Idempotent (registers once per run per key). Returns true if the key is
+## (now) registered. Graceful: a missing/invalid file → warning → false (the seed no-ops, the run stays valid).
+func _ensure_contaminant_registered(key: String) -> bool:
+	if key == "":
+		return false
+	if _registered_contaminants.get(key, false):
+		return true
+	if _live == null or not _live.has_method("register_contaminant_json"):
+		return false
+	var path := "res://data/species/%s.json" % key
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		push_warning("contaminant '%s' not found at %s" % [key, path])
+		return false
+	var text := f.get_as_text()  # whole JSON; FileAccess (RefCounted) closes on free
+	if not _live.register_contaminant_json(text):
+		push_warning("contaminant '%s' failed to validate" % key)
+		return false
+	_registered_contaminants[key] = true
+	return true
 
 
 ## Update the hovered brush cell from the mouse (world → cell, clamped to the world/live grid) + refresh preview.
@@ -1206,6 +1436,7 @@ func _build_scene() -> void:
 	_build_interaction_ui(ui)
 	_build_timeline(ui)
 	_build_intervention_ui(ui)
+	_build_contamination_ui(ui)
 	_build_mission_ui(ui)
 	# --live was requested but the LiveSim cdylib failed to load → show why (we fell back to file replay).
 	if _has_flag("--live") and _live == null:
@@ -1684,6 +1915,7 @@ func _resync_to_live() -> void:
 	_snaps = [snap]
 	_idx = 0
 	_injections = []
+	_registered_contaminants = {}  # a fresh core env has an empty consortium → re-register on next seed/schedule (ADR-019)
 	_fit_history = []
 	_allele_history = []
 	_live_specimen_log = []  # fresh run → fresh specimen history
@@ -1741,7 +1973,7 @@ func _rebuild_markers_from_journal() -> void:
 				continue
 			var tool := _journal_kind_to_tool(kind)
 			if tool < 0:
-				continue  # a non-intervention action (e.g. inoculate) — no palette marker for it
+				continue  # a non-marker action (e.g. a bare Advance) — nothing to place on the axis
 			_injections.append({
 				"generation": gen,
 				"tool": TOOL_KEYS[tool],
@@ -1761,6 +1993,7 @@ func _journal_kind_to_tool(kind: String) -> int:
 		"cull", "region_cull": return TOOL_ANTIBIOTIC
 		"nutrient", "region_nutrient": return TOOL_NUTRIENT
 		"toxin", "region_toxin": return TOOL_TOXIN
+		"inoculate", "region_inoculate": return TOOL_INOCULATE  # ADR-019: manual OR scheduled immigration marker
 		_: return -1
 
 

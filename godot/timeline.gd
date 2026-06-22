@@ -19,6 +19,7 @@ const TOOL_STYLE := {
 	"cull": {"color": Color(0.95, 0.42, 0.42), "glyph": "💊"},     # red (antibiotic)
 	"nutrient": {"color": Color(0.95, 0.78, 0.32), "glyph": "🌱"}, # amber
 	"toxin": {"color": Color(0.74, 0.46, 0.95), "glyph": "☣"},    # violet
+	"inoculate": {"color": Color(0.62, 0.85, 0.38), "glyph": "🦠"}, # biohazard-lime (ADR-019 immigration / contamination)
 }
 
 var _count: int = 0
