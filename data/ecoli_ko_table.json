@@ -1,0 +1,51 @@
+{
+  "format_version": 1,
+  "description": "Frozen single-gene knockout growth-ratio table for the ADR-017 E. coli oversight firewall. Per anchor gene: quantized growth-ratio-vs-wild-type (u16 permille) on glucose-minimal, aerobic. 1000 permille = wild-type growth, 0 = growth-lethal. The deterministic sim reads ONLY these integers (oracle-fba frozen-table lookup); the offline solver's floats never reach the hash path.",
+  "condition": "glucose-minimal medium, aerobic",
+  "objective": "biomass (FBA growth)",
+  "quantization": "u16 permille of wild-type growth, floor",
+  "source": "cobrapy-fba",
+  "provenance": "cobrapy single_gene_deletion on BiGG e_coli_core (0.31.1), default medium (glucose-minimal, aerobic). Floats quantized to permille HERE, offline; only the frozen integers ship. Matches curated-from-literature values to +/-0 permille for these 5 anchors.",
+  "genes": [
+    {
+      "gene": "gltA",
+      "b_number": "b0720",
+      "go_id": 4108,
+      "locus_id": 10,
+      "growth_ratio_permille": 0,
+      "citation": "Orth, Thiele & Palsson, Nat Biotechnol 28:245 (2010); Orth et al., EcoSal Plus (2010). TCA-entry, lethal aerobic on glucose-minimal in e_coli_core."
+    },
+    {
+      "gene": "ptsG",
+      "b_number": "b1101",
+      "go_id": 8982,
+      "locus_id": 32,
+      "growth_ratio_permille": 1000,
+      "citation": "Feist & Palsson, Nat Biotechnol 26:659 (2008); Orth et al. (2010). Alternate glucose uptake remains; KO neutral in silico."
+    },
+    {
+      "gene": "pflB",
+      "b_number": "b0903",
+      "go_id": 8861,
+      "locus_id": 28,
+      "growth_ratio_permille": 1000,
+      "citation": "Sawers & Watson, Mol Microbiol 29:945 (1998); Orth et al. (2010). PFL is anaerobic; aerobic KO neutral."
+    },
+    {
+      "gene": "pta",
+      "b_number": "b2297",
+      "go_id": 8959,
+      "locus_id": 76,
+      "growth_ratio_permille": 1000,
+      "citation": "Wolfe, Microbiol Mol Biol Rev 69:12 (2005); Orth et al. (2010). Acetate-overflow lever; FBA biomass unchanged."
+    },
+    {
+      "gene": "ldhA",
+      "b_number": "b1380",
+      "go_id": 8720,
+      "locus_id": 37,
+      "growth_ratio_permille": 1000,
+      "citation": "Bunch et al., Microbiology 143:187 (1997); Orth et al. (2010). Fermentative branch; aerobic KO neutral."
+    }
+  ]
+}

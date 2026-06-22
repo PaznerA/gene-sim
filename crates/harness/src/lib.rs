@@ -35,6 +35,8 @@ use sim_core::gp::{trait_map_for, OntologyMap};
 use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod campaign;
+pub mod firewall;
+pub mod oversight;
 pub mod replay;
 pub mod species;
 
@@ -450,19 +452,24 @@ impl Env for GeneSimEnv {
                 self.last_region_edit = Some((outcome, covered));
                 self.last_edit = None;
             }
-            // ── ADR-017 S5 INERT SCAFFOLDING — strict NO-OPs (hash-neutral) ─────────────────────────────
-            // These are journaled/round-tripped but draw ZERO `SimRng` and mutate no hashed component, so the
-            // pinned literal `0x4e4d_0520_722a_a069` is unchanged (the unchanged-ness IS the neutrality proof).
-            // They are modeled on `Advance(0)`, NOT on `ApplyEdit` (which DRAWS from the stream). S5 wires the
-            // firewall buffer + the off-thread oracle-fba producer; S6 (🛑 re-pin) turns the read coefficient on.
-            // See `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
+            // ── ADR-017 S5 OVERSIGHT actions — strict NO-OPs at the bare `step` level (hash-neutral) ─────
+            // The firewall BUFFERING + the off-thread oracle dispatch + the epoch-boundary drain live in the
+            // harness DRIVER (`oversight::OversightEpisode`), NOT here in the single-threaded `World` step — so
+            // the dispatch concurrency is in the env layer (inv #2), and `step` itself stays a pure consumer of
+            // the journaled action stream. At `step` these draw ZERO `SimRng` and mutate no hashed component, so
+            // the pinned literal `0x4e4d_0520_722a_a069` is unchanged. Modeled on `Advance(0)`, NOT `ApplyEdit`
+            // (which DRAWS). See `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
             Action::RequestEcoliEdit { .. } => {
-                // Request the deep edit: at S5 this records into the EditFirewall pending buffer and (live mode)
-                // dispatches the FBA solve off-thread. Today it is inert — no sim mutation, no RNG draw.
+                // The driver buffers the request + dispatches the oracle; the bare step is inert (no RNG, no
+                // hashed mutation) so a journaled stream containing a request replays consistently.
             }
             Action::CommitEcoliImpact { .. } => {
-                // Commit the quantized impact: at S5 this stores the payload into a per-species committed slot
-                // read BETWEEN steps. Today the slot is unbuilt and unread — no sim mutation, no RNG draw.
+                // S5 APPLIES AN IDENTITY MODIFIER (coefficient 1.0 — no selection change): the entire firewall
+                // runs end-to-end and the journal records a real commit, but applying a 1.0× growth-ratio factor
+                // is a no-op, so the hash does NOT move (the F2-Strategy expressed-but-unread → coefficient-zero
+                // precedent). The committed `growth_ratio_q`/`exchange_deltas` are WRITTEN to the journal but
+                // UNREAD by selection. S6 (🛑 re-pin, human sign-off) turns the read coefficient on via an
+                // `EcoliEditModifier`. Today: no sim mutation, no RNG draw.
             }
         }
 
