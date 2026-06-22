@@ -42,6 +42,12 @@ pub enum Trait {
     AcetateOverflow,
     /// Fermentation capacity (lactate / ethanol) — microbe.
     FermentationCapacity,
+
+    // ── Predator trait (ADR-013 F6 — Bdellovibrio) — the host-attack/lytic machinery phenotype, expressed via
+    // the Bdellovibrio [`bdellovibrio_trait_map`]. Deliberately NOT in [`Trait::ALL`] (the 9-trait plant order),
+    // exactly like the E. coli microbe traits; a predator species expresses it through its own `TraitMap`.
+    /// Predation capacity (host-cell invasion / peptidoglycan-remodeling attack rate) — predator.
+    PredationCapacity,
 }
 
 impl Trait {
@@ -79,6 +85,7 @@ impl Trait {
             Trait::RespirationMode => "respiration_mode",
             Trait::AcetateOverflow => "acetate_overflow",
             Trait::FermentationCapacity => "fermentation_capacity",
+            Trait::PredationCapacity => "predation_capacity",
         }
     }
 }
@@ -219,13 +226,35 @@ pub fn ecoli_trait_map() -> TraitMap {
     ])
 }
 
+/// The Bdellovibrio per-species [`TraitMap`] (ADR-013 F6 — the predator). `GrowthRate` (the selection-driving
+/// trait) anchors on the TCA backbone gene `gltA` (GO-4108), exactly as E. coli does — a predator still funds its
+/// own growth from kept predation-J via the budget. `PredationCapacity` — the attack-rate lever — anchors on the
+/// host-cell-invasion / peptidoglycan-hydrolase molecular function (GO-8745, "lysozyme/peptidoglycan muralytic
+/// activity"), the `hit`/lytic-machinery attack genes baked into `data/species/bdellovibrio.json`. A `hit`-locus
+/// CRISPRi Knockdown (activity→0) drives `PredationCapacity` → 0 → `predation_rate` → 0 (the gene-driven OVERSIGHT
+/// lever, exactly like `pta`→`mineralize_rate`). Ordered (inv #3). A PURE ADDITION — it touches neither
+/// [`default_plant_trait_map`] nor [`ecoli_trait_map`], so the plant/E. coli express paths are byte-unperturbed.
+#[must_use]
+pub fn bdellovibrio_trait_map() -> TraitMap {
+    let b = |t, go| TraitBinding {
+        trait_: t,
+        locus: LocusSelector::ByGoAnchor(GoTermId(go)),
+        param: ParamId(0),
+    };
+    TraitMap(vec![
+        b(Trait::GrowthRate, 4108), // gltA — citrate synthase (TCA/growth backbone)
+        b(Trait::PredationCapacity, 8745), // peptidoglycan/host-invasion lytic machinery (the attack lever)
+    ])
+}
+
 /// Select the per-species [`TraitMap`] by the species `key` (ADR-017 "RUN E. coli"). A pure, ordered `match`
-/// (never a `HashMap` — inv #3): `"ecoli-core"` → [`ecoli_trait_map`]; EVERY other key → the default plant map,
-/// so an unknown/missing key degrades safely to the historical behaviour.
+/// (never a `HashMap` — inv #3): `"ecoli-core"` → [`ecoli_trait_map`]; `"bdellovibrio"` → [`bdellovibrio_trait_map`];
+/// EVERY other key → the default plant map, so an unknown/missing key degrades safely to the historical behaviour.
 #[must_use]
 pub fn trait_map_for(key: &str) -> TraitMap {
     match key {
         "ecoli-core" => ecoli_trait_map(),
+        "bdellovibrio" => bdellovibrio_trait_map(),
         _ => default_plant_trait_map(),
     }
 }
@@ -268,6 +297,11 @@ pub enum TrophicRole {
     Mixotroph,
     /// Earns by mineralizing detritus — the plant→detritus→microbe loop (F4 obligate decomposer).
     Decomposer,
+    /// Earns ONLY by consuming (predating) other organisms' joules — the F6 Bdellovibrio predator. Taps NO
+    /// abiotic resource channel (unlike `Heterotroph`, which would also draw free_nutrient/detritus via the
+    /// metabolism apportion), so the [`crate::trophic::predation`] kernel is its SOLE income — that is the
+    /// STRUCTURAL guarantee a dedicated role buys (a `Heterotroph + affinity` would double-dip the abiotic taps).
+    Predator,
 }
 
 impl Default for TrophicRole {
@@ -275,6 +309,17 @@ impl Default for TrophicRole {
     fn default() -> Self {
         TrophicRole::Autotroph
     }
+}
+
+/// Is a [`TrophicRole`] eligible PREY for the F6 predator ([`crate::trophic::predation`])? An ordered, pure
+/// predicate (never a `HashMap`, inv #3): `true` for {`Heterotroph`, `Decomposer`}, `false` for {`Autotroph`,
+/// `Mixotroph`, `Predator`}. This encodes Bdellovibrio's gram-negative-bacteria host range — it invades the
+/// periplasm of OTHER BACTERIA, not plant cells (`Autotroph`), and there is NO intraguild/hyper-predation in
+/// this slice (`Predator` is not prey). `Mixotroph` (algal/plant-ish) is excluded pending the taxonomy owner.
+/// E. coli is a `Decomposer` → eligible prey, so the F6 predator closes plant→microbe→predator.
+#[must_use]
+pub fn is_prey(role: TrophicRole) -> bool {
+    matches!(role, TrophicRole::Heterotroph | TrophicRole::Decomposer)
 }
 
 /// Map a species `key` → its trophic role. An ordered `match` exactly parallel to [`trait_map_for`] — the
@@ -286,6 +331,7 @@ impl Default for TrophicRole {
 pub fn role_for(key: &str) -> TrophicRole {
     match key {
         "ecoli-core" => TrophicRole::Decomposer,
+        "bdellovibrio" => TrophicRole::Predator,
         _ => TrophicRole::Autotroph,
     }
 }
@@ -300,6 +346,7 @@ pub fn role_from_str(s: &str) -> Option<TrophicRole> {
         "heterotroph" => Some(TrophicRole::Heterotroph),
         "mixotroph" => Some(TrophicRole::Mixotroph),
         "decomposer" => Some(TrophicRole::Decomposer),
+        "predator" => Some(TrophicRole::Predator),
         _ => None,
     }
 }
@@ -368,6 +415,14 @@ pub struct Strategy {
     /// detritus/mineralization tap), so a `pta` CRISPRi Knockdown throttles per-org mineralization. Read ONLY
     /// by the F4 `mineralize` system for a Decomposer; inert for every other role.
     pub mineralize_rate: u16,
+    /// Per-org PREDATION attack rate on the fixed `u16` grid `[0, UNIT_SCALE]` (ADR-013 F6, parallel to
+    /// [`Strategy::mineralize_rate`]): gene-anchored on [`Trait::PredationCapacity`] (the Bdellovibrio
+    /// `hit`/lytic-machinery attack genes, GO-8745), so a `hit`-locus CRISPRi Knockdown throttles the attack rate
+    /// (the OVERSIGHT lever). Read ONLY by the F6 [`crate::trophic::predation`] system for a
+    /// [`TrophicRole::Predator`]; INERT (`== 0`) for every other role — absent anchor → `0`, exactly like
+    /// `mineralize_rate` is inert off a Decomposer. Keeps predator demand OUT of metabolism's resource-channel
+    /// apportion (a predator taps no abiotic pool — the kernel is its sole income).
+    pub predation_rate: u16,
 }
 
 /// The channel→anchor-trait pairing (declaration-ordered, parallel to [`BudgetChannel::ALL`]). Each channel's
@@ -395,6 +450,19 @@ const CHANNEL_TRAITS_ECOLI: [(BudgetChannel, Trait); 5] = [
     (BudgetChannel::Reproduction, Trait::FermentationCapacity),
     (BudgetChannel::Maintenance, Trait::RespirationMode),
     (BudgetChannel::Defense, Trait::AcetateOverflow),
+];
+/// The PREDATOR (Bdellovibrio) channel anchors (ADR-013 F6) — a PURE ADDITION that leaves the plant/E. coli
+/// anchor tables untouched (so their express paths are byte-unperturbed). `Growth` is the only anchor the small
+/// Bdellovibrio map binds (`gltA`/GrowthRate); the other four channels are absent in its TraitMap → `0.0`, so
+/// `normalize_permille` puts all the budget on Growth (a lean predator that funds growth from kept predation-J).
+/// `Acquisition` anchors on `PredationCapacity` so an attack-rate-heavy predator also invests an acquisition
+/// slice — harmless, since the F6 kernel reads the dedicated `predation_rate`, not this budget channel.
+const CHANNEL_TRAITS_PREDATOR: [(BudgetChannel, Trait); 5] = [
+    (BudgetChannel::Acquisition, Trait::PredationCapacity),
+    (BudgetChannel::Growth, Trait::GrowthRate),
+    (BudgetChannel::Reproduction, Trait::PredationCapacity),
+    (BudgetChannel::Maintenance, Trait::GrowthRate),
+    (BudgetChannel::Defense, Trait::PredationCapacity),
 ];
 
 /// The uniform fallback budget (`[200; 5]`, Σ = 1000) substituted when every channel anchor expresses `0.0`
@@ -426,6 +494,7 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
         TrophicRole::Heterotroph | TrophicRole::Decomposer | TrophicRole::Mixotroph => {
             &CHANNEL_TRAITS_ECOLI
         }
+        TrophicRole::Predator => &CHANNEL_TRAITS_PREDATOR,
         TrophicRole::Autotroph => &CHANNEL_TRAITS,
     };
     // Raw channel weights on the u16 grid, ordered by BudgetChannel::ALL.
@@ -456,11 +525,21 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
         p.get(Trait::AcetateOverflow).unwrap_or(0.0).clamp(0.0, 1.0),
     )) * u64::from(fixed::PERMILLE))
         / u64::from(fixed::UNIT_SCALE)) as u16;
+    // Predation attack rate (ADR-013 F6): PredationCapacity → the F6 predation kernel's per-org attack-rate
+    // lever, quantized [0,1]→u16 directly on the grid (parallel to the affinity slots, NOT a permille). Absent
+    // for any non-predator genome (→ 0), so it is inert off a Predator — exactly like mineralize_rate off a
+    // Decomposer. A `hit`-locus CRISPRi Knockdown (PredationCapacity→0) drives it to 0 (the OVERSIGHT lever).
+    let predation_rate = fixed::to_unit_u16(
+        p.get(Trait::PredationCapacity)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+    );
     Strategy {
         budget,
         role,
         affinity,
         mineralize_rate,
+        predation_rate,
     }
 }
 
@@ -684,6 +763,11 @@ mod tests {
             s.mineralize_rate, 0,
             "plant has no AcetateOverflow → mineralize_rate 0"
         );
+        // ADR-013 F6: the plant has no PredationCapacity anchor → predation_rate 0 (inert off a Predator).
+        assert_eq!(
+            s.predation_rate, 0,
+            "plant has no PredationCapacity → predation_rate 0"
+        );
         // E. coli role pin (its budget is the uniform fallback over sample_genome — anchors don't match).
         let ecoli_map = OntologyMap::new(ecoli_trait_map());
         let se = express_strategy(&ecoli_map, &g, TrophicRole::Decomposer);
@@ -747,6 +831,106 @@ mod tests {
             "knocking down pta/AcetateOverflow lowers mineralize_rate ({} -> {})",
             s.mineralize_rate,
             s_ko.mineralize_rate
+        );
+    }
+
+    #[test]
+    fn f6_predator_predation_rate_is_gene_driven_and_inert_off_predator() {
+        // ADR-013 F6: a Predator's predation_rate comes from PredationCapacity (the hit/lytic attack genes). A
+        // synthetic map binding it to a known value drives the attack-rate lever off the genome — proving a
+        // hit-locus CRISPRi edit moves it. INERT (0) for a plant genome (no PredationCapacity anchor).
+        let g = Genome {
+            version: 2,
+            loci: vec![genome::Locus {
+                id: LocusId(0),
+                name: "anchor".to_string(),
+                sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                parameters: vec![genome::Parameter {
+                    id: ParamId(0),
+                    value: genome::ParamValue::Numeric {
+                        value: 0.5,
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                }],
+                tags: genome::OntologyTags {
+                    so_term: genome::SoTermId(704),
+                    go_refs: vec![],
+                },
+            }],
+        };
+        let b = |t| TraitBinding {
+            trait_: t,
+            locus: LocusSelector::ByIndex(LocusId(0)),
+            param: ParamId(0),
+        };
+        let map = OntologyMap::new(TraitMap(vec![b(Trait::PredationCapacity)]));
+        let s = express_strategy(&map, &g, TrophicRole::Predator);
+        // PredationCapacity=0.5 → predation_rate = to_unit_u16(0.5) = 32767.
+        assert_eq!(
+            s.predation_rate, 32767,
+            "predation_rate tracks PredationCapacity (the hit/lytic attack lever)"
+        );
+        assert_eq!(s.role, TrophicRole::Predator);
+        // Knock the hit anchor down → predation_rate falls (the CRISPRi throttle lever).
+        let mut g_ko = g.clone();
+        if let genome::ParamValue::Numeric { value, .. } = &mut g_ko.loci[0].parameters[0].value {
+            *value = 0.1;
+        }
+        let s_ko = express_strategy(&map, &g_ko, TrophicRole::Predator);
+        assert!(
+            s_ko.predation_rate < s.predation_rate,
+            "knocking down the hit/PredationCapacity anchor lowers predation_rate ({} -> {})",
+            s.predation_rate,
+            s_ko.predation_rate
+        );
+        // INERT off a Predator: the same map under an Autotroph role still expresses predation_rate from the
+        // bound anchor (the field tracks the gene, not the role) — but the kernel only READS it for a Predator,
+        // and a plant genome (no PredationCapacity binding) yields 0:
+        let s_plant = express_strategy(
+            &OntologyMap::new(default_plant_trait_map()),
+            &genome::sample_genome(),
+            TrophicRole::Autotroph,
+        );
+        assert_eq!(s_plant.predation_rate, 0, "no anchor → predation_rate 0");
+    }
+
+    #[test]
+    fn is_prey_encodes_bdellovibrio_host_range() {
+        // ADR-013 F6: Bdellovibrio invades gram-negative BACTERIA — Heterotroph/Decomposer are prey; Autotroph
+        // (plant cells), Mixotroph (algal/plant-ish), and Predator (no hyper-predation this slice) are NOT.
+        assert!(is_prey(TrophicRole::Heterotroph));
+        assert!(
+            is_prey(TrophicRole::Decomposer),
+            "E. coli (Decomposer) is prey"
+        );
+        assert!(!is_prey(TrophicRole::Autotroph), "plants are not prey");
+        assert!(!is_prey(TrophicRole::Mixotroph));
+        assert!(
+            !is_prey(TrophicRole::Predator),
+            "no hyper-predation this slice"
+        );
+    }
+
+    #[test]
+    fn bdellovibrio_role_and_map_dispatch_by_key() {
+        // ADR-013 F6: the data-driven seams light up for "bdellovibrio" without new roster plumbing.
+        assert_eq!(role_for("bdellovibrio"), TrophicRole::Predator);
+        assert_eq!(role_from_str("predator"), Some(TrophicRole::Predator));
+        assert_eq!(
+            role_from_str("Predator"),
+            Some(TrophicRole::Predator),
+            "case-insensitive"
+        );
+        assert_eq!(trait_map_for("bdellovibrio"), bdellovibrio_trait_map());
+        // The niche.trophic_role override path the JSON boundary uses.
+        assert_eq!(
+            role_from_override(Some("predator"), "bdellovibrio"),
+            TrophicRole::Predator
+        );
+        assert_eq!(
+            role_from_override(None, "bdellovibrio"),
+            TrophicRole::Predator
         );
     }
 

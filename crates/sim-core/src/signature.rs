@@ -161,8 +161,8 @@ pub(crate) fn signature_row(
     row
 }
 
-/// The categorical role ordinal `{Autotroph 0, Heterotroph 1, Mixotroph 2, Decomposer 3}` carried beside the
-/// vector (a FILTER, not a distance dim). Matches the [`gp::TrophicRole`] declaration order.
+/// The categorical role ordinal `{Autotroph 0, Heterotroph 1, Mixotroph 2, Decomposer 3, Predator 4}` carried
+/// beside the vector (a FILTER, not a distance dim). Matches the [`gp::TrophicRole`] declaration order.
 #[must_use]
 pub(crate) fn role_ordinal(role: gp::TrophicRole) -> u8 {
     match role {
@@ -170,6 +170,7 @@ pub(crate) fn role_ordinal(role: gp::TrophicRole) -> u8 {
         gp::TrophicRole::Heterotroph => 1,
         gp::TrophicRole::Mixotroph => 2,
         gp::TrophicRole::Decomposer => 3,
+        gp::TrophicRole::Predator => 4,
     }
 }
 
@@ -229,6 +230,7 @@ mod tests {
         assert_eq!(role_ordinal(gp::TrophicRole::Heterotroph), 1);
         assert_eq!(role_ordinal(gp::TrophicRole::Mixotroph), 2);
         assert_eq!(role_ordinal(gp::TrophicRole::Decomposer), 3);
+        assert_eq!(role_ordinal(gp::TrophicRole::Predator), 4);
     }
 
     #[test]
@@ -238,6 +240,7 @@ mod tests {
             role: gp::TrophicRole::Autotroph,
             affinity: [60000, 0, 0],
             mineralize_rate: 0,
+            predation_rate: 0,
         };
         let row = signature_row(&strat, &[], 0, 0); // no flow matrix → Block B all zero
         assert_eq!(row.len(), SIGNATURE_DIMS);
