@@ -46,7 +46,18 @@ mod tests {
         // are the SAME parse/validate path: building from the shipped JSON TEXT must yield a BuiltSpecies
         // identical (key, entity_count, genome, …) to loading the file. This locks the two byte SOURCES in
         // sync so the gate catches any drift between the renderer's res:// path and the harness CLI path.
-        for stem in ["default", "ecoli", "bdellovibrio", "mycoplasma", "bacillus"] {
+        for stem in [
+            "default",
+            "ecoli",
+            "bdellovibrio",
+            "mycoplasma",
+            "bacillus",
+            "pseudomonas",
+            "staph",
+            "cutibacterium",
+            "aspergillus-niger",
+            "penicillium",
+        ] {
             let path = format!(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/{}.json"),
                 stem
@@ -217,6 +228,188 @@ mod tests {
         assert!(
             built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
             "every Bacillus locus carries a real CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_pseudomonas_species_loads() {
+        // ADR-019 S0 (Mode A contaminant): the baked real Pseudomonas aeruginosa PAO1 genome
+        // (scripts/bake_pseudomonas_species.py: curated central-metabolism + biofilm-EPS + efflux/defence
+        // roster × real NCBI GCF_000006765.1 CDS) must load + build. Data-not-code: the gate catches a broken or
+        // incomplete re-bake. The niche declares the MIXOTROPH role (the biofilm metabolic generalist / oligotroph
+        // that grows in distilled water); it resolves through gp::role_from_override → Mixotroph. The contaminant
+        // is inert DATA on disk (hash-neutral): no sim-core TraitMap binds it in S0, so every locus ships with
+        // empty go_refs. ConsortiumConfig::default_mode_a references the `pseudomonas` key directly.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/pseudomonas.json"
+        );
+        let built = load_species_file(path).expect("data/species/pseudomonas.json should load");
+        assert_eq!(built.key, "pseudomonas");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("mixotroph"),
+            "the niche declares the mixotroph role (data-driven gp::role_from_override → Mixotroph)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Mixotroph,
+            "the declared override must resolve to Mixotroph at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated contaminant roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Pseudomonas locus carries a real CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_staph_species_loads() {
+        // ADR-019 S0 (Mode A contaminant): the baked real Staphylococcus epidermidis ATCC 12228 genome
+        // (scripts/bake_staph_species.py: curated central-metabolism + surface-adhesin roster × real NCBI
+        // GCF_000007645.1 CDS) must load + build. Data-not-code: the gate catches a broken or incomplete re-bake.
+        // The niche declares the HETEROTROPH role (the operator-introduced skin-flora commensal); it resolves
+        // through gp::role_from_override → Heterotroph. The contaminant is inert DATA on disk (hash-neutral): no
+        // sim-core TraitMap binds it in S0, so every locus ships with empty go_refs.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/staph.json");
+        let built = load_species_file(path).expect("data/species/staph.json should load");
+        assert_eq!(built.key, "staph");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("heterotroph"),
+            "the niche declares the heterotroph role (data-driven gp::role_from_override → Heterotroph)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Heterotroph,
+            "the declared override must resolve to Heterotroph at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated contaminant roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Staphylococcus locus carries a real CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_cutibacterium_species_loads() {
+        // ADR-019 S0 (Mode A contaminant): the baked real Cutibacterium acnes KPA171202 genome
+        // (scripts/bake_cutibacterium_species.py: curated metabolism/propionate + sebum-lipase/CAMP roster ×
+        // real NCBI GCF_000008345.1 CDS) must load + build. Data-not-code: the gate catches a broken or incomplete
+        // re-bake. The niche declares the DECOMPOSER role (the slow lipophilic anaerobe that mineralizes sebum
+        // detritus); it resolves through gp::role_from_override → Decomposer. The contaminant is inert DATA on
+        // disk (hash-neutral): no sim-core TraitMap binds it in S0, so every locus ships with empty go_refs.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/cutibacterium.json"
+        );
+        let built = load_species_file(path).expect("data/species/cutibacterium.json should load");
+        assert_eq!(built.key, "cutibacterium");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("decomposer"),
+            "the niche declares the decomposer role (data-driven gp::role_from_override → Decomposer)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Decomposer,
+            "the declared override must resolve to Decomposer at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated contaminant roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Cutibacterium locus carries a real CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_aspergillus_niger_species_loads() {
+        // ADR-019 S0 (Mode A contaminant, EUKARYOTE): the baked curated Aspergillus niger CBS 513.88 anchor
+        // roster (scripts/bake_aspergillus_niger_species.py: conidiation cascade + pigment + saprotroph
+        // metabolism × real NCBI GCF_000002855.3 spliced CDS) must load + build. NOT genome-complete — a curated
+        // representative locus set for a 33.9 Mb / ~14k-gene mold (the kernel reads role + trait levers, not
+        // specific genes). The niche declares the DECOMPOSER role (the osmotrophic saprotroph that takes the
+        // plate); it resolves through gp::role_from_override → Decomposer. Inert DATA on disk (hash-neutral):
+        // no sim-core TraitMap binds it in S0, so every locus ships with empty go_refs. ConsortiumConfig::
+        // default_mode_a references the `aspergillus-niger` key directly.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/aspergillus-niger.json"
+        );
+        let built =
+            load_species_file(path).expect("data/species/aspergillus-niger.json should load");
+        assert_eq!(built.key, "aspergillus-niger");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("decomposer"),
+            "the niche declares the decomposer role (data-driven gp::role_from_override → Decomposer)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Decomposer,
+            "the declared override must resolve to Decomposer at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated eukaryote anchor roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Aspergillus locus carries a real spliced CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_penicillium_species_loads() {
+        // ADR-019 S0 (Mode A contaminant, EUKARYOTE): the baked curated Penicillium rubens Wisconsin 54-1255
+        // anchor roster (scripts/bake_penicillium_species.py: conidiation cascade + pigment + penicillin cluster
+        // × real NCBI GCF_028828025.1 spliced CDS) must load + build. NOT genome-complete — a curated
+        // representative locus set for a ~32 Mb / ~13k-gene mold (the kernel reads role + trait levers, not
+        // specific genes). The niche declares the DECOMPOSER role (the most common airborne saprotroph mold);
+        // it resolves through gp::role_from_override → Decomposer. Inert DATA on disk (hash-neutral): no sim-core
+        // TraitMap binds it in S0, so every locus ships with empty go_refs.
+        use sim_core::gp::{role_from_override, TrophicRole};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/penicillium.json"
+        );
+        let built = load_species_file(path).expect("data/species/penicillium.json should load");
+        assert_eq!(built.key, "penicillium");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("decomposer"),
+            "the niche declares the decomposer role (data-driven gp::role_from_override → Decomposer)"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::Decomposer,
+            "the declared override must resolve to Decomposer at the boundary"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            !built.genome.loci.is_empty(),
+            "the curated eukaryote anchor roster is non-empty"
+        );
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Penicillium locus carries a real spliced CDS"
         );
     }
 
