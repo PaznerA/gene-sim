@@ -25,8 +25,10 @@ extends Node2D
 ## Keys (windowed): Space pause · V cycle ecosystem→specimen→relations · Tab cycle specimen · D cycle layer ·
 ##   S toggle plant sprites/dots · B toggle selective edit brush (live) · [ / ] brush radius ·
 ##   ,/. step · 1/2/3 zoom scope · wheel zoom (brush: wheel = radius) · arrows pan.
-## Brush (live, ADR-011): with B on, hover paints a disc on the map; click applies a CRISPR edit to ONLY the
-##   organisms in that region (LiveSim.apply_edit_region) using the intervention panel's Cas/locus/guide.
+## Brush (live, ADR-011 / SP-3.6): with B on, hover paints a disc on the map; click/drag applies the ACTIVE
+##   intervention tool to ONLY that region — CRISPR (apply_edit_region) / PCR (pcr_amplify) / Antibiotic (cull) /
+##   Nutrient (nutrient) / Toxin (toxin). The disc COLOUR signals the active tool; POSITION MATTERS (the brush
+##   cell → RegionSpec → Region::contains in the core picks the orgs/cells). Biology stays in the core (inv #2).
 ## Mouse (windowed): drag = pan · hover = cell/plant tooltip · click = pin detail (cell stats + genome
 ##   ontology in ecosystem; focus + detail a plant in specimen).
 
@@ -171,12 +173,49 @@ var _guide_edit: LineEdit
 var _inject_status: Label
 var _cas_ids: Array = []  # cas variant id per _cas_picker item
 var _locus_ids: Array = []  # locus id per _locus_picker item
-var _injections: Array = []  # [{generation, applied}] for the timeline markers
-var _brush: Node2D  # selective-edit brush overlay (ADR-011 S-F)
+var _injections: Array = []  # [{generation, tool, applied, label}] for the timeline markers (SP-3.7)
+var _brush: Node2D  # selective-edit brush overlay (ADR-011 S-F), retinted per active tool (SP-3.6)
 var _brush_on: bool = false  # brush mode active (paint region edits) vs normal pan/inspect
 var _brush_radius: int = 4  # brush disc radius in world cells
 var _brush_cell: Vector2i = Vector2i(-1, -1)  # hovered world cell
+var _brush_painting: bool = false  # a left-button drag-paint stroke is in progress (SP-3.6 drag-to-paint)
 var _brush_button: Button
+# SP-3.6 intervention TOOL PALETTE: one active tool of the 5 (CRISPR / PCR / Antibiotic / Nutrient / Toxin).
+# Selecting a tool swaps the per-tool param sub-panel + retints the brush; the brush then paints THAT tool's
+# Action at the hovered cell. Biology stays in the core (inv #2) — these only issue the journaled Action + read
+# the verdict. The ButtonGroup keeps exactly one selected.
+const TOOL_CRISPR := 0
+const TOOL_PCR := 1
+const TOOL_ANTIBIOTIC := 2
+const TOOL_NUTRIENT := 3
+const TOOL_TOXIN := 4
+# Per-tool brush tint (the painted disc COLOUR signals which tool will land WHERE) — mirrors timeline.gd::TOOL_STYLE.
+const TOOL_TINTS := [
+	Color(0.42, 0.9, 0.46, 0.30),   # CRISPR green
+	Color(0.36, 0.82, 0.92, 0.30),  # PCR cyan
+	Color(0.95, 0.42, 0.42, 0.30),  # Antibiotic red
+	Color(0.95, 0.78, 0.32, 0.30),  # Nutrient amber
+	Color(0.74, 0.46, 0.95, 0.30),  # Toxin violet
+]
+# The `tool` string each marker carries (timeline.gd keys its colour/glyph off these).
+const TOOL_KEYS := ["crispr", "pcr", "cull", "nutrient", "toxin"]
+var _active_tool: int = TOOL_CRISPR
+var _tool_buttons: Array = []  # the 5 palette toggle Buttons (radio via a shared ButtonGroup)
+var _tool_panels: Array = []   # the 5 per-tool param sub-VBoxes (only the active one is visible)
+# PCR params
+var _pcr_species: OptionButton
+var _pcr_count: SpinBox
+var _pcr_endow: SpinBox
+# Antibiotic (cull) params
+var _cull_species: OptionButton
+var _cull_strength: HSlider
+var _cull_strength_label: Label
+# Nutrient params
+var _nutrient_channel: OptionButton
+var _nutrient_amount: SpinBox
+# Toxin params
+var _toxin_channel: OptionButton
+var _toxin_amount: SpinBox
 # Gamification (ADR-011 S-G2): a mission to SUPPRESS allele frequency in a target zone under a budget +
 # deadline (the brush lowers allele, selection raises it → a tug-of-war). Renderer-side game rules over the
 # core-exported snapshot (inv #2 — no biology computed here); not part of the determinism hash.
@@ -280,11 +319,17 @@ func _ready() -> void:
 	if _live != null and _has_flag("--brush"):  # optional: show + fire one demo brush stroke for --shot
 		_live.step(20)
 		_publish_frame()
+		# --tool <crispr|pcr|cull|nutrient|toxin>: pick the palette tool to demo (SP-3.6 per-tool smoke); default CRISPR.
+		var tool_arg := _arg_value("--tool")
+		if tool_arg != "" and _tool_buttons.size() == 5:
+			var ti: int = maxi(0, TOOL_KEYS.find(tool_arg))
+			_tool_buttons[ti].set_pressed_no_signal(true)
+			_select_tool(ti)
 		_set_brush_mode(true)
 		_brush_cell = Vector2i(LIVE_GRID.x / 2, LIVE_GRID.y / 2)
 		_brush_radius = 6
 		_brush.set_brush(_brush_cell, _brush_radius)
-		_apply_brush()
+		_apply_active_tool()
 	if _arg_value("--view") == "relations":  # optional: open the Relations FlowMatrix heatmap for --shot
 		_set_view_mode(VIEW_RELATIONS)
 	if _arg_value("--view") == "specimen":  # optional: open the L-system specimen view for --shot
@@ -411,6 +456,7 @@ func _on_menu_start(cfg: Dictionary) -> void:
 	_species_stem = _apply_species(species_stem)
 	_do_reset(_seed)
 	_populate_locus_picker()  # refresh the edit-target picker for the new species' genome (ADR-017)
+	_populate_species_pickers()  # refresh the PCR/Antibiotic target-species pickers for the new roster (SP-3.6)
 	# Mission is a MENU choice now (off by default = free-play sandbox). Apply it + (re)activate its UI on Start;
 	# the --mission CLI flag is the headless/scripted equivalent (set in _setup_live, overridden here).
 	_mission_on = bool(cfg.get("mission", false))
@@ -579,50 +625,68 @@ func _populate_locus_picker() -> void:
 		_locus_ids.append(int((l as Dictionary).get("id", 0)))
 
 
+## The unified 5-TOOL intervention palette (SP-3.6): a radio row of CRISPR / PCR / Antibiotic / Nutrient / Toxin,
+## a swapped per-tool param sub-panel, the shared region brush (drag to paint — POSITION MATTERS), and one status
+## readout. Reuses 100% of the existing brush + region plumbing; each tool issues ONE journaled Action through a
+## LiveSim #[func] and reads the verdict (biology stays in the core, inv #2).
 func _build_intervention_ui(ui: CanvasLayer) -> void:
 	var body := _dark_panel(0.55)
-	body.custom_minimum_size = Vector2(262, 0)
+	body.custom_minimum_size = Vector2(278, 0)
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 5)
 	body.add_child(col)
 
-	var r1 := HBoxContainer.new()
-	r1.add_child(_dim_label("Cas:"))
-	_cas_picker = OptionButton.new()
-	r1.add_child(_cas_picker)
-	col.add_child(r1)
+	# Tool palette: 5 radio toggles (one active). Selecting a tool swaps its param sub-panel + retints the brush.
+	var palette := HBoxContainer.new()
+	palette.add_theme_constant_override("separation", 3)
+	col.add_child(palette)
+	var grp := ButtonGroup.new()
+	var tool_specs := [
+		{"glyph": "🧬", "name": "CRISPR", "tip": "Region CRISPR edit"},
+		{"glyph": "🧫", "name": "PCR", "tip": "Amplify a resident species (faithful clones)"},
+		{"glyph": "💊", "name": "Antibiotic", "tip": "Cull a species in the region"},
+		{"glyph": "🌱", "name": "Nutrient", "tip": "Feed a pool plane (light/nutrient/detritus)"},
+		{"glyph": "☣", "name": "Toxin", "tip": "Spike the chem field (toxin/kin/alarm)"},
+	]
+	_tool_buttons.clear()
+	for i in tool_specs.size():
+		var spec: Dictionary = tool_specs[i]
+		var b := Button.new()
+		b.text = str(spec["glyph"])
+		b.tooltip_text = str(spec["name"]) + " — " + str(spec["tip"])
+		b.toggle_mode = true
+		b.button_group = grp
+		b.custom_minimum_size = Vector2(34, 0)
+		b.pressed.connect(_on_tool_selected.bind(i))
+		palette.add_child(b)
+		_tool_buttons.append(b)
 
-	var r2 := HBoxContainer.new()
-	r2.add_child(_dim_label("Locus:"))
-	_locus_picker = OptionButton.new()
-	r2.add_child(_locus_picker)
-	col.add_child(r2)
+	# Per-tool param sub-panels (only the active tool's is visible). Built into one stack; visibility swaps.
+	var params_stack := VBoxContainer.new()
+	col.add_child(params_stack)
+	_tool_panels.clear()
+	_tool_panels.resize(5)
+	_tool_panels[TOOL_CRISPR] = _build_crispr_params()
+	_tool_panels[TOOL_PCR] = _build_pcr_params()
+	_tool_panels[TOOL_ANTIBIOTIC] = _build_cull_params()
+	_tool_panels[TOOL_NUTRIENT] = _build_nutrient_params()
+	_tool_panels[TOOL_TOXIN] = _build_toxin_params()
+	for p in _tool_panels:
+		params_stack.add_child(p)
 
-	var r3 := HBoxContainer.new()
-	r3.add_child(_dim_label("Guide:"))
-	_guide_edit = LineEdit.new()
-	_guide_edit.text = "ACGTGGACGTTTTAGGCCGG"
-	_guide_edit.custom_minimum_size = Vector2(160, 0)
-	_guide_edit.text_submitted.connect(_on_guide_submitted)
-	r3.add_child(_guide_edit)
-	col.add_child(r3)
-
+	# Action row: a brush toggle (shared by every tool) + a whole-species CRISPR inject (CRISPR-only convenience).
 	var btns := HBoxContainer.new()
 	btns.add_theme_constant_override("separation", 6)
 	col.add_child(btns)
-	var inject := Button.new()
-	inject.text = "Inject (whole species)"
-	inject.pressed.connect(_on_inject_pressed)
-	btns.add_child(inject)
 	_brush_button = Button.new()
 	_brush_button.text = "🖌 Brush: off"
 	_brush_button.toggle_mode = true
-	_brush_button.tooltip_text = "Paint a region edit on the map (key B); wheel = radius"
+	_brush_button.tooltip_text = "Paint the active tool on the map (key B); drag to paint; wheel = radius"
 	_brush_button.toggled.connect(_on_brush_toggled)
 	btns.add_child(_brush_button)
 
 	_inject_status = _dim_label("")
-	_inject_status.custom_minimum_size = Vector2(250, 0)
+	_inject_status.custom_minimum_size = Vector2(266, 0)
 	_inject_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_inject_status)
 
@@ -631,11 +695,165 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 			_cas_picker.add_item(str((v as Dictionary).get("name", "cas")))
 			_cas_ids.append(int((v as Dictionary).get("id", 0)))
 		_populate_locus_picker()
+		_populate_species_pickers()
+
+	_tool_buttons[TOOL_CRISPR].set_pressed_no_signal(true)
+	_select_tool(TOOL_CRISPR)  # default to CRISPR; shows its params + green brush tint
 
 	var fs := _field_screen_size()
 	_intervention_panel = PanelChrome.new()
-	_intervention_panel.setup("🧬 CRISPR", body, ui, Vector2(maxf(240.0, fs.x - 274.0), 70.0), _pill_rail)
+	_intervention_panel.setup("🧪 INTERVENE", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 70.0), _pill_rail)
 	_intervention_panel.set_active(_live != null)
+
+
+## CRISPR param sub-panel: the EXISTING Cas / Locus / Guide pickers verbatim (fires Action::ApplyEditRegion).
+func _build_crispr_params() -> VBoxContainer:
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Cas:"))
+	_cas_picker = OptionButton.new()
+	r1.add_child(_cas_picker)
+	col.add_child(r1)
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Locus:"))
+	_locus_picker = OptionButton.new()
+	r2.add_child(_locus_picker)
+	col.add_child(r2)
+	var r3 := HBoxContainer.new()
+	r3.add_child(_dim_label("Guide:"))
+	_guide_edit = LineEdit.new()
+	_guide_edit.text = "ACGTGGACGTTTTAGGCCGG"
+	_guide_edit.custom_minimum_size = Vector2(150, 0)
+	_guide_edit.text_submitted.connect(_on_guide_submitted)
+	r3.add_child(_guide_edit)
+	col.add_child(r3)
+	return col
+
+
+## PCR param sub-panel: target species + clone count + per-clone J endowment (fires LiveSim.pcr_amplify).
+func _build_pcr_params() -> VBoxContainer:
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Species:"))
+	_pcr_species = OptionButton.new()
+	r1.add_child(_pcr_species)
+	col.add_child(r1)
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Clones:"))
+	_pcr_count = _make_spin(1, 256, 1, 8)
+	r2.add_child(_pcr_count)
+	col.add_child(r2)
+	var r3 := HBoxContainer.new()
+	r3.add_child(_dim_label("Endow J:"))
+	_pcr_endow = _make_spin(1000, 100000000, 1000, 200000)
+	r3.add_child(_pcr_endow)
+	col.add_child(r3)
+	return col
+
+
+## Antibiotic (cull) param sub-panel: target species + a permille [0,1000] kill-fraction (fires LiveSim.cull).
+func _build_cull_params() -> VBoxContainer:
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Species:"))
+	_cull_species = OptionButton.new()
+	r1.add_child(_cull_species)
+	col.add_child(r1)
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Kill:"))
+	_cull_strength = HSlider.new()
+	_cull_strength.min_value = 0
+	_cull_strength.max_value = 1000
+	_cull_strength.step = 10
+	_cull_strength.value = 500
+	_cull_strength.custom_minimum_size = Vector2(120, 0)
+	_cull_strength.value_changed.connect(_on_cull_strength_changed)
+	r2.add_child(_cull_strength)
+	_cull_strength_label = _dim_label("50%")
+	r2.add_child(_cull_strength_label)
+	col.add_child(r2)
+	return col
+
+
+## Nutrient param sub-panel: a pool-plane channel {Light, Nutrient, Detritus} + the J amount (fires LiveSim.nutrient).
+func _build_nutrient_params() -> VBoxContainer:
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Channel:"))
+	_nutrient_channel = OptionButton.new()
+	_nutrient_channel.add_item("Light")      # 0
+	_nutrient_channel.add_item("Nutrient")   # 1 (free_nutrient)
+	_nutrient_channel.add_item("Detritus")   # 2
+	_nutrient_channel.select(1)
+	r1.add_child(_nutrient_channel)
+	col.add_child(r1)
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Amount J:"))
+	_nutrient_amount = _make_spin(1000, 100000000, 1000, 800000)
+	r2.add_child(_nutrient_amount)
+	col.add_child(r2)
+	return col
+
+
+## Toxin param sub-panel: a chem-field channel {Toxin, Kin, Alarm} + the milli amount (fires LiveSim.toxin).
+func _build_toxin_params() -> VBoxContainer:
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	var r1 := HBoxContainer.new()
+	r1.add_child(_dim_label("Channel:"))
+	_toxin_channel = OptionButton.new()
+	_toxin_channel.add_item("Toxin")  # 0
+	_toxin_channel.add_item("Kin")    # 1
+	_toxin_channel.add_item("Alarm")  # 2
+	_toxin_channel.select(0)
+	r1.add_child(_toxin_channel)
+	col.add_child(r1)
+	var r2 := HBoxContainer.new()
+	r2.add_child(_dim_label("Amount:"))
+	_toxin_amount = _make_spin(1000, 100000000, 1000, 500000)
+	r2.add_child(_toxin_amount)
+	col.add_child(r2)
+	return col
+
+
+## A configured SpinBox (helper for the per-tool integer params). Renderer-only widget plumbing.
+func _make_spin(lo: float, hi: float, step: float, val: float) -> SpinBox:
+	var s := SpinBox.new()
+	s.min_value = lo
+	s.max_value = hi
+	s.step = step
+	s.value = val
+	s.custom_minimum_size = Vector2(120, 0)
+	return s
+
+
+## Fill the per-tool target-species OptionButtons from the live per-species observation (observe_species() order =
+## SpeciesId order, inv #3). The item's metadata carries the raw SpeciesId ordinal the core resolves (the
+## RequestEcoliEdit / RegionInoculate u16-scaffold convention). Called at UI build + after a species change/reset.
+func _populate_species_pickers() -> void:
+	for ob in [_pcr_species, _cull_species]:
+		if ob == null:
+			continue
+		var prev: int = ob.selected
+		ob.clear()
+		for row in _panel_species_list():
+			var d: Dictionary = row
+			ob.add_item(str(d.get("name", "species")))
+			ob.set_item_metadata(ob.item_count - 1, int(d.get("species_id", 0)))
+		if prev >= 0 and prev < ob.item_count:
+			ob.select(prev)
+
+
+## The selected raw SpeciesId ordinal in a species OptionButton (the u16 scaffold the core resolves at the step
+## boundary). Defaults to 0 when nothing is selected.
+func _picker_species_id(ob: OptionButton) -> int:
+	if ob == null or ob.selected < 0:
+		return 0
+	return int(ob.get_item_metadata(ob.selected))
 
 
 func _on_guide_submitted(_text: String) -> void:
@@ -658,25 +876,65 @@ func _on_inject_pressed() -> void:
 
 
 ## Show an edit outcome (whole-species or region) in the status line + drop a timeline marker. Shared by the
-## "Inject" button and the selective brush.
+## "Inject" button and the CRISPR brush — defaults to the CRISPR tool tag (the other tools call
+## `_record_tool_outcome` with their own tag).
 func _record_edit_outcome(outcome: Dictionary) -> void:
+	_record_tool_outcome(TOOL_CRISPR, outcome)
+
+
+## Generalized per-tool outcome readout (SP-3.6/3.7): show the verdict in the status line + drop a PER-TOOL
+## timeline marker `{generation, tool, applied, label}`. Every tool routes through here so the status line + the
+## timeline stay in lock-step. Read-only (inv #2) — `outcome` is the core's verdict, marshaled by the LiveSim
+## #[func]; this only displays it.
+func _record_tool_outcome(tool: int, outcome: Dictionary) -> void:
 	var applied := bool(outcome.get("applied", false))
-	_inject_status.text = ("✓ " if applied else "✗ ") + str(outcome.get("detail", ""))
-	_inject_status.add_theme_color_override(
-		"font_color", Color(0.5, 0.92, 0.52) if applied else Color(0.96, 0.55, 0.5))
-	_injections.append({"generation": int(outcome.get("generation", 0)), "applied": applied})
+	var detail := str(outcome.get("detail", ""))
+	if _inject_status != null:
+		_inject_status.text = ("✓ " if applied else "✗ ") + detail
+		_inject_status.add_theme_color_override(
+			"font_color", Color(0.5, 0.92, 0.52) if applied else Color(0.96, 0.55, 0.5))
+	_injections.append({
+		"generation": int(outcome.get("generation", 0)),
+		"tool": TOOL_KEYS[tool],
+		"applied": applied,
+		"label": detail,
+	})
 	if _timeline != null:
 		_timeline.set_markers(_injections)
 
 
-## Toggle the selective brush mode (key B / the panel button). Live-mode only; clears the overlay when off.
+## Select an intervention tool (SP-3.6): swap its param sub-panel into view + retint the brush so the painted disc
+## colour signals which tool will land. Pure renderer state (inv #2). `_on_tool_selected` is the button hook.
+func _on_tool_selected(tool: int) -> void:
+	_select_tool(tool)
+
+
+func _select_tool(tool: int) -> void:
+	_active_tool = clampi(tool, 0, _tool_panels.size() - 1)
+	for i in _tool_panels.size():
+		if _tool_panels[i] != null:
+			_tool_panels[i].visible = (i == _active_tool)
+	if _brush != null:
+		_brush.set_tint(TOOL_TINTS[_active_tool])  # the disc COLOUR = the active tool
+
+
+func _on_cull_strength_changed(v: float) -> void:
+	if _cull_strength_label != null:
+		_cull_strength_label.text = "%d%%" % int(round(v / 10.0))  # permille → %
+
+
+## Toggle the selective brush mode (key B / the panel button). Live-mode only; clears the overlay when off and
+## re-tints to the active tool when on.
 func _set_brush_mode(on: bool) -> void:
 	_brush_on = on and _live != null
 	if _brush_button != null:
 		_brush_button.set_pressed_no_signal(_brush_on)
 		_brush_button.text = "🖌 Brush: on" if _brush_on else "🖌 Brush: off"
-	if _brush != null and not _brush_on:
-		_brush.clear()
+	if _brush != null:
+		if _brush_on:
+			_brush.set_tint(TOOL_TINTS[_active_tool])
+		else:
+			_brush.clear()
 
 
 func _on_brush_toggled(pressed: bool) -> void:
@@ -684,17 +942,64 @@ func _on_brush_toggled(pressed: bool) -> void:
 
 
 ## Apply a region-scoped edit centred on the current brush cell, using the panel's Cas/locus/guide selection.
+## (Kept for the --shot demo path; the live brush dispatches via _apply_active_tool.)
 func _apply_brush() -> void:
-	if _live == null or _brush_cell.x < 0 or _cas_picker.selected < 0 or _locus_picker.selected < 0:
+	if _live == null or _brush_cell.x < 0 or _cas_picker == null or _cas_picker.selected < 0 \
+			or _locus_picker.selected < 0:
 		return
 	if not _can_spend_edit():
 		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
-	_record_edit_outcome(_live.apply_edit_region(
+	_record_tool_outcome(TOOL_CRISPR, _live.apply_edit_region(
 		cas_id, locus_id, _guide_edit.text, _brush_cell.x, _brush_cell.y, _brush_radius))
 	if _mission_on:
 		_edits_used += 1
+
+
+## Dispatch the ACTIVE tool at the current brush cell (SP-3.6). POSITION MATTERS end-to-end: brush cell →
+## RegionSpec → Region::contains in the core selects the orgs/cells. Each tool issues ONE journaled Action via its
+## LiveSim #[func] and records the per-tool verdict (status line + timeline marker). Biology stays in the core
+## (inv #2). The four substrate/clone #[func]s are has_method-guarded so the renderer degrades gracefully against
+## an older cdylib (before SP-3.5 lands) — exactly the forward-compat probe used for observe_species/flow_matrix.
+func _apply_active_tool() -> void:
+	if _live == null or _brush_cell.x < 0:
+		return
+	var cx := _brush_cell.x
+	var cy := _brush_cell.y
+	var r := _brush_radius
+	match _active_tool:
+		TOOL_CRISPR:
+			_apply_brush()  # the existing CRISPR region edit (spends a mission edit, gates on budget)
+		TOOL_PCR:
+			if not _live.has_method("pcr_amplify"):
+				_flash_status("✗ PCR unsupported by this build", false)
+				return
+			var sid := _picker_species_id(_pcr_species)
+			var cnt := int(_pcr_count.value) if _pcr_count != null else 1
+			var endow := int(_pcr_endow.value) if _pcr_endow != null else 0
+			_record_tool_outcome(TOOL_PCR, _live.pcr_amplify(sid, cx, cy, r, cnt, endow))
+		TOOL_ANTIBIOTIC:
+			if not _live.has_method("cull"):
+				_flash_status("✗ Antibiotic unsupported by this build", false)
+				return
+			var sid2 := _picker_species_id(_cull_species)
+			var strength := int(_cull_strength.value) if _cull_strength != null else 0
+			_record_tool_outcome(TOOL_ANTIBIOTIC, _live.cull(sid2, cx, cy, r, strength))
+		TOOL_NUTRIENT:
+			if not _live.has_method("nutrient"):
+				_flash_status("✗ Nutrient unsupported by this build", false)
+				return
+			var ch := _nutrient_channel.selected if _nutrient_channel != null else 1
+			var amt := int(_nutrient_amount.value) if _nutrient_amount != null else 0
+			_record_tool_outcome(TOOL_NUTRIENT, _live.nutrient(ch, cx, cy, r, amt))
+		TOOL_TOXIN:
+			if not _live.has_method("toxin"):
+				_flash_status("✗ Toxin unsupported by this build", false)
+				return
+			var ch2 := _toxin_channel.selected if _toxin_channel != null else 0
+			var amt2 := int(_toxin_amount.value) if _toxin_amount != null else 0
+			_record_tool_outcome(TOOL_TOXIN, _live.toxin(ch2, cx, cy, r, amt2))
 
 
 ## Update the hovered brush cell from the mouse (world → cell, clamped to the world/live grid) + refresh preview.
@@ -1412,8 +1717,51 @@ func _on_load_pressed() -> void:
 	if not bool(r.get("ok", false)):
 		_flash_status("✗ load failed: " + str(r.get("detail", "no save")), false)
 		return
-	_resync_to_live()
+	_resync_to_live()  # clears _injections; the markers are re-derived from the restored journal below
+	_rebuild_markers_from_journal()
 	_flash_status("📂 loaded — gen %d, %d actions" % [int(r.get("generation", 0)), int(r.get("actions", 0))], true)
+
+
+## Re-derive the timeline intervention markers from the RESTORED journal after a load (SP-3.7). The journal is the
+## source of truth: each region Action maps to the generation = the running sum of the preceding `Advance` counts.
+## The markers are thus a DETERMINISTIC PROJECTION of the replayed journal, so a scrubbed/replayed session shows
+## every intervention exactly where it fired. Read-only (inv #2): GDScript only reads the ordered Action tags the
+## core exports; it computes no biology. Uses the forward-compat `journal_actions` #[func] when the cdylib exposes
+## it (the same has_method probe used for observe_species/flow_matrix); without it the markers stay empty (a load
+## still replays correctly — only the visual markers are absent until the export lands).
+func _rebuild_markers_from_journal() -> void:
+	_injections = []
+	if _live != null and _live.has_method("journal_actions"):
+		var gen := 0
+		for entry in _live.journal_actions():
+			var d: Dictionary = entry
+			var kind := str(d.get("kind", ""))
+			if kind == "advance":
+				gen += int(d.get("n", 0))
+				continue
+			var tool := _journal_kind_to_tool(kind)
+			if tool < 0:
+				continue  # a non-intervention action (e.g. inoculate) — no palette marker for it
+			_injections.append({
+				"generation": gen,
+				"tool": TOOL_KEYS[tool],
+				"applied": true,  # a journaled Action replayed → it landed (the journal records what fired)
+				"label": str(d.get("detail", "")),
+			})
+	if _timeline != null:
+		_timeline.set_markers(_injections)
+
+
+## Map a journal Action `kind` tag (the LiveSim journal_actions export, when present) to a palette tool index, or
+## -1 for actions that are not one of the five palette interventions. Pure string mapping (inv #2).
+func _journal_kind_to_tool(kind: String) -> int:
+	match kind:
+		"apply_edit_region", "crispr": return TOOL_CRISPR
+		"pcr_amplify", "pcr": return TOOL_PCR
+		"cull", "region_cull": return TOOL_ANTIBIOTIC
+		"nutrient", "region_nutrient": return TOOL_NUTRIENT
+		"toxin", "region_toxin": return TOOL_TOXIN
+		_: return -1
 
 
 ## Flash a short message in the intervention status line (shared by save/load + edits).
@@ -2737,7 +3085,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_brush_radius(_brush_radius - 1)
 			elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
 				_update_brush_cell()
-				_apply_brush()
+				_brush_painting = true  # begin a drag-paint stroke (POSITION MATTERS along the drag)
+				_apply_active_tool()
+			elif event.button_index == MOUSE_BUTTON_LEFT and not event.pressed:
+				_brush_painting = false  # end the stroke
 			return
 		if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
 			_set_zoom(_cam.zoom.x * 1.15)
@@ -2755,7 +3106,11 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	if event is InputEventMouseMotion:
 		if _brush_on:
+			var prev_cell := _brush_cell
 			_update_brush_cell()  # follow the cursor with the brush preview
+			# Drag-to-paint (SP-3.6): while the button is held, fire the active tool at each NEWLY-hovered cell.
+			if _brush_painting and (event.button_mask & MOUSE_BUTTON_MASK_LEFT) and _brush_cell != prev_cell:
+				_apply_active_tool()
 			if _tooltip != null:
 				_tooltip.visible = false
 			return

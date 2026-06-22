@@ -619,6 +619,157 @@ impl LiveSim {
             .unwrap_or(0)
     }
 
+    /// **SP-3 PCR-AMPLIFY** — spawn `count` FAITHFUL clones of an ALREADY-RESIDENT `species` ordinal inside the
+    /// disc `(cx, cy, radius)`, each endowed with `endow_j` joules MINTED from the `intervention` ledger tap
+    /// (conserved). Each clone copies its local template's heritable state VERBATIM (no mutation). RNG-free,
+    /// journaled for save/load (inv #3). Cell-scoped, no organism handle (inv #6); biology in the core (inv #2)
+    /// — GDScript only issues the Action + reads the verdict. Returns `{applied, detail, generation, covered}`
+    /// (`covered` = the clones placed; `0` if the species has no in-region template).
+    #[func]
+    fn pcr_amplify(
+        &mut self,
+        species: i64,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+        count: i64,
+        endow_j: i64,
+    ) -> VarDictionary {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::pcr_amplify called before reset()");
+            return region_dict(false, "not reset", 0, 0);
+        };
+        let before = env.intervention_minted();
+        let n = count.clamp(0, i64::from(u32::MAX)) as u32;
+        let action = Action::RegionPcrAmplify {
+            species: species.clamp(0, i64::from(u16::MAX)) as u16,
+            region: RegionSpec {
+                cx: cx.max(0) as u32,
+                cy: cy.max(0) as u32,
+                radius: radius.max(0) as u32,
+            },
+            count: n,
+            endow_j: endow_j.max(0),
+        };
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load
+        let env = self.env.as_mut().expect("env present");
+        let minted = env.intervention_minted() - before;
+        let cur_gen = env_gen(env);
+        // A clone mints OFFSPRING from the tap iff a local template existed; minted==0 → no-op (no template).
+        let covered = if endow_j > 0 {
+            (minted / endow_j.max(1)) as u32
+        } else {
+            0
+        };
+        region_dict(
+            covered > 0,
+            &format!("PCR → {covered} clones · +{minted} J"),
+            cur_gen,
+            covered,
+        )
+    }
+
+    /// **SP-3 ANTIBIOTIC CULL** — deterministically kill a `strength`-permille `[0,1000]` kill-fraction of the
+    /// `species` ordinal's living orgs inside the disc `(cx, cy, radius)`; each culled org's residual J → detritus
+    /// (carcass→detritus, conserved — no tap minted). RNG-free, journaled (inv #3). Cell-scoped (inv #6); biology
+    /// in the core (inv #2). Returns `{applied, detail, generation, covered}` (`covered` = orgs killed).
+    #[func]
+    fn cull(&mut self, species: i64, cx: i64, cy: i64, radius: i64, strength: i64) -> VarDictionary {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::cull called before reset()");
+            return region_dict(false, "not reset", 0, 0);
+        };
+        let before_pop = env.observe().population_size;
+        let action = Action::RegionCull {
+            species: species.clamp(0, i64::from(u16::MAX)) as u16,
+            region: RegionSpec {
+                cx: cx.max(0) as u32,
+                cy: cy.max(0) as u32,
+                radius: radius.max(0) as u32,
+            },
+            strength: strength.clamp(0, 1000) as u16,
+        };
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load
+        let env = self.env.as_mut().expect("env present");
+        let killed = before_pop.saturating_sub(env.observe().population_size);
+        let cur_gen = env_gen(env);
+        region_dict(
+            killed > 0,
+            &format!("Cull → {killed} killed → detritus"),
+            cur_gen,
+            killed,
+        )
+    }
+
+    /// **SP-3 NUTRIENT FEED** — deposit `amount_j` joules into one pool plane (`channel`: `0` light · `1`
+    /// free_nutrient · `2` detritus) across the disc `(cx, cy, radius)`, MINTED from the `intervention` ledger
+    /// tap (conserved; `POOL_CAP` spill → overflow). Species-agnostic. RNG-free, journaled (inv #3). Cell-scoped
+    /// (inv #6); biology in the core (inv #2). Returns `{applied, detail, generation, covered}` (`covered` = 0;
+    /// `detail` reports the minted J).
+    #[func]
+    fn nutrient(&mut self, channel: i64, cx: i64, cy: i64, radius: i64, amount_j: i64) -> VarDictionary {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::nutrient called before reset()");
+            return region_dict(false, "not reset", 0, 0);
+        };
+        let before = env.intervention_minted();
+        let action = Action::RegionNutrient {
+            channel: channel.clamp(0, 2) as u8,
+            region: RegionSpec {
+                cx: cx.max(0) as u32,
+                cy: cy.max(0) as u32,
+                radius: radius.max(0) as u32,
+            },
+            amount_j: amount_j.max(0),
+        };
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load
+        let env = self.env.as_mut().expect("env present");
+        let minted = env.intervention_minted() - before;
+        let cur_gen = env_gen(env);
+        region_dict(
+            minted > 0,
+            &format!("Nutrient ch{channel} → +{minted} J"),
+            cur_gen,
+            0,
+        )
+    }
+
+    /// **SP-3 TOXIN SPIKE** — deposit `amount_milli` (== J 1:1) into one chem plane (`channel`: `0` toxin · `1`
+    /// kin · `2` alarm) across the disc `(cx, cy, radius)`, MINTED from the `intervention` ledger tap (conserved;
+    /// `CHEM_CAP` spill → overflow). RNG-free, journaled (inv #3). Cell-scoped (inv #6); biology in the core
+    /// (inv #2). Returns `{applied, detail, generation, covered}` (`covered` = 0; `detail` reports the minted milli).
+    #[func]
+    fn toxin(&mut self, channel: i64, cx: i64, cy: i64, radius: i64, amount_milli: i64) -> VarDictionary {
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::toxin called before reset()");
+            return region_dict(false, "not reset", 0, 0);
+        };
+        let before = env.intervention_minted();
+        let action = Action::RegionToxin {
+            channel: channel.clamp(0, 2) as u8,
+            region: RegionSpec {
+                cx: cx.max(0) as u32,
+                cy: cy.max(0) as u32,
+                radius: radius.max(0) as u32,
+            },
+            amount_milli: amount_milli.max(0),
+        };
+        env.step(action.clone());
+        self.journal.push(action); // record for save/load
+        let env = self.env.as_mut().expect("env present");
+        let minted = env.intervention_minted() - before;
+        let cur_gen = env_gen(env);
+        region_dict(
+            minted > 0,
+            &format!("Toxin ch{channel} → +{minted} milli"),
+            cur_gen,
+            0,
+        )
+    }
+
     /// Set the CONTAINMENT knob + consortium config the **next** `reset` builds its immigration schedule under
     /// (ADR-019 S2). `level`: `0` Sealed (OFF, the default) · `1` Clean · `2` Lab · `3` Open. `species_keys` is
     /// the consortium menu (kebab keys the renderer also registers as contaminants); `radius`/`endow_j`/

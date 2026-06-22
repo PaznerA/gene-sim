@@ -37,14 +37,22 @@ pub struct Ledger {
     /// named tap (kept separate from `respired` so chem dissipation is independently attributable). Zero on a
     /// chem-free run (no species emits → `ChemField == 0` → nothing decays) → byte-identical to F4's J path.
     pub chem_decay: i64,
+    /// Cumulative `J` minted into the world as a deliberate OPERATOR INTERVENTION (SP-3): the endowment of a
+    /// PCR-amplified clone, a nutrient-feed deposit, or a toxin-spike — minted here at the operator's request
+    /// (not transferred from a resident, not solar). A SIXTH influx-family tap parallel to `immigration`, kept
+    /// independently named so a deliberate injection is attributable separately from solar `influx` and
+    /// contaminant `immigration`. Zero on a run that issues no SP-3 intervention (the pinned plant config) →
+    /// byte-identical to the pre-SP-3 ledger. (An antibiotic CULL mints NOTHING — its carcass→detritus is a
+    /// paired bucket move accounted exactly like a starvation death — so it never touches this tap.)
+    pub intervention: i64,
 }
 
 impl Ledger {
-    /// The `J` the books say should currently be live: `initial + influx + immigration − respired − overflow −
-    /// chem_decay`.
+    /// The `J` the books say should currently be live: `initial + influx + immigration + intervention −
+    /// respired − overflow − chem_decay`.
     #[must_use]
     pub fn expected_total(&self) -> i64 {
-        self.initial_total + self.influx + self.immigration
+        self.initial_total + self.influx + self.immigration + self.intervention
             - self.respired
             - self.overflow
             - self.chem_decay
@@ -115,7 +123,7 @@ pub fn assert_ledger_closes(ledger: &Ledger, live: &LiveTotal) {
     assert!(
         measured == expected,
         "ledger_closes VIOLATED: measured live J = {measured} (pools={} + energy={} + biomass={} + chem={}) \
-         != expected {expected} (initial={} + influx={} + immigration={} − respired={} − overflow={} − chem_decay={}); leak of {} J",
+         != expected {expected} (initial={} + influx={} + immigration={} + intervention={} − respired={} − overflow={} − chem_decay={}); leak of {} J",
         live.pools,
         live.energy,
         live.biomass,
@@ -123,6 +131,7 @@ pub fn assert_ledger_closes(ledger: &Ledger, live: &LiveTotal) {
         ledger.initial_total,
         ledger.influx,
         ledger.immigration,
+        ledger.intervention,
         ledger.respired,
         ledger.overflow,
         ledger.chem_decay,
@@ -152,6 +161,7 @@ mod tests {
             respired: 120,
             overflow: 30,
             chem_decay: 10,
+            intervention: 0,
         };
         assert_eq!(l.expected_total(), 1140);
         assert!(l.closes(1140));
@@ -172,6 +182,7 @@ mod tests {
             respired: 120,
             overflow: 0,
             chem_decay: 0,
+            intervention: 0,
         };
         assert_eq!(l.expected_total(), 1680);
         assert!(l.closes(1680));
@@ -185,6 +196,34 @@ mod tests {
             ..l
         };
         assert_eq!(no_immig.expected_total(), 1180);
+    }
+
+    #[test]
+    fn intervention_tap_conserves() {
+        // SP-3: 1000 seeded, +300 solar influx, +700 deliberate intervention (PCR endowment + nutrient feed +
+        // toxin spike), −120 respired → 1880 live. The intervention tap is a SIXTH source, independently
+        // attributable from solar `influx` and contaminant `immigration`.
+        let l = Ledger {
+            initial_total: 1000,
+            influx: 300,
+            immigration: 0,
+            respired: 120,
+            overflow: 0,
+            chem_decay: 0,
+            intervention: 700,
+        };
+        assert_eq!(l.expected_total(), 1880);
+        assert!(l.closes(1880));
+        assert!(
+            !l.closes(1881),
+            "a conjured intervention quantum must break the books"
+        );
+        // A run that never intervenes (intervention == 0) is byte-identical to the pre-SP-3 ledger math.
+        let no_intervention = Ledger {
+            intervention: 0,
+            ..l
+        };
+        assert_eq!(no_intervention.expected_total(), 1180);
     }
 
     #[test]
@@ -211,6 +250,7 @@ mod tests {
             respired: 120,
             overflow: 30,
             chem_decay: 0,
+            intervention: 0,
         }; // expected 1150
         let ok = LiveTotal {
             pools: 800,
