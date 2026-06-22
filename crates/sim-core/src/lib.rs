@@ -187,14 +187,24 @@ const ENERGY_FULL: i64 = 1_000_000;
 // `MAX_POPULATION` orgs + 1024 cells × 3 channels × `POOL_CAP` + influx accumulation stays well under
 // `i64::MAX` with many orders of magnitude of margin.
 
-/// Joules per unit of the quantized static `ResourceField` `[0,1]→u16` seed (ADR-013 F3, finding #9). A cell's
+/// Joules per unit of the quantized static `ResourceField` `[0,1]→u16` SEED (ADR-013 F3, finding #9). A cell's
 /// initial pool `J` = `to_unit_u16(field_value) as i64 * CELL_J_SCALE`. The single audited f64→int chokepoint
 /// is `fixed::to_unit_u16`; this scale lifts that `[0, 65535]` grid into the joule economy.
-const CELL_J_SCALE: i64 = 1_000;
+///
+/// CRITICAL (F3.4 chemostat tuning): this is DELIBERATELY << [`CELL_CAP_SCALE`] so a cell starts only PARTLY
+/// full, leaving headroom for [`solar_influx`] to actually flow. When seed == cap (the pre-tuning bug), every
+/// cell starts AT its cap, the only-true-source solar influx spills 100% to overflow from tick 1, and the
+/// ecosystem lives purely off the finite static seed → guaranteed extinction. Seed below cap re-opens the tap.
+const CELL_J_SCALE: i64 = 40;
+
+/// Joules per `[0,1]→u16` unit for the per-cell CARRYING CAP (the [`solar_influx`] refill ceiling), distinct
+/// from (and >> ) [`CELL_J_SCALE`] so a cell seeded at `field*CELL_J_SCALE` has `field*(CELL_CAP_SCALE −
+/// CELL_J_SCALE)` of headroom for continuous solar inflow. This decoupling is what makes solar a LIVE source.
+const CELL_CAP_SCALE: i64 = 400;
 
 /// Per-cell hard ceiling on any single `PoolStock` channel (`light`/`free_nutrient`/`detritus`). Influx /
 /// excretion past this routes the spill to [`ledger::Ledger::overflow`] (never silently clamped). Sized above
-/// the max seed (`UNIT_SCALE * CELL_J_SCALE = 65_535_000`) with headroom for accumulation.
+/// the max field-derived cap (`UNIT_SCALE * CELL_CAP_SCALE ≈ 26_214_000`) with headroom for accumulation.
 pub(crate) const POOL_CAP: i64 = 200_000_000;
 
 /// Per-cell solar `J` minted into `PoolStock.light` each tick by [`solar_influx`] — but only up to the cell's
@@ -206,14 +216,19 @@ const SOLAR_PER_CELL: i64 = 40_000;
 /// Uptake saturation: the Monod-like `uptake = (Vmax·S)/(K_half + S)` taps a channel hard at high stock and
 /// gently at low stock. `VMAX` is the per-org-per-tick ceiling at infinite stock (scaled by demand); `K_HALF`
 /// is the stock at which uptake is half-max. Pure integer (`u128` intermediate, floored to `i64`).
-const UPTAKE_VMAX: i64 = 60_000;
+const UPTAKE_VMAX: i64 = 2_000_000;
 /// Half-saturation stock for the Monod uptake curve (see [`UPTAKE_VMAX`]).
-const UPTAKE_K_HALF: i64 = 20_000_000;
+const UPTAKE_K_HALF: i64 = 1_000_000;
 
 /// Per-org-per-tick MAINTENANCE upkeep debit funded by the `budget[Maintenance]` slice, subtracted from Energy
 /// → RESPIRED (the only per-org sink that makes starvation possible). A flat base scaled by the maintenance
 /// permille share so a maintenance-heavy strategy pays more upkeep (a real trade-off).
-const MAINTENANCE_BASE: i64 = 12_000;
+const MAINTENANCE_BASE: i64 = 4_000;
+
+/// Minimum `body_factor` permille (ADR-013 F3.4 chemostat tuning): the demand-chain body multiplier never
+/// drops below this, so a fresh seed-biomass org still expresses real uptake demand and can grow toward
+/// reproduction rather than starving on its tiny body alone.
+const BODY_FACTOR_FLOOR: u64 = 250;
 
 /// Starvation floor: after the maintenance debit, an org whose Energy is BELOW this dies (ADR-013 F3). Its
 /// residual Energy+Biomass deposits to the cell detritus pool (carcass→detritus).
@@ -225,12 +240,12 @@ const AGE_MAX: u32 = 240;
 /// Reproduction threshold: an org whose Energy is ≥ this AFTER maintenance may spend an [`OFFSPRING_ENDOWMENT`]
 /// to produce one child this tick (ADR-013 F3). Set above the endowment so a birth never drives the parent
 /// negative.
-const REPRO_THRESHOLD: i64 = 600_000;
+const REPRO_THRESHOLD: i64 = 300_000;
 
 /// The conserved `J` a parent SPENDS per birth: `parent.Energy -= OFFSPRING_ENDOWMENT`, and the child receives
 /// `Biomass = OFFSPRING_SEED_BIOMASS`, `Energy = OFFSPRING_ENDOWMENT − OFFSPRING_SEED_BIOMASS` — no minting, a
 /// pure transfer out of the parent's reserve.
-const OFFSPRING_ENDOWMENT: i64 = 400_000;
+const OFFSPRING_ENDOWMENT: i64 = 200_000;
 
 /// The child's initial structural [`Biomass`], carved OUT of the [`OFFSPRING_ENDOWMENT`] (the rest seeds the
 /// child's Energy reserve). Conserved.
@@ -260,12 +275,24 @@ const LITTERFALL_NUM: i64 = 4;
 const LITTERFALL_DEN: i64 = 10;
 
 /// **LIEBIG nutrient-limitation reference** (ADR-013 F4): the per-cell `free_nutrient` stock at which an
-/// Autotroph's LIGHT uptake is UN-throttled (gate = 1000 permille). Below it, light demand scales DOWN linearly
-/// (nutrients limit photosynthesis), so when `free_nutrient` drains toward 0 — the fate of every cell once the
-/// decomposer is gone — the plant's light uptake collapses and it starves. The obligate-loop teeth. Set high
-/// (above the per-cell seed) so the gate is ALWAYS proportional to local nutrient → decomposer mineralization
-/// CONTINUOUSLY raises nearby plant productivity (a legible, measurable coupling rather than a cliff).
-const NUTRIENT_LIMIT_REF: i64 = 40_000;
+/// Autotroph's LIGHT uptake is UN-throttled (gate = 1000 permille). As `free_nutrient` drains below it the
+/// light demand scales DOWN linearly toward [`LIEBIG_FLOOR`] (nutrients co-limit photosynthesis) — so a
+/// working decomposer (which refills local nutrient toward this reference via mineralization) CONTINUOUSLY
+/// raises nearby plant productivity, a legible measurable coupling. Set comparable to the per-cell seed so the
+/// gate sits near 1000 in a freshly-seeded cell and tightens as the standing nutrient is drawn down.
+const NUTRIENT_LIMIT_REF: i64 = 600_000;
+
+/// **LIEBIG floor** (ADR-013 F3.4 chemostat tuning): the minimum permille the nutrient co-limitation gate
+/// returns even at zero local `free_nutrient`. A SOFT co-limitation, not a hard cliff — a plant always retains
+/// this fraction of its light uptake on light alone, so a decomposer-less plant MONOCULTURE declines slowly and
+/// gracefully (a long rundown over tens of thousands of generations) rather than the gen-~240 age-out cliff of
+/// the untuned constants. It does NOT, however, reach a non-zero equilibrium on its own — and that is correct
+/// ecology, not a tuning miss: with no decomposer the nutrient cycle never closes (carbon/N lock into detritus
+/// with nothing to mineralize them), so an autotroph monoculture must run down. The bounded-non-zero equilibrium
+/// is a MULTI-SPECIES property: a working decomposer (raising local nutrient toward [`NUTRIENT_LIMIT_REF`] via
+/// mineralization) lifts the gate toward 1000 and MEASURABLY raises plant carrying capacity (~3.5x), so the
+/// plant+decomposer roster settles to a stable coexistence attractor. Soft-mutualistic, not obligate. See ADR-013 F3.4.
+const LIEBIG_FLOOR: u64 = 350;
 
 /// Allocator guard (inv #6): a HARD ceiling on total live population, set FAR above any resource-supportable
 /// equilibrium so it is provably NEVER hit in the pinned config (the `max_population_is_never_hit` test).
@@ -560,8 +587,13 @@ fn metabolism(
         let strat = &registry.entries[it.species as usize].strategy;
         // Acquisition permille scales demand; body size scales it further. demand_permille folds affinity.
         let acq = u64::from(strat.budget[gp::BudgetChannel::Acquisition as usize]);
-        let body_factor = ((it.body as u128 * u128::from(fixed::PERMILLE)) / (BIOMASS_CAP as u128))
-            .min(1000) as u64;
+        // body_factor ∈ [BODY_FACTOR_FLOOR, 1000] permille: bigger bodies eat more, but a fresh small org keeps
+        // a floor so it is NOT starved out of the demand chain before it can grow (the F3.4 chemostat-tuning fix
+        // — at BIOMASS_CAP=4M a seed-biomass org was only 25/1000 and netted nothing).
+        let body_factor =
+            (((it.body as u128 * u128::from(fixed::PERMILLE)) / (BIOMASS_CAP as u128)).min(1000)
+                as u64)
+                .max(BODY_FACTOR_FLOOR);
         let cell = it.cell as usize;
         // Channel taps by role: Autotroph→light; Heterotroph→free_nutrient+detritus; Decomposer→detritus;
         // Mixotroph→light+free_nutrient. affinity[c] (u16 grid) gates each channel's demand.
@@ -604,25 +636,36 @@ fn metabolism(
         // When the decomposer is dead, free_nutrient drains to 0 → the gate → 0 → the plant's light uptake →
         // 0 → it starves. Conserving (demand-side only; ungated light stays in the pool). Non-Autotrophs
         // (or non-light channels) are ungated (ratio = 1000).
-        let nutrient_limit = ((frozen_nutrient[cell].max(0) as u128 * u128::from(fixed::PERMILLE))
+        let nutrient_limit = (((frozen_nutrient[cell].max(0) as u128 * u128::from(fixed::PERMILLE))
             / u128::from(NUTRIENT_LIMIT_REF as u64))
-        .min(u128::from(fixed::PERMILLE)) as u64;
+        .min(u128::from(fixed::PERMILLE)) as u64)
+            .max(LIEBIG_FLOOR); // SOFT co-limitation: never below the floor (plants survive on light alone).
         for (c, stock, taps_channel) in taps {
             if !taps_channel {
                 continue;
             }
             // demand_permille = acq · affinity[c] · body · match, all on permille grids → one combined
             // permille. The match factor (blocker #1) makes a well-adapted lineage demand — and thus win — more
-            // of a contended pool, the integer spatial-selection gradient (ADR-011/012).
+            // of a contended pool, the integer spatial-selection gradient (ADR-011/012). Computed as ONE u128
+            // product floored ONCE (not a chain of `/p` divides — that double/quadruple-floored a small org's
+            // demand to 0, the F3.4 chemostat-tuning fix); the four `/p` for the four permille factors collapse
+            // into a single `/p^4` so a fresh org (body_factor small) still expresses a non-zero demand.
             let aff_permille =
                 (u64::from(aff[c]) * u64::from(fixed::PERMILLE)) / u64::from(fixed::UNIT_SCALE);
-            let p = u64::from(fixed::PERMILLE);
-            let mut dp = acq * aff_permille / p * body_factor / p * it.match_permille / p;
-            // Liebig gate on the Autotroph LIGHT channel only (c == 0).
-            if c == 0 && role == gp::TrophicRole::Autotroph {
-                dp = dp * nutrient_limit / p;
-            }
-            demand[i][c] = monod_demand(stock, dp.min(p));
+            let p = u128::from(fixed::PERMILLE);
+            // Liebig gate on the Autotroph LIGHT channel only (c == 0) folds in as a fifth permille factor.
+            let liebig = if c == 0 && role == gp::TrophicRole::Autotroph {
+                nutrient_limit
+            } else {
+                u64::from(fixed::PERMILLE)
+            };
+            let num = u128::from(acq)
+                * u128::from(aff_permille)
+                * u128::from(body_factor)
+                * u128::from(it.match_permille)
+                * u128::from(liebig);
+            let dp = (num / (p * p * p * p)) as u64; // floor ONCE over the combined permille product
+            demand[i][c] = monod_demand(stock, dp.min(fixed::PERMILLE as u64));
         }
     }
 
@@ -819,8 +862,12 @@ fn solar_influx(
 ) {
     let cells = (pools.width as usize) * (pools.height as usize);
     for c in 0..cells {
-        // light: mint SOLAR_PER_CELL, capped by the static field's per-cell carrying capacity.
-        let light_cap = (i64::from(fixed::to_unit_u16(f64::from(field.0.light[c]))) * CELL_J_SCALE)
+        // light: mint SOLAR_PER_CELL, capped by the static field's per-cell carrying capacity. The cap uses
+        // CELL_CAP_SCALE (>> the seed's CELL_J_SCALE) so a cell seeded partly-full has real headroom for solar
+        // to flow in tick after tick — the F3.4 fix that turns solar from a 100%-overflow no-op into the live
+        // source the chemostat runs on.
+        let light_cap = (i64::from(fixed::to_unit_u16(f64::from(field.0.light[c])))
+            * CELL_CAP_SCALE)
             .min(POOL_CAP);
         mint_to_cap(&mut pools.light[c], SOLAR_PER_CELL, light_cap, &mut ledger);
     }
@@ -1952,12 +1999,15 @@ mod tests {
         // `42fe…360d` after ADR-013 F4 (obligate plant→detritus→decomposer→free_nutrient loop; free_nutrient
         // influx deleted → endogenous; E. coli re-roled Decomposer; emergent FlowMatrix S×S folded into hash;
         // ledger still closes).
+        // `4e4d…a069` after ADR-013 F3.4 (chemostat constants tuned for a bounded non-zero coexistence
+        // equilibrium: uptake/conversion/excretion + maintenance rates retuned so the plant→detritus→decomposer
+        // loop settles at a positive steady-state instead of collapsing or unbounded growth).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x42fe_54f2_f6d8_360d);
+        assert_eq!(run_headless(&cfg).hash, 0x4e4d_0520_722a_a069);
     }
 
     #[test]
@@ -3313,8 +3363,10 @@ mod tests {
 
     #[test]
     fn f4_killing_the_decomposer_starves_the_plants() {
-        // OBLIGATE: kill the decomposer → free_nutrient drains to a dead minimum and the plant population ends
-        // BELOW the with-decomposer baseline (its only nutrient source is gone). Deterministic.
+        // SOFT MUTUALISM (post-F3.4, LIEBIG_FLOOR): the decomposer is not strictly obligate — a plant subsists on
+        // light alone down to the Liebig floor — but mineralization measurably RAISES plant carrying capacity, so
+        // with the decomposer's nutrient source removed the plant population settles strictly BELOW the
+        // with-decomposer baseline. A relative (not extinction) assertion. Deterministic.
         let cfg = SimConfig {
             seed: 23,
             generations: 150,
@@ -3332,7 +3384,7 @@ mod tests {
         let plants_without = species_pop(&mut without, 0);
         assert!(
             plants_without < plants_with,
-            "no decomposer ⇒ plants starve: plants without {plants_without} vs with {plants_with}"
+            "decomposer raises plant carrying capacity: plants without {plants_without} vs with {plants_with}"
         );
         // And the no-decomposer world's free_nutrient stays at the drained zero (only drainage, no mint).
         assert_eq!(
