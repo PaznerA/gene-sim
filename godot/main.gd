@@ -48,7 +48,8 @@ const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph",
-	"light", "free_nutrient", "detritus"]  # GSS3 live-pool joule-economy planes appended after soil_ph
+	"light", "free_nutrient", "detritus",  # GSS3 live-pool joule-economy planes appended after soil_ph
+	"toxin", "kin", "alarm"]  # GSS4 chem planes (ADR-013 F5: allelopathy/kin/chemotaxis) appended after detritus
 # Optional per-channel legend captions (the joule economy made readable at a glance). Falls back to
 # "<name>   low → high" for any channel not listed here. Renderer-only labelling (inv #2).
 const OVERLAY_LEGENDS := {
@@ -2502,6 +2503,9 @@ func _cell_lines(snap, i: int) -> Array:
 		"light          %.3f" % snap.light[i],
 		"free_nutrient  %.3f" % snap.free_nutrient[i],
 		"detritus       %.3f" % snap.detritus[i],
+		"toxin          %.3f" % snap.toxin[i],
+		"kin            %.3f" % snap.kin[i],
+		"alarm          %.3f" % snap.alarm[i],
 	]
 
 
@@ -2567,10 +2571,12 @@ func _update_overlay(snap) -> void:
 	_overlay.scale = Vector2(_cell, _cell)
 	var mat := _overlay.material as ShaderMaterial
 	if mat != null:
-		# layer 0..2 sample the population texture; 3..5 the soil texture (R1.0); 6..8 the pool texture (GSS3).
+		# layer 0..2 sample the population texture; 3..5 the soil texture (R1.0); 6..8 the pool texture (GSS3);
+		# 9..11 the chem texture (GSS4, ADR-013 F5: toxin/kin/alarm).
 		mat.set_shader_parameter("layer", _overlay_mode - 1)
 		mat.set_shader_parameter("soil_tex", ImageTexture.create_from_image(snap.to_soil_image()))
 		mat.set_shader_parameter("pool_tex", ImageTexture.create_from_image(snap.to_pool_image()))
+		mat.set_shader_parameter("chem_tex", ImageTexture.create_from_image(snap.to_chem_image()))
 
 
 func _refresh_hud() -> void:

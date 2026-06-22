@@ -116,7 +116,7 @@ pub enum Action {
     ///
     /// At S4/S5 the step arm is a strict NO-OP: it draws ZERO `SimRng` words and mutates no hashed component
     /// (modeled on `Advance(0)`, NOT on `ApplyEdit` — `ApplyEdit` DRAWS from the stream). This is what keeps
-    /// the pinned literal `0x4e4d_0520_722a_a069` unchanged. Round-trips through `actions.ndjson`; on replay it
+    /// the pinned literal `0x47a0_3c8f_6701_f240` unchanged. Round-trips through `actions.ndjson`; on replay it
     /// is a no-op for the sim (only the paired [`Action::CommitEcoliImpact`] carries effect, and that is also
     /// journaled). `species` is a raw `u16` here (not the core's `SpeciesId`) until S5 promotes the core type to
     /// serde — see `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.

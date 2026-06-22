@@ -19,6 +19,7 @@ use bevy_ecs::prelude::*;
 use genome::Genome;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
+pub mod chem;
 pub mod climate;
 pub mod det;
 pub mod fixed;
@@ -166,7 +167,7 @@ struct ClimateFieldRes(climate::ClimateField);
 /// math: a `× 1000/1000` permille factor leaves the single combined-permille product unchanged. NOT folded into
 /// [`hash_world`] (the factor only ever reaches the hash THROUGH its coupling effect on the already-hashed
 /// Energy/Biomass/pools — like soil/climate). So the pinned single-species PLANT config (no edit, all-neutral)
-/// keeps `0x4e4d_0520_722a_a069`; activating a NON-neutral factor is the deliberate re-pin owned by a later
+/// keeps `0x47a0_3c8f_6701_f240`; activating a NON-neutral factor is the deliberate re-pin owned by a later
 /// phase (this slice WIRES it but the pinned run never sets a non-neutral factor).
 #[derive(Resource)]
 pub(crate) struct EditModifierRes {
@@ -633,7 +634,9 @@ fn metabolism(
     soil_field: Res<SoilFieldRes>,
     climate_field: Res<ClimateFieldRes>,
     edit_mod: Res<EditModifierRes>,
+    kin_prov: Res<chem::KinProvenance>,
     mut pools: ResMut<PoolStock>,
+    mut chem: ResMut<chem::ChemField>,
     mut prov: ResMut<trophic::PoolProvenance>,
     mut flow: ResMut<trophic::FlowMatrix>,
     mut ledger: ResMut<ledger::Ledger>,
@@ -648,12 +651,18 @@ fn metabolism(
         &Position,
     )>,
 ) {
+    use chem::ChemModifier as _;
     use climate::ClimateModifier as _;
     use soil::EnvironmentModifier as _;
     let soil_mod = soil::LinearTraitMatchModifier;
     let clim_mod = climate::TemperatureMatchModifier;
+    let chem_mod = chem::InCoreChem;
     let clim_sample = climate_field.0.sample(); // GLOBAL climate coupling (ADR-012 E3).
     let width = pools.width;
+    // ADR-013 F5: FREEZE the chem toxin plane at start-of-tick (the `frozen_light` discipline) so within-tick
+    // emit/mint order never affects within-tick sense — archetype-reorder safe. A fresh deposit is sensed
+    // in-cell only NEXT tick (after diffusion). KinProvenance is read-only here (own-species marker lookup).
+    let frozen_toxin = chem.frozen_toxin();
     // ── Canonical order: (cell_index, SpeciesId, OrgId). Built ONCE over the LIVING set (inv #3). ──
     // BLOCKER #1 fix: the ADR-011/012 soil+climate match factor is re-expressed as an INTEGER permille that
     // scales DEMAND (pre-apportion) — NOT an f64 multiply on the granted J. The f64 factor is computed once
@@ -673,14 +682,23 @@ fn metabolism(
             let match_permille = (u64::from(fixed::to_unit_u16(match_unit))
                 * u64::from(fixed::PERMILLE))
                 / u64::from(fixed::UNIT_SCALE);
+            // ADR-013 F5: sense the org's OWN cell chem, FROZEN at start-of-tick. Toxin suppress + kin boost are
+            // INTEGER PERMILLE factors folded into the SAME demand product (the EditModifier precedent). Both
+            // return the NEUTRAL 1000 in a chem-free cell → the byte-identical pre-F5 demand math.
+            let cell = cell_index(p, width);
+            let tox_suppress = chem_mod.toxin_suppress_permille(frozen_toxin[cell as usize]);
+            let kin_own = kin_prov.own(cell as usize, sp.0 .0 as usize);
+            let kin_boost = chem_mod.kin_boost_permille(kin_own);
             MetabolismItem {
-                cell: cell_index(p, width),
+                cell,
                 species: sp.0 .0,
                 org: id.0,
                 // Bigger bodies demand more (size→uptake feedback); floor at seed biomass so a fresh org eats.
                 body: biomass.0.max(OFFSPRING_SEED_BIOMASS),
                 // Floor at a baseline so a poor match still eats a little (no zeroed weight — ADR-005 spirit).
                 match_permille: match_permille.max(u64::from(fixed::PERMILLE) / 4),
+                tox_suppress,
+                kin_boost,
             }
         })
         .collect();
@@ -781,10 +799,20 @@ fn metabolism(
                 * u128::from(it.match_permille)
                 * u128::from(liebig);
             let mut dp = (num / (p * p * p * p)) as u64; // floor ONCE over the combined permille product
-                                                         // ADR-017 S6: scale demand by the committed edit factor (permille). Skipped entirely at the neutral
-                                                         // `1000` so the no-edit path is byte-identical (the pinned hash is unmoved); when a knockout commits,
-                                                         // `dp · edit_factor_q / 1000` throttles uptake pre-apportion (never an f64 multiply on the granted-J
-                                                         // path — the F3 invariant; the floored integer demand is the only consumer downstream).
+                                                         // ADR-013 F5: fold the chem SENSE factors (toxin-suppress · kin-boost, both permille) into demand,
+                                                         // GATED on non-neutral so a chem-free cell NEVER executes the extra multiply (`× 1000/1000` is a
+                                                         // no-op → byte-identical pre-F5 demand math, the EditModifier precedent). High local toxin lowers
+                                                         // demand (competitive exclusion); own-species kin raises it (kin cooperation). Folded together as
+                                                         // ONE u128 product floored ONCE (no double-floor; `tox·kin/(p·p)` joins the combined permille).
+                                                         // The chem couplings ride the SAME pre-apportion demand seam — never an f64 multiply on granted-J.
+            if it.tox_suppress != fixed::PERMILLE as u64 || it.kin_boost != fixed::PERMILLE as u64 {
+                dp = ((u128::from(dp) * u128::from(it.tox_suppress) * u128::from(it.kin_boost))
+                    / (p * p)) as u64;
+            }
+            // ADR-017 S6: scale demand by the committed edit factor (permille). Skipped entirely at the neutral
+            // `1000` so the no-edit path is byte-identical (the pinned hash is unmoved); when a knockout commits,
+            // `dp · edit_factor_q / 1000` throttles uptake pre-apportion (never an f64 multiply on the granted-J
+            // path — the F3 invariant; the floored integer demand is the only consumer downstream).
             if edit_factor_q != EDIT_FACTOR_NEUTRAL_Q {
                 dp = ((u128::from(dp) * u128::from(edit_factor_q)) / p) as u64;
             }
@@ -849,6 +877,11 @@ fn metabolism(
     // order-pinned (ADR-013 F4, adversarial #2).
     let mut litterfall: std::collections::BTreeMap<u64, (u32, u16, i64)> =
         std::collections::BTreeMap::new();
+    // ADR-013 F5: per-org toxin mints, COLLECTED here (the q.iter_mut() walk is arbitrary order) and applied to
+    // the chem toxin plane in a SEPARATE canonical (cell, SpeciesId, OrgId) pass so the cap-overflow routing is
+    // order-pinned (the litterfall precedent). Each is a paired respired↔toxin split that conserves J.
+    let mut toxin_mints: std::collections::BTreeMap<u64, (u32, i64)> =
+        std::collections::BTreeMap::new();
     for (id, sp, mut energy, mut biomass, mut age, _d, _t, p) in q.iter_mut() {
         age.0 = age.0.saturating_add(1);
         let granted_total = match by_org.get(&id.0) {
@@ -878,20 +911,50 @@ fn metabolism(
         let (new_e, e_over) = credit_capped(energy.0, kept_energy, ENERGY_CAP);
         energy.0 = new_e;
 
+        // ADR-013 F5 TOXIN MINT: re-route a fraction of the DEFENSE budget slice (already inside respired_convert)
+        // OUT of respired and INTO the toxin plane — the keystone J-source (a paired respired↔toxin move, atomic
+        // here where the convert split runs). `toxin_minted = defense_J · TOXIN_YIELD_NUM / TOXIN_YIELD_DEN`,
+        // floored ONCE. A species with budget[Defense]==0 mints zero → an allelopathy-off roster is byte-identical
+        // (hash-neutral). Bounded by the Defense slice (⊆ respired_convert), so litter + toxin ≤ respired_convert.
+        let defense_j = chem::defense_slice(&split);
+        let toxin_minted = defense_j * chem::TOXIN_YIELD_NUM / chem::TOXIN_YIELD_DEN;
         // ADR-013 F4 LITTERFALL: an AUTOTROPH sheds a fraction of its convert-respired inefficiency to detritus
-        // (a living canopy rains litter even without death). A residual SPLIT of the already-floored respired
-        // value (no double-floor): `litter` → detritus, `respired_convert − litter` → respired. Decomposers
-        // shed nothing here (their loss is the mineralization respired tap).
+        // (a living canopy rains litter even without death). A residual SPLIT of the respired value REMAINING
+        // after the toxin mint (no double-floor; keeps litter + toxin ≤ respired_convert): `litter` → detritus,
+        // the rest → respired. Decomposers shed nothing here (their loss is the mineralization respired tap).
+        let respired_after_toxin = respired_convert - toxin_minted;
         let litter = if strat.role == gp::TrophicRole::Autotroph {
-            respired_convert * LITTERFALL_NUM / LITTERFALL_DEN
+            respired_after_toxin * LITTERFALL_NUM / LITTERFALL_DEN
         } else {
             0
         };
-        ledger.respired += respired_convert - litter;
+        // Debit the respired-bound amount: respired_convert minus the toxin re-route minus the litter split.
+        ledger.respired += respired_convert - toxin_minted - litter;
         ledger.overflow += b_over + e_over;
         if litter > 0 {
             litterfall.insert(id.0, (cell_index(p, width), sp.0 .0, litter));
         }
+        if toxin_minted > 0 {
+            toxin_mints.insert(id.0, (cell_index(p, width), toxin_minted));
+        }
+    }
+    // Apply toxin mints in canonical (cell, OrgId) order (the BTreeMap is OrgId-keyed; sort by (cell, org) so a
+    // cap-saturation spill is order-pinned — the litterfall precedent). Each deposit is the paired half of the
+    // respired↔toxin move debited above; the cap-rejected part routes to overflow (nets out — never silent clamp).
+    let mut toxin_rows: Vec<(u32, u64, i64)> = toxin_mints
+        .into_iter()
+        .map(|(org, (cell, amt))| (cell, org, amt))
+        .collect();
+    toxin_rows.sort_unstable_by_key(|r| (r.0, r.1));
+    for (cell, _org, amt) in toxin_rows {
+        let cellu = cell as usize;
+        // milli == J 1:1; amt is bounded by the Defense slice << i32::MAX.
+        let rejected = chem::deposit_capped_plane(
+            chem.plane_mut(chem::ChemChannel::Toxin as usize),
+            cellu,
+            amt as i32,
+        );
+        ledger.overflow += i64::from(rejected); // toxin cap spill → overflow (nets out)
     }
     // Apply litterfall deposits in canonical (cell, SpeciesId, OrgId) order (the BTreeMap is OrgId-keyed; sort
     // the rows by (cell, species, org) so a cap-saturation spill is order-pinned — adversarial #2). Each is a
@@ -922,6 +985,13 @@ struct MetabolismItem {
     /// org's per-channel DEMAND so a well-adapted lineage out-competes a poorly-adapted one for the same pool
     /// (real integer spatial selection — no f64 on the granted-J path).
     match_permille: u64,
+    /// ADR-013 F5 TOXIN-SUPPRESS permille `[TOXIN_SUPPRESS_FLOOR, 1000]`: high local (FROZEN) toxin lowers this
+    /// org's demand → less uptake → competitive exclusion (allelopathy). `1000` (neutral) in a chem-free cell →
+    /// byte-identical pre-F5 demand math.
+    tox_suppress: u64,
+    /// ADR-013 F5 KIN-BOOST permille `[1000, 1000+KIN_BOOST_CAP]`: more own-species kin marker at this cell →
+    /// more uptake (kin cooperation). `1000` (neutral) when no own-kin is present → byte-identical pre-F5 math.
+    kin_boost: u64,
 }
 
 /// One organism's `reproduce_or_die` row, snapshotted in canonical `(cell, SpeciesId, OrgId)` order so the
@@ -1048,7 +1118,9 @@ fn reproduce_or_die(
     mut draws: ResMut<DrawCount>,
     mut next_id: ResMut<NextOrgId>,
     registry: Res<SpeciesRegistry>,
+    kin_prov: Res<chem::KinProvenance>,
     mut pools: ResMut<PoolStock>,
+    mut chem: ResMut<chem::ChemField>,
     mut prov: ResMut<trophic::PoolProvenance>,
     mut ledger: ResMut<ledger::Ledger>,
     mut q: Query<(
@@ -1064,7 +1136,14 @@ fn reproduce_or_die(
         &Position,
     )>,
 ) {
+    use chem::ChemModifier as _;
+    let chem_mod = chem::InCoreChem;
     let width = pools.width;
+    // ADR-013 F5: FREEZE the chem toxin + alarm planes at start-of-tick (the `frozen_light` discipline) so the
+    // maintenance/death/birth passes all read a stable field — within-pass deposits (death-alarm) never feed
+    // back into this tick's sense. Toxin → lethal maintenance drain (kin-spared); alarm → flee dispersal.
+    let frozen_toxin = chem.frozen_toxin();
+    let frozen_alarm = chem.frozen_alarm();
     // ── Build ONE canonical (cell, SpeciesId, OrgId) order over the LIVING set (inv #3, finding #5). ──
     let mut rows: Vec<ReproRow> = q
         .iter()
@@ -1093,10 +1172,25 @@ fn reproduce_or_die(
     let mut maint_energy: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
     for r in &rows {
         let strat = &registry.entries[r.species as usize].strategy;
+        let cellu = r.cell as usize;
+        let kin_own = kin_prov.own(cellu, r.species as usize);
         let maint_permille = u64::from(strat.budget[gp::BudgetChannel::Maintenance as usize]);
-        let debit = (MAINTENANCE_BASE as u128 * u128::from(maint_permille)
+        let mut debit = (MAINTENANCE_BASE as u128 * u128::from(maint_permille)
             / u128::from(fixed::PERMILLE)) as i64;
-        let paid = debit.min(r.energy.max(0)); // never below 0 (no saturating_sub silent floor)
+        // ADR-013 F5 KIN-SURVIVAL: own-species kin marker lowers upkeep (kin cooperation). An integer permille
+        // factor `[1000−KIN_SURVIVAL_CAP, 1000]`; NEUTRAL 1000 with no own-kin → byte-identical pre-F5 debit.
+        let kin_surv = chem_mod.kin_survival_permille(kin_own);
+        if kin_surv != fixed::PERMILLE as u64 {
+            debit = (u128::from(debit as u64) * u128::from(kin_surv) / u128::from(fixed::PERMILLE))
+                as i64;
+        }
+        // ADR-013 F5 TOXIN LETHAL-DRAIN: the org burns reserves resisting local (FROZEN) toxin — a separate
+        // org-Energy→respired J path (does NOT consume field toxin; sensing only reads). KIN-SPARING: an org
+        // with its own-species kin present pays a discounted drain (allelopathy is asymmetric → Defense is not
+        // strictly self-defeating). Zero in a chem-free cell → byte-identical pre-F5 maintenance.
+        let tox_drain = chem_mod.toxin_drain_j(frozen_toxin[cellu], kin_own);
+        let total_debit = debit + tox_drain;
+        let paid = total_debit.min(r.energy.max(0)); // never below 0 (no saturating_sub silent floor)
         let energy_after = r.energy - paid;
         ledger.respired += paid;
         maint_energy.insert(r.org, energy_after);
@@ -1106,14 +1200,26 @@ fn reproduce_or_die(
         if starved || senescent {
             // Carcass → detritus: residual Energy (post-maintenance) + Biomass deposits to the cell pool.
             let residual = energy_after.max(0) + r.biomass.max(0);
-            let cellu = r.cell as usize;
+            // ADR-013 F5 DEATH-ALARM: a dying org diverts a pinned fraction of its carcass residual to the alarm
+            // plane INSTEAD of detritus (a residual split like LITTERFALL — stays conserved, the residual was
+            // already J about to deposit; it just splits to a different conserved store). The rest → detritus.
+            let alarm_share = residual * chem::ALARM_FRACTION_NUM / chem::ALARM_FRACTION_DEN;
+            let to_detritus = residual - alarm_share;
             let headroom = (POOL_CAP - pools.detritus[cellu]).max(0);
-            let accepted = residual.min(headroom);
+            let accepted = to_detritus.min(headroom);
             pools.detritus[cellu] += accepted;
             // ADR-013 F4: tag the carcass detritus with the dead org's species so a decomposer's later harvest
             // of it attributes flow[decomposer][this-species] in the FlowMatrix (the obligate-loop edge).
             prov.deposit_detritus(cellu, r.species as usize, accepted);
-            ledger.overflow += residual - accepted; // detritus cap spill → overflow (finding #5)
+            // The alarm_share → the alarm plane (milli == J 1:1; bounded by the carcass residual << i32::MAX).
+            // Cap-rejected part → overflow (nets out).
+            let alarm_rejected = chem::deposit_capped_plane(
+                chem.plane_mut(chem::ChemChannel::Alarm as usize),
+                cellu,
+                alarm_share as i32,
+            );
+            // detritus cap spill (to_detritus − accepted) + alarm cap spill → overflow (finding #5; nets out).
+            ledger.overflow += (to_detritus - accepted) + i64::from(alarm_rejected);
             dead.push(r.entity);
         }
     }
@@ -1178,7 +1284,16 @@ fn reproduce_or_die(
         let child_d = mutate_unit(r.drought, dd);
         let child_t = mutate_unit(r.thermal, dt);
         // Dispersal: integer Moore step (next_u64 % 9), no unit_f64 → no float in the hashed Position.
-        let k = (ddisp % 9) as i64;
+        // ADR-013 F5 ALARM-BIASED DISPERSAL — DRAW-COUNT-NEUTRAL: F5 adds ZERO draws. It RE-INTERPRETS the
+        // already-drawn `ddisp` word: read the FROZEN alarm plane at the parent cell's Moore neighbourhood,
+        // compute the FLEE direction (lowest-alarm Moore index, ties→lowest index, no sqrt → bit-reproducible),
+        // and remap the raw Moore step via the baked LUT so it is byte-identical cross-platform. Gated on
+        // non-zero neighbour alarm → a chem-free run falls back to the plain `ddisp % 9` (byte-identical).
+        let raw_k = ddisp % 9;
+        let k = match chem::flee_direction(&frozen_alarm, width, chem.height, r.px, r.py) {
+            Some(flee_dir) => chem::alarm_bias_step(raw_k, flee_dir) as i64,
+            None => raw_k as i64,
+        };
         let nx = (r.px as i64 + (k % 3 - 1)).clamp(0, WORLD_DIMS.0 as i64 - 1) as u32;
         let ny = (r.py as i64 + (k / 3 - 1)).clamp(0, WORLD_DIMS.1 as i64 - 1) as u32;
         let org = next_id.0;
@@ -1241,6 +1356,7 @@ fn mutate_unit(value: f64, word: u64) -> f64 {
 /// (default) a debug-build assert. Pure read — draws ZERO `SimRng`, never folded into `hash_world`.
 fn measure_and_assert_ledger(
     pools: Res<PoolStock>,
+    chem: Res<chem::ChemField>,
     ledger: Res<ledger::Ledger>,
     q: Query<(&Energy, &Biomass)>,
 ) {
@@ -1254,7 +1370,8 @@ fn measure_and_assert_ledger(
         pools: pools.total(),
         energy,
         biomass,
-        chem: 0, // documented zero until F5
+        // ADR-013 F5: chem is now a LIVE bucket — the toxin/kin/alarm planes (i32 milli == J, widened to i64).
+        chem: chem.total(),
     };
     #[cfg(feature = "determinism")]
     ledger::assert_ledger_closes(&ledger, &live);
@@ -1562,6 +1679,14 @@ impl Simulation {
         world.insert_resource(ledger);
         world.insert_resource(pools);
         world.insert_resource(ResourceFieldRes(resource_field));
+        // ADR-013 F5: the chemical/signal field (toxin/kin/alarm), seeded ALL-ZERO — chem is ENDOGENOUS
+        // (emitted by organisms, never seed-generated), so it draws NO derive_seed / SimRng. Because Σchem == 0
+        // at the all-zero seed, the ledger's initial_total above is UNCHANGED by adding it (no reset surprise);
+        // the planes start matching WORLD_DIMS == RESOURCE_DIMS == PoolStock dims. Inserted right after PoolStock.
+        world.insert_resource(chem::ChemField::zeroed(
+            resource::RESOURCE_DIMS.0,
+            resource::RESOURCE_DIMS.1,
+        ));
         // ADR-013 F3 allocators: the monotonic OrgId source (never reuses a despawned id) and the draw counter
         // (folded into hash_world so a birth-enumeration off-by-one breaks the hash locally).
         world.insert_resource(NextOrgId(next_org_id));
@@ -1574,6 +1699,10 @@ impl Simulation {
         let cells = (resource::RESOURCE_DIMS.0 as usize) * (resource::RESOURCE_DIMS.1 as usize);
         world.insert_resource(trophic::FlowMatrix::zeroed(species_count));
         world.insert_resource(trophic::PoolProvenance::new(cells, species_count));
+        // ADR-013 F5: the per-species KIN attribution (the legible kin-SELECTION mechanic — own-species boost,
+        // not generic crowding), REUSING the PoolProvenance flat `[cell*S + species]` mechanism. Starts zero;
+        // NOT folded into hash_world (internal bookkeeping the demand/maintenance sense reads from).
+        world.insert_resource(chem::KinProvenance::new(cells, species_count));
         // The multi-species spine (ADR R3-A): the ordered species registry. Now READ by the F3/F4 pipeline
         // (metabolism/mineralize read each species' cached Strategy).
         world.insert_resource(SpeciesRegistry { entries });
@@ -1586,14 +1715,26 @@ impl Simulation {
         // harvest record) → reproduce_or_die (maintenance debit + death FIRST + birth — the ONLY SimRng
         // consumer; carcass→detritus provenance) → assert_flow_closes (row-sum==0) → measure_and_assert_ledger
         // (LAST: closes the books every tick).
+        // ADR-013 F5 inserts 3 chem stages + 1 assert into this chain (all single-threaded, integer, no
+        // HashMap): reset_chem_scratch (zero the reused double-buffer; ChemField PERSISTS cross-tick) right after
+        // reset_flow; diffuse_and_decay (reflecting Σ-conserved stencil THEN the chem_decay tap; cell-only,
+        // organism-free) after solar_influx so it runs on the PREVIOUS tick's emitted chem BEFORE this tick's
+        // organisms sense it (a one-tick lag); emit_chem (kin marker + live-distress alarm, J-paired) after
+        // mineralize; assert_chem_conserved_system (the semantic chem gate) before assert_flow_closes. Toxin is
+        // minted INLINE in metabolism (the respired↔toxin paired move is atomic where the Defense slice is
+        // computed); death-alarm rides reproduce_or_die's existing canonical death pass.
         schedule.add_systems(
             (
                 advance_tick,
                 trophic::reset_flow,
+                chem::reset_chem_scratch,
                 solar_influx,
+                chem::diffuse_and_decay,
                 metabolism,
                 trophic::mineralize,
+                chem::emit_chem,
                 reproduce_or_die,
+                chem::assert_chem_conserved_system,
                 trophic::assert_flow_closes,
                 measure_and_assert_ledger,
             )
@@ -1828,6 +1969,48 @@ impl Simulation {
             }
         }
 
+        // ADR-013 F5: resample the live chem planes (toxin/kin/alarm) onto the snapshot grid, normalized by
+        // CHEM_CAP via the audited chem::sample_to chokepoint (mirrors pool_sample_to). The chem field IS folded
+        // into hash_world; reading its already-hashed values into a display buffer is downstream of the tick,
+        // adds NOTHING to the hash, and draws ZERO SimRng (the read-only projection discipline, inv #2/#3).
+        let chem = self.world.resource::<chem::ChemField>();
+        let (cf_toxin, cf_kin, cf_alarm) = chem.render_planes();
+        let mut toxin = vec![0.0f32; cells];
+        let mut kin = vec![0.0f32; cells];
+        let mut alarm = vec![0.0f32; cells];
+        for y in 0..height {
+            for x in 0..width {
+                let c = (y as usize) * (width as usize) + (x as usize);
+                toxin[c] = chem::ChemField::sample_to(
+                    cf_toxin,
+                    chem.width,
+                    chem.height,
+                    x,
+                    y,
+                    width,
+                    height,
+                );
+                kin[c] = chem::ChemField::sample_to(
+                    cf_kin,
+                    chem.width,
+                    chem.height,
+                    x,
+                    y,
+                    width,
+                    height,
+                );
+                alarm[c] = chem::ChemField::sample_to(
+                    cf_alarm,
+                    chem.width,
+                    chem.height,
+                    x,
+                    y,
+                    width,
+                    height,
+                );
+            }
+        }
+
         GridSnapshot {
             width,
             height,
@@ -1842,6 +2025,9 @@ impl Simulation {
             light,
             free_nutrient,
             detritus,
+            toxin,
+            kin,
+            alarm,
         }
     }
 
@@ -2124,6 +2310,13 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
             pools.detritus.clone(),
         )
     };
+    // ADR-013 F5: snapshot the live chem planes (toxin, kin, alarm) in fixed row-major order — the deliberate
+    // F5 re-pin's new hash inputs. Raw i32 (== J milli), folded right after the PoolStock fold below.
+    let (chem_toxin, chem_kin, chem_alarm) = {
+        let chem = world.resource::<chem::ChemField>();
+        let (t, k, a) = chem.render_planes();
+        (t.to_vec(), k.to_vec(), a.to_vec())
+    };
     // ADR-013 F4: fold the MEASURED FlowMatrix into the hash in fixed (row-major) order. A measurement derived
     // from already-hashed pools/orgs adds no NEW information, but it is folded explicitly so a flow-recording
     // regression breaks the hash LOCALLY (the row-sum==0 + ledger gates are the semantic authority). Hash-load-
@@ -2158,6 +2351,15 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
             v.hash(&mut h);
         }
     }
+    // ADR-013 F5: the live chem planes (toxin, kin, alarm), raw i32 in fixed (channel, row-major) order, folded
+    // right AFTER the PoolStock fold (the deliberate F5 re-pin — these are NEW hash inputs). A chem-free run
+    // (all-zero planes) folds 3·cells zeros → the contribution is a fixed constant, so the no-emit J path is
+    // byte-identical to F4 up to this constant (the re-pin captures emitting runs).
+    for plane in [&chem_toxin, &chem_kin, &chem_alarm] {
+        for v in plane {
+            v.hash(&mut h);
+        }
+    }
     // ADR-013 F4: the MEASURED FlowMatrix, folded in fixed row-major order (dimension first).
     flow_s.hash(&mut h);
     for v in &flow_flat {
@@ -2168,6 +2370,8 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
     led.influx.hash(&mut h);
     led.respired.hash(&mut h);
     led.overflow.hash(&mut h);
+    // ADR-013 F5: the FOURTH named tap, folded alongside respired/overflow (zero on a chem-free run).
+    led.chem_decay.hash(&mut h);
     draw_count.hash(&mut h);
     allele_freq.to_bits().hash(&mut h);
     final_word.hash(&mut h);
@@ -2213,12 +2417,14 @@ mod tests {
         // `4e4d…a069` after ADR-013 F3.4 (chemostat constants tuned for a bounded non-zero coexistence
         // equilibrium: uptake/conversion/excretion + maintenance rates retuned so the plant→detritus→decomposer
         // loop settles at a positive steady-state instead of collapsing or unbounded growth).
+        // `47a0…f240` after ADR-013 F5 (toxin/kin/alarm chem field: conserved 4-neighbour diffusion + decay,
+        // emit costs J, sense couplings suppress-uptake/boost-kin/bias-dispersal; chem folded into hash + ledger).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x4e4d_0520_722a_a069);
+        assert_eq!(run_headless(&cfg).hash, 0x47a0_3c8f_6701_f240);
     }
 
     #[test]
@@ -3250,6 +3456,7 @@ mod tests {
         sim.step(cfg.generations);
         // Recompute the live total from the world and assert the ledger closes against it.
         let pools_total = sim.world.resource::<PoolStock>().total();
+        let chem_total = sim.world.resource::<chem::ChemField>().total(); // ADR-013 F5: chem is a live bucket
         let (mut e, mut b) = (0i64, 0i64);
         for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
             e += energy.0;
@@ -3259,7 +3466,7 @@ mod tests {
             pools: pools_total,
             energy: e,
             biomass: b,
-            chem: 0,
+            chem: chem_total,
         };
         assert!(
             ledger::ledger_closes(&sim.ledger(), &live),
@@ -3639,6 +3846,147 @@ mod tests {
         );
     }
 
+    /// Inject `amount` milli-J of toxin into every cell whose `x < split_x` (the left band), keeping the ledger
+    /// closed by lifting `initial_total` (the injected chem is now part of the live Σ). Models a toxin-producer
+    /// having pre-loaded one region — the SENSE coupling under test. Test-only.
+    fn paint_toxin_left_band(sim: &mut Simulation, split_x: u32, amount: i32) {
+        let mut injected: i64 = 0;
+        {
+            let mut chem = sim.world.resource_mut::<chem::ChemField>();
+            let w = chem.width;
+            let h = chem.height;
+            let plane = chem.plane_mut(chem::ChemChannel::Toxin as usize);
+            for y in 0..h {
+                for x in 0..split_x.min(w) {
+                    let c = (y * w + x) as usize;
+                    plane[c] += amount;
+                    injected += i64::from(amount);
+                }
+            }
+        }
+        // The world now holds `injected` more joules (as chem) → the books close iff initial_total rises to match.
+        sim.world.resource_mut::<ledger::Ledger>().initial_total += injected;
+    }
+
+    /// Count living organisms in the left band (`x < split_x`) and the right band (`x >= split_x`) of the world.
+    fn pop_left_right(sim: &mut Simulation, split_x: u32) -> (usize, usize) {
+        let mut left = 0usize;
+        let mut right = 0usize;
+        for p in sim.world.query::<&Position>().iter(&sim.world) {
+            if p.x < split_x {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+        (left, right)
+    }
+
+    #[test]
+    fn f5_toxin_allelopathy_suppresses_a_neighbouring_region() {
+        // ADR-013 F5 ALLELOPATHY (the functional gate): pre-load a STRONG toxin field over the LEFT half of the
+        // world (modelling a toxin-producer that has saturated that region), leave the RIGHT half toxin-free, and
+        // run. The toxin SENSE couplings — uptake-suppress (less demand → less uptake) + lethal maintenance drain
+        // (burns reserves resisting) — must make the toxic region's population settle strictly BELOW the
+        // toxin-free region's, even starting from a balanced placement. Deterministic, integer; the ledger stays
+        // closed (the injected toxin is booked into initial_total + decays via the chem_decay tap).
+        let cfg = SimConfig {
+            seed: 4242,
+            generations: 80,
+            entity_count: 1200,
+        };
+        let split_x = WORLD_DIMS.0 / 2;
+        let mut sim = Simulation::reset(&cfg);
+        // Baseline: with NO toxin, the two halves track each other (a fairness control on the placement).
+        let (l0, r0) = pop_left_right(&mut sim, split_x);
+        assert!(l0 > 0 && r0 > 0, "both halves must start populated");
+
+        // A toxic world: paint a near-saturating toxin band over the left half, then run.
+        let mut toxic = Simulation::reset(&cfg);
+        paint_toxin_left_band(&mut toxic, split_x, 30_000_000); // strong, but < CHEM_CAP
+        toxic.step(cfg.generations);
+        let (left, right) = pop_left_right(&mut toxic, split_x);
+
+        assert!(
+            left < right,
+            "allelopathy: the toxic (left) region must be suppressed below the toxin-free (right) region, \
+             got left={left} right={right}"
+        );
+
+        // And the ledger still closes with the injected + decayed toxin fully accounted (the F5 four-bucket close).
+        let pools_total = toxic.world.resource::<PoolStock>().total();
+        let chem_total = toxic.world.resource::<chem::ChemField>().total();
+        let (mut e, mut b) = (0i64, 0i64);
+        for (energy, biomass) in toxic
+            .world
+            .query::<(&Energy, &Biomass)>()
+            .iter(&toxic.world)
+        {
+            e += energy.0;
+            b += biomass.0;
+        }
+        let live = ledger::LiveTotal {
+            pools: pools_total,
+            energy: e,
+            biomass: b,
+            chem: chem_total,
+        };
+        assert!(
+            ledger::ledger_closes(&toxic.ledger(), &live),
+            "F5 four-bucket ledger must close with a live chem field: live {} vs expected {}",
+            live.sum(),
+            toxic.ledger().expected_total()
+        );
+    }
+
+    #[test]
+    fn f5_chem_field_is_emitted_by_the_default_roster_and_decays() {
+        // ADR-013 F5: the default plant roster has a non-zero Defense budget, so it MINTS toxin; every living org
+        // marks kin; low-energy/dying orgs raise alarm. After a run the chem field is non-empty (the mechanic is
+        // live, not dormant) AND the chem_decay tap has accumulated (decay ran). Deterministic.
+        let cfg = SimConfig {
+            seed: 23,
+            generations: 60,
+            entity_count: 600,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let chem_total = sim.world.resource::<chem::ChemField>().total();
+        assert!(
+            chem_total > 0,
+            "the default roster must emit chem (toxin/kin/alarm)"
+        );
+        assert!(
+            sim.ledger().chem_decay > 0,
+            "the chem_decay tap must accumulate (decay is the only chem sink)"
+        );
+    }
+
+    #[test]
+    fn f5_chem_run_is_deterministic_run_to_run() {
+        // ADR-013 F5: the chem pipeline (diffuse/decay/emit/sense + the alarm-biased DRAW-COUNT-NEUTRAL dispersal)
+        // adds ZERO SimRng draws and is all-integer, so a fixed (seed, gen) run is byte-identical run-to-run. The
+        // multi-ISA CI matrix is the cross-arch authority; this is the same-arch run==run necessary condition.
+        let cfg = SimConfig {
+            seed: 909,
+            generations: 50,
+            entity_count: 800,
+        };
+        assert_eq!(run_headless(&cfg).hash, run_headless(&cfg).hash);
+        // The DrawCount is unchanged by F5: a chem-active run draws the SAME number of words as the births alone
+        // (the alarm bias re-interprets an already-drawn word — no extra draw). Two runs agree on it.
+        let draws = |c: &SimConfig| -> u64 {
+            let mut s = Simulation::reset(c);
+            s.step(c.generations);
+            s.world.resource::<DrawCount>().0
+        };
+        assert_eq!(
+            draws(&cfg),
+            draws(&cfg),
+            "draw count is deterministic + chem adds none"
+        );
+    }
+
     #[test]
     fn edit_factor_q_maps_growth_ratio_to_strictly_positive_band() {
         // ADR-017 S6: the pinned integer mapping. Loss-of-function lifts off the 0.5× floor toward 1.0×; a
@@ -3939,6 +4287,7 @@ mod tests {
             Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
         sim.step(cfg.generations);
         let pools_total = sim.world.resource::<PoolStock>().total();
+        let chem_total = sim.world.resource::<chem::ChemField>().total(); // ADR-013 F5: chem is a live bucket
         let (mut e, mut b) = (0i64, 0i64);
         for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
             e += energy.0;
@@ -3948,7 +4297,7 @@ mod tests {
             pools: pools_total,
             energy: e,
             biomass: b,
-            chem: 0,
+            chem: chem_total,
         };
         assert!(
             ledger::ledger_closes(&sim.ledger(), &live),

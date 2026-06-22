@@ -316,6 +316,9 @@ R1.0 ships the **substrate only, provably hash-neutral, no coupling**:
 - `SOIL_STREAM_BASE` `0x0050_4F49_4C00_0000` ("SOIL") — soil control points (ADR-008).
 - `CLIM_STREAM_BASE` `0x0043_4C49_4D00_0000` ("CLIM") — climate field (ADR-012).
 - `RESOURCE_STREAM_BASE` `0x0052_5352_4300_0000` ("RSRC") — resource pools light/nutrient/detritus (ADR-013 F1).
+- `CHEM_STREAM_BASE` `0x0043_4845_4D00_0000` ("CHEM") — RESERVED for future abiotic/seeded chem-field variation
+  (ADR-013 F5). **NOT yet derived** — F5 chem is ENDOGENOUS (organism-emitted, seeded all-zero), so it draws
+  ZERO `derive_seed`/`SimRng`; the base is reserved here to keep the disjoint-stream discipline future-proof.
 - Future spatial/substrate phases must reserve new disjoint ranges here before use.
 
 ---

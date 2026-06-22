@@ -53,9 +53,9 @@ if ! printf '%s' "$OUT" | grep -q "snapshot OK"; then
   exit 1
 fi
 echo "GODOT READER OK — $(printf '%s' "$OUT" | grep 'snapshot OK')"
-# GSS3 channel-count contract: a silent channel-count regression (e.g. a stale 6-channel reader, or a
-# producer that drops the 3 pool planes) goes RED here. main.gd prints `channels=%d` from the file header.
-printf '%s' "$OUT" | grep -q "channels=9" || { echo "FAIL — expected channels=9 (GSS3 pool planes), got:"; printf '%s\n' "$OUT"; exit 1; }
+# GSS4 channel-count contract: a silent channel-count regression (e.g. a stale 9-channel reader, or a
+# producer that drops the 3 chem planes) goes RED here. main.gd prints `channels=%d` from the file header.
+printf '%s' "$OUT" | grep -q "channels=12" || { echo "FAIL — expected channels=12 (GSS4 chem planes), got:"; printf '%s\n' "$OUT"; exit 1; }
 
 # 2. S4.3 render scene (headless build smoke) — ISOMETRIC (default, P3) AND orthographic (--ortho opt-out).
 for mode in "" "--ortho"; do

@@ -1,14 +1,16 @@
 extends RefCounted
-## Reads a gene-sim binary snapshot (.bin, format "GSS3") written by the Rust core
+## Reads a gene-sim binary snapshot (.bin, format "GSS4") written by the Rust core
 ## (sim-core `GridSnapshot::write_snapshot_bytes`). Little-endian layout:
-##   "GSS3" | u32 width | u32 height | u32 channel_count(=9) | u64 generation | u32 population
+##   "GSS4" | u32 width | u32 height | u32 channel_count(=12) | u64 generation | u32 population
 ##   | f32[w*h] density | f32[w*h] allele_freq | f32[w*h] fitness
 ##   | f32[w*h] soil_moisture | f32[w*h] soil_nutrients | f32[w*h] soil_ph
-##   | f32[w*h] light | f32[w*h] free_nutrient | f32[w*h] detritus   (each channel row-major)
-## The soil_* channels (roadmap R1.0) and the live-pool light/free_nutrient/detritus planes (GSS3, the
-## joule economy made visible) are PARSED here and packed into RGBF textures (to_soil_image / to_pool_image)
-## for the data-layer shader's full-field overlays. GSS3 bumped the magic from GSS2 so a stale 3-/6-channel
-## reader fails LOUD on bad magic rather than silently mis-parsing the wider body at the wrong offsets (inv #2).
+##   | f32[w*h] light | f32[w*h] free_nutrient | f32[w*h] detritus
+##   | f32[w*h] toxin | f32[w*h] kin | f32[w*h] alarm   (each channel row-major)
+## The soil_* channels (roadmap R1.0), the live-pool light/free_nutrient/detritus planes (GSS3, the joule
+## economy made visible), and the chem toxin/kin/alarm planes (GSS4, ADR-013 F5 — allelopathy/kin/chemotaxis)
+## are PARSED here and packed into RGBF textures (to_soil_image / to_pool_image / to_chem_image) for the
+## data-layer shader's full-field overlays. GSS4 bumped the magic from GSS3 so a stale 9-channel reader fails
+## LOUD on bad magic rather than silently mis-parsing the wider body at the wrong offsets (inv #2).
 ##
 ## INVARIANT #2 (STOP THE LINE if violated): this ONLY parses snapshot bytes and exposes them for rendering.
 ## It computes NO biology / genotype→phenotype — all of that lives in the Rust core. The renderer is read-only.
@@ -18,7 +20,7 @@ extends RefCounted
 ## Consumers `preload("res://snapshot.gd")`; the static factory self-references via `SnapshotData` below.
 ## Both are resolved at parse time and need no `.godot/` cache.
 
-const MAGIC := "GSS3"
+const MAGIC := "GSS4"
 const SnapshotData := preload("res://snapshot.gd")
 
 var width: int = 0
@@ -36,6 +38,10 @@ var soil_ph: PackedFloat32Array
 var light: PackedFloat32Array
 var free_nutrient: PackedFloat32Array
 var detritus: PackedFloat32Array
+# GSS4 chem planes (ADR-013 F5: allelopathy/kin/chemotaxis), appended AFTER detritus — offsets 0..8 never reorder.
+var toxin: PackedFloat32Array
+var kin: PackedFloat32Array
+var alarm: PackedFloat32Array
 
 
 static func load_from(path: String) -> SnapshotData:
@@ -64,13 +70,16 @@ static func load_from(path: String) -> SnapshotData:
 	s.light = f.get_buffer(n * 4).to_float32_array()
 	s.free_nutrient = f.get_buffer(n * 4).to_float32_array()
 	s.detritus = f.get_buffer(n * 4).to_float32_array()
+	s.toxin = f.get_buffer(n * 4).to_float32_array()
+	s.kin = f.get_buffer(n * 4).to_float32_array()
+	s.alarm = f.get_buffer(n * 4).to_float32_array()
 	if not _channels_complete(s):
 		push_error("snapshot: %s has truncated/short channels (expected %d floats each)" % [path, n])
 		return null
 	return s
 
 
-## Parse a GSS3 snapshot from an in-memory byte buffer (e.g. `LiveSim.snapshot()` in --live mode) rather
+## Parse a GSS4 snapshot from an in-memory byte buffer (e.g. `LiveSim.snapshot()` in --live mode) rather
 ## than a file. Same layout as load_from. Returns null on bad magic / short buffer. Read-only (inv #2).
 static func parse_bytes(buf: PackedByteArray) -> SnapshotData:
 	if buf.size() < 28 or buf.slice(0, 4).get_string_from_ascii() != MAGIC:
@@ -94,7 +103,10 @@ static func parse_bytes(buf: PackedByteArray) -> SnapshotData:
 	s.soil_ph = read.call(off); off += n * 4
 	s.light = read.call(off); off += n * 4
 	s.free_nutrient = read.call(off); off += n * 4
-	s.detritus = read.call(off)
+	s.detritus = read.call(off); off += n * 4
+	s.toxin = read.call(off); off += n * 4
+	s.kin = read.call(off); off += n * 4
+	s.alarm = read.call(off)
 	if not _channels_complete(s):
 		push_error("snapshot: byte buffer has truncated/short channels (expected %d floats each)" % n)
 		return null
@@ -108,7 +120,7 @@ static func _channels_complete(s: SnapshotData) -> bool:
 	if s.width < 0 or s.height < 0:
 		return false
 	for arr in [s.density, s.allele_freq, s.fitness, s.soil_moisture, s.soil_nutrients, s.soil_ph,
-			s.light, s.free_nutrient, s.detritus]:
+			s.light, s.free_nutrient, s.detritus, s.toxin, s.kin, s.alarm]:
 		if arr.size() != n:
 			return false
 	return true
@@ -149,4 +161,16 @@ func to_pool_image() -> Image:
 		for x in width:
 			var i := y * width + x
 			img.set_pixel(x, y, Color(light[i], free_nutrient[i], detritus[i]))
+	return img
+
+
+## Build a CPU-side Image encoding the GSS4 chem channels (R=toxin, G=kin, B=alarm) for the data-layer
+## shader's chem layers (ADR-013 F5: allelopathy/kin/chemotaxis made visible) — mirrors to_pool_image exactly.
+## Pure CPU — safe under headless. Read-only: just packs the already-exported normalized floats (inv #2).
+func to_chem_image() -> Image:
+	var img := Image.create(width, height, false, Image.FORMAT_RGBF)
+	for y in height:
+		for x in width:
+			var i := y * width + x
+			img.set_pixel(x, y, Color(toxin[i], kin[i], alarm[i]))
 	return img
