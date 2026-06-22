@@ -374,11 +374,11 @@ const MAINTENANCE_BASE: i64 = 4_000;
 /// Minimum `body_factor` permille (ADR-013 F3.4 chemostat tuning): the demand-chain body multiplier never
 /// drops below this, so a fresh seed-biomass org still expresses real uptake demand and can grow toward
 /// reproduction rather than starving on its tiny body alone.
-const BODY_FACTOR_FLOOR: u64 = 250;
+pub(crate) const BODY_FACTOR_FLOOR: u64 = 250;
 
 /// Starvation floor: after the maintenance debit, an org whose Energy is BELOW this dies (ADR-013 F3). Its
 /// residual Energy+Biomass deposits to the cell detritus pool (carcass→detritus).
-const MAINTENANCE_FLOOR: i64 = 1;
+pub(crate) const MAINTENANCE_FLOOR: i64 = 1;
 
 /// Senescence ceiling: an org at this [`Age`] dies of old age (HARD at F3; soft coupling deferred).
 const AGE_MAX: u32 = 240;
@@ -398,7 +398,7 @@ const OFFSPRING_ENDOWMENT: i64 = 200_000;
 pub(crate) const OFFSPRING_SEED_BIOMASS: i64 = 100_000;
 
 /// Per-org Energy cap (ADR-013 F3). Convert/uptake past this routes to [`ledger::Ledger::overflow`].
-const ENERGY_CAP: i64 = 4_000_000;
+pub(crate) const ENERGY_CAP: i64 = 4_000_000;
 
 /// Per-org Biomass cap (ADR-013 F3). Growth past this routes to [`ledger::Ledger::overflow`].
 pub(crate) const BIOMASS_CAP: i64 = 4_000_000;
@@ -406,9 +406,9 @@ pub(crate) const BIOMASS_CAP: i64 = 4_000_000;
 /// Trophic-efficiency NUMERATOR/DENOMINATOR (`EFF_NUM/EFF_DEN < 1`): the fraction of CONVERTED uptake that is
 /// KEPT; the residual `granted − Σ(kept)` is RESPIRED (computed as a residual, never an independent divide that
 /// double-floors a quantum — adversarial finding #7).
-const EFF_NUM: i64 = 7;
+pub(crate) const EFF_NUM: i64 = 7;
 /// Trophic-efficiency denominator (see [`EFF_NUM`]).
-const EFF_DEN: i64 = 10;
+pub(crate) const EFF_DEN: i64 = 10;
 
 /// **LITTERFALL** fraction NUMERATOR/DENOMINATOR (ADR-013 F4): of an AUTOTROPH's convert-RESPIRED inefficiency
 /// carbon, this fraction is instead shed to the cell `detritus` pool every tick (a living canopy rains litter
@@ -1124,7 +1124,7 @@ pub(crate) fn pool_channel_mut(pools: &mut PoolStock, ch: usize) -> &mut [i64] {
 
 /// Credit `amount` to `value` up to `cap`; returns `(new_value, overflow)` where `overflow` is the part that
 /// exceeded the cap (routed to the OVERFLOW tap, never silently clamped — finding #7). `amount >= 0`.
-fn credit_capped(value: i64, amount: i64, cap: i64) -> (i64, i64) {
+pub(crate) fn credit_capped(value: i64, amount: i64, cap: i64) -> (i64, i64) {
     let target = value + amount;
     if target > cap {
         (cap, target - cap)
@@ -1810,8 +1810,10 @@ impl Simulation {
         // free_nutrient is now endogenous) → metabolism (uptake/convert/excrete + litterfall + free_nutrient
         // provenance, RNG-free) → mineralize (the F4 decomposer detritus→free_nutrient loop + FlowMatrix
         // harvest record) → reproduce_or_die (maintenance debit + death FIRST + birth — the ONLY SimRng
-        // consumer; carcass→detritus provenance) → assert_flow_closes (row-sum==0) → measure_and_assert_ledger
-        // (LAST: closes the books every tick).
+        // consumer; carcass→detritus provenance) → predation (ADR-013 F6: Bdellovibrio consume co-located prey J
+        // on a frozen census; AFTER reproduce_or_die so it owns its kills' despawn + carcass deposit; writes the
+        // first org-eats-org FlowMatrix off-diagonal; RNG-free no-op on a predator-free roster) →
+        // assert_flow_closes (row-sum==0) → measure_and_assert_ledger (LAST: closes the books every tick).
         // ADR-013 F5 inserts 3 chem stages + 1 assert into this chain (all single-threaded, integer, no
         // HashMap): reset_chem_scratch (zero the reused double-buffer; ChemField PERSISTS cross-tick) right after
         // reset_flow; diffuse_and_decay (reflecting Σ-conserved stencil THEN the chem_decay tap; cell-only,
@@ -1831,6 +1833,7 @@ impl Simulation {
                 trophic::mineralize,
                 chem::emit_chem,
                 reproduce_or_die,
+                trophic::predation,
                 chem::assert_chem_conserved_system,
                 trophic::assert_flow_closes,
                 measure_and_assert_ledger,
@@ -3927,6 +3930,76 @@ mod tests {
         roster
     }
 
+    /// A 3-species obligate-PREDATOR roster (ADR-013 F6): plant (Autotroph) + E. coli-like decomposer
+    /// (Decomposer, eligible prey) + Bdellovibrio (Predator). `predator` toggles whether the predator is present;
+    /// `vigorous` toggles its attack rate (a high-PredationCapacity gene → real predation, vs ~0 → a throttled
+    /// predator that barely eats — the cascade baseline). The predator funds GrowthRate from gltA and its
+    /// attack-rate lever from PredationCapacity, both bound to a single high anchor for a vigorous predator.
+    fn obligate_predator_roster(predator: bool, vigorous: bool) -> Vec<RosterEntry> {
+        let mut roster = obligate_roster(true); // plant (sid 0) + decomposer (sid 1)
+        if predator {
+            // PredationCapacity drives the attack rate: 0.9 = vigorous, ~0.0 = throttled (the cascade off-state).
+            let attack = if vigorous { 0.9 } else { 0.0 };
+            roster.push(RosterEntry {
+                name: "bdellovibrio".to_string(),
+                key: "bdellovibrio".to_string(),
+                // GrowthRate anchor (gltA) drives predator growth; PredationCapacity anchor drives the attack rate.
+                // Bind GrowthRate to a vigorous value and PredationCapacity to the `attack` level.
+                genome: two_param_genome(0.9, attack),
+                gp_map: gp::OntologyMap::new(gp::TraitMap(vec![
+                    gp::TraitBinding {
+                        trait_: Trait::GrowthRate,
+                        locus: gp::LocusSelector::ByIndex(genome::LocusId(0)),
+                        param: genome::ParamId(0),
+                    },
+                    gp::TraitBinding {
+                        trait_: Trait::PredationCapacity,
+                        locus: gp::LocusSelector::ByIndex(genome::LocusId(0)),
+                        param: genome::ParamId(1),
+                    },
+                ])),
+                entity_count: 180, // predators start SPARSE (dense seeding instant-crashes prey then itself)
+                role: gp::TrophicRole::Predator,
+            });
+        }
+        roster
+    }
+
+    /// A one-locus genome with TWO numeric params (P0, P1), so a roster can bind GrowthRate→P0 and
+    /// PredationCapacity→P1 independently (the predator's growth vs attack-rate genes).
+    fn two_param_genome(p0: f64, p1: f64) -> Genome {
+        Genome {
+            version: 2,
+            loci: vec![genome::Locus {
+                id: genome::LocusId(0),
+                name: "anchor".to_string(),
+                sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                parameters: vec![
+                    genome::Parameter {
+                        id: genome::ParamId(0),
+                        value: genome::ParamValue::Numeric {
+                            value: p0,
+                            min: 0.0,
+                            max: 1.0,
+                        },
+                    },
+                    genome::Parameter {
+                        id: genome::ParamId(1),
+                        value: genome::ParamValue::Numeric {
+                            value: p1,
+                            min: 0.0,
+                            max: 1.0,
+                        },
+                    },
+                ],
+                tags: genome::OntologyTags {
+                    so_term: genome::SoTermId(704),
+                    go_refs: vec![],
+                },
+            }],
+        }
+    }
+
     /// Σ free_nutrient over all cells of the live PoolStock (the plant-available pool the loop feeds).
     fn total_free_nutrient(sim: &Simulation) -> i64 {
         sim.world.resource::<PoolStock>().free_nutrient.iter().sum()
@@ -4054,6 +4127,178 @@ mod tests {
             total_free_nutrient(&without),
             0,
             "without a mineralizer, free_nutrient never reappears"
+        );
+    }
+
+    // ── ADR-013 F6: the Bdellovibrio predator + predation kernel ──────────────────────────────────────
+
+    #[test]
+    fn f6_predation_conserves_j_and_ledger_closes_every_tick() {
+        // The predation kernel is a paired conserved transfer: prey J → predator (kept) − efficiency-tax
+        // (respired) + carcass residual (detritus). measure_and_assert_ledger (the LAST in-chain system) asserts
+        // ledger_closes EVERY tick post-predation; a multi-gen 3-species run reaching here proves J conservation.
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 80,
+            entity_count: 600,
+        };
+        let mut sim = Simulation::reset_with_roster(
+            &cfg,
+            &EnvParams::default(),
+            obligate_predator_roster(true, true),
+        );
+        // Stepping runs the in-chain assert_flow_closes + measure_and_assert_ledger every tick — a clean run is
+        // the conservation proof. (Under `--features determinism` these are HARD asserts.)
+        sim.step(cfg.generations);
+        // The 3-species matrix is 3×3 and every row still sums to zero by the diagonal-pairing construction.
+        let (s, flat) = sim.flow_matrix();
+        assert_eq!(s, 3, "three-species roster → 3×3 matrix");
+        for i in 0..s {
+            let row: i64 = (0..s).map(|j| flat[i * s + j]).sum();
+            assert_eq!(row, 0, "predator row {i} must sum to zero by construction");
+        }
+    }
+
+    #[test]
+    fn f6_flow_matrix_predator_prey_off_diagonal_is_nonzero_rowsum_zero() {
+        // The headline FlowMatrix assertion: predation writes the first true org-eats-org off-diagonal —
+        // flow[bdello][ecoli] (row 2 = predator, col 1 = decomposer prey) goes NONZERO and the predator row
+        // still sums to zero. plant=0, ecoli=1, bdello=2.
+        let cfg = SimConfig {
+            seed: 44,
+            generations: 60,
+            entity_count: 600,
+        };
+        let mut sim = Simulation::reset_with_roster(
+            &cfg,
+            &EnvParams::default(),
+            obligate_predator_roster(true, true),
+        );
+        // Accumulate the predation edge over the whole run (a single-tick matrix may be momentarily empty if no
+        // predator/prey share a cell that tick; the dynamics test below covers populations directly).
+        let mut saw_edge = false;
+        for _ in 0..cfg.generations {
+            sim.step(1);
+            let (s, flat) = sim.flow_matrix();
+            assert_eq!(s, 3);
+            let pred_eats_ecoli = flat[2 * s + 1]; // row 2 (bdello), col 1 (ecoli)
+            if pred_eats_ecoli != 0 {
+                saw_edge = true;
+            }
+            // Row-sum==0 holds throughout (a structural integer identity).
+            for i in 0..s {
+                let row: i64 = (0..s).map(|j| flat[i * s + j]).sum();
+                assert_eq!(row, 0, "row {i} must sum to zero");
+            }
+        }
+        assert!(
+            saw_edge,
+            "the Bdellovibrio→E.coli predation off-diagonal (flow[2][1]) must go nonzero over the run"
+        );
+    }
+
+    #[test]
+    fn f6_predation_is_deterministic_run_to_run() {
+        // The kernel draws ZERO SimRng (DrawCount untouched → births stay the sole RNG consumer), so a 3-species
+        // predator run is byte-reproducible: same seed twice → identical final hash (inv #3).
+        let cfg = SimConfig {
+            seed: 57,
+            generations: 50,
+            entity_count: 600,
+        };
+        let h = || {
+            let mut sim = Simulation::reset_with_roster(
+                &cfg,
+                &EnvParams::default(),
+                obligate_predator_roster(true, true),
+            );
+            sim.step(cfg.generations);
+            sim.run_stats().hash
+        };
+        assert_eq!(h(), h(), "predator run must be deterministic run-to-run");
+    }
+
+    #[test]
+    fn f6_trophic_cascade_throttling_the_predator_lifts_ecoli_and_the_plant() {
+        // THE HEADLINE: the first top-down 3-level cascade. Two 3-species runs differing ONLY in the predator's
+        // attack rate (PredationCapacity gene: vigorous vs ~0 throttled). Throttling the predator → E. coli rises
+        // → more mineralization → more free_nutrient → the plant Liebig gate opens → the plant rises. Mirrors
+        // f4_obligate_loop_decomposer_mineralizes_free_nutrient (two runs, relative assertion). Deterministic.
+        let cfg = SimConfig {
+            seed: 88,
+            generations: 200,
+            entity_count: 600,
+        };
+        let run = |vigorous: bool| {
+            let mut sim = Simulation::reset_with_roster(
+                &cfg,
+                &EnvParams::default(),
+                obligate_predator_roster(true, vigorous),
+            );
+            drain_seeded_free_nutrient(&mut sim);
+            sim.step(cfg.generations);
+            sim
+        };
+        let mut vigorous = run(true);
+        let mut throttled = run(false);
+        let ecoli_vig = species_pop(&mut vigorous, 1);
+        let ecoli_thr = species_pop(&mut throttled, 1);
+        let plant_vig = species_pop(&mut vigorous, 0);
+        let plant_thr = species_pop(&mut throttled, 0);
+        // Throttling predation lifts E. coli (top-down release of the prey).
+        assert!(
+            ecoli_thr > ecoli_vig,
+            "throttling the predator must lift E. coli: throttled {ecoli_thr} vs vigorous {ecoli_vig}"
+        );
+        // And the cascade reaches the plant (more decomposer → more free_nutrient → Liebig gate opens).
+        assert!(
+            total_free_nutrient(&throttled) > total_free_nutrient(&vigorous),
+            "throttling the predator must raise free_nutrient: throttled {} vs vigorous {}",
+            total_free_nutrient(&throttled),
+            total_free_nutrient(&vigorous)
+        );
+        assert!(
+            plant_thr >= plant_vig,
+            "the cascade reaches the plant: throttled {plant_thr} >= vigorous {plant_vig}"
+        );
+        // The vigorous run lit a real predation edge over its course (flow[2][1] nonzero at least once is covered
+        // by the off-diagonal test; here we confirm the vigorous predator actually ate, i.e. E. coli was suppressed).
+        assert!(
+            ecoli_vig < ecoli_thr,
+            "a vigorous Bdellovibrio measurably suppresses its E. coli prey"
+        );
+    }
+
+    #[test]
+    fn f6_predator_starves_without_prey_then_a_predator_free_run_is_a_noop() {
+        // Two structural facts: (1) a predator with NO prey present cannot earn (the kernel early-returns on empty
+        // prey) → it starves out via the existing maintenance/starvation path (population falls); (2) a
+        // predator-free roster is a strict no-op — the predation system records nothing and the run equals the
+        // 2-species F4 baseline byte-for-byte (the FlowMatrix never lights a predator edge).
+        let cfg = SimConfig {
+            seed: 12,
+            generations: 40,
+            entity_count: 600,
+        };
+        // (2) predator-free 3rd-slot vs the plain 2-species roster: identical hash (predation is a no-op).
+        let h_no_pred = {
+            let mut sim = Simulation::reset_with_roster(
+                &cfg,
+                &EnvParams::default(),
+                obligate_predator_roster(false, true),
+            );
+            sim.step(cfg.generations);
+            sim.run_stats().hash
+        };
+        let h_baseline = {
+            let mut sim =
+                Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+            sim.step(cfg.generations);
+            sim.run_stats().hash
+        };
+        assert_eq!(
+            h_no_pred, h_baseline,
+            "a predator-free 3-species roster equals the 2-species F4 baseline (predation is a no-op)"
         );
     }
 

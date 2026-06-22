@@ -46,7 +46,7 @@ mod tests {
         // are the SAME parse/validate path: building from the shipped JSON TEXT must yield a BuiltSpecies
         // identical (key, entity_count, genome, …) to loading the file. This locks the two byte SOURCES in
         // sync so the gate catches any drift between the renderer's res:// path and the harness CLI path.
-        for stem in ["default", "ecoli"] {
+        for stem in ["default", "ecoli", "bdellovibrio"] {
             let path = format!(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/{}.json"),
                 stem
@@ -105,6 +105,45 @@ mod tests {
         assert!(
             built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
             "every E. coli locus carries a real CDS"
+        );
+    }
+
+    #[test]
+    fn shipped_bdellovibrio_species_loads() {
+        // ADR-013 F6: the baked real Bdellovibrio HD100 PREDATOR genome (scripts/bake_bdellovibrio_species.py:
+        // curated predation-anchor roster × real NCBI GCF_000196175.1 CDS) must load + build. Data-not-code: the
+        // gate catches a broken or incomplete re-bake. The niche declares the predator role via trophic_role, and
+        // the two TraitMap anchors (gltA → GrowthRate, GO-4108; the lytic attack machinery → PredationCapacity,
+        // GO-8745) must be present so the predation kernel's attack-rate lever resolves.
+        use sim_core::gp::{bdellovibrio_trait_map, GenotypePhenotypeMap, OntologyMap, Trait};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/bdellovibrio.json"
+        );
+        let built = load_species_file(path).expect("data/species/bdellovibrio.json should load");
+        assert_eq!(built.key, "bdellovibrio");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("predator"),
+            "the niche declares the predator role (data-driven gp::role_from_override → Predator)"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Bdellovibrio locus carries a real CDS"
+        );
+        // The PredationCapacity attack-rate lever resolves off the baked GO-8745 anchor (wild-type 1.0), and
+        // GrowthRate off gltA (GO-4108) — so a `hit`-locus knockdown would drive the attack rate down.
+        let pheno = OntologyMap::new(bdellovibrio_trait_map()).express(&built.genome);
+        assert_eq!(
+            pheno.get(Trait::GrowthRate),
+            Some(1.0),
+            "GrowthRate expresses off gltA wild-type activity"
+        );
+        assert_eq!(
+            pheno.get(Trait::PredationCapacity),
+            Some(1.0),
+            "PredationCapacity expresses off the lytic attack-machinery anchor (the hit/attack lever)"
         );
     }
 
