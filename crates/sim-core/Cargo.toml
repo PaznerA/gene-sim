@@ -8,6 +8,12 @@ description = "Headless, deterministic Bevy ECS tick loop + seeded ChaCha8 RNG (
 
 [features]
 proptest = []
+# ADR-013 F3: make `assert_ledger_closes` a HARD assert (panic, not debug_assert) in the release
+# determinism-hash run so a lost/minted joule fails the CI multi-ISA gate semantically — not only on a
+# hash mismatch. CI's multi-ISA legs build `--features determinism`. Off by default (debug builds already
+# assert via `debug_assert`-equivalent paths in tests); enabling it never changes the hash, only whether a
+# conservation violation panics in a release run.
+determinism = []
 
 [dependencies]
 genome = { workspace = true }
