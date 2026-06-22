@@ -670,8 +670,9 @@ fn observation_to_dict(obs: &Observation) -> VarDictionary {
 
 /// Convert a [`sim_core::SpeciesObservation`] into a GDScript-facing `Dictionary` (the specimen view's
 /// per-species row). Keys: `species_id` (int), `name` (string), `key` (string — the renderer's glyph
-/// tiebreak), `role` (string), and `phenotype` (nested `{trait_name: value}`). Pure data marshalling; no
-/// biology (invariant #2).
+/// tiebreak), `role` (string), `population_size` (int), `allele_freq` (float), `mean_fitness` (float — the
+/// Vitals panel reader key), `mean_energy` (float — field-named alias, == `mean_fitness`), and `phenotype`
+/// (nested `{trait_name: value}`). Pure data marshalling; no biology (invariant #2).
 fn species_observation_to_dict(obs: &sim_core::SpeciesObservation) -> VarDictionary {
     let mut dict = VarDictionary::new();
     dict.set("species_id", i64::from(obs.species_id));
@@ -680,6 +681,14 @@ fn species_observation_to_dict(obs: &sim_core::SpeciesObservation) -> VarDiction
     // The role's Debug repr is presentation only (e.g. "Autotroph"/"Heterotroph") — no biology here.
     let role = format!("{:?}", obs.role);
     dict.set("role", role.as_str());
+    // Per-species vitals (R3 widening): pure reads carried verbatim from the core's read-only projection.
+    dict.set("population_size", i64::from(obs.population_size));
+    dict.set("allele_freq", obs.allele_freq);
+    // LOAD-BEARING key — the EXACT key the Vitals "Fitness" row reads (main.gd `_species_stat`). mean_energy
+    // is already ENERGY_FULL-normalized to [0,1] in-core, the SAME scale snapshot()'s fitness channel uses.
+    dict.set("mean_fitness", obs.mean_energy);
+    // Field-named alias (matches the struct field + the main.gd doc); equals mean_fitness by construction.
+    dict.set("mean_energy", obs.mean_energy);
 
     let mut pheno = VarDictionary::new();
     for (trait_, value) in &obs.phenotype.values {

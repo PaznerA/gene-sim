@@ -1136,6 +1136,21 @@ pub struct SpeciesObservation {
     pub role: gp::TrophicRole,
     /// This species' genome expressed through ITS OWN map (microbe traits for E. coli, plant traits for plants).
     pub phenotype: Phenotype,
+    /// Count of LIVING organisms carrying this `Species(SpeciesId)` tag. A PURE read of already-hashed state
+    /// (the [`Species`]/[`OrgId`] components are part of `hash_world`'s row tuple), NEVER folded into
+    /// `hash_world` itself — it adds no new hash input and cannot move the determinism hash (inv #3). Summed
+    /// over every species it equals the total living-org count by construction (each org carries one tag).
+    pub population_size: u32,
+    /// Mean per-individual [`Genotype`] in `[0, 1]` over THIS species' living orgs (`0.0` for an empty species,
+    /// mirroring [`mean_genotype`]'s empty convention). Derived from the already-hashed [`Genotype`] component
+    /// via an `OrgId`-sorted fold; never folded into `hash_world` (hash-neutral read-only projection, inv #3).
+    pub allele_freq: f64,
+    /// Mean per-individual [`Energy`] over THIS species' living orgs, NORMALIZED to `[0, 1]` by [`ENERGY_FULL`]
+    /// — the SAME normalization [`snapshot`](Simulation::snapshot)'s `fitness` channel applies (`energy / n /
+    /// ENERGY_FULL`), so every species' "fitness" reads on one scale next to the primary's. `0.0` for an empty
+    /// species (zero-division guard → exactly `0.0`, never NaN). Derived from the already-hashed [`Energy`]
+    /// component; never folded into `hash_world` (hash-neutral read-only projection, inv #3).
+    pub mean_energy: f64,
 }
 
 /// A stepwise, deterministic headless simulation handle (SPEC §2.2 — the gym-like env builds on this).
@@ -1439,6 +1454,41 @@ impl Simulation {
     #[must_use]
     pub fn observe_all(&self) -> Vec<SpeciesObservation> {
         let registry = self.world.resource::<SpeciesRegistry>();
+        let n = registry.entries.len();
+
+        // ── ONE read-only, SpeciesId-partitioned, OrgId-sorted aggregation pass (inv #3) ──────────────
+        // Ordered Vecs indexed by SpeciesId ordinal — NEVER a HashMap. Energy accumulates as i64 (exact,
+        // commutative integer add → order-independent); the f64 allele_sum fold is pinned by the (sid, OrgId)
+        // sort, exactly as `mean_genotype` / `snapshot` pin theirs. `try_query` runs on the IMMUTABLE `&World`
+        // so observe_all stays a pure `&self` projection; it draws ZERO SimRng, mutates nothing → cannot move
+        // `hash_world`.
+        let mut counts: Vec<u32> = vec![0; n];
+        let mut allele_sum: Vec<f64> = vec![0.0; n];
+        let mut energy_sum: Vec<i64> = vec![0; n];
+
+        // The (Species, OrgId, Genotype, Energy) components are all registered by `reset_with_roster`'s spawn,
+        // so `try_query` is `Some` for any live run; a never-spawned world yields an empty fold → all-zero stats.
+        let mut rows: Vec<(u16, u64, f64, i64)> = self
+            .world
+            .try_query::<(&Species, &OrgId, &Genotype, &Energy)>()
+            .map(|mut q| {
+                q.iter(&self.world)
+                    .map(|(sp, id, g, e)| (sp.0 .0, id.0, g.0, e.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Partition by SpeciesId, then OrgId WITHIN species — pins the non-associative f64 allele_sum order.
+        rows.sort_unstable_by_key(|r| (r.0, r.1));
+        for (sid, _id, g, e) in &rows {
+            let i = *sid as usize;
+            if i < n {
+                // `i < n` keeps the index total; a stray tag is impossible (Species minted from the registry).
+                counts[i] += 1;
+                allele_sum[i] += *g;
+                energy_sum[i] += *e;
+            }
+        }
+
         registry
             .entries
             .iter()
@@ -1449,6 +1499,19 @@ impl Simulation {
                 key: entry.key.clone(),
                 role: entry.strategy.role,
                 phenotype: entry.gp_map.express(&entry.genome),
+                population_size: counts[idx],
+                allele_freq: if counts[idx] == 0 {
+                    0.0
+                } else {
+                    allele_sum[idx] / counts[idx] as f64
+                },
+                // Mean Energy normalized to [0,1] by ENERGY_FULL — the SAME normalization snapshot()'s fitness
+                // channel uses. Zero-division guard yields exactly 0.0 (never NaN) for an empty species.
+                mean_energy: if counts[idx] == 0 {
+                    0.0
+                } else {
+                    energy_sum[idx] as f64 / counts[idx] as f64 / ENERGY_FULL as f64
+                },
             })
             .collect()
     }
@@ -2174,6 +2237,136 @@ mod tests {
             all[0].phenotype,
             gp::OntologyMap::new(gp::default_plant_trait_map()).express(&g_a)
         );
+        // Per-species population/allele/energy projection (R3 widening). generations:0 → no births/deaths have
+        // run, so each species still carries its exact spawn count.
+        assert_eq!(all[0].population_size, 50, "plant-a keeps its spawn count");
+        assert_eq!(
+            all[1].population_size, 50,
+            "microbe-b keeps its spawn count"
+        );
+        // Conservation invariant: per-species population sums to the total living-org count.
+        let total_living = sim
+            .world
+            .try_query::<&OrgId>()
+            .map_or(0, |mut q| q.iter(&sim.world).count()) as u32;
+        assert_eq!(
+            all[0].population_size + all[1].population_size,
+            total_living,
+            "per-species population sums to total living orgs"
+        );
+        // Both projected stats are in their normalized [0,1] ranges.
+        for o in &all {
+            assert!(
+                (0.0..=1.0).contains(&o.allele_freq),
+                "allele_freq in [0,1]: {}",
+                o.allele_freq
+            );
+            assert!(
+                (0.0..=1.0).contains(&o.mean_energy),
+                "mean_energy (ENERGY_FULL-normalized) in [0,1]: {}",
+                o.mean_energy
+            );
+        }
+    }
+
+    #[test]
+    fn per_species_stats_match_hand_computed_fixture() {
+        // The partition pass sums/divides correctly AND carries the ENERGY_FULL normalization: hand-compute the
+        // (sid, OrgId)-sorted mean Genotype and mean(Energy)/ENERGY_FULL via a PARALLEL query and assert
+        // observe_all matches bit-for-bit (f64 ==) — same canonical fold order as mean_genotype.
+        let roster = vec![
+            RosterEntry {
+                name: "alpha".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 4,
+                role: gp::TrophicRole::Autotroph,
+            },
+            RosterEntry {
+                name: "beta".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 4,
+                role: gp::TrophicRole::Heterotroph,
+            },
+        ];
+        let cfg = SimConfig {
+            seed: 90_125,
+            generations: 0,
+            entity_count: 8,
+        };
+        let sim = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster);
+        let all = sim.observe_all();
+
+        // Parallel hand fold: collect live rows, sort by (sid, OrgId), accumulate per species in THAT order.
+        let mut rows: Vec<(u16, u64, f64, i64)> = sim
+            .world
+            .try_query::<(&Species, &OrgId, &Genotype, &Energy)>()
+            .map(|mut q| {
+                q.iter(&sim.world)
+                    .map(|(sp, id, g, e)| (sp.0 .0, id.0, g.0, e.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_unstable_by_key(|r| (r.0, r.1));
+        let n = all.len();
+        let mut counts = vec![0u32; n];
+        let mut allele_sum = vec![0.0f64; n];
+        let mut energy_sum = vec![0i64; n];
+        for (sid, _id, g, e) in &rows {
+            let i = *sid as usize;
+            counts[i] += 1;
+            allele_sum[i] += *g;
+            energy_sum[i] += *e;
+        }
+        for i in 0..n {
+            assert_eq!(all[i].population_size, counts[i]);
+            let want_allele = allele_sum[i] / counts[i] as f64;
+            let want_energy = energy_sum[i] as f64 / counts[i] as f64 / ENERGY_FULL as f64;
+            assert_eq!(all[i].allele_freq, want_allele, "allele_freq bit-for-bit");
+            assert_eq!(
+                all[i].mean_energy, want_energy,
+                "mean_energy carries the ENERGY_FULL normalization, bit-for-bit"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_species_reports_zero_not_nan() {
+        // The zero-division guard yields exactly 0.0 (never NaN) for a species with no living orgs — mirrors
+        // mean_genotype's empty convention.
+        let roster = vec![
+            RosterEntry {
+                name: "populated".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 10,
+                role: gp::TrophicRole::Autotroph,
+            },
+            RosterEntry {
+                name: "empty".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 0,
+                role: gp::TrophicRole::Heterotroph,
+            },
+        ];
+        let cfg = SimConfig {
+            seed: 555,
+            generations: 0,
+            entity_count: 10,
+        };
+        let sim = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster);
+        let all = sim.observe_all();
+        assert_eq!(all[1].population_size, 0, "empty species has no orgs");
+        assert_eq!(all[1].allele_freq, 0.0, "empty allele_freq is exactly 0.0");
+        assert!(!all[1].allele_freq.is_nan(), "never NaN");
+        assert_eq!(all[1].mean_energy, 0.0, "empty mean_energy is exactly 0.0");
+        assert!(!all[1].mean_energy.is_nan(), "never NaN");
     }
 
     #[test]
