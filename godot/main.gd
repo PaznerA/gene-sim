@@ -17,10 +17,11 @@ extends Node2D
 ##   --live [--seed N]     Drive an OPEN-ENDED SANDBOX run live via the LiveSim gdext node (build the cdylib
 ##                         cargo build --manifest-path crates/godot-sim/Cargo.toml). Space pauses, ▶ steps.
 ##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
+##   --view relations      Open the Relations FlowMatrix heatmap view for --shot.
 ##   --focus <i>           With --view specimen: focus specimen i (0 baseline, 1.. edits) for --shot.
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
 ##
-## Keys (windowed): Space pause · V toggle ecosystem/specimen · Tab cycle specimen · D cycle layer ·
+## Keys (windowed): Space pause · V cycle ecosystem→specimen→relations · Tab cycle specimen · D cycle layer ·
 ##   S toggle plant sprites/dots · B toggle selective edit brush (live) · [ / ] brush radius ·
 ##   ,/. step · 1/2/3 zoom scope · wheel zoom (brush: wheel = radius) · arrows pan.
 ## Brush (live, ADR-011): with B on, hover paints a disc on the map; click applies a CRISPR edit to ONLY the
@@ -38,6 +39,7 @@ const Timeline := preload("res://timeline.gd")
 const Iso := preload("res://iso.gd")
 const IsoGround := preload("res://iso_ground.gd")
 const Sparkline := preload("res://sparkline.gd")
+const RelationsHeatmap := preload("res://relations_heatmap.gd")
 const Brush := preload("res://brush.gd")
 const PanelChrome := preload("res://panel.gd")
 const PillRail := preload("res://pill_rail.gd")
@@ -45,6 +47,14 @@ const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
+# View modes (Rel-UI.0): the top toggle cycles Ecosystem → Specimen → Relations. The Relations view renders the
+# emergent S×S FlowMatrix (core-measured inter-species joule flows) as a heatmap; it is renderer-only VIEW state
+# (a third _view_mode value) and degrades gracefully until the F4 core wires the matrix (see _flow_matrix_or_empty).
+const VIEW_NAMES := ["Ecosystem", "Specimen", "Relations"]
+const VIEW_COUNT := 3
+const VIEW_ECOSYSTEM := 0
+const VIEW_SPECIMEN := 1
+const VIEW_RELATIONS := 2
 # The species-genome traits, in canonical order (matches the core's Trait::ALL). Iterate THIS, never the
 # specimens.json Dictionary's keys, so the readout order is stable (inv #3 hygiene, even in UI).
 const TRAIT_KEYS := [
@@ -80,7 +90,7 @@ var _idx: int = 0
 var _cell: float = 12.0
 var _overlay_mode: int = 1  # index into OVERLAY_NAMES; 1 = density
 var _paused: bool = false
-var _view_mode: int = 0  # 0 = ecosystem, 1 = specimen (L-system plants)
+var _view_mode: int = 0  # 0 = ecosystem · 1 = specimen (L-system plants / microbe) · 2 = relations (FlowMatrix heatmap)
 var _specimens: Dictionary = {}  # parsed specimens.json: {baseline:{...}, edits:[...]}
 var _live_specimen_log: Array = []  # --live: incremental log of distinct genome states (baseline + per edit)
 # --live, multi-species: per-species incremental specimen log, keyed by species_id (int) ->
@@ -114,6 +124,15 @@ var _specimen_bounds := Rect2()
 var _focus: int = 0  # which specimen (index into _specimen_list()) is focused in the specimen view
 var _specimen_panel: Control
 var _specimen_picker: OptionButton
+# Relations view (Rel-UI.0): a fixed (NOT world-space) docked S×S heatmap of the core FlowMatrix.
+var _relations_root: Node2D  # holds the relations heatmap (parallels _specimen_root)
+var _relations_panel: Control  # PanelChrome wrapper (🔗 RELATIONS)
+var _relations_heatmap: Control  # the RelationsHeatmap _draw() node
+var _relations_banner: Label  # degrade-state banner (State 1/2 text; hidden in State 3)
+# Per-species panel vitals (Rel-UI.1): 3-up Population / Allele / Fitness, value + ▲▼ trend per row.
+var _species_vital_rows: Array = []  # [{key:String, fmt:String, value:Label}] one per vitals row
+var _species_vital_note: Label  # "pending core export" note, shown only when a stat reads "—"
+var _prev_species_stats: Dictionary = {}  # last tick's per-species stat values (keyed "<species_id>:<key>") for ▲▼
 var _trait_rows: Array = []  # [{name:Label, bar:ProgressBar, value:Label, delta:Label}] one per max(plant,microbe) trait row
 var _prev_button: Button
 var _next_button: Button
@@ -255,8 +274,10 @@ func _ready() -> void:
 		_brush_radius = 6
 		_brush.set_brush(_brush_cell, _brush_radius)
 		_apply_brush()
+	if _arg_value("--view") == "relations":  # optional: open the Relations FlowMatrix heatmap for --shot
+		_set_view_mode(VIEW_RELATIONS)
 	if _arg_value("--view") == "specimen":  # optional: open the L-system specimen view for --shot
-		_set_view_mode(1)
+		_set_view_mode(VIEW_SPECIMEN)
 		var focus_arg := _arg_value("--focus")  # optional: focus a specific specimen (0=baseline, 1..=edits)
 		if focus_arg != "" and not _specimen_list().is_empty():
 			_focus = clampi(int(focus_arg), 0, _specimen_list().size() - 1)
@@ -278,6 +299,8 @@ func _ready() -> void:
 	# constructs without a GPU, quit.
 	if _has_flag("--check"):
 		_render_specimens()  # exercise the L-system build path headlessly (catches GDScript errors)
+		_update_trait_readout()  # exercise the per-species vitals + trait readout build path (Rel-UI.1)
+		_refresh_relations()  # exercise the relations heatmap refresh + degrade path (Rel-UI.0, State 1 in replay)
 		_fill_detail("(check)", ["density 0.0"])  # exercise the detail/ontology rendering path
 		print("render scene OK — %d snapshots, %d specimens, cell=%d, grid %dx%d" % [
 			_snaps.size(), _specimen_list().size(), int(_cell), _snaps[0].width, _snaps[0].height])
@@ -476,7 +499,10 @@ func _setup_live() -> bool:
 ## RENDER_HZ. FILE replay uses the Timer, not this. (History granularity is the render rate, not per-generation;
 ## lower the speed slider for finer detail.)
 func _process(delta: float) -> void:
-	if _paused or _view_mode != 0 or _live == null:
+	# The live sim keeps stepping in the Ecosystem AND Relations views (the FlowMatrix is per-generation, so the
+	# heatmap wants live frames); only the Specimen view pauses stepping (it inspects a static genome). Determinism
+	# is unaffected — _process advances by whole LIVE_STEP generations, never wall-clock.
+	if _paused or _view_mode == VIEW_SPECIMEN or _live == null:
 		return
 	# Advance: accumulate owed generations, then step in a bounded loop (cap so a slow/backlogged frame can't
 	# spiral — input keeps priority over throughput).
@@ -522,6 +548,8 @@ func _publish_frame() -> void:
 		_timeline.setup(gens)
 		_timeline.set_markers(_injections)
 	_show(_snaps.size() - 1)
+	if _view_mode == VIEW_RELATIONS:
+		_refresh_relations()  # the FlowMatrix is per-generation — repaint the heatmap each render tick in Relations
 
 
 ## Live-mode CRISPR intervention UI (P6): pick a Cas variant / locus / guide and Inject. The renderer only
@@ -825,6 +853,13 @@ func _build_scene() -> void:
 	_specimen_root.visible = false
 	add_child(_specimen_root)
 
+	# Relations view (Rel-UI.0) — hidden until toggled. A parallel root to _specimen_root; the heatmap itself is a
+	# fixed Control built into the panel chrome (in _build_relations_ui), not world-space, so this root just gates
+	# visibility symmetrically with the others.
+	_relations_root = Node2D.new()
+	_relations_root.visible = false
+	add_child(_relations_root)
+
 	# A camera framing the whole field; S4.4 adds zoom scopes on top of this.
 	_cam = Camera2D.new()
 	_cam.position = _field_center()
@@ -851,6 +886,7 @@ func _build_scene() -> void:
 	_build_vitals_ui(ui)
 	_build_controls(ui, field_screen)
 	_build_specimen_ui(ui, field_screen)
+	_build_relations_ui(ui, field_screen)
 	_build_interaction_ui(ui)
 	_build_timeline(ui)
 	_build_intervention_ui(ui)
@@ -1403,7 +1439,7 @@ func _sync_scope_buttons() -> void:
 
 
 func _on_view_pressed() -> void:
-	_set_view_mode(1 - _view_mode)
+	_set_view_mode((_view_mode + 1) % VIEW_COUNT)
 
 
 func _on_play_pressed() -> void:
@@ -1434,33 +1470,40 @@ func _step_rel(delta: int) -> void:
 
 # ──────────────────────────── specimen (L-system) view ────────────────────────────
 
+## Switch the active view (0 ecosystem · 1 specimen · 2 relations). Pure VIEW state (inv #2): toggles node
+## visibility + panel set_active; computes no biology. The Relations branch refreshes the FlowMatrix heatmap.
 func _set_view_mode(m: int) -> void:
 	_view_mode = m
-	_world.visible = (m == 0)
-	_specimen_root.visible = (m == 1)
+	_world.visible = (m == VIEW_ECOSYSTEM)
+	_specimen_root.visible = (m == VIEW_SPECIMEN)
+	if _relations_root != null:
+		_relations_root.visible = (m == VIEW_RELATIONS)
 	if _vignette != null:
-		_vignette.visible = (m == 0)
+		_vignette.visible = (m == VIEW_ECOSYSTEM)  # screen-space edge darkening only suits the field view
 	if _detail_panel != null:
 		_detail_panel.visible = false  # clear stale inspection on view switch
 	if _tooltip != null:
 		_tooltip.visible = false
 	if _timeline != null:
-		_timeline.visible = (m == 0)  # the timeline indexes snapshots, irrelevant in specimen view
+		# The matrix is per-generation (like the snapshot index), so the timeline stays visible in Relations too.
+		_timeline.visible = (m == VIEW_ECOSYSTEM or m == VIEW_RELATIONS)
 	if _intervention_panel != null:
-		_intervention_panel.set_active(_live != null and m == 0)
+		_intervention_panel.set_active(_live != null and m == VIEW_ECOSYSTEM)
 	if _vitals_panel != null:
-		_vitals_panel.set_active(m == 0)
-		if m != 0:
+		_vitals_panel.set_active(m == VIEW_ECOSYSTEM)
+		if m != VIEW_ECOSYSTEM:
 			_set_brush_mode(false)  # the brush only makes sense in the ecosystem view
 		if _mission_panel != null:
-			_mission_panel.set_active(_mission_on and m == 0)
+			_mission_panel.set_active(_mission_on and m == VIEW_ECOSYSTEM)
 	if _view_button != null:
-		_view_button.text = "View: Specimen" if m == 1 else "View: Ecosystem"
+		_view_button.text = "View: " + VIEW_NAMES[m]
 	if _layer_picker != null:
-		_layer_picker.disabled = (m == 1)
+		_layer_picker.disabled = (m != VIEW_ECOSYSTEM)  # the data-layer picker only drives the ecosystem overlay
 	if _specimen_panel != null:
-		_specimen_panel.set_active(m == 1)
-	if m == 1:
+		_specimen_panel.set_active(m == VIEW_SPECIMEN)
+	if _relations_panel != null:
+		_relations_panel.set_active(m == VIEW_RELATIONS)
+	if m == VIEW_SPECIMEN:
 		# The specimen view now renders a GENUINE per-species body: a Microbe rod glyph for E. coli, the L-system
 		# plant for the abstract species (branched in _render_specimens). No placeholder.
 		_refresh_live_specimens()  # in --live there is no specimens.json — build one from the live genome
@@ -1468,6 +1511,9 @@ func _set_view_mode(m: int) -> void:
 		_update_trait_readout()
 		_emphasise_focus()
 		_frame_focused_specimen()
+	elif m == VIEW_RELATIONS:
+		_refresh_relations()  # pull species names + the flat FlowMatrix, feed the heatmap (degrades gracefully)
+		_frame_world()  # the heatmap is a fixed Control panel, not world-space — keep the camera neutral
 	else:
 		_frame_world()
 	_sync_controls()  # enable/disable scrubber + step for the new mode
@@ -1814,6 +1860,45 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	_specimen_picker.item_selected.connect(_on_specimen_selected)
 	col.add_child(_specimen_picker)
 
+	# Per-species VITALS row (Rel-UI.1): a compact 3-up Population / Allele / Fitness block, each a value + ▲▼
+	# trend, inserted between the picker and the Traits header. Populated in _update_trait_readout via
+	# _species_stat: the PRIMARY (active observe()) species reads run-level observe()/snapshot today; non-primary
+	# species (and any field the core does not yet expose) render "—" + a "pending core export" note. When the
+	# Layer-B core widening lands (population_size/allele_freq/mean_energy on SpeciesObservation) the same label
+	# loop shows live numbers for EVERY species with NO further GDScript change (it already reads obs.get(...)).
+	_species_vital_rows.clear()
+	var vitals_hdr := Label.new()
+	vitals_hdr.text = "Vitals"
+	vitals_hdr.add_theme_font_size_override("font_size", 12)
+	vitals_hdr.add_theme_color_override("font_color", Color(0.7, 0.78, 0.7))
+	col.add_child(vitals_hdr)
+	# {label, stat-key (the obs.get key for non-primary), %-format} per row, in display order.
+	var vital_specs := [
+		{"label": "Population", "key": "population_size", "fmt": "%d"},
+		{"label": "Allele", "key": "allele_freq", "fmt": "%.2f"},
+		{"label": "Fitness", "key": "mean_fitness", "fmt": "%.2f"},
+	]
+	for vs in vital_specs:
+		var vrow := HBoxContainer.new()
+		vrow.add_theme_constant_override("separation", 6)
+		col.add_child(vrow)
+		var vname := Label.new()
+		vname.text = str(vs["label"])
+		vname.custom_minimum_size = Vector2(86, 0)
+		vname.add_theme_font_size_override("font_size", 11)
+		vname.add_theme_color_override("font_color", Color(0.86, 0.9, 0.86))
+		vrow.add_child(vname)
+		var vval := _vital_label()  # value + ▲▼ glyph, reusing the existing vitals label style
+		vval.custom_minimum_size = Vector2(150, 0)
+		vrow.add_child(vval)
+		_species_vital_rows.append({"key": str(vs["key"]), "fmt": str(vs["fmt"]), "value": vval})
+	# A one-line note shown only when a non-primary / unexposed stat reads "—" (cleared when all stats are live).
+	_species_vital_note = Label.new()
+	_species_vital_note.add_theme_font_size_override("font_size", 10)
+	_species_vital_note.add_theme_color_override("font_color", Color(0.6, 0.62, 0.6))
+	_species_vital_note.visible = false
+	col.add_child(_species_vital_note)
+
 	var traits_hdr := Label.new()
 	traits_hdr.text = "Traits  (vs baseline)"
 	traits_hdr.add_theme_font_size_override("font_size", 12)
@@ -1869,6 +1954,218 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	_specimen_panel = PanelChrome.new()
 	_specimen_panel.setup("🌱 SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 70.0), _pill_rail)
 	_specimen_panel.set_active(false)
+
+
+## Build the Relations view chrome (Rel-UI.0): a docked fixed-Control panel holding the S×S FlowMatrix heatmap,
+## a degrade-state banner, and a diverging sign/magnitude legend. The heatmap reads core-measured integers only
+## (inv #2): the renderer paints them as colored cells + printed numbers and computes no biology.
+func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
+	var body := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.0, 0.0, 0.0, 0.5)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(10)
+	body.add_theme_stylebox_override("panel", sb)
+	body.custom_minimum_size = Vector2(360, 0)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	body.add_child(col)
+
+	var cap := Label.new()
+	cap.text = "rows = sink (gains) · cols = source (gives)"
+	cap.add_theme_font_size_override("font_size", 11)
+	cap.add_theme_color_override("font_color", Color(0.7, 0.78, 0.7))
+	col.add_child(cap)
+
+	# Degrade-state banner: shown in State 1 (no flow_matrix method) / State 2 (present but all-zero); hidden in
+	# State 3 (live non-zero). The DATA picks the state (see _refresh_relations) — never a version flag.
+	_relations_banner = Label.new()
+	_relations_banner.add_theme_font_size_override("font_size", 11)
+	_relations_banner.add_theme_color_override("font_color", Color(0.98, 0.8, 0.4))
+	_relations_banner.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_relations_banner.custom_minimum_size = Vector2(340, 0)
+	_relations_banner.visible = false
+	col.add_child(_relations_banner)
+
+	_relations_heatmap = RelationsHeatmap.new()
+	_relations_heatmap.custom_minimum_size = Vector2(340, 300)
+	col.add_child(_relations_heatmap)
+
+	# Diverging sign/magnitude legend strip (reuses the _legend_label colored-text pattern, diverging variant).
+	var legend := HBoxContainer.new()
+	legend.add_theme_constant_override("separation", 8)
+	col.add_child(legend)
+	legend.add_child(_diverging_swatch(Color(0.90, 0.32, 0.30), "− j drains i"))
+	legend.add_child(_diverging_swatch(Color(0.13, 0.14, 0.15), "0"))
+	legend.add_child(_diverging_swatch(Color(0.30, 0.86, 0.42), "j feeds i"))
+	var units := Label.new()
+	units.text = "(net J / generation)"
+	units.add_theme_font_size_override("font_size", 10)
+	units.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
+	col.add_child(units)
+
+	_relations_panel = PanelChrome.new()
+	_relations_panel.setup("🔗 RELATIONS", body, ui, Vector2(maxf(220.0, field_px.x - 376.0), 70.0), _pill_rail)
+	_relations_panel.set_active(false)
+
+
+## A small color swatch + label for the diverging legend strip (presentation only).
+func _diverging_swatch(col: Color, text: String) -> HBoxContainer:
+	var box := HBoxContainer.new()
+	box.add_theme_constant_override("separation", 4)
+	var chip := ColorRect.new()
+	chip.color = col
+	chip.custom_minimum_size = Vector2(14, 14)
+	box.add_child(chip)
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.add_theme_font_size_override("font_size", 10)
+	lbl.add_theme_color_override("font_color", Color(0.86, 0.9, 0.86))
+	box.add_child(lbl)
+	return box
+
+
+## Tolerant read of the core FlowMatrix export. Returns {} when the LiveSim cdylib has no flow_matrix() method
+## (today's cdylib + file-replay where _live == null) — State 1. Otherwise returns {s:int, j:PackedInt64Array}.
+## Same forward/back-compat has_method probe used for observe_species/species_key (inv #2: pure read of an export).
+func _flow_matrix_or_empty() -> Dictionary:
+	if _live != null and _live.has_method("flow_matrix"):
+		return _live.flow_matrix() as Dictionary
+	return {}
+
+
+## Pull species names (observe_species() order = SpeciesId order = FlowMatrix index order, by construction) and the
+## flat FlowMatrix, then feed the heatmap. THREE honest degrade states picked purely from the DATA:
+##   State 1 — no flow_matrix method → {} → render an S×S all-zero grid sized from the species roster + banner.
+##   State 2 — method present, matrix all-zero (F4.0 scaffold) → real cells, neutral, "loop not yet closed" banner.
+##   State 3 — method present, non-zero (F4.1 live) → diverging ramp saturates; banner hidden.
+## ZERO biology here (inv #2): the renderer only sizes the grid, forwards integers, and selects banner text.
+func _refresh_relations() -> void:
+	if _relations_heatmap == null:
+		return
+	var names := _species_names()
+	_relations_heatmap.setup(names)
+	var fm := _flow_matrix_or_empty()
+	var method_present: bool = (_live != null and _live.has_method("flow_matrix"))
+	var s := int(fm.get("s", 0))
+	var flat: PackedInt64Array = fm.get("j", PackedInt64Array())
+	# When the matrix is absent/degenerate, size an all-zero grid from the species roster so the grid + real labels
+	# still render (State 1). The heatmap tolerates a zero/short array as a valid degenerate input.
+	if s <= 0 or flat.size() != s * s:
+		s = names.size()
+		flat = PackedInt64Array()
+		flat.resize(s * s)  # zero-filled
+	_relations_heatmap.set_matrix(flat, s)
+	# Banner: distinguish "no export" (State 1) from "export wired, physics off" (State 2) from "live" (State 3).
+	if _relations_banner != null:
+		if not method_present:
+			_relations_banner.text = "Relations not yet coupled — build/run a cdylib with the F4 FlowMatrix (flow_matrix())"
+			_relations_banner.visible = true
+		elif _all_zero(flat):
+			_relations_banner.text = "FlowMatrix present, loop not yet closed (F4.1) — all flows zero"
+			_relations_banner.visible = true
+		else:
+			_relations_banner.visible = false
+
+
+## True if every entry of `flat` is zero (or it is empty). Pure display-state check, not biology.
+func _all_zero(flat: PackedInt64Array) -> bool:
+	for v in flat:
+		if v != 0:
+			return false
+	return true
+
+
+## The species display names in SpeciesId order (the FlowMatrix / observe_species index order, by construction).
+## Live → observe_species() names (degrades to the single observe() species when the per-species export is absent);
+## file-replay → a single "species" label so the relations grid still renders 1×1 (State 1). Read-only (inv #2).
+func _species_names() -> PackedStringArray:
+	var out := PackedStringArray()
+	if _live != null and _live.has_method("observe_species"):
+		for sp in _live.observe_species():
+			out.append(str((sp as Dictionary).get("name", "species")))
+		if out.size() > 0:
+			return out
+	if _live != null:
+		out.append(str(_live.observe().get("name", "species")))
+		return out
+	out.append("species")  # file-replay: a single placeholder row/col so the grid renders
+	return out
+
+
+## A per-species stat for the Vitals block (Rel-UI.1). The PRIMARY (active observe()) species reads RUN-LEVEL
+## values today (population_size ← observe().population, allele_freq ← observe().allele_freq, mean_fitness ←
+## _mean_pop over the snapshot) so single-species runs read correctly NOW. NON-primary species (and any field the
+## core does not yet expose) read obs.get(key, null) → null until the Layer-B core widening lands. Returns null on
+## any unexposed value (rendered "—"). Read-only (inv #2): pure projection of already-exported core scalars.
+func _species_stat(obs: Dictionary, sid: int, key: String):
+	if _is_primary_species(sid):
+		match key:
+			"population_size":
+				if _live != null:
+					return int(_live.observe().get("population", 0))
+				if not _snaps.is_empty():
+					return int((_snaps[_idx]).population)
+			"allele_freq":
+				if _live != null:
+					return clampf(float(_live.observe().get("allele_freq", 0.0)), 0.0, 1.0)
+				if not _snaps.is_empty():
+					return _mean_pop((_snaps[_idx]).allele_freq, (_snaps[_idx]).density)
+			"mean_fitness":
+				if not _snaps.is_empty():
+					return _mean_pop((_snaps[_idx]).fitness, (_snaps[_idx]).density)
+	# Non-primary species, or a key the active observe() path does not cover: read the per-species export if the
+	# core has widened SpeciesObservation (Layer B). Absent today → null → "—" + the pending-export note.
+	if obs.has(key):
+		return obs[key]
+	return null
+
+
+## Whether `sid` is the PRIMARY active species the run-level observe() reports on (R3-B: single-active, id 0 today).
+func _is_primary_species(sid: int) -> bool:
+	return sid == 0
+
+
+## Format a stat value for the vitals row. null / NAN → "—" (the honest "not yet exported" marker). The trend
+## glyph is prepended by the caller. Pure presentation (inv #2).
+func _fmt_stat(v, fmt: String) -> String:
+	if v == null:
+		return "—"
+	var f := float(v)
+	if is_nan(f):
+		return "—"
+	if fmt == "%d":
+		return "%d" % int(round(f))
+	return fmt % f
+
+
+## The SpeciesId-ordered per-species observation rows (live → observe_species(); else a single synthetic row for
+## the primary species so the panel still reads). Each row: {species_id:int, name:String, key:String, obs:Dict}.
+## Read-only (inv #2): observe_species() is a pure core export; this only reshapes it for the panel.
+func _panel_species_list() -> Array:
+	var out: Array = []
+	if _live != null and _live.has_method("observe_species"):
+		for sp in _live.observe_species():
+			var d: Dictionary = sp
+			out.append({
+				"species_id": int(d.get("species_id", 0)),
+				"name": str(d.get("name", "species")),
+				"key": str(d.get("key", "default")),
+				"obs": d,
+			})
+		out.sort_custom(func(a, b): return int(a["species_id"]) < int(b["species_id"]))  # SpeciesId order (inv #3)
+		if not out.is_empty():
+			return out
+	# Fallback: a single primary-species row (the active observe() species, or a file-replay placeholder).
+	var key := "default"
+	var nm := "species"
+	if _live != null:
+		if _live.has_method("species_key") and String(_live.species_key()) != "":
+			key = String(_live.species_key())
+		nm = str(_live.observe().get("name", nm))
+	out.append({"species_id": 0, "name": nm, "key": key, "obs": {}})
+	return out
 
 
 ## Refill the picker from the current specimen list (baseline first). Clamps _focus into range.
@@ -1928,6 +2225,64 @@ func _active_trait_keys() -> Array:
 ## Rewrite the trait bars/values/deltas for the focused specimen (vs baseline = list index 0). The row COUNT is
 ## fixed at build (max of the plant/microbe sets); rows beyond the active species' key list are hidden so the
 ## panel reads as exactly the species' phenotype (5 for the microbe, 9 for the plant).
+## The panel-species row (species_id + obs) for the currently focused specimen. Matches the focused specimen's
+## name+key back to _panel_species_list() (SpeciesId-ordered); falls back to the primary row. Read-only (inv #2).
+func _focused_species_row() -> Dictionary:
+	var rows := _panel_species_list()
+	if rows.is_empty():
+		return {"species_id": 0, "name": "species", "key": "default", "obs": {}}
+	var list := _specimen_list()
+	if not list.is_empty():
+		var spec: Dictionary = list[clampi(_focus, 0, list.size() - 1)]
+		var fkey := str(spec.get("key", ""))
+		var fname := str(spec.get("label", "")).split(" — ")[0]  # the picker label is "Name — baseline/edit N"
+		for r in rows:
+			if str(r["key"]) == fkey and str(r["name"]) == fname:
+				return r
+		for r in rows:  # name may not match (legacy labels); fall back to a key match
+			if str(r["key"]) == fkey:
+				return r
+	return rows[0]
+
+
+## Fill the 3-up Population / Allele / Fitness vitals block for the FOCUSED species (Rel-UI.1). PRIMARY species
+## read run-level values today; non-primary (and any unexposed field) render "—" + a one-line pending-export note.
+## Trend ▲▼ is vs the previous tick's value for that species+key. Read-only (inv #2): pure projection of exports.
+func _update_species_vitals() -> void:
+	if _species_vital_rows.is_empty():
+		return
+	var row := _focused_species_row()
+	var sid := int(row["species_id"])
+	var obs: Dictionary = row.get("obs", {})
+	var any_pending := false
+	for vr in _species_vital_rows:
+		var vrow: Dictionary = vr
+		var key := str(vrow["key"])
+		var v = _species_stat(obs, sid, key)
+		var lbl: Label = vrow["value"]
+		var trend_key := "%d:%s" % [sid, key]
+		if v == null:
+			lbl.text = "—"
+			any_pending = true
+		else:
+			var f := float(v)
+			lbl.text = "%s  %s" % [_species_stat_trend(f, trend_key), _fmt_stat(v, str(vrow["fmt"]))]
+			_prev_species_stats[trend_key] = f
+	if _species_vital_note != null:
+		_species_vital_note.text = "per-species stat pending core export"
+		_species_vital_note.visible = any_pending
+
+
+## ▲ / ▼ / = trend of `now` vs the previous tick's value for `key` (per-species variant of _trend; no RNG).
+func _species_stat_trend(now: float, key: String) -> String:
+	if not _prev_species_stats.has(key):
+		return "·"
+	var prev := float(_prev_species_stats[key])
+	if absf(now - prev) <= maxf(0.0005, absf(prev) * 0.001):
+		return "="
+	return "▲" if now > prev else "▼"
+
+
 func _update_trait_readout() -> void:
 	if _trait_rows.is_empty():
 		return
@@ -1937,6 +2292,7 @@ func _update_trait_readout() -> void:
 	# Chrome glyph follows the FOCUSED specimen's species (🦠 for E. coli, 🌱 for the plant).
 	if _specimen_panel != null and _specimen_panel.has_method("set_title"):
 		_specimen_panel.set_title("🦠 SPECIMEN" if _is_microbe_key(_focused_key()) else "🌱 SPECIMEN")
+	_update_species_vitals()  # the 3-up Population/Allele/Fitness block for the focused species (Rel-UI.1)
 	var keys := _active_trait_keys()
 	var focused: Dictionary = (list[clampi(_focus, 0, list.size() - 1)] as Dictionary).get("traits", {})
 	var base: Dictionary = (list[0] as Dictionary).get("traits", {})
@@ -2206,12 +2562,20 @@ func _update_overlay(snap) -> void:
 
 func _refresh_hud() -> void:
 	_refresh_vitals()  # title-bar chips + Vitals scoreboard + sparkline
-	if _view_mode == 1:
+	if _view_mode == VIEW_SPECIMEN:
 		# Specimen view: caption in the title status; hide the data legend.
 		if _title_status != null:
 			var edits := _specimen_list().size() - 1
 			_title_status.text = ("specimen view — baseline + %d edited genome(s)   [V back]" % maxi(0, edits)
 				if edits >= 0 else "specimen view — no specimens.json   [V back]")
+		if _legend != null:
+			_legend.set_active(false)
+		return
+	if _view_mode == VIEW_RELATIONS:
+		# Relations view: caption in the title status; the inferno data legend is irrelevant (the heatmap carries
+		# its own diverging sign/magnitude legend strip).
+		if _title_status != null:
+			_title_status.text = "relations view — S×S inter-species joule flows   [V back]"
 		if _legend != null:
 			_legend.set_active(false)
 		return
@@ -2312,7 +2676,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_play_button()
 			_refresh_hud()
 		KEY_V:
-			_set_view_mode(1 - _view_mode)
+			_set_view_mode((_view_mode + 1) % VIEW_COUNT)
 		KEY_TAB:
 			# Cycle the focused specimen (specimen view only); guard empty list (no div-by-zero).
 			if _view_mode == 1 and not _specimen_list().is_empty():
