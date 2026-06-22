@@ -26,6 +26,7 @@ var _names: PackedStringArray = PackedStringArray()
 var _flat: PackedInt64Array = PackedInt64Array()
 var _s: int = 0
 var _max_abs: int = 0  # per-set max-abs over OFF-diagonal entries (display scaling only; 0 ⇒ uniform neutral)
+var _guilds: PackedInt32Array = PackedInt32Array()  # ADR-014 overlay: guild id per species (or empty = no overlay)
 
 
 ## Axis labels, in SpeciesId order (the same order observe_species()/the FlowMatrix use → row/col i is the i-th
@@ -53,6 +54,34 @@ func set_matrix(flat: PackedInt64Array, s: int) -> void:
 	queue_redraw()
 
 
+## ADR-014 GUILD-COLOURING overlay (VIEW-ONLY, inv #2): a per-species guild id (single-link clustered in the
+## Rust boundary crate at a pinned threshold, computed off-hash — GDScript does NO clustering). Same-guild
+## species share an axis-label hue. An empty array (old cdylib / index empty) simply disables the tint — the
+## MEASURED FlowMatrix heatmap cells are UNTOUCHED. The renderer only maps a finished integer → a hue.
+func set_guilds(guild_ids: PackedInt32Array) -> void:
+	_guilds = guild_ids
+	queue_redraw()
+
+
+## A stable per-guild colour from a small fixed palette indexed by the guild id (pure presentation, like the
+## inferno legend ramp). The id is the lowest-member SpeciesId, so the mapping is stable run-to-run. Returns a
+## neutral tint when the overlay is absent or the index is out of range.
+func _guild_color(i: int) -> Color:
+	if _guilds.size() == 0 or i < 0 or i >= _guilds.size():
+		return Color(0.74, 0.82, 0.74)  # the original neutral axis-label colour (no overlay)
+	var gid: int = int(_guilds[i])
+	# Fixed palette indexed by guild id (hash id → hue); kept small + deterministic.
+	var palette := [
+		Color(0.45, 0.86, 0.50),  # green
+		Color(0.55, 0.70, 0.98),  # blue
+		Color(0.96, 0.74, 0.40),  # amber
+		Color(0.86, 0.52, 0.92),  # violet
+		Color(0.96, 0.55, 0.55),  # red
+		Color(0.50, 0.92, 0.88),  # teal
+	]
+	return palette[gid % palette.size()]
+
+
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, size), Color(0.0, 0.0, 0.0, 0.32))
 	# Size the grid from the species count (labels), so the grid + real names render even when the matrix is
@@ -67,17 +96,18 @@ func _draw() -> void:
 	var cell := maxf(CELL_MIN, minf(avail.x / float(n), avail.y / float(n)))
 	var print_values := (n <= 6)  # when S<=6 the integer J value fits legibly inside the cell
 
-	# Column (source) headers across the top.
+	# Column (source) headers across the top — tinted by the species' guild colour (ADR-014 overlay; neutral
+	# when no guild overlay is present).
 	for j in n:
 		var cx := grid_origin.x + float(j) * cell
 		var nm := _names[j] if j < _names.size() else "sp%d" % j
-		_draw_small(nm, Vector2(cx + 2.0, HEADER_H - 14.0), Color(0.74, 0.82, 0.74), cell - 4.0)
+		_draw_small(nm, Vector2(cx + 2.0, HEADER_H - 14.0), _guild_color(j), cell - 4.0)
 
 	for i in n:
 		var cy := grid_origin.y + float(i) * cell
-		# Row (sink) label down the left gutter.
+		# Row (sink) label down the left gutter — same guild tint.
 		var rnm := _names[i] if i < _names.size() else "sp%d" % i
-		_draw_small(rnm, Vector2(PAD, cy + cell * 0.5 - 4.0), Color(0.74, 0.82, 0.74), LABEL_W - PAD)
+		_draw_small(rnm, Vector2(PAD, cy + cell * 0.5 - 4.0), _guild_color(i), LABEL_W - PAD)
 		for j in n:
 			var cx := grid_origin.x + float(j) * cell
 			var rect := Rect2(cx, cy, cell - 2.0, cell - 2.0)

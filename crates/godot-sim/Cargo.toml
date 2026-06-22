@@ -36,6 +36,10 @@ sim-core = { path = "../sim-core" }
 harness = { path = "../harness" }
 crispr = { path = "../crispr" }
 genome = { path = "../genome" }
+# The std-only relations boundary driver (ADR-014). godot-sim (the detached render boundary, GPL-scanned
+# separately by check_license.sh) depends on it — so sim-core/harness need NOT — keeping the core dependency
+# graph clean. The k-NN / guild clustering runs HERE (downstream of the deterministic core), VIEW-ONLY.
+relations-index = { path = "../relations-index" }
 
 # gdext, pinned exactly to api-4-6 (ADR-010). default-features=false drops __codegen-full (lazy
 # codegen) and pins the api level explicitly rather than auto-detecting the installed Godot.

@@ -310,6 +310,20 @@ impl GeneSimEnv {
             .flow_matrix()
     }
 
+    /// The read-only per-species relations **signatures** as `(s, D, flat s*D u16, roles s u8)` (ADR-014
+    /// re-grounded — delegates to [`sim_core::Simulation::species_signatures`]; panics if called before
+    /// `reset`). A PURE off-hash projection (Block A cached Strategy, Block B measured FlowMatrix) — no RNG
+    /// draw, no mutation, never folded into the determinism hash (inv #2/#3). The boundary
+    /// `relations-index` k-NN / guild clustering consumes this; the output is VIEW-ONLY and never re-enters
+    /// the sim.
+    #[must_use]
+    pub fn species_signatures(&self) -> (usize, usize, Vec<u16>, Vec<u8>) {
+        self.sim
+            .as_ref()
+            .expect("GeneSimEnv::species_signatures called before reset")
+            .species_signatures()
+    }
+
     /// A read-only, derived per-cell [`sim_core::GridSnapshot`] of the current state (delegates to
     /// [`sim_core::Simulation::snapshot`]; panics if called before `reset`).
     ///

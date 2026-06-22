@@ -654,6 +654,86 @@ for the OVERSIGHT loop (ADR-017 S2). This un-gates S2 → S3 (`crates/oracle-fba
 
 ---
 
+## ADR-014 — Relations sidecar: per-species SIGNATURE + view-only nearest/guild index (re-grounded)
+
+- **Date:** 2026-06-22
+- **Status:** Accepted (re-grounds the retired fabricated-cosine ADR-014 DRAFT). Continuation roadmap #5 / ADR-017
+  S8 / ADR-013 Rel-phase. **HASH-NEUTRAL** (no re-pin — the pinned literal `0x47a0_3c8f_6701_f240` is unchanged).
+
+### Context
+ADR-013 F4 made the MEASURED `FlowMatrix` the on-hash relation source. The OLD ADR-014 draft proposed a
+*fabricated-cosine* community matrix COUPLED INTO `selection()` as a `[0.5,1.5]` `RelationModifier` — that design
+is RETIRED. This re-grounding INVERTS it: the relations signal is a READ-ONLY, OFF-HASH projection that flows
+ONE-WAY into the renderer; there is NO fabricated cosine and NO `RelationModifier`. The "vector-DB relations" leg
+of the vision (a sqlite-vec ANN sidecar) is scaffolded behind the process boundary but NOT wired — the actual
+roster is S=2 (→3 with the future predator), where EXACT integer k-NN is correct, instant, and bit-reproducible.
+
+### Decision — the PINNED contract (load-bearing for cross-run stability)
+1. **Per-species SIGNATURE = `u16[D]`, D = 12** (PINNED, append-only so a stored sidecar index stays valid),
+   exported READ-ONLY off-hash in `SpeciesId` order by `Simulation::species_signatures() -> (s, D, Vec<u16>,
+   Vec<u8> role)` (`crates/sim-core/src/signature.rs`; harness + `LiveSim::species_relations()` passthroughs).
+   **ONE SHARED SCALE:** every dim lives on the u16 grid `[0, UNIT_SCALE = 65535]` so L1 is block-balanced.
+   - **Block A — STRATEGY/metabolic identity (9 dims)**, from the cached `gp::Strategy` (ADR-013 F2, off-hash):
+     `[0..5)` `budget[5]` permille rescaled `*65535/1000`; `[5..8)` `affinity[3]` (already on the grid);
+     `[8]` `mineralize_rate` permille rescaled (the F4 detritus-loop lever).
+   - **Block B — MEASURED interaction (3 dims)**, from a read-only `flow_matrix()` projection (the F4
+     RE-GROUNDING — measured flows, NOT a fabricated cosine): `[9]` `in_flow` = Σ max(0, row); `[10]` `out_flow`
+     = Σ max(0, col); `[11]` `degree` = nonzero off-diagonal partner count. `in/out` map i64→u16 via a PINNED
+     integer base-2 log/clamp against `FLOW_J_SCALE = 1<<28` — NEVER a per-call max-abs (which would make
+     signatures non-comparable across snapshots). `degree` scaled by `(s−1)`.
+   - **`role:u8`** = the `TrophicRole` ordinal `{Autotroph 0, Heterotroph 1, Mixotroph 2, Decomposer 3}` carried
+     ALONGSIDE the vector as a label/FILTER — **NEVER a distance dim** (Autotroph and Decomposer are not
+     metrically "close"; folding role into L1 corrupts the metric — adopted from Design 2).
+   - **`base_growth` is DROPPED** from the distance vector (it is already echoed by budget+affinity) — so NO
+     float ever enters the signature bytes. The only quantization is integer rescaling + the Block-B log/clamp.
+2. **Index backend = EXACT in-Rust k-NN + single-link guild clustering** in `crates/relations-index` (std-only,
+   `#![forbid(unsafe_code)]`, empty `[dependencies]`, on the oracle-fba template). Trait seam
+   `NearestIndex`/`GuildIndex` (inv #5) + `InRustIndex`: integer-L1 `d(a,b)=Σ|a_k−b_k|` (u64, no float, no
+   transcendental); `nearest(focal,k)` sorted `(distance asc, sid asc)` — a total order, ties → lowest
+   `SpeciesId`; `guilds(T)` single-link union-find at the PINNED threshold, edges walked ascending `(i,j)`,
+   guild ids canonicalized to the lowest member `SpeciesId`. `RelError {Io,Spawn,NonZeroExit,MissingOutput}`
+   mirrors `FbaError`/`SlimError` (Spawn/NonZeroExit RESERVED for the sidecar). **Chosen over ANN because EXACT
+   integer k-NN has ZERO of the HNSW/ANN insertion-order/float-ordering nondeterminism inv #3 forbids; sqlite-vec's
+   sublinear-recall value only materializes at thousands of vectors (the future E. coli edit-variant fan-out).**
+3. **PINNED constants** (load-bearing for cross-run guild/nearest stability; display-scaling choices, not biology):
+   - `signature::FLOW_J_SCALE = 1 << 28` (268_435_456 J) — the Block-B in/out log/clamp saturation point.
+   - `relations_index::GUILD_THRESHOLD = 240_000` — the single-link integer-L1 edge threshold `T`.
+   - `signature::SIGNATURE_DIMS = 12`, the block layout above, and the L1 metric (ties → lowest SpeciesId).
+4. **sqlite-vec SCALE PATH — scaffolded, probe-and-skip, NOT wired.** `resolve_reldb_bin()` (`$RELDB_BIN →
+   ~/.local/bin/relations-index → PATH`, the oracle `resolve_*_bin` pattern) + an `index_via_sidecar` stub
+   (returns `MissingOutput`). When a roster-size trigger trips (the future thousands-of-edit-variant fan-out), a
+   separate `relations-index` CLI linking **sqlite-vec — pinned `v0.1.x` (Apache-2.0 OR MIT, GPL-clean, inv #7;
+   exact patch pinned in this table when the trigger is implemented)** is shelled out to, writing run-namespaced
+   `.db` sidecar rows (a FILE the sim core never opens). The boundary crate stays dependency-free FOREVER; since
+   sqlite-vec never enters `Cargo.lock`, the license gate's resolved-tree scan never even sees it.
+
+### Hash-neutrality (three independent reasons, each sufficient — the pinned literal CANNOT move)
+1. **READ-ONLY OFF-HASH SOURCE.** `species_signatures()` is a pure projection: Block A reads the F2-certified
+   cached `Strategy` (unread by selection); Block B reads `flow_matrix()` (folded into `hash_world` ONCE in F4 —
+   READING it adds no hash input). Walks the `SpeciesRegistry` in `SpeciesId` order (no `HashMap`, inv #3), draws
+   ZERO `SimRng`, mutates nothing, NEVER inserted into `hash_world`. `base_growth` is dropped → no float in the bytes.
+2. **PROCESS-BOUNDARY CONSUMER.** The k-NN/clustering runs in `relations-index`, which the deterministic core
+   NEVER calls during `step()/selection()/metabolism()` — structurally downstream (numbers flow core → boundary →
+   renderer, never back). In the sqlite-vec path the core does not even open the `.db`.
+3. **ONE-WAY VIEW SINK** — the explicit INVERSION of the retired draft: no fabricated cosine, no `RelationModifier`,
+   no seam by which the output re-enters selection. The gate test `species_signatures_export_is_hash_neutral`
+   asserts the pinned literal is UNCHANGED with the export + index present.
+
+### Non-goals (explicitly out of scope this ADR)
+- NO `selection()` coupling / NO `RelationModifier` (the retired draft's Rel-5). Any future coupling is a
+  separate, ledgered, human-signed-off re-pin under a LATER ADR.
+- The old "Rel-1 generalize-the-gate" slice is OBSOLETE: `relations-index` was already pre-registered in
+  `scripts/check_license.sh` `BOUNDARY_CRATES` (the skip branch flips to ENFORCED automatically the moment
+  `crates/relations-index/Cargo.toml` lands — no gate edit needed).
+
+### Consequences
+- **+** A view-only relations overlay (guild label tints + a nearest-species advisory strip with a provenance
+  badge distinct from the MEASURED FlowMatrix) grounded in real F4 flows; bit-reproducible, hash-neutral; the
+  core dependency graph stays clean (only godot-sim depends on `relations-index`).
+- **−** The sqlite-vec scale path is deferred (scaffolded only); the in-Rust `InRustIndex` is the sole CI/gate path.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

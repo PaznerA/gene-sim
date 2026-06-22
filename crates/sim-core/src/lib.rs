@@ -26,6 +26,7 @@ pub mod fixed;
 pub mod gp;
 pub mod ledger;
 pub mod resource;
+pub mod signature;
 pub mod snapshot;
 pub mod soil;
 pub mod trophic;
@@ -2123,6 +2124,44 @@ impl Simulation {
         (fm.s(), fm.flat().to_vec())
     }
 
+    /// The read-only per-species relations **signatures** (ADR-014 re-grounded). Returns
+    /// `(s, D, flat_signatures, roles)`:
+    /// * `s` — species count (= [`SpeciesRegistry`] length, walked in [`SpeciesId`] ordinal order);
+    /// * `D` — [`signature::SIGNATURE_DIMS`] (pinned `12`);
+    /// * `flat_signatures` — `s * D` `u16`, row-major (`row i` = species `i`'s signature), on the shared
+    ///   `[0, UNIT_SCALE]` grid (Block A = strategy budget/affinity/mineralize, Block B = measured FlowMatrix
+    ///   in/out/degree). NO float ever enters the bytes (`base_growth` is DROPPED);
+    /// * `roles` — `s` `u8`, the categorical [`gp::TrophicRole`] ordinal per species, carried ALONGSIDE the
+    ///   vector as a label/filter (NEVER a distance dim).
+    ///
+    /// Pure read-only projection — draws NO `SimRng`, mutates nothing, NEVER folded into `hash_world` (mirrors
+    /// the [`flow_matrix`](Self::flow_matrix) read-only contract, inv #2/#3). Block A reads the cached
+    /// [`gp::Strategy`] (ADR-013 F2, off-hash), Block B reads the recorded `FlowMatrix` (ADR-013 F4) — reading
+    /// either cannot perturb the run. Walks the [`SpeciesRegistry`] in `SpeciesId` order (no `HashMap`, inv #3),
+    /// the SAME canonical order as `flow_matrix`/`observe_all`. The output is VIEW-ONLY (the boundary
+    /// `relations-index` k-NN/clustering consumes it) and NEVER re-enters selection/metabolism/the hash.
+    #[must_use]
+    pub fn species_signatures(&self) -> (usize, usize, Vec<u16>, Vec<u8>) {
+        let registry = self.world.resource::<SpeciesRegistry>();
+        let fm = self.world.resource::<trophic::FlowMatrix>();
+        let s = registry.entries.len();
+        let d = signature::SIGNATURE_DIMS;
+        let flat = fm.flat();
+        let fm_s = fm.s();
+        let mut sigs = Vec::with_capacity(s * d);
+        let mut roles = Vec::with_capacity(s);
+        // Walk in SpeciesId ordinal order (= Vec index) — canonical, HashMap-free (inv #3). Block B uses the
+        // FlowMatrix only when its dimension matches the roster (s == fm_s); otherwise Block B is all-zero
+        // (a fresh run before the first measurement, or a mismatched matrix — defensive, never a panic).
+        let (b_flat, b_s) = if fm_s == s { (flat, s) } else { (&[][..], 0) };
+        for (i, entry) in registry.entries.iter().enumerate() {
+            let row = signature::signature_row(&entry.strategy, b_flat, b_s, i);
+            sigs.extend_from_slice(&row);
+            roles.push(signature::role_ordinal(entry.strategy.role));
+        }
+        (s, d, sigs, roles)
+    }
+
     /// Mutate the **species** genome with access to the run's single seeded RNG, then re-express the
     /// `BaseGrowthRate` so the edit changes subsequent selection dynamics (SPEC §4; invariant #2, #3, #6).
     ///
@@ -2515,6 +2554,82 @@ mod tests {
         let entry = &reg.entries[0];
         let expect = gp::express_strategy(&entry.gp_map, &entry.genome, entry.strategy.role);
         assert_eq!(*sim.species_strategy(SpeciesId(0)), expect);
+    }
+
+    #[test]
+    fn species_signatures_are_fixed_shape_ordered_and_integer() {
+        // ADR-014 re-grounded: species_signatures() returns (s, D, flat s*D u16, roles s u8) in SpeciesId order.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 8,
+            entity_count: 40,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(8);
+        let (s, d, flat, roles) = sim.species_signatures();
+        assert_eq!(s, 1, "default reset → 1 species");
+        assert_eq!(d, signature::SIGNATURE_DIMS, "pinned D = 12");
+        assert_eq!(flat.len(), s * d, "flat is exactly s*D");
+        assert_eq!(roles.len(), s, "one role per species");
+        // Block A (budget) for the single species must match the cached Strategy projection.
+        let strat = sim.species_strategy(SpeciesId(0));
+        for (k, &b) in strat.budget.iter().enumerate() {
+            let expect = (u32::from(b.min(1000)) * u32::from(u16::MAX) / 1000) as u16;
+            assert_eq!(
+                flat[k], expect,
+                "budget dim {k} matches the strategy projection"
+            );
+        }
+        // Affinity dims pass through unchanged (already on the grid).
+        assert_eq!(&flat[5..8], &strat.affinity[..]);
+        // Role ordinal is the Autotroph default (0) for the plant.
+        assert_eq!(roles[0], 0);
+    }
+
+    #[test]
+    fn species_signatures_are_deterministic_same_state() {
+        // Same state → identical bytes (a pure projection). Two fresh resets at the same config + same step
+        // count must export byte-identical signatures.
+        let cfg = SimConfig {
+            seed: 99,
+            generations: 5,
+            entity_count: 30,
+        };
+        let export = |c: &SimConfig| {
+            let mut sim = Simulation::reset(c);
+            sim.step(5);
+            sim.species_signatures()
+        };
+        assert_eq!(export(&cfg), export(&cfg));
+        // And calling it twice on the SAME instance is idempotent (read-only).
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(5);
+        assert_eq!(sim.species_signatures(), sim.species_signatures());
+    }
+
+    #[test]
+    fn species_signatures_export_is_hash_neutral() {
+        // PROVE the off-hash contract: exporting signatures (and reading flow_matrix/strategy) does not move the
+        // pinned literal. We run the PINNED config to completion, taking the signature export every generation,
+        // and assert the final hash is STILL the pinned literal — the export is a pure read, never folded.
+        let cfg = SimConfig {
+            seed: 13_679_457_532_755_275_413,
+            generations: 50,
+            entity_count: 1000,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        for _ in 0..cfg.generations {
+            // Read the export mid-run; a pure projection must not perturb the stream.
+            let (s, d, flat, roles) = sim.species_signatures();
+            assert_eq!(flat.len(), s * d);
+            assert_eq!(roles.len(), s);
+            sim.step(1);
+        }
+        let stats = sim.run_stats();
+        assert_eq!(
+            stats.hash, 0x47a0_3c8f_6701_f240,
+            "signature export must be hash-neutral (the pinned literal cannot move)"
+        );
     }
 
     #[test]
