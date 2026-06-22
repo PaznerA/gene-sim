@@ -406,6 +406,62 @@ mod tests {
     }
 
     #[test]
+    fn save_journal_round_trips_and_replays_sp3_interventions() {
+        // SP-3: a journal carrying the four intervention Actions round-trips through save/read and replays to the
+        // same hash as a direct run (additive serde; all RNG-free → replay-exact). The journal IS the source of
+        // truth for the timeline markers (a deterministic projection of these ordered lines).
+        let dir = temp_dir("sp3_saveload");
+        let env = EnvConfig {
+            entity_count: 300,
+            ..Default::default()
+        };
+        let region = crate::RegionSpec {
+            cx: 16,
+            cy: 16,
+            radius: 20,
+        };
+        let actions = vec![
+            Action::Advance(5),
+            Action::RegionPcrAmplify {
+                species: 0,
+                region,
+                count: 8,
+                endow_j: 700_000,
+            },
+            Action::Advance(3),
+            Action::RegionCull {
+                species: 0,
+                region,
+                strength: 300,
+            },
+            Action::RegionNutrient {
+                channel: 2,
+                region,
+                amount_j: 4_000_000,
+            },
+            Action::RegionToxin {
+                channel: 0,
+                region,
+                amount_milli: 2_000_000,
+            },
+            Action::Advance(4),
+        ];
+        save_journal(&dir, &env, 11, &actions).unwrap();
+        let (sj, read_back) = read_journal(&dir).unwrap();
+        assert_eq!(sj.seed, 11);
+        assert_eq!(
+            read_back, actions,
+            "round-trip must preserve the SP-3 action sequence"
+        );
+        assert_eq!(
+            replay(&dir).unwrap(),
+            run_episode(&env, 11, &actions),
+            "a loaded SP-3 journal must replay to the same hash as the direct run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn record_then_replay_is_bit_identical() {
         // THE acceptance criterion (SPEC §10.5/§6): record an episode of mixed Advance + ApplyEdit
         // actions, then replay it, and assert the replayed stats hash == the recorded stats hash.

@@ -530,6 +530,40 @@ fn write_episode_snapshots_and_injections(
                     true,
                 ));
             }
+            // SP-3: the four intervention tools step through and stamp a timeline marker at the current
+            // cumulative generation (the intervention landed "now", between Advance blocks). All RNG-free.
+            Action::RegionPcrAmplify { species, count, .. } => {
+                env.step(action.clone());
+                injections.push((generation, format!("pcr {count}× sp{species}"), true));
+            }
+            Action::RegionCull {
+                species, strength, ..
+            } => {
+                env.step(action.clone());
+                injections.push((generation, format!("cull sp{species} @{strength}‰"), true));
+            }
+            Action::RegionNutrient {
+                channel, amount_j, ..
+            } => {
+                env.step(action.clone());
+                injections.push((
+                    generation,
+                    format!("nutrient ch{channel} +{amount_j}J"),
+                    true,
+                ));
+            }
+            Action::RegionToxin {
+                channel,
+                amount_milli,
+                ..
+            } => {
+                env.step(action.clone());
+                injections.push((
+                    generation,
+                    format!("toxin ch{channel} +{amount_milli}m"),
+                    true,
+                ));
+            }
         }
     }
 

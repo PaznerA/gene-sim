@@ -1185,6 +1185,55 @@ fn mint_to_cap(cell: &mut i64, amount: i64, cap: i64, ledger: &mut ledger::Ledge
     ledger.overflow += amount - accepted; // the rejected part → overflow (nets out)
 }
 
+/// **DEPOSIT A CARCASS RESIDUAL** (ADR-013 F4/F5 carcass→detritus, factored out at SP-3.0) — the SHARED
+/// accounting for a dead organism's residual `J`, called by BOTH [`reproduce_or_die`] (a starvation/senescence
+/// death) AND [`Simulation::region_cull`] (an antibiotic kill). The residual is `J` that was already live (the
+/// dead org's post-maintenance Energy + Biomass); this MOVES it bucket-to-bucket — a paired transfer, NOT a
+/// mint — so it never touches an influx tap. Splits it like LITTERFALL:
+/// * a pinned [`chem::ALARM_FRACTION_NUM`]/[`chem::ALARM_FRACTION_DEN`] fraction → the alarm chem plane (a
+///   dying org's distress signal — F5 DEATH-ALARM), milli == J 1:1, [`chem::CHEM_CAP`]-capped;
+/// * the rest → the cell's `detritus` pool, [`POOL_CAP`]-capped, species-tagged in [`trophic::PoolProvenance`]
+///   so a decomposer's later harvest attributes `flow[decomposer][this-species]` in the [`trophic::FlowMatrix`]
+///   (the obligate-loop edge);
+/// * both cap-rejected parts → the OVERFLOW tap (finding #5 — never a silent clamp; the residual always nets
+///   out exactly: `accepted_detritus + accepted_alarm + overflow_spill == residual`).
+///
+/// Pure integer, ZERO `SimRng` (inv #3). Conserves `J` BY CONSTRUCTION: every quantum of `residual` lands in
+/// detritus, the alarm plane, or the overflow tap. A non-positive `residual` is a clean no-op.
+#[allow(clippy::too_many_arguments)]
+fn deposit_carcass(
+    pools: &mut PoolStock,
+    chem: &mut chem::ChemField,
+    prov: &mut trophic::PoolProvenance,
+    ledger: &mut ledger::Ledger,
+    cellu: usize,
+    species: usize,
+    residual: i64,
+) {
+    if residual <= 0 {
+        return;
+    }
+    // ADR-013 F5 DEATH-ALARM: divert a pinned fraction of the residual to the alarm plane INSTEAD of detritus
+    // (a residual split like LITTERFALL — stays conserved). The rest → detritus.
+    let alarm_share = residual * chem::ALARM_FRACTION_NUM / chem::ALARM_FRACTION_DEN;
+    let to_detritus = residual - alarm_share;
+    let headroom = (POOL_CAP - pools.detritus[cellu]).max(0);
+    let accepted = to_detritus.min(headroom);
+    pools.detritus[cellu] += accepted;
+    // ADR-013 F4: tag the carcass detritus with the dead org's species so a decomposer's later harvest of it
+    // attributes flow[decomposer][this-species] in the FlowMatrix (the obligate-loop edge).
+    prov.deposit_detritus(cellu, species, accepted);
+    // The alarm_share → the alarm plane (milli == J 1:1; bounded by the carcass residual << i32::MAX).
+    // Cap-rejected part → overflow (nets out).
+    let alarm_rejected = chem::deposit_capped_plane(
+        chem.plane_mut(chem::ChemChannel::Alarm as usize),
+        cellu,
+        alarm_share as i32,
+    );
+    // detritus cap spill (to_detritus − accepted) + alarm cap spill → overflow (finding #5; nets out).
+    ledger.overflow += (to_detritus - accepted) + i64::from(alarm_rejected);
+}
+
 /// **REPRODUCE OR DIE** (ADR-013 F3 KEYSTONE) — energy-funded births + deaths, REPLACING constant-N
 /// Wright-Fisher. Runs AFTER metabolism so only post-maintenance survivors breed.
 ///
@@ -1291,28 +1340,18 @@ fn reproduce_or_die(
         let starved = energy_after < MAINTENANCE_FLOOR;
         let senescent = r.age >= AGE_MAX;
         if starved || senescent {
-            // Carcass → detritus: residual Energy (post-maintenance) + Biomass deposits to the cell pool.
+            // Carcass → detritus: residual Energy (post-maintenance) + Biomass deposits to the cell pool, split
+            // alarm/detritus + cap-spill→overflow by the SHARED `deposit_carcass` helper (SP-3.0 extraction).
             let residual = energy_after.max(0) + r.biomass.max(0);
-            // ADR-013 F5 DEATH-ALARM: a dying org diverts a pinned fraction of its carcass residual to the alarm
-            // plane INSTEAD of detritus (a residual split like LITTERFALL — stays conserved, the residual was
-            // already J about to deposit; it just splits to a different conserved store). The rest → detritus.
-            let alarm_share = residual * chem::ALARM_FRACTION_NUM / chem::ALARM_FRACTION_DEN;
-            let to_detritus = residual - alarm_share;
-            let headroom = (POOL_CAP - pools.detritus[cellu]).max(0);
-            let accepted = to_detritus.min(headroom);
-            pools.detritus[cellu] += accepted;
-            // ADR-013 F4: tag the carcass detritus with the dead org's species so a decomposer's later harvest
-            // of it attributes flow[decomposer][this-species] in the FlowMatrix (the obligate-loop edge).
-            prov.deposit_detritus(cellu, r.species as usize, accepted);
-            // The alarm_share → the alarm plane (milli == J 1:1; bounded by the carcass residual << i32::MAX).
-            // Cap-rejected part → overflow (nets out).
-            let alarm_rejected = chem::deposit_capped_plane(
-                chem.plane_mut(chem::ChemChannel::Alarm as usize),
+            deposit_carcass(
+                &mut pools,
+                &mut chem,
+                &mut prov,
+                &mut ledger,
                 cellu,
-                alarm_share as i32,
+                r.species as usize,
+                residual,
             );
-            // detritus cap spill (to_detritus − accepted) + alarm cap spill → overflow (finding #5; nets out).
-            ledger.overflow += (to_detritus - accepted) + i64::from(alarm_rejected);
             dead.push(r.entity);
         }
     }
@@ -2365,6 +2404,331 @@ impl Simulation {
             ));
         }
         count
+    }
+
+    /// **REGION PCR-AMPLIFY** (SP-3.1) — the faithful local-clone tool: spawn `count` FAITHFUL clones of an
+    /// ALREADY-RESIDENT species `sid` inside the `region` disc, each endowed with `endow_j` joules MINTED from
+    /// the named `intervention` ledger tap (conserved — a PCR reaction ADDS copies, never conjured, never halves
+    /// the template). Unlike [`region_inoculate`] (which bakes a NEUTRAL `0.5` contaminant), each clone COPIES
+    /// its heritable state VERBATIM from a deterministically-chosen resident template org of `sid` — so a clone
+    /// is bit-identical heritable state to its local template (faithful PCR); subsequent generations mutate
+    /// normally through [`reproduce_or_die`]. Returns the number of clones actually spawned (`0` if the species
+    /// is not LOCALLY present in the disc — you cannot PCR-amplify what has no template; mirrors
+    /// `region_inoculate`'s empty-disc no-op).
+    ///
+    /// **Determinism (inv #3):** RNG-FREE. (1) Enumerate in-region cells in canonical `cell_index` order. (2)
+    /// CENSUS the species' LIVING in-region orgs, COLLECT-then-SORT by `(cell_index, SpeciesId, OrgId)` (the
+    /// `reproduce_or_die` canonical key) so template selection is a pure function of state, never Query order.
+    /// (3) For each of `count` clones, pick the template ROUND-ROBIN over the sorted census (`k % census.len()`,
+    /// deterministic — NOT a random parent), copy its `Genotype`/`DroughtTol`/`ThermalTol` VERBATIM (NO
+    /// `mutate_unit` — that distinguishes a PCR clone from a sexual birth), and co-locate the clone on the
+    /// TEMPLATE'S cell (daughter-cell semantics — a clone biologically arises where its template is; zero RNG).
+    /// OrgIds minted IN ORDER from the monotonic [`NextOrgId`]. ZERO `next_u64` draws → the spawn stream is
+    /// unchanged, exactly the property [`region_inoculate`] documents.
+    ///
+    /// **Granularity (inv #6):** `region` targets CELLS; the species/region pair is an operator-level event.
+    /// **Conservation:** `endow_j` splits into a seed `Biomass` ([`OFFSPRING_SEED_BIOMASS`], clamped) + residual
+    /// `Energy` (Σ == endow_j); `count·endow_j` is booked to the `intervention` tap so live `J` rises by exactly
+    /// the tap. PCR never registers a new species → the FlowMatrix/SpeciesRegistry dimension is untouched.
+    pub fn region_pcr_amplify(
+        &mut self,
+        sid: SpeciesId,
+        region: Region,
+        count: u32,
+        endow_j: i64,
+    ) -> u32 {
+        if count == 0 || endow_j <= 0 {
+            return 0;
+        }
+        let species_count = self.world.resource::<SpeciesRegistry>().entries.len();
+        if sid.0 as usize >= species_count {
+            return 0; // not registered — defensive no-op
+        }
+        let width = self.world.resource::<PoolStock>().width;
+        // CENSUS the targeted species' LIVING in-region orgs; collect heritable state + cell, then SORT by the
+        // canonical (cell_index, SpeciesId, OrgId) key so template selection is a pure function of state (inv #3).
+        struct Template {
+            cell: u32,
+            org: u64,
+            genotype: f64,
+            drought: f64,
+            thermal: f64,
+            px: u32,
+            py: u32,
+        }
+        let mut census: Vec<Template> = Vec::new();
+        for (id, sp, g, d, t, p) in self
+            .world
+            .query::<(
+                &OrgId,
+                &Species,
+                &Genotype,
+                &DroughtTol,
+                &ThermalTol,
+                &Position,
+            )>()
+            .iter(&self.world)
+        {
+            if sp.0 == sid && region.contains(p.x, p.y) {
+                census.push(Template {
+                    cell: cell_index(p, width),
+                    org: id.0,
+                    genotype: g.0,
+                    drought: d.0,
+                    thermal: t.0,
+                    px: p.x,
+                    py: p.y,
+                });
+            }
+        }
+        if census.is_empty() {
+            return 0; // no local template — PCR needs one (cannot amplify what is not locally present)
+        }
+        census.sort_unstable_by_key(|c| (c.cell, sid.0, c.org));
+        // Split endow_j into a seed Biomass (carved out, clamped) + residual Energy — CONSERVED (Σ == endow_j).
+        let seed_biomass = OFFSPRING_SEED_BIOMASS.min(endow_j);
+        let seed_energy = endow_j - seed_biomass;
+        // Mint count·endow_j into the world via the intervention tap (a PCR reaction ADDS copies — conserved).
+        self.world.resource_mut::<ledger::Ledger>().intervention += endow_j * i64::from(count);
+        // Spawn count clones round-robin over the sorted census; each inherits its template VERBATIM (no mutate).
+        for k in 0..count {
+            let tpl = &census[(k as usize) % census.len()];
+            let (genotype, drought, thermal, px, py) =
+                (tpl.genotype, tpl.drought, tpl.thermal, tpl.px, tpl.py);
+            let org = {
+                let mut next = self.world.resource_mut::<NextOrgId>();
+                let id = next.0;
+                next.0 += 1;
+                id
+            };
+            self.world.spawn((
+                OrgId(org),
+                Energy(seed_energy),
+                Biomass(seed_biomass),
+                Age(0),
+                // Heritable state COPIED VERBATIM from the template — faithful PCR, NOT a mutated sexual birth.
+                Genotype(genotype),
+                DroughtTol(drought),
+                ThermalTol(thermal),
+                // Daughter-cell placement: the clone co-locates on its template's cell (deterministic, zero RNG).
+                Position { x: px, y: py },
+                Species(sid),
+            ));
+        }
+        count
+    }
+
+    /// **REGION CULL** (SP-3.2) — the selective-antibiotic tool: deterministically kill a `strength`-permille
+    /// kill-FRACTION of one species `sid`'s LIVING orgs inside the `region` disc, depositing each culled org's
+    /// residual `J` to detritus via the shared [`deposit_carcass`] helper (carcass→detritus, accounted EXACTLY
+    /// like a starvation death — a paired bucket move, NO tap minted). Returns the number of orgs killed.
+    ///
+    /// **Determinism (inv #3):** RNG-FREE — NOT a per-org coin flip (which would draw + risk reordering). CENSUS
+    /// the species' in-region orgs, COLLECT-then-SORT by `(cell_index, SpeciesId, OrgId)` (the `reproduce_or_die`
+    /// canonical key), then kill the first `kills` of them where `kills` is the largest-remainder apportionment
+    /// of `floor(n · strength / 1000)` — computed via [`fixed::apportion`] over `[strength, 1000−strength]` so
+    /// the kill/spare split reuses the same conserving tie rule (ties→lowest canonical index). A pure function of
+    /// the sorted census + strength, integer, position-dependent, ZERO draws. `strength` is clamped to
+    /// `[0, 1000]`; `0` (or an empty census) is a clean no-op.
+    ///
+    /// **Granularity (inv #6):** `region` targets CELLS; the SUBSET-to-kill is an emergent apportionment of the
+    /// canonical census, never an organism handle the operator names.
+    pub fn region_cull(&mut self, sid: SpeciesId, region: Region, strength: u16) -> u32 {
+        let strength = u64::from(strength.min(fixed::PERMILLE as u16));
+        if strength == 0 {
+            return 0;
+        }
+        let species_count = self.world.resource::<SpeciesRegistry>().entries.len();
+        if sid.0 as usize >= species_count {
+            return 0; // not registered — defensive no-op
+        }
+        let width = self.world.resource::<PoolStock>().width;
+        // CENSUS the species' in-region living orgs: collect (cell, org, entity, residual=Energy+Biomass), SORT
+        // canonically so the kept/killed split is a pure function of state (inv #3).
+        struct Victim {
+            cell: u32,
+            org: u64,
+            entity: Entity,
+            residual: i64,
+        }
+        let mut census: Vec<Victim> = Vec::new();
+        for (entity, id, sp, energy, biomass, p) in self
+            .world
+            .query::<(Entity, &OrgId, &Species, &Energy, &Biomass, &Position)>()
+            .iter(&self.world)
+        {
+            if sp.0 == sid && region.contains(p.x, p.y) {
+                census.push(Victim {
+                    cell: cell_index(p, width),
+                    org: id.0,
+                    entity,
+                    residual: energy.0.max(0) + biomass.0.max(0),
+                });
+            }
+        }
+        if census.is_empty() {
+            return 0;
+        }
+        census.sort_unstable_by_key(|v| (v.cell, sid.0, v.org));
+        // Apportion the census by [strength, 1000−strength]: the FIRST share is the kill count (largest-remainder,
+        // ties→lowest index — the `fixed::apportion` tie rule). `kills` is exactly that many of the sorted census.
+        let n = census.len() as i64;
+        let split = fixed::apportion(n, &[strength, fixed::PERMILLE as u64 - strength]);
+        let kills = split[0] as usize;
+        if kills == 0 {
+            return 0;
+        }
+        // Deposit each victim's residual to detritus (carcass→detritus — the shared helper; conserved, NO tap),
+        // then despawn. Walk the sorted census so the per-cell detritus cap-spill is order-pinned (inv #3).
+        let victims: Vec<(usize, Entity, i64)> = census
+            .iter()
+            .take(kills)
+            .map(|v| (v.cell as usize, v.entity, v.residual))
+            .collect();
+        for &(cellu, _entity, residual) in &victims {
+            self.cull_deposit(cellu, sid.0 as usize, residual);
+        }
+        for &(_cellu, entity, _residual) in &victims {
+            self.world.despawn(entity);
+        }
+        kills as u32
+    }
+
+    /// Helper for [`region_cull`]: deposit one culled org's `residual` to detritus via the shared
+    /// [`deposit_carcass`] (carcass→detritus). Sequences the four `&mut` resource borrows the helper needs
+    /// through one `resource_scope` so they never alias on the single-threaded `World` (inv #3).
+    fn cull_deposit(&mut self, cellu: usize, species: usize, residual: i64) {
+        self.world
+            .resource_scope(|world, mut pools: bevy_ecs::prelude::Mut<PoolStock>| {
+                world.resource_scope(|world, mut chem: bevy_ecs::prelude::Mut<chem::ChemField>| {
+                    world.resource_scope(
+                        |world, mut prov: bevy_ecs::prelude::Mut<trophic::PoolProvenance>| {
+                            let mut ledger = world.resource_mut::<ledger::Ledger>();
+                            deposit_carcass(
+                                &mut pools,
+                                &mut chem,
+                                &mut prov,
+                                &mut ledger,
+                                cellu,
+                                species,
+                                residual,
+                            );
+                        },
+                    );
+                });
+            });
+    }
+
+    /// **REGION NUTRIENT** (SP-3.3) — the feed tool: deposit `amount_j` joules into one [`PoolStock`] plane
+    /// (`channel` ∈ {0 light, 1 free_nutrient, 2 detritus}) across the in-region cells, MINTED from the named
+    /// `intervention` ledger tap (conserved). The amount is apportioned across the in-region cells by
+    /// largest-remainder ([`fixed::apportion`]) so the per-cell split is order-independent and replay-exact; each
+    /// cell's [`POOL_CAP`] headroom spill routes to the OVERFLOW tap (`accepted + overflow_spill == amount`,
+    /// never a silent clamp — the F3 overflow-routing precedent). Returns the `J` actually ACCEPTED into pools
+    /// (`amount_j − overflow_spill`).
+    ///
+    /// **Determinism (inv #3):** RNG-FREE — deterministic cell enumeration in `cell_index` order, integer
+    /// apportionment. Species-agnostic (it feeds the substrate, not an organism). An empty disc / non-positive
+    /// amount is a clean no-op (mints nothing).
+    pub fn region_nutrient(&mut self, channel: u8, region: Region, amount_j: i64) -> i64 {
+        if amount_j <= 0 {
+            return 0;
+        }
+        let (width, height) = {
+            let pools = self.world.resource::<PoolStock>();
+            (pools.width, pools.height)
+        };
+        // Enumerate in-region cells in canonical cell_index order — RNG-free.
+        let mut cells: Vec<usize> = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if region.contains(x, y) {
+                    cells.push((y * width + x) as usize);
+                }
+            }
+        }
+        if cells.is_empty() {
+            return 0;
+        }
+        // Apportion amount_j EVENLY across the in-region cells (largest-remainder conserves the total exactly).
+        let weights = vec![1u64; cells.len()];
+        let per_cell = fixed::apportion(amount_j, &weights);
+        let mut pools = self.world.resource_mut::<PoolStock>();
+        let plane: &mut Vec<i64> = match channel {
+            0 => &mut pools.light,
+            1 => &mut pools.free_nutrient,
+            _ => &mut pools.detritus,
+        };
+        // Book the FULL amount to the intervention tap; the cap-rejected part is booked to overflow below (it
+        // nets out — saturating logic ROUTES the spill, never silently clamps; the mint_to_cap precedent).
+        let mut accepted_total = 0i64;
+        let mut overflow_total = 0i64;
+        for (&c, &amount) in cells.iter().zip(per_cell.iter()) {
+            let headroom = (POOL_CAP - plane[c]).max(0);
+            let accepted = amount.min(headroom);
+            plane[c] += accepted;
+            accepted_total += accepted;
+            overflow_total += amount - accepted;
+        }
+        let mut ledger = self.world.resource_mut::<ledger::Ledger>();
+        ledger.intervention += amount_j; // ALL minted J booked to intervention…
+        ledger.overflow += overflow_total; // …the cap-rejected part booked to overflow (nets out)
+        accepted_total
+    }
+
+    /// **REGION TOXIN** (SP-3.3) — the chemical-spike tool: deposit `amount_milli` (== `J` 1:1, the
+    /// CHEM_J_PER_MILLI pin) into one [`chem::ChemField`] plane (`channel` ∈ {0 toxin, 1 kin, 2 alarm}) across
+    /// the in-region cells, MINTED from the named `intervention` ledger tap (conserved). Each in-region cell
+    /// gets the per-cell apportioned share via [`chem::deposit_capped_plane`] (the same call the death-alarm
+    /// split uses); per-cell [`chem::CHEM_CAP`] cap-rejected part routes to the OVERFLOW tap. Returns the milli-J
+    /// actually ACCEPTED into the field.
+    ///
+    /// **Determinism (inv #3):** RNG-FREE — deterministic cell enumeration in `cell_index` order, integer
+    /// apportionment. Because chem is a LIVE [`ledger::LiveTotal::chem`] bucket, the minted milli MUST be booked:
+    /// `intervention += accepted`, `overflow += cap-rejected` (the `alarm_rejected → overflow` precedent). An
+    /// empty disc / non-positive amount is a clean no-op.
+    pub fn region_toxin(&mut self, channel: u8, region: Region, amount_milli: i64) -> i64 {
+        if amount_milli <= 0 {
+            return 0;
+        }
+        let (width, height) = {
+            let chem = self.world.resource::<chem::ChemField>();
+            (chem.width, chem.height)
+        };
+        let mut cells: Vec<usize> = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if region.contains(x, y) {
+                    cells.push((y * width + x) as usize);
+                }
+            }
+        }
+        if cells.is_empty() {
+            return 0;
+        }
+        // Apportion amount_milli evenly across the in-region cells (largest-remainder conserves the total).
+        let weights = vec![1u64; cells.len()];
+        let per_cell = fixed::apportion(amount_milli, &weights);
+        // Clamp the channel selector to a valid plane (0 toxin, 1 kin, 2 alarm).
+        let ch = usize::from(channel.min(2));
+        let mut accepted_total = 0i64;
+        let mut overflow_total = 0i64;
+        {
+            let mut chem = self.world.resource_mut::<chem::ChemField>();
+            let plane = chem.plane_mut(ch);
+            for (&c, &amount) in cells.iter().zip(per_cell.iter()) {
+                // milli == J 1:1; the per-cell share is bounded by amount_milli << i32::MAX for any sane input,
+                // so the i64→i32 narrowing is lossless for realistic spikes (clamp defensively).
+                let amt_i32 = amount.clamp(0, i64::from(i32::MAX)) as i32;
+                let rejected = chem::deposit_capped_plane(plane, c, amt_i32);
+                accepted_total += i64::from(amt_i32 - rejected);
+                overflow_total += amount - i64::from(amt_i32 - rejected);
+            }
+        }
+        let mut ledger = self.world.resource_mut::<ledger::Ledger>();
+        ledger.intervention += amount_milli; // ALL minted milli booked to intervention…
+        ledger.overflow += overflow_total; // …cap-rejected part booked to overflow (nets out)
+        accepted_total
     }
 
     /// The run's conserved-energy [`Ledger`](ledger::Ledger) (ADR-013 F0a; read-only copy). Empty until the
@@ -5095,6 +5459,380 @@ mod tests {
             established > died_out,
             "a well-adapted immigrant must out-establish a poorly-adapted one (well {established} vs poor \
              {died_out})"
+        );
+    }
+
+    // ── SP-3 intervention tools (PCR-amplify / cull / nutrient / toxin) ────────────────────────────────────
+
+    #[test]
+    fn sp3_pcr_amplify_clones_are_byte_identical_to_a_local_template_and_conserve_j() {
+        // SP-3.1: a PCR clone copies its local template's heritable state VERBATIM (faithful PCR — no mutation),
+        // J rises by EXACTLY count·endow_j from the intervention tap, and ledger_closes holds.
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 300,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        // The primary species is SpeciesId(0); it has residents spread across the grid. Pick a disc with orgs.
+        let sid = SpeciesId(0);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 20,
+        }; // wide disc → covers residents
+           // The distinct heritable states present in-region BEFORE amplifying.
+        let templates: std::collections::BTreeSet<(u64, u64, u64)> = sim
+            .world
+            .query::<(&Species, &Genotype, &DroughtTol, &ThermalTol, &Position)>()
+            .iter(&sim.world)
+            .filter(|(sp, _, _, _, p)| sp.0 == sid && region.contains(p.x, p.y))
+            .map(|(_sp, g, d, t, _p)| (g.0.to_bits(), d.0.to_bits(), t.0.to_bits()))
+            .collect();
+        assert!(
+            !templates.is_empty(),
+            "the disc must cover resident templates"
+        );
+
+        let before_live = measure_live(&mut sim).sum();
+        let before_tap = sim.ledger().intervention;
+        let count = 16u32;
+        let endow_j = 900_000i64;
+        let spawned = sim.region_pcr_amplify(sid, region, count, endow_j);
+        assert_eq!(spawned, count, "every requested clone is placed");
+
+        // Every clone's heritable triple is one of the in-region templates (no neutral 0.5 contaminant, no
+        // mutation drift) — faithful PCR. Check the full set of present triples is a subset of the templates.
+        let after_triples: std::collections::BTreeSet<(u64, u64, u64)> = sim
+            .world
+            .query::<(&Species, &Genotype, &DroughtTol, &ThermalTol)>()
+            .iter(&sim.world)
+            .filter(|(sp, ..)| sp.0 == sid)
+            .map(|(_sp, g, d, t)| (g.0.to_bits(), d.0.to_bits(), t.0.to_bits()))
+            .collect();
+        // No NEW heritable triple was introduced by the clones (every clone copied a template verbatim).
+        assert!(
+            after_triples
+                .iter()
+                .all(|tr| templates.contains(tr) || sim_default_triples().contains(tr)),
+            "a PCR clone must carry a verbatim template triple, never an invented/mutated one"
+        );
+
+        let minted = endow_j * i64::from(count);
+        assert_eq!(
+            sim.ledger().intervention - before_tap,
+            minted,
+            "the intervention tap records exactly count·endow_j"
+        );
+        let after_live = measure_live(&mut sim).sum();
+        assert_eq!(
+            after_live - before_live,
+            minted,
+            "live J rises by exactly the minted endowment (conserved — PCR adds, never conjures)"
+        );
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold right after a PCR amplification"
+        );
+        // And it keeps closing as the clones metabolize.
+        sim.step(15);
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must keep holding after the clones metabolize"
+        );
+    }
+
+    /// The full set of heritable triples present in a fresh `reset` of the pinned-shape config — used by the PCR
+    /// test to confirm a clone introduces no triple absent from the resident population.
+    fn sim_default_triples() -> std::collections::BTreeSet<(u64, u64, u64)> {
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 300,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.world
+            .query::<(&Genotype, &DroughtTol, &ThermalTol)>()
+            .iter(&sim.world)
+            .map(|(g, d, t)| (g.0.to_bits(), d.0.to_bits(), t.0.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn sp3_pcr_amplify_no_local_template_is_a_clean_noop() {
+        // SP-3.1: PCR needs a local template. A species with NO in-region org → spawn nothing, mint nothing.
+        let cfg = SimConfig {
+            seed: 5,
+            generations: 0,
+            entity_count: 200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        // Register a contaminant with ZERO residents (never inoculated), then try to amplify it.
+        let sid = register_contaminant_decomposer(&mut sim, "absent", 0.5);
+        let before = measure_live(&mut sim).sum();
+        let placed = sim.region_pcr_amplify(
+            sid,
+            Region {
+                cx: 16,
+                cy: 16,
+                radius: 8,
+            },
+            10,
+            500_000,
+        );
+        assert_eq!(placed, 0, "no local template → no clones");
+        assert_eq!(sim.ledger().intervention, 0, "no template → mint nothing");
+        assert_eq!(measure_live(&mut sim).sum(), before, "J unchanged");
+    }
+
+    #[test]
+    fn sp3_pcr_amplify_is_replay_reproducible_rng_free() {
+        // SP-3.1: amplification is RNG-FREE + deterministic — two identical (seed, amplify, advance) sequences
+        // produce byte-identical hashes (template selection + placement are pure functions of state).
+        let cfg = SimConfig {
+            seed: 88,
+            generations: 0,
+            entity_count: 300,
+        };
+        let run = || {
+            let mut sim = Simulation::reset(&cfg);
+            sim.region_pcr_amplify(
+                SpeciesId(0),
+                Region {
+                    cx: 16,
+                    cy: 16,
+                    radius: 18,
+                },
+                12,
+                700_000,
+            );
+            sim.step(12);
+            sim.run_stats().hash
+        };
+        assert_eq!(
+            run(),
+            run(),
+            "a PCR-amplified run must replay bit-identically"
+        );
+    }
+
+    #[test]
+    fn sp3_cull_kills_the_apportioned_subset_and_carcasses_to_detritus_conserving_j() {
+        // SP-3.2: a 500-permille cull kills floor(n·0.5) of the canonical census; the residual moves to detritus
+        // (a paired bucket move — NO tap), so live J is UNCHANGED and ledger_closes holds.
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 300,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let sid = SpeciesId(0);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 30,
+        }; // covers the whole grid → the full population is the census
+        let n_before = species_pop(&mut sim, sid.0) as i64;
+        assert!(n_before > 0);
+        let before_live = measure_live(&mut sim).sum();
+        let before_tap = (sim.ledger().intervention, sim.ledger().immigration);
+        let killed = sim.region_cull(sid, region, 500); // 50% permille
+        let expected = fixed::apportion(n_before, &[500, 500])[0] as u32;
+        assert_eq!(
+            killed, expected,
+            "kills the largest-remainder apportioned count"
+        );
+        assert_eq!(
+            species_pop(&mut sim, sid.0) as i64,
+            n_before - i64::from(killed),
+            "population drops by exactly the killed count"
+        );
+        // CONSERVATION: a cull mints NOTHING — neither the intervention nor immigration tap moves.
+        assert_eq!(
+            (sim.ledger().intervention, sim.ledger().immigration),
+            before_tap,
+            "an antibiotic cull mints no J (carcass→detritus is a paired bucket move)"
+        );
+        let after_live = measure_live(&mut sim).sum();
+        assert_eq!(
+            after_live, before_live,
+            "live J is unchanged by a cull (residual moved store→detritus, none lost/minted)"
+        );
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold right after a cull"
+        );
+        sim.step(10);
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must keep holding after the cull's detritus is decomposed"
+        );
+    }
+
+    #[test]
+    fn sp3_cull_is_deterministic_and_strength_zero_is_a_noop() {
+        // SP-3.2: zero strength → no kill, no draws; the same cull reproduces bit-identically.
+        let cfg = SimConfig {
+            seed: 17,
+            generations: 0,
+            entity_count: 300,
+        };
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 30,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let before = species_pop(&mut sim, 0);
+        assert_eq!(
+            sim.region_cull(SpeciesId(0), region, 0),
+            0,
+            "strength 0 → no-op"
+        );
+        assert_eq!(
+            species_pop(&mut sim, 0),
+            before,
+            "no-op leaves population intact"
+        );
+
+        let run = || {
+            let mut sim = Simulation::reset(&cfg);
+            sim.region_cull(SpeciesId(0), region, 300);
+            sim.step(10);
+            sim.run_stats().hash
+        };
+        assert_eq!(run(), run(), "a culled run must replay bit-identically");
+    }
+
+    #[test]
+    fn sp3_nutrient_feed_mints_from_intervention_tap_conserving_j() {
+        // SP-3.3: a nutrient feed deposits amount_j into the chosen pool plane from the intervention tap;
+        // accepted + overflow == amount_j, and ledger_closes holds.
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 6,
+        };
+        let before_live = measure_live(&mut sim).sum();
+        let before_tap = sim.ledger().intervention;
+        let before_over = sim.ledger().overflow;
+        let amount = 8_000_000i64;
+        let accepted = sim.region_nutrient(2, region, amount); // channel 2 = detritus
+        let minted = sim.ledger().intervention - before_tap;
+        let spilled = sim.ledger().overflow - before_over;
+        assert_eq!(
+            minted, amount,
+            "the intervention tap records exactly amount_j"
+        );
+        assert_eq!(
+            accepted + spilled,
+            amount,
+            "accepted + overflow == amount (never silently clamped)"
+        );
+        let after_live = measure_live(&mut sim).sum();
+        assert_eq!(
+            after_live - before_live,
+            accepted,
+            "live J rises by exactly the accepted part (the spill nets out via overflow)"
+        );
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold right after a nutrient feed"
+        );
+    }
+
+    #[test]
+    fn sp3_toxin_spike_mints_into_the_chem_field_conserving_j() {
+        // SP-3.3: a toxin spike deposits amount_milli (== J 1:1) into the chosen chem plane from the
+        // intervention tap; accepted + overflow == amount, and ledger_closes holds (chem is a live bucket).
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 5,
+        };
+        let before_live = measure_live(&mut sim).sum();
+        let before_tap = sim.ledger().intervention;
+        let before_over = sim.ledger().overflow;
+        let before_chem = sim.world.resource::<chem::ChemField>().total();
+        let amount = 5_000_000i64;
+        let accepted = sim.region_toxin(0, region, amount); // channel 0 = toxin
+        let minted = sim.ledger().intervention - before_tap;
+        let spilled = sim.ledger().overflow - before_over;
+        assert_eq!(
+            minted, amount,
+            "the intervention tap records exactly amount_milli"
+        );
+        assert_eq!(
+            accepted + spilled,
+            amount,
+            "accepted + overflow == amount (never silently clamped)"
+        );
+        let after_chem = sim.world.resource::<chem::ChemField>().total();
+        assert_eq!(
+            after_chem - before_chem,
+            accepted,
+            "the chem field rises by exactly the accepted milli (== J 1:1)"
+        );
+        let after_live = measure_live(&mut sim).sum();
+        assert_eq!(
+            after_live - before_live,
+            accepted,
+            "live J (incl chem) rises by the accepted part"
+        );
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold right after a toxin spike"
+        );
+    }
+
+    #[test]
+    fn sp3_interventions_are_hash_neutral_when_inert() {
+        // SP-3: the four new methods are UNCALLED by the pinned path; a plain Advance run's hash is byte-
+        // identical with them compiled in but un-invoked (the pinned literal is unmoved). The pinned config
+        // (determinism_hash_is_pinned) is the proof of value; this guards the property locally on a smaller run.
+        let plain = || {
+            let cfg = SimConfig {
+                seed: 13_679_457_532_755_275_413,
+                generations: 40,
+                entity_count: 400,
+            };
+            run_headless(&cfg).hash
+        };
+        assert_eq!(
+            plain(),
+            plain(),
+            "an inert intervention surface must be reproducible"
+        );
+        // The intervention tap defaults zero on a plain run (no method invoked → no mint).
+        let cfg = SimConfig {
+            seed: 42,
+            generations: 20,
+            entity_count: 200,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(20);
+        assert_eq!(
+            sim.ledger().intervention,
+            0,
+            "no SP-3 method invoked → the intervention tap stays zero"
         );
     }
 

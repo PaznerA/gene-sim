@@ -193,6 +193,68 @@ pub enum Action {
         /// Per-organism starting joule reserve, MINTED from the `immigration` ledger tap (conserved).
         endow_j: i64,
     },
+
+    /// **SP-3 PCR-AMPLIFY** — the faithful local-clone tool: spawn `count` FAITHFUL clones of an ALREADY-RESIDENT
+    /// species inside the `region` disc, each endowed with `endow_j` joules MINTED from the named `intervention`
+    /// ledger tap (conserved — a PCR reaction ADDS copies, never conjured, never halves the template). Unlike
+    /// [`Action::RegionInoculate`] (a neutral baked contaminant), each clone COPIES its heritable state VERBATIM
+    /// from a deterministically-chosen LOCAL resident template (no mutation, daughter-cell placement). RNG-FREE,
+    /// region-scoped (cells, never an organism — inv #6), journaled into `actions.ndjson`. A clean no-op if the
+    /// species has no in-region template. `species` is a raw [`sim_core::SpeciesId`] ordinal (the
+    /// `RegionInoculate`/`RequestEcoliEdit` scaffold convention; resolved at the step boundary). Externally-tagged
+    /// serde-additive: every existing `actions.ndjson` line is byte-identical, so the pinned config keeps
+    /// `0x47a0_3c8f_6701_f240`.
+    RegionPcrAmplify {
+        /// Target RESIDENT species ordinal (operator/species granularity — inv #6). Raw `u16` scaffold.
+        species: u16,
+        /// The disc region (cells) to amplify into — inv #6 (no organism handle).
+        region: RegionSpec,
+        /// Number of clones to spawn.
+        count: u32,
+        /// Per-clone starting joule reserve, MINTED from the `intervention` ledger tap (conserved).
+        endow_j: i64,
+    },
+
+    /// **SP-3 ANTIBIOTIC CULL** — the selective-kill tool: deterministically kill a `strength`-permille kill
+    /// FRACTION of one species' LIVING orgs inside the `region` disc; each culled org's residual `J` deposits to
+    /// detritus (carcass→detritus, accounted EXACTLY like a starvation death — a paired bucket move, NO tap
+    /// minted). RNG-FREE (a largest-remainder apportioned SUBSET of the canonical census, NOT a per-org coin
+    /// flip), region-scoped (cells — inv #6), journaled. `strength` is a permille kill-fraction in `[0, 1000]`.
+    RegionCull {
+        /// Target species ordinal (operator/species granularity — inv #6). Raw `u16` scaffold.
+        species: u16,
+        /// The disc region (cells) to cull within — inv #6 (no organism handle).
+        region: RegionSpec,
+        /// Permille kill FRACTION `[0, 1000]` applied DETERMINISTICALLY to the canonical in-region census.
+        strength: u16,
+    },
+
+    /// **SP-3 NUTRIENT FEED** — the substrate-feed tool: deposit `amount_j` joules into one [`sim_core`]
+    /// `PoolStock` plane (`channel` ∈ {0 light, 1 free_nutrient, 2 detritus}) across the `region` disc, MINTED
+    /// from the named `intervention` ledger tap (conserved; per-cell `POOL_CAP` spill → overflow). Species-
+    /// AGNOSTIC (it feeds the substrate, not an organism — no `species` field). RNG-FREE, region-scoped (cells —
+    /// inv #6), journaled.
+    RegionNutrient {
+        /// Pool channel selector: `0` light · `1` free_nutrient · `2` detritus (read by ordinal — inv #3).
+        channel: u8,
+        /// The disc region (cells) to feed — inv #6 (no organism handle).
+        region: RegionSpec,
+        /// Joules to deposit, MINTED from the `intervention` ledger tap (conserved).
+        amount_j: i64,
+    },
+
+    /// **SP-3 TOXIN SPIKE** — the chemical-spike tool: deposit `amount_milli` (== `J` 1:1) into one [`sim_core`]
+    /// `ChemField` plane (`channel` ∈ {0 toxin, 1 kin, 2 alarm}) across the `region` disc, MINTED from the named
+    /// `intervention` ledger tap (conserved; per-cell `CHEM_CAP` spill → overflow). The channel selector makes
+    /// kin/alarm reachable, not only toxin. RNG-FREE, region-scoped (cells — inv #6), journaled.
+    RegionToxin {
+        /// Chem channel selector: `0` toxin · `1` kin · `2` alarm (read by ordinal — inv #3).
+        channel: u8,
+        /// The disc region (cells) to spike — inv #6 (no organism handle).
+        region: RegionSpec,
+        /// Milli-J (== `J` 1:1) to deposit, MINTED from the `intervention` ledger tap (conserved).
+        amount_milli: i64,
+    },
 }
 
 /// A spatial brush region for [`Action::ApplyEditRegion`]: a disc of world cells (centre + radius). Serde so
@@ -337,6 +399,19 @@ impl GeneSimEnv {
             .expect("GeneSimEnv::immigration_minted called before reset")
             .ledger()
             .immigration
+    }
+
+    /// The cumulative `J` minted into the run via the `intervention` tap so far (SP-3 — for the panel + tests):
+    /// the sum of PCR-clone endowments + nutrient-feed + toxin-spike J. `0` on a run that issues no SP-3
+    /// intervention. (An antibiotic CULL mints NOTHING — it never touches this tap.) Panics if called before
+    /// `reset`.
+    #[must_use]
+    pub fn intervention_minted(&self) -> i64 {
+        self.sim
+            .as_ref()
+            .expect("GeneSimEnv::intervention_minted called before reset")
+            .ledger()
+            .intervention
     }
 
     /// Drain every scheduled inoculation whose `due_epoch < up_to_generation` (ADR-019 S2), advancing the
@@ -741,6 +816,57 @@ impl Env for GeneSimEnv {
                     sim_core::EditEffect::Knockout,
                 );
             }
+            // ── SP-3 intervention tools — all read ONLY `self.sim` (a RESIDENT species/the substrate), so they
+            // sit in the MAIN match on the single `sim` borrow (UNLIKE RegionInoculate, which also reads
+            // `self.consortium`). Each resolves a raw `species: u16` → `SpeciesId` at the boundary, is RNG-free,
+            // and books its J move through the core's named `intervention` tap (or, for Cull, a paired carcass
+            // move). last_edit/last_region_edit reset to None (these are not CRISPR-edit outcomes).
+            Action::RegionPcrAmplify {
+                species,
+                region,
+                count,
+                endow_j,
+            } => {
+                sim.region_pcr_amplify(
+                    sim_core::SpeciesId::new(species),
+                    region.to_region(),
+                    count,
+                    endow_j,
+                );
+                self.last_edit = None;
+                self.last_region_edit = None;
+            }
+            Action::RegionCull {
+                species,
+                region,
+                strength,
+            } => {
+                sim.region_cull(
+                    sim_core::SpeciesId::new(species),
+                    region.to_region(),
+                    strength,
+                );
+                self.last_edit = None;
+                self.last_region_edit = None;
+            }
+            Action::RegionNutrient {
+                channel,
+                region,
+                amount_j,
+            } => {
+                sim.region_nutrient(channel, region.to_region(), amount_j);
+                self.last_edit = None;
+                self.last_region_edit = None;
+            }
+            Action::RegionToxin {
+                channel,
+                region,
+                amount_milli,
+            } => {
+                sim.region_toxin(channel, region.to_region(), amount_milli);
+                self.last_edit = None;
+                self.last_region_edit = None;
+            }
             // ADR-019 S1: RegionInoculate is dispatched ABOVE (it reads self.consortium + self.sim together);
             // it can never reach this match arm. The `unreachable!` documents that + keeps the match total.
             Action::RegionInoculate { .. } => {
@@ -957,6 +1083,31 @@ mod tests {
                 count: _,
                 endow_j: _,
             } => {}
+            // SP-3: the four intervention tools target a SPECIES (`species: u16`, → `SpeciesId` at the boundary)
+            // or the SUBSTRATE (a `channel`) + a CELL region (`region`) — never a per-organism handle, so they
+            // stay at the operator/species granularity ceiling (inv #6). The destructure names every field so a
+            // future organism-handle field (e.g. an `OrgId`) would stop this compiling and force a review.
+            Action::RegionPcrAmplify {
+                species: _,
+                region: RegionSpec { .. },
+                count: _,
+                endow_j: _,
+            } => {}
+            Action::RegionCull {
+                species: _,
+                region: RegionSpec { .. },
+                strength: _,
+            } => {}
+            Action::RegionNutrient {
+                channel: _,
+                region: RegionSpec { .. },
+                amount_j: _,
+            } => {}
+            Action::RegionToxin {
+                channel: _,
+                region: RegionSpec { .. },
+                amount_milli: _,
+            } => {}
         }
     }
 
@@ -1152,6 +1303,193 @@ mod tests {
             hash_a, hash_a2,
             "an inoculated run must replay bit-identically"
         );
+    }
+
+    // ── SP-3 intervention Actions (PCR-amplify / cull / nutrient / toxin) ──────────────────────────────────
+
+    fn sp3_region() -> RegionSpec {
+        RegionSpec {
+            cx: 16,
+            cy: 16,
+            radius: 20,
+        }
+    }
+
+    #[test]
+    fn sp3_actions_round_trip_through_serde_back_compat() {
+        // SP-3: each new externally-tagged variant round-trips, and a pre-SP-3 line still parses unchanged (the
+        // additive-serde discipline that keeps existing actions.ndjson byte-identical).
+        let cases: Vec<(Action, &str)> = vec![
+            (
+                Action::RegionPcrAmplify {
+                    species: 0,
+                    region: sp3_region(),
+                    count: 8,
+                    endow_j: 900_000,
+                },
+                "{\"RegionPcrAmplify\":",
+            ),
+            (
+                Action::RegionCull {
+                    species: 0,
+                    region: sp3_region(),
+                    strength: 500,
+                },
+                "{\"RegionCull\":",
+            ),
+            (
+                Action::RegionNutrient {
+                    channel: 2,
+                    region: sp3_region(),
+                    amount_j: 8_000_000,
+                },
+                "{\"RegionNutrient\":",
+            ),
+            (
+                Action::RegionToxin {
+                    channel: 0,
+                    region: sp3_region(),
+                    amount_milli: 5_000_000,
+                },
+                "{\"RegionToxin\":",
+            ),
+        ];
+        for (action, tag) in cases {
+            let j = serde_json::to_string(&action).unwrap();
+            assert!(j.starts_with(tag), "tag wrong: {j}");
+            assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), action);
+        }
+        // Back-compat: existing lines are unaffected by adding the variants.
+        assert_eq!(
+            serde_json::from_str::<Action>("{\"Advance\":10}").unwrap(),
+            Action::Advance(10)
+        );
+        assert_eq!(
+            serde_json::from_str::<Action>("{\"RegionInoculate\":{\"species_key\":\"bacillus\",\"region\":{\"cx\":1,\"cy\":2,\"radius\":3},\"count\":4,\"endow_j\":5}}").unwrap(),
+            Action::RegionInoculate {
+                species_key: "bacillus".to_string(),
+                region: RegionSpec { cx: 1, cy: 2, radius: 3 },
+                count: 4,
+                endow_j: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn sp3_interventions_are_hash_neutral_when_inert() {
+        // SP-3 hash-neutrality (the lib.rs:1197 inoculation template): a run that issues NO SP-3 intervention is
+        // byte-identical to a plain run — the four Actions are inert until invoked, the intervention tap is zero
+        // at rest. Mirrors `inoculation_system_is_hash_neutral_when_inert`.
+        let plain = || {
+            let mut env = GeneSimEnv::new(400);
+            env.reset(13_679_457_532_755_275_413);
+            env.step(Action::Advance(40));
+            (env.run_stats().hash, env.intervention_minted())
+        };
+        let (h, tap) = plain();
+        let (h2, tap2) = plain();
+        assert_eq!(h, h2, "an inert intervention surface must be reproducible");
+        assert_eq!(tap, 0, "no intervention fired → zero intervention tap");
+        assert_eq!(tap2, 0);
+    }
+
+    #[test]
+    fn sp3_pcr_amplify_conserves_j_and_is_replay_reproducible() {
+        // SP-3 PCR twin (the lib.rs:1124 template): a journaled RegionPcrAmplify lifts the intervention tap and
+        // is replay-reproducible — the SAME (seed, amplify, advance) yields an identical hash.
+        let run = || -> (i64, u64) {
+            let mut env = GeneSimEnv::new(300);
+            env.reset(2024);
+            env.step(Action::RegionPcrAmplify {
+                species: 0, // the resident primary species (always present after reset)
+                region: sp3_region(),
+                count: 12,
+                endow_j: 700_000,
+            });
+            let tap = env.intervention_minted();
+            env.step(Action::Advance(20));
+            (tap, env.run_stats().hash)
+        };
+        let (tap, hash) = run();
+        assert!(
+            tap > 0,
+            "a PCR amplification mints from the intervention tap"
+        );
+        assert_eq!(
+            run().1,
+            hash,
+            "a PCR-amplified run must replay bit-identically"
+        );
+    }
+
+    #[test]
+    fn sp3_cull_conserves_j_and_is_replay_reproducible() {
+        // SP-3 cull twin: a journaled RegionCull mints NOTHING (carcass→detritus is a paired bucket move) and is
+        // replay-reproducible.
+        let run = || -> (i64, u64) {
+            let mut env = GeneSimEnv::new(300);
+            env.reset(2024);
+            env.step(Action::RegionCull {
+                species: 0,
+                region: sp3_region(),
+                strength: 400,
+            });
+            let tap = env.intervention_minted();
+            env.step(Action::Advance(20));
+            (tap, env.run_stats().hash)
+        };
+        let (tap, hash) = run();
+        assert_eq!(
+            tap, 0,
+            "an antibiotic cull mints no J (it never touches the intervention tap)"
+        );
+        assert_eq!(run().1, hash, "a culled run must replay bit-identically");
+    }
+
+    #[test]
+    fn sp3_nutrient_conserves_j_and_is_replay_reproducible() {
+        // SP-3 nutrient twin: a journaled RegionNutrient lifts the intervention tap and is replay-reproducible.
+        let run = || -> (i64, u64) {
+            let mut env = GeneSimEnv::new(300);
+            env.reset(2024);
+            env.step(Action::RegionNutrient {
+                channel: 2, // detritus
+                region: sp3_region(),
+                amount_j: 8_000_000,
+            });
+            let tap = env.intervention_minted();
+            env.step(Action::Advance(20));
+            (tap, env.run_stats().hash)
+        };
+        let (tap, hash) = run();
+        assert_eq!(
+            tap, 8_000_000,
+            "a nutrient feed mints exactly amount_j from the intervention tap"
+        );
+        assert_eq!(run().1, hash, "a fed run must replay bit-identically");
+    }
+
+    #[test]
+    fn sp3_toxin_conserves_j_and_is_replay_reproducible() {
+        // SP-3 toxin twin: a journaled RegionToxin lifts the intervention tap and is replay-reproducible.
+        let run = || -> (i64, u64) {
+            let mut env = GeneSimEnv::new(300);
+            env.reset(2024);
+            env.step(Action::RegionToxin {
+                channel: 0, // toxin
+                region: sp3_region(),
+                amount_milli: 5_000_000,
+            });
+            let tap = env.intervention_minted();
+            env.step(Action::Advance(20));
+            (tap, env.run_stats().hash)
+        };
+        let (tap, hash) = run();
+        assert_eq!(
+            tap, 5_000_000,
+            "a toxin spike mints exactly amount_milli from the intervention tap"
+        );
+        assert_eq!(run().1, hash, "a spiked run must replay bit-identically");
     }
 
     #[test]
