@@ -19,28 +19,28 @@
 //! ## Binary format ([`GridSnapshot::write_snapshot_bytes`])
 //! Little-endian, `std`-only (no `bincode`/`serde`):
 //! ```text
-//!   bytes 0..4 : ASCII magic "GSS3"
+//!   bytes 0..4 : ASCII magic "GSS4"
 //!   u32 LE     : width
 //!   u32 LE     : height
-//!   u32 LE     : channel_count (= 9)
+//!   u32 LE     : channel_count (= 12)
 //!   u64 LE     : generation
 //!   u32 LE     : population
 //!   then channel-major, each channel's width*height f32 LE values in row-major order,
 //!   channels in order: density, allele_freq, fitness, soil_moisture, soil_nutrients, soil_ph,
-//!   light, free_nutrient, detritus.
+//!   light, free_nutrient, detritus, toxin, kin, alarm.
 //! ```
 
 use std::io;
 use std::path::Path;
 
-/// ASCII magic header identifying the snapshot binary format (`"GSS3"` = Gene-Sim Snapshot v3; v2 added the
-/// 3 soil channels, v3 appends the 3 live-pool channels — a bumped magic turns a stale 6-channel reader into a
-/// loud bad-magic error, not silence).
-pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS3";
+/// ASCII magic header identifying the snapshot binary format (`"GSS4"` = Gene-Sim Snapshot v4; v2 added the
+/// 3 soil channels, v3 appended the 3 live-pool channels, v4 (ADR-013 F5) appends the 3 chem channels
+/// (toxin/kin/alarm) — a bumped magic turns a stale 9-channel reader into a loud bad-magic error, not silence).
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS4";
 
 /// The number of per-cell channels a [`GridSnapshot`] carries: `density`, `allele_freq`, `fitness`,
-/// `soil_moisture`, `soil_nutrients`, `soil_ph`, `light`, `free_nutrient`, `detritus`.
-pub const CHANNEL_COUNT: u32 = 9;
+/// `soil_moisture`, `soil_nutrients`, `soil_ph`, `light`, `free_nutrient`, `detritus`, `toxin`, `kin`, `alarm`.
+pub const CHANNEL_COUNT: u32 = 12;
 
 /// A read-only, derived per-cell grid view of the simulation for the renderer (SPEC §W10).
 ///
@@ -80,6 +80,12 @@ pub struct GridSnapshot {
     pub free_nutrient: Vec<f32>,
     /// Per-cell live `detritus` stock in `[0, 1]`, row-major (resampled from `PoolStock` / `POOL_CAP`).
     pub detritus: Vec<f32>,
+    /// Per-cell live `toxin` chem stock in `[0, 1]`, row-major (ADR-013 F5; resampled from `ChemField` / `CHEM_CAP`).
+    pub toxin: Vec<f32>,
+    /// Per-cell live `kin` marker in `[0, 1]`, row-major (ADR-013 F5; resampled from `ChemField` / `CHEM_CAP`).
+    pub kin: Vec<f32>,
+    /// Per-cell live `alarm` signal in `[0, 1]`, row-major (ADR-013 F5; resampled from `ChemField` / `CHEM_CAP`).
+    pub alarm: Vec<f32>,
 }
 
 impl GridSnapshot {
@@ -111,6 +117,9 @@ impl GridSnapshot {
             &self.light,
             &self.free_nutrient,
             &self.detritus,
+            &self.toxin,
+            &self.kin,
+            &self.alarm,
         ] {
             for &v in channel {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -163,6 +172,9 @@ mod tests {
         let light = read_channel();
         let free_nutrient = read_channel();
         let detritus = read_channel();
+        let toxin = read_channel();
+        let kin = read_channel();
+        let alarm = read_channel();
         assert_eq!(off, bytes.len(), "trailing bytes");
 
         GridSnapshot {
@@ -179,6 +191,9 @@ mod tests {
             light,
             free_nutrient,
             detritus,
+            toxin,
+            kin,
+            alarm,
         }
     }
 
@@ -198,6 +213,9 @@ mod tests {
             light: vec![0.01, 0.12, 0.23, 0.34, 0.45, 0.56],
             free_nutrient: vec![0.99, 0.88, 0.77, 0.66, 0.55, 0.44],
             detritus: vec![0.02, 0.04, 0.08, 0.16, 0.32, 0.64],
+            toxin: vec![0.03, 0.06, 0.09, 0.12, 0.15, 0.18],
+            kin: vec![0.07, 0.14, 0.21, 0.28, 0.35, 0.42],
+            alarm: vec![0.5, 0.4, 0.3, 0.2, 0.1, 0.05],
         };
         let back = parse(&snap.write_snapshot_bytes());
 
@@ -216,6 +234,9 @@ mod tests {
         assert_eq!(back.light, snap.light);
         assert_eq!(back.free_nutrient, snap.free_nutrient);
         assert_eq!(back.detritus, snap.detritus);
+        assert_eq!(back.toxin, snap.toxin);
+        assert_eq!(back.kin, snap.kin);
+        assert_eq!(back.alarm, snap.alarm);
         // Full struct equality.
         assert_eq!(back, snap);
     }
@@ -236,10 +257,13 @@ mod tests {
             light: vec![0.0; 16],
             free_nutrient: vec![0.0; 16],
             detritus: vec![0.0; 16],
+            toxin: vec![0.0; 16],
+            kin: vec![0.0; 16],
+            alarm: vec![0.0; 16],
         };
         let bytes = snap.write_snapshot_bytes();
-        // 28-byte header + 9 channels * 16 cells * 4 bytes.
-        assert_eq!(bytes.len(), 28 + 9 * 16 * 4);
-        assert_eq!(&bytes[0..4], b"GSS3");
+        // 28-byte header + 12 channels * 16 cells * 4 bytes.
+        assert_eq!(bytes.len(), 28 + 12 * 16 * 4);
+        assert_eq!(&bytes[0..4], b"GSS4");
     }
 }

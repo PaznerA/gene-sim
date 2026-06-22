@@ -7,7 +7,7 @@
 //! ## Hash-neutral by construction (the `edits_used` precedent)
 //! The ledger lives in the **harness/env layer**, NEVER an ECS `World` resource — exactly like
 //! [`crate::campaign::ScenarioResult::edits_used`]. So it adds **0 bytes** to `sim_core`'s `hash_world`: the
-//! pinned determinism literal `0x4e4d_0520_722a_a069` is unchanged whether or not credit is being accrued. That
+//! pinned determinism literal `0x47a0_3c8f_6701_f240` is unchanged whether or not credit is being accrued. That
 //! unchanged-ness IS the neutrality proof (asserted by `oversight_accrual_is_hash_neutral`). It is a **pure
 //! integer fold** over RNG-free read-only projections (`region_allele` Term A + `flow_matrix` Term B), so it
 //! recomputes byte-identically on replay from `(seed, actions)` (inv #3).

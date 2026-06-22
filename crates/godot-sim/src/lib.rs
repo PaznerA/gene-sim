@@ -55,7 +55,7 @@ fn resolve_species_path(name: &str) -> Option<std::path::PathBuf> {
 /// `LiveSim` — the one Godot node the live-sim feature exposes (ADR-010).
 ///
 /// A thin `RefCounted` wrapper over [`harness::GeneSimEnv`]. GDScript drives it with
-/// `reset(seed)` → `step(n)` → `observe()` and reads `snapshot(w, h)` bytes (GSS3, parsed by the
+/// `reset(seed)` → `step(n)` → `observe()` and reads `snapshot(w, h)` bytes (GSS4, parsed by the
 /// existing `godot/snapshot.gd`). All biology runs in the embedded Rust core (invariant #2).
 #[derive(GodotClass)]
 #[class(base=RefCounted)]
@@ -324,7 +324,64 @@ impl LiveSim {
         d
     }
 
-    /// Produce the read-only GSS3 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
+    /// The VIEW-ONLY per-species relations overlay (ADR-014 re-grounded): nearest-species similarity + guild
+    /// clustering over the off-hash `species_signatures()` export. Returns
+    /// `{s: int, guild_of: PackedInt32Array, nearest: Dictionary}`:
+    /// * `guild_of[i]` — the guild id (lowest-member `SpeciesId`) of species `i`, single-link clustered at the
+    ///   pinned [`relations_index::GUILD_THRESHOLD`];
+    /// * `nearest[focal] = PackedInt32Array[sid0, dist0, sid1, dist1, …]` — each focal species' top-k nearest
+    ///   by EXACT integer-L1 distance, ordered `(distance asc, sid asc)`.
+    ///
+    /// The k-NN / clustering runs HERE in the std-only `relations-index` boundary crate (downstream of the
+    /// deterministic core, which never calls it). No biology/index math in GDScript — GDScript only colours
+    /// with the finished ordered integer arrays. Read-only (inv #2/#3): `species_signatures()` is a pure
+    /// off-hash projection, so this never perturbs the run. Empty (`s:0`) before `reset` or for an empty roster.
+    #[func]
+    fn species_relations(&self) -> VarDictionary {
+        use relations_index::{GUILD_THRESHOLD, GuildIndex, InRustIndex, NearestIndex};
+        let mut d = VarDictionary::new();
+        match self.env.as_ref() {
+            Some(env) => {
+                let (s, dims, sigs, roles) = env.species_signatures();
+                let idx = InRustIndex::index(s, dims, &sigs, &roles);
+                d.set("s", s as i64);
+                // Guild id per species (widen u16 → i32 for Godot int marshaling).
+                let guilds: Vec<i32> = idx
+                    .guilds(GUILD_THRESHOLD)
+                    .iter()
+                    .map(|&g| i32::from(g))
+                    .collect();
+                d.set(
+                    "guild_of",
+                    &PackedInt32Array::from(guilds.as_slice()).to_variant(),
+                );
+                // Top-k nearest per focal species, flattened as [sid, dist, sid, dist, …].
+                let k = 3usize;
+                let mut nearest = VarDictionary::new();
+                for focal in 0..s {
+                    let mut flat: Vec<i32> = Vec::new();
+                    for n in idx.nearest(focal, k) {
+                        flat.push(n.sid as i32);
+                        flat.push(n.distance.min(i32::MAX as u32) as i32);
+                    }
+                    nearest.set(
+                        focal as i64,
+                        &PackedInt32Array::from(flat.as_slice()).to_variant(),
+                    );
+                }
+                d.set("nearest", &nearest.to_variant());
+            }
+            None => {
+                godot_error!("LiveSim::species_relations called before reset()");
+                d.set("s", 0_i64);
+                d.set("guild_of", &PackedInt32Array::new().to_variant());
+                d.set("nearest", &VarDictionary::new().to_variant());
+            }
+        }
+        d
+    }
+
+    /// Produce the read-only GSS4 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
     ///
     /// Read-only: it never draws from the RNG or mutates state, so taking snapshots cannot change the
     /// determinism hash (invariant #3). The bytes are exactly
@@ -638,10 +695,10 @@ fn region_dict(applied: bool, detail: &str, generation: i64, covered: u32) -> Va
     d
 }
 
-/// Build the GSS3 snapshot bytes from the env's live `Simulation` (read-only — invariant #3).
+/// Build the GSS4 snapshot bytes from the env's live `Simulation` (read-only — invariant #3).
 ///
 /// [`harness::GeneSimEnv::snapshot`] delegates to [`sim_core::Simulation::snapshot`] (no RNG draw,
-/// no mutation); [`sim_core::GridSnapshot::write_snapshot_bytes`] emits the exact GSS3 layout that
+/// no mutation); [`sim_core::GridSnapshot::write_snapshot_bytes`] emits the exact GSS4 layout that
 /// `godot/snapshot.gd` parses.
 fn snapshot_bytes(env: &mut GeneSimEnv, w: u32, h: u32) -> Vec<u8> {
     env.snapshot(w, h).write_snapshot_bytes()

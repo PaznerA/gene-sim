@@ -27,8 +27,14 @@ in priority order (🔁 = deliberate re-pin, EXECUTED not staged — see the F3/
    OVERSIGHT UI to earn/spend/trigger edits; a richer KO table beyond the 5 anchor genes.)*
 4. **ADR-013 F5 — chemical/signal diffusion field** 🔁 (toxin/kin/alarm; double-buffered, Σ-conserved; GSS3 bump) →
    allelopathy / chemotaxis / kin-selection emerge on top of the trophic web.
-5. **ADR-017 S8 — relations vector-DB sidecar** (sqlite-vec at the process boundary, inv #1; view-only ANN overlay
-   on the now-live MEASURED FlowMatrix). The "vector-DB relations" leg of the vision.
+5. [~] **ADR-014 re-grounded — relations sidecar** (sqlite-vec at the process boundary, inv #1; view-only overlay
+   on the now-live MEASURED FlowMatrix). The "vector-DB relations" leg of the vision. **DONE (Rel-1/2/3):**
+   off-hash per-species `u16[12]` signature export (`crates/sim-core/src/signature.rs` + harness/`LiveSim`
+   passthroughs), the std-only `crates/relations-index` boundary crate (exact integer-L1 k-NN + single-link guild
+   clustering; sqlite-vec scale path scaffolded probe-and-skip), and the godot Relations overlay (guild label
+   tints + a nearest-species advisory strip with a provenance badge; 4th graceful-degrade state). HASH-NEUTRAL —
+   `0x47a0_3c8f_6701_f240` unchanged (`species_signatures_export_is_hash_neutral`). ADR-014 in DECISIONS.md.
+   **Rel-4 (sqlite-vec sidecar wire at large S) deferred** behind the roster-size trigger.
 6. **3rd species — predator (Bdellovibrio)** 🔁 — a true heterotroph predator gives the FlowMatrix real
    off-diagonals (predation), completing plant→microbe→predator. Pin the InteractionKernel contention semantics first.
 7. **Balance & playtest** — tune the coexistence for gameplay (now plant ~6600 / decomposer ~1450); add a slow

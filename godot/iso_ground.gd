@@ -19,6 +19,7 @@ var _iso = null  # iso.gd instance
 var _snap = null
 var _overlay_mode: int = 0  # 0 off · 1 density · 2 allele · 3 fitness · 4 moisture · 5 nutrients · 6 ph
 # · 7 light · 8 free_nutrient · 9 detritus (the GSS3 live-pool joule-economy planes, full fields like soil)
+# · 10 toxin · 11 kin · 12 alarm (the GSS4 chem planes, ADR-013 F5: allelopathy/kin/chemotaxis)
 
 
 func setup(w: int, h: int, cell: float, iso) -> void:
@@ -82,7 +83,10 @@ func _channel(x: int, y: int) -> float:
 		6: return clampf(_snap.soil_ph[i], 0.0, 1.0)
 		7: return clampf(_snap.light[i], 0.0, 1.0)
 		8: return clampf(_snap.free_nutrient[i], 0.0, 1.0)
-		_: return clampf(_snap.detritus[i], 0.0, 1.0)  # mode 9 detritus
+		9: return clampf(_snap.detritus[i], 0.0, 1.0)
+		10: return clampf(_snap.toxin[i], 0.0, 1.0)  # GSS4 chem (ADR-013 F5)
+		11: return clampf(_snap.kin[i], 0.0, 1.0)
+		_: return clampf(_snap.alarm[i], 0.0, 1.0)  # mode 12 alarm
 
 
 func _grass(x: int, y: int) -> Color:

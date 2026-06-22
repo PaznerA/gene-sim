@@ -48,7 +48,8 @@ const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph",
-	"light", "free_nutrient", "detritus"]  # GSS3 live-pool joule-economy planes appended after soil_ph
+	"light", "free_nutrient", "detritus",  # GSS3 live-pool joule-economy planes appended after soil_ph
+	"toxin", "kin", "alarm"]  # GSS4 chem planes (ADR-013 F5: allelopathy/kin/chemotaxis) appended after detritus
 # Optional per-channel legend captions (the joule economy made readable at a glance). Falls back to
 # "<name>   low → high" for any channel not listed here. Renderer-only labelling (inv #2).
 const OVERLAY_LEGENDS := {
@@ -137,7 +138,8 @@ var _specimen_picker: OptionButton
 var _relations_root: Node2D  # holds the relations heatmap (parallels _specimen_root)
 var _relations_panel: Control  # PanelChrome wrapper (🔗 RELATIONS)
 var _relations_heatmap: Control  # the RelationsHeatmap _draw() node
-var _relations_banner: Label  # degrade-state banner (State 1/2 text; hidden in State 3)
+var _relations_banner: Label  # degrade-state banner (State 1/2/4 text; hidden in State 3)
+var _relations_nearest: Label  # ADR-014 nearest-species strip (view-only/advisory; hidden when no overlay)
 # Per-species panel vitals (Rel-UI.1): 3-up Population / Allele / Fitness, value + ▲▼ trend per row.
 var _species_vital_rows: Array = []  # [{key:String, fmt:String, value:Label}] one per vitals row
 var _species_vital_note: Label  # "pending core export" note, shown only when a stat reads "—"
@@ -2014,6 +2016,32 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	units.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
 	col.add_child(units)
 
+	# ── ADR-014 NEAREST-SPECIES strip (VIEW-ONLY / advisory) ────────────────────────────────────────────
+	# A caption + a top-k nearest list per the off-hash metabolic/interaction SIGNATURE similarity. A PROVENANCE
+	# BADGE distinct from the heatmap's "MEASURED" framing keeps a viewer from conflating the off-hash similarity
+	# overlay with the on-hash FlowMatrix. GDScript only renders finished ordered integers (no biology/index math).
+	var caption := Label.new()
+	caption.text = "nearest species (metabolic / interaction similarity)"
+	caption.add_theme_font_size_override("font_size", 11)
+	caption.add_theme_color_override("font_color", Color(0.7, 0.78, 0.9))
+	col.add_child(caption)
+
+	var badge := Label.new()
+	badge.text = "◆ ADVISORY · off-hash signature similarity — NOT the MEASURED FlowMatrix · view-only"
+	badge.add_theme_font_size_override("font_size", 9)
+	badge.add_theme_color_override("font_color", Color(0.62, 0.7, 0.86))
+	badge.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	badge.custom_minimum_size = Vector2(340, 0)
+	col.add_child(badge)
+
+	_relations_nearest = Label.new()
+	_relations_nearest.add_theme_font_size_override("font_size", 10)
+	_relations_nearest.add_theme_color_override("font_color", Color(0.84, 0.88, 0.94))
+	_relations_nearest.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_relations_nearest.custom_minimum_size = Vector2(340, 0)
+	_relations_nearest.visible = false
+	col.add_child(_relations_nearest)
+
 	_relations_panel = PanelChrome.new()
 	_relations_panel.setup("🔗 RELATIONS", body, ui, Vector2(maxf(220.0, field_px.x - 376.0), 70.0), _pill_rail)
 	_relations_panel.set_active(false)
@@ -2041,6 +2069,16 @@ func _diverging_swatch(col: Color, text: String) -> HBoxContainer:
 func _flow_matrix_or_empty() -> Dictionary:
 	if _live != null and _live.has_method("flow_matrix"):
 		return _live.flow_matrix() as Dictionary
+	return {}
+
+
+## Tolerant read of the ADR-014 relations overlay export (guild_of + nearest). Returns {} when the LiveSim cdylib
+## has no species_relations() method (old cdylib / file-replay where _live == null) — the 4th degrade state. Same
+## forward-compat has_method probe used for flow_matrix/observe_species (inv #2: a pure read of an OFF-HASH export;
+## the k-NN/clustering ran in the std-only relations-index boundary crate, never in GDScript).
+func _species_relations_or_empty() -> Dictionary:
+	if _live != null and _live.has_method("species_relations"):
+		return _live.species_relations() as Dictionary
 	return {}
 
 
@@ -2076,6 +2114,49 @@ func _refresh_relations() -> void:
 			_relations_banner.visible = true
 		else:
 			_relations_banner.visible = false
+
+	# ── ADR-014 OVERLAY (additive, graceful-degrading 4th state) ──────────────────────────────────────────
+	# Feed the guild tints + the nearest-species strip from the OFF-HASH species_relations() export. When the
+	# method is absent (old cdylib) or the index is empty, the tints + strip simply don't appear; the MEASURED
+	# FlowMatrix heatmap above renders EXACTLY as today and is never blocked on the index.
+	var rel := _species_relations_or_empty()
+	var rel_s := int(rel.get("s", 0))
+	var guilds: PackedInt32Array = rel.get("guild_of", PackedInt32Array())
+	if _relations_heatmap.has_method("set_guilds"):
+		# Only overlay when the guild vector lines up with the rendered roster; else clear (neutral labels).
+		if rel_s == s and guilds.size() == s and s > 0:
+			_relations_heatmap.set_guilds(guilds)
+		else:
+			_relations_heatmap.set_guilds(PackedInt32Array())
+	# Nearest-species strip: list each focal species' top-k nearest names + a distance pip.
+	if _relations_nearest != null:
+		var nearest: Dictionary = rel.get("nearest", {})
+		if rel_s == s and s > 0 and nearest.size() > 0:
+			_relations_nearest.text = _format_nearest(names, nearest)
+			_relations_nearest.visible = true
+		else:
+			_relations_nearest.visible = false
+
+
+## Format the nearest-species map into an advisory strip: "plant → ecoli(d12.3k), …" per focal species. GDScript
+## only forwards finished ordered integers from the boundary index → names + a distance pip; NO biology/index math.
+func _format_nearest(names: PackedStringArray, nearest: Dictionary) -> String:
+	var lines: PackedStringArray = PackedStringArray()
+	for focal in nearest.keys():
+		var fi := int(focal)
+		var fname := names[fi] if fi >= 0 and fi < names.size() else "sp%d" % fi
+		var pairs: PackedInt32Array = nearest[focal]
+		var parts: PackedStringArray = PackedStringArray()
+		var p := 0
+		while p + 1 < pairs.size():
+			var sid := int(pairs[p])
+			var dist := int(pairs[p + 1])
+			var nm := names[sid] if sid >= 0 and sid < names.size() else "sp%d" % sid
+			parts.append("%s·d%d" % [nm, dist])
+			p += 2
+		if parts.size() > 0:
+			lines.append("%s → %s" % [fname, ", ".join(parts)])
+	return "\n".join(lines)
 
 
 ## True if every entry of `flat` is zero (or it is empty). Pure display-state check, not biology.
@@ -2502,6 +2583,9 @@ func _cell_lines(snap, i: int) -> Array:
 		"light          %.3f" % snap.light[i],
 		"free_nutrient  %.3f" % snap.free_nutrient[i],
 		"detritus       %.3f" % snap.detritus[i],
+		"toxin          %.3f" % snap.toxin[i],
+		"kin            %.3f" % snap.kin[i],
+		"alarm          %.3f" % snap.alarm[i],
 	]
 
 
@@ -2567,10 +2651,12 @@ func _update_overlay(snap) -> void:
 	_overlay.scale = Vector2(_cell, _cell)
 	var mat := _overlay.material as ShaderMaterial
 	if mat != null:
-		# layer 0..2 sample the population texture; 3..5 the soil texture (R1.0); 6..8 the pool texture (GSS3).
+		# layer 0..2 sample the population texture; 3..5 the soil texture (R1.0); 6..8 the pool texture (GSS3);
+		# 9..11 the chem texture (GSS4, ADR-013 F5: toxin/kin/alarm).
 		mat.set_shader_parameter("layer", _overlay_mode - 1)
 		mat.set_shader_parameter("soil_tex", ImageTexture.create_from_image(snap.to_soil_image()))
 		mat.set_shader_parameter("pool_tex", ImageTexture.create_from_image(snap.to_pool_image()))
+		mat.set_shader_parameter("chem_tex", ImageTexture.create_from_image(snap.to_chem_image()))
 
 
 func _refresh_hud() -> void:

@@ -1,11 +1,12 @@
 //! The conserved-energy LEDGER of the joule economy (ADR-013 CHEMOSTAT-J, phase **F0a** — scaffolding).
 //!
-//! Every joule (`J`, an `i64` quantum) in the substrate is conserved EXACTLY modulo **three named taps**:
-//! INFLUX (solar minted per tick), RESPIRED (maintenance + trophic-efficiency loss), and OVERFLOW (the
-//! explicit sink for any cap-saturation event, so saturating arithmetic can never *silently* destroy a
-//! quantum). The invariant **`ledger_closes`** — `Σ(all live J) == initial_total + influx − respired −
-//! overflow` — is a SEMANTIC gate stronger than the bit-hash; the metabolism/pool phases (F0b/F1/F3) will
-//! assert it every tick.
+//! Every joule (`J`, an `i64` quantum) in the substrate is conserved EXACTLY modulo **four named taps**:
+//! INFLUX (solar minted per tick), RESPIRED (maintenance + trophic-efficiency loss), OVERFLOW (the explicit
+//! sink for any cap-saturation event, so saturating arithmetic can never *silently* destroy a quantum), and
+//! CHEM_DECAY (ADR-013 F5 — the chemical/signal field's dissipation, the only chem sink; kept independently
+//! named so chem dissipation stays attributable and `respired`'s meaning stays clean). The invariant
+//! **`ledger_closes`** — `Σ(all live J) == initial_total + influx − respired − overflow − chem_decay` — is a
+//! SEMANTIC gate stronger than the bit-hash; the metabolism/pool/chem phases (F0b/F1/F3/F5) assert it every tick.
 //!
 //! At **F0a** the ledger is present and inserted as a resource, but no system moves `J` yet (energy is still
 //! `f64`, no pools exist), so it closes trivially against an initial total of 0. Adding it is **hash-neutral**
@@ -25,13 +26,17 @@ pub struct Ledger {
     pub respired: i64,
     /// Cumulative `J` routed to the overflow sink on cap-saturation — never silently lost.
     pub overflow: i64,
+    /// Cumulative `J` dissipated by chemical/signal-field DECAY (ADR-013 F5) — the only chem sink, a FOURTH
+    /// named tap (kept separate from `respired` so chem dissipation is independently attributable). Zero on a
+    /// chem-free run (no species emits → `ChemField == 0` → nothing decays) → byte-identical to F4's J path.
+    pub chem_decay: i64,
 }
 
 impl Ledger {
-    /// The `J` the books say should currently be live: `initial + influx − respired − overflow`.
+    /// The `J` the books say should currently be live: `initial + influx − respired − overflow − chem_decay`.
     #[must_use]
     pub fn expected_total(&self) -> i64 {
-        self.initial_total + self.influx - self.respired - self.overflow
+        self.initial_total + self.influx - self.respired - self.overflow - self.chem_decay
     }
 
     /// The `ledger_closes` conservation invariant: does the actually-measured live `J` equal what the taps
@@ -43,11 +48,11 @@ impl Ledger {
 }
 
 /// A snapshot of the live `J` currently held in the world, partitioned into its conserved buckets. The
-/// `ledger_closes` contract is `Σ buckets == ledger.expected_total()`. At F3 the schema's `pools + chem +
-/// energy + biomass` reduces to **`pools + energy + biomass`**: `chem` is a DOCUMENTED ZERO (the
-/// chemical/signal diffusion field lands at F5), kept here as an explicit field rather than a phantom term so
-/// the closure equation is total and self-documenting. This struct draws nothing from the `SimRng` stream and
-/// is never folded into `hash_world` — measuring conservation is **hash-neutral**.
+/// `ledger_closes` contract is `Σ buckets == ledger.expected_total()`. As of ADR-013 F5 the schema's `pools +
+/// chem + energy + biomass` is FULLY LIVE: `chem` is `ChemField::total()` (the toxin/kin/alarm planes, i32
+/// milli == J 1:1, widened to i64 — no conversion), not the documented zero it was through F4. This struct
+/// draws nothing from the `SimRng` stream and is never folded into `hash_world` — measuring conservation is
+/// **hash-neutral**.
 ///
 /// The live pipeline (F3) builds this each tick by summing, in canonical `(cell, SpeciesId, OrgId)` order
 /// (never `HashMap`/Query order — inv #3): every `PoolStock` channel (light + free_nutrient + detritus over
@@ -64,12 +69,13 @@ pub struct LiveTotal {
     pub energy: i64,
     /// `Σ` per-organism structural `Biomass` joules.
     pub biomass: i64,
-    /// `Σ` chemical/signal-field joules. **Documented zero until F5** — present so the equation is total.
+    /// `Σ` chemical/signal-field joules (ADR-013 F5) — `ChemField::total()`, the toxin/kin/alarm planes
+    /// (i32 milli == J, widened to i64). Zero on a chem-free run (no species emits).
     pub chem: i64,
 }
 
 impl LiveTotal {
-    /// The total live `J` in the world: `pools + energy + biomass + chem` (chem = 0 until F5).
+    /// The total live `J` in the world: `pools + energy + biomass + chem`.
     #[must_use]
     pub fn sum(&self) -> i64 {
         self.pools + self.energy + self.biomass + self.chem
@@ -77,8 +83,8 @@ impl LiveTotal {
 }
 
 /// Does the conservation contract hold? `Σ(pools + energy + biomass + chem) == initial + influx − respired −
-/// overflow`. The SEMANTIC gate stronger than the bit-hash: it catches a lost (or minted) quantum that a
-/// re-pinned hash would otherwise silently bless. Pure read — hash-neutral, no RNG.
+/// overflow − chem_decay`. The SEMANTIC gate stronger than the bit-hash: it catches a lost (or minted) quantum
+/// that a re-pinned hash would otherwise silently bless. Pure read — hash-neutral, no RNG.
 #[must_use]
 pub fn ledger_closes(ledger: &Ledger, live: &LiveTotal) -> bool {
     ledger.closes(live.sum())
@@ -98,7 +104,7 @@ pub fn assert_ledger_closes(ledger: &Ledger, live: &LiveTotal) {
     assert!(
         measured == expected,
         "ledger_closes VIOLATED: measured live J = {measured} (pools={} + energy={} + biomass={} + chem={}) \
-         != expected {expected} (initial={} + influx={} − respired={} − overflow={}); leak of {} J",
+         != expected {expected} (initial={} + influx={} − respired={} − overflow={} − chem_decay={}); leak of {} J",
         live.pools,
         live.energy,
         live.biomass,
@@ -107,6 +113,7 @@ pub fn assert_ledger_closes(ledger: &Ledger, live: &LiveTotal) {
         ledger.influx,
         ledger.respired,
         ledger.overflow,
+        ledger.chem_decay,
         measured - expected,
     );
 }
@@ -125,32 +132,35 @@ mod tests {
 
     #[test]
     fn taps_conserve() {
-        // 1000 seeded, +300 minted, −120 respired, −30 to overflow → 1150 should be live.
+        // 1000 seeded, +300 minted, −120 respired, −30 to overflow, −10 to chem_decay → 1140 should be live.
         let l = Ledger {
             initial_total: 1000,
             influx: 300,
             respired: 120,
             overflow: 30,
+            chem_decay: 10,
         };
-        assert_eq!(l.expected_total(), 1150);
-        assert!(l.closes(1150));
+        assert_eq!(l.expected_total(), 1140);
+        assert!(l.closes(1140));
         assert!(
-            !l.closes(1149),
+            !l.closes(1139),
             "a single lost quantum must break the books"
         );
     }
 
     #[test]
-    fn live_total_sums_buckets_and_chem_is_zero_until_f5() {
+    fn live_total_sums_all_four_buckets_incl_chem() {
+        // ADR-013 F5: chem is now a LIVE bucket (the toxin/kin/alarm field). Σ folds it in.
         let live = LiveTotal {
             pools: 400,
             energy: 250,
             biomass: 100,
-            chem: 0,
+            chem: 75,
         };
-        assert_eq!(live.sum(), 750);
-        // chem is a documented zero at F3; the schema reduces to pools + energy + biomass.
-        assert_eq!(live.chem, 0);
+        assert_eq!(live.sum(), 825);
+        // A chem-free run still closes with chem == 0 (byte-identical to F4's J path).
+        let chem_free = LiveTotal { chem: 0, ..live };
+        assert_eq!(chem_free.sum(), 750);
     }
 
     #[test]
@@ -160,6 +170,7 @@ mod tests {
             influx: 300,
             respired: 120,
             overflow: 30,
+            chem_decay: 0,
         }; // expected 1150
         let ok = LiveTotal {
             pools: 800,
@@ -282,8 +293,50 @@ mod tests {
         assert_ledger_closes(&ledger, &empty);
 
         // Final cross-check: every J that ever entered is accounted for as live-or-tapped. With orgs empty,
-        // all live J is in the pool, and it equals initial + influx − respired − overflow.
+        // all live J is in the pool, and it equals initial + influx − respired − overflow − chem_decay.
         assert_eq!(empty.sum(), pools);
         assert_eq!(empty.sum(), ledger.expected_total());
+    }
+
+    /// ADR-013 F5: the FOUR-bucket close with a non-zero chem field. EMIT is a paired Energy→chem move (Σ
+    /// unchanged); DECAY is the only chem sink (→ the chem_decay tap). The books close every step by
+    /// construction; the assert is the guard that catches an unpaired chem move.
+    #[test]
+    fn synthetic_fixture_closes_with_a_live_chem_field() {
+        let mut ledger = Ledger::default();
+        let mut pools: i64 = 500;
+        let mut energy: i64 = 300; // one org's Energy reserve
+        let mut chem: i64 = 0;
+        let mk = |pools: i64, energy: i64, chem: i64| LiveTotal {
+            pools,
+            energy,
+            biomass: 0,
+            chem,
+        };
+        ledger.initial_total = mk(pools, energy, chem).sum();
+        assert_ledger_closes(&ledger, &mk(pools, energy, chem));
+
+        // EMIT: the org spends 50 J on a kin marker — Energy→chem, a paired move, Σ unchanged, no tap.
+        let emit = 50;
+        energy -= emit;
+        chem += emit; // milli == J 1:1
+        assert_ledger_closes(&ledger, &mk(pools, energy, chem));
+
+        // DECAY: the chem field dissipates 8 J → the chem_decay tap (the only chem sink).
+        let decay = 8;
+        chem -= decay;
+        ledger.chem_decay += decay;
+        assert_ledger_closes(&ledger, &mk(pools, energy, chem));
+
+        // INFLUX + a normal respired tick still compose with the chem taps.
+        pools += 100;
+        ledger.influx += 100;
+        energy -= 20;
+        ledger.respired += 20;
+        assert_ledger_closes(&ledger, &mk(pools, energy, chem));
+
+        // The decayed J is GONE from the live total but ACCOUNTED in the tap (the books still close).
+        assert_eq!(mk(pools, energy, chem).sum(), ledger.expected_total());
+        assert_eq!(ledger.chem_decay, decay);
     }
 }
