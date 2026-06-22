@@ -25,8 +25,11 @@ in priority order (🔁 = deliberate re-pin, EXECUTED not staged — see the F3/
    firewall (no wall-clock leak), and the `EcoliEditModifier` — a committed edit ripples (gltA KO → ↓decomposer →
    ↓FlowMatrix edge → ↓plant via F4). HASH-NEUTRAL (identity/neutral-gated → no re-pin). *(Follow-up: an in-game
    OVERSIGHT UI to earn/spend/trigger edits; a richer KO table beyond the 5 anchor genes.)*
-4. **ADR-013 F5 — chemical/signal diffusion field** 🔁 (toxin/kin/alarm; double-buffered, Σ-conserved; GSS3 bump) →
-   allelopathy / chemotaxis / kin-selection emerge on top of the trophic web.
+4. ✅ **DONE** — **ADR-013 F5 chemical/signal field** (RE-PIN `0x4e4d→0x47a0`, `cbafffa`): toxin/kin/alarm,
+   conserved 4-neighbour diffusion (Σ-before==after) + decay tap, emit (toxin re-routes Defense budget) + sense
+   (suppress-uptake/boost-kin/bias-dispersal); chem in hash + ledger; GSS4 overlays. Allelopathy / kin-selection /
+   chemotaxis EMERGE. Multi-ISA validated, merged `a1c3757`. **+ light balancing** (coexistence holds with chem,
+   no change) **+ hash-neutral perf** (`f53e1e9`, −6 to −13% on the tick).
 5. [~] **ADR-014 re-grounded — relations sidecar** (sqlite-vec at the process boundary, inv #1; view-only overlay
    on the now-live MEASURED FlowMatrix). The "vector-DB relations" leg of the vision. **DONE (Rel-1/2/3):**
    off-hash per-species `u16[12]` signature export (`crates/sim-core/src/signature.rs` + harness/`LiveSim`
