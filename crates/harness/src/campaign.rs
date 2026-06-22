@@ -209,6 +209,13 @@ pub fn evaluate(scenario: &Scenario, actions: &[Action]) -> ScenarioResult {
                 }
                 // else: refused (over budget) — not replayed, exactly like the live `_can_spend_edit`.
             }
+            // ADR-017 S5 INERT SCAFFOLDING: the oversight actions step through as strict no-ops (zero RNG, no
+            // hashed mutation) so the journaled action stream stays consistent. S5 grafts the epoch-boundary
+            // firewall drain HERE (the `RequestEcoliEdit` → buffer, `CommitEcoliImpact` → committed-slot, drain
+            // at each epoch boundary in (SpeciesId, req_id) order). Today it carries no campaign effect.
+            os @ (Action::RequestEcoliEdit { .. } | Action::CommitEcoliImpact { .. }) => {
+                env.step(os.clone());
+            }
         }
     }
 

@@ -104,6 +104,66 @@ pub enum Action {
     /// Apply a CRISPR edit to only the organisms inside a CELL region (the selective brush, ADR-011 S-D).
     /// The [`RegionSpec`] names cells, never an organism — the invariant-#6 type guard at the action level.
     ApplyEditRegion(EditAction, RegionSpec),
+
+    /// **INERT SCAFFOLDING (ADR-017 S5 design; not yet load-bearing).** The player spends earned credit to
+    /// request a deep, real-E. coli edit. The non-deterministic FBA solve is the PRODUCER (off-thread, outside
+    /// the hash); this action only *journals* the request at a deterministic position in the stream. It targets
+    /// a `species` (operator/species granularity, inv #6 — never a per-organism handle) + a `locus`, and names
+    /// the future `due_epoch` the resulting impact must commit at. `req_id` is a deterministic monotonic
+    /// occurrence index into the request stream (NEVER wall-clock/UUID — replay-stable).
+    ///
+    /// At S4/S5 the step arm is a strict NO-OP: it draws ZERO `SimRng` words and mutates no hashed component
+    /// (modeled on `Advance(0)`, NOT on `ApplyEdit` — `ApplyEdit` DRAWS from the stream). This is what keeps
+    /// the pinned literal `0x4e4d_0520_722a_a069` unchanged. Round-trips through `actions.ndjson`; on replay it
+    /// is a no-op for the sim (only the paired [`Action::CommitEcoliImpact`] carries effect, and that is also
+    /// journaled). `species` is a raw `u16` here (not the core's `SpeciesId`) until S5 promotes the core type to
+    /// serde — see `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
+    RequestEcoliEdit {
+        /// Target species (operator/species granularity — inv #6). Raw `u16` scaffold; → `SpeciesId` at S5.
+        species: u16,
+        /// Target locus on that species' genome (the gene the deep edit perturbs).
+        locus: LocusId,
+        /// How the deep edit acts on transcription (reuses the landed `crispr::EditKind`, commit 41a7f48).
+        edit_kind: crispr::EditKind,
+        /// The generation epoch at which the resulting impact is due to commit (a function of the Tick stream,
+        /// NOT wall-clock). The firewall buffers the impact until this epoch.
+        due_epoch: u32,
+        /// Deterministic monotonic occurrence index into the request stream (replay-stable ordering key).
+        req_id: u32,
+    },
+
+    /// **INERT SCAFFOLDING (ADR-017 S5 design; not yet load-bearing).** The CONSUMER side of the firewall: the
+    /// harness journals the QUANTIZED integer result of a background FBA solve, committed at a fixed epoch. The
+    /// payload (`growth_ratio_q` + ordered `exchange_deltas`) is carried INLINE so replay reads the impact
+    /// straight from `actions.ndjson` and NEVER re-runs the deep compute; `slipped_from` makes a deterministic
+    /// epoch slip self-describing in the journal. `content_hash` binds the quantized bytes (NOT the floats, NOT
+    /// the FBA model-version string — that belongs in provenance). Floats never cross this boundary: everything
+    /// is quantized via `fixed::to_unit_u16` inside the subprocess before it is journaled.
+    ///
+    /// At S4/S5 the step arm is a strict NO-OP: it draws ZERO `SimRng` words and the impact is WRITTEN to no
+    /// hashed component (the F2-Strategy "expressed-but-unread → coefficient zero" precedent). S6 — a deliberate
+    /// 🛑 re-pin behind human sign-off — turns the read coefficient on via an `EcoliEditModifier`.
+    CommitEcoliImpact {
+        /// Target species (matches the paired request). Raw `u16` scaffold; → `SpeciesId` at S5.
+        species: u16,
+        /// The request this commit answers (the `(species, req_id)` pair is the deterministic drain key).
+        req_id: u32,
+        /// The epoch this impact actually commits at (after any deterministic slip).
+        due_epoch: u32,
+        /// If the commit slipped past its originally-scheduled epoch, the epoch it was originally due at
+        /// (self-describing slip — replay is exact). `None` = committed on its first scheduled epoch.
+        slipped_from: Option<u32>,
+        /// Content hash over the quantized bytes (`growth_ratio_q` + index-ordered `exchange_deltas`). Binds
+        /// the committed integers so a tampered journal cannot inject a divergent impact silently (S5 rejects
+        /// a mismatch on replay as `InvalidData`).
+        content_hash: u64,
+        /// Quantized growth-ratio factor (`fixed::to_unit_u16` scale). The S6 modifier reads this as a
+        /// strictly-positive `[0.5,1.5]` permille factor; UNREAD at S4/S5.
+        growth_ratio_q: u16,
+        /// Quantized exchange-flux deltas as `(exchange_index, signed_delta)`, in canonical exchange-index
+        /// order. The S6 modifier taps these into the decomposer's mineralize_rate; UNREAD at S4/S5.
+        exchange_deltas: Vec<(u16, i16)>,
+    },
 }
 
 /// A spatial brush region for [`Action::ApplyEditRegion`]: a disc of world cells (centre + radius). Serde so
@@ -390,6 +450,20 @@ impl Env for GeneSimEnv {
                 self.last_region_edit = Some((outcome, covered));
                 self.last_edit = None;
             }
+            // ── ADR-017 S5 INERT SCAFFOLDING — strict NO-OPs (hash-neutral) ─────────────────────────────
+            // These are journaled/round-tripped but draw ZERO `SimRng` and mutate no hashed component, so the
+            // pinned literal `0x4e4d_0520_722a_a069` is unchanged (the unchanged-ness IS the neutrality proof).
+            // They are modeled on `Advance(0)`, NOT on `ApplyEdit` (which DRAWS from the stream). S5 wires the
+            // firewall buffer + the off-thread oracle-fba producer; S6 (🛑 re-pin) turns the read coefficient on.
+            // See `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
+            Action::RequestEcoliEdit { .. } => {
+                // Request the deep edit: at S5 this records into the EditFirewall pending buffer and (live mode)
+                // dispatches the FBA solve off-thread. Today it is inert — no sim mutation, no RNG draw.
+            }
+            Action::CommitEcoliImpact { .. } => {
+                // Commit the quantized impact: at S5 this stores the payload into a per-species committed slot
+                // read BETWEEN steps. Today the slot is unbuilt and unread — no sim mutation, no RNG draw.
+            }
         }
 
         let obs = sim.observe();
@@ -568,6 +642,26 @@ mod tests {
             // ApplyEditRegion targets a species LocusId + a CELL region (cx/cy/radius) — still no organism
             // handle, so per-organism targeting stays unrepresentable (ADR-011 invariant-#6 ruling).
             Action::ApplyEditRegion(EditAction { target: _, .. }, RegionSpec { .. }) => {}
+            // ADR-017 S5: both oversight variants target a SPECIES (`species: u16`, → `SpeciesId` at S5) + a
+            // species LocusId — never a per-organism handle, so the deep-edit request stays at the
+            // operator/species granularity ceiling (inv. #6). The destructure names every field so a future
+            // organism-handle field would stop this compiling and force a review.
+            Action::RequestEcoliEdit {
+                species: _,
+                locus: _,
+                edit_kind: _,
+                due_epoch: _,
+                req_id: _,
+            } => {}
+            Action::CommitEcoliImpact {
+                species: _,
+                req_id: _,
+                due_epoch: _,
+                slipped_from: _,
+                content_hash: _,
+                growth_ratio_q: _,
+                exchange_deltas: _,
+            } => {}
         }
     }
 
@@ -637,6 +731,58 @@ mod tests {
             "guide string missing: {j}"
         );
         assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), edit);
+    }
+
+    #[test]
+    fn ecoli_oversight_actions_round_trip_and_are_back_compat() {
+        // ADR-017 S5 INERT SCAFFOLDING. The two new variants journal to `actions.ndjson` and survive a
+        // serde round-trip; the externally-tagged enum keeps every EXISTING line byte-identical (purely
+        // additive). Proves the back-compat discipline before the firewall is wired.
+
+        // (1) The new variants round-trip exactly (including the inline quantized payload + Option<u32>).
+        let req = Action::RequestEcoliEdit {
+            species: 1,
+            locus: LocusId(7),
+            edit_kind: crispr::EditKind::Knockdown,
+            due_epoch: 42,
+            req_id: 0,
+        };
+        let jr = serde_json::to_string(&req).unwrap();
+        assert!(jr.starts_with("{\"RequestEcoliEdit\":"), "tag wrong: {jr}");
+        assert_eq!(serde_json::from_str::<Action>(&jr).unwrap(), req);
+
+        let commit = Action::CommitEcoliImpact {
+            species: 1,
+            req_id: 0,
+            due_epoch: 44,
+            slipped_from: Some(42),
+            content_hash: 0xdead_beef_0000_0001,
+            growth_ratio_q: 30_000,
+            exchange_deltas: vec![(3, -120), (11, 88)],
+        };
+        let jc = serde_json::to_string(&commit).unwrap();
+        assert!(jc.starts_with("{\"CommitEcoliImpact\":"), "tag wrong: {jc}");
+        assert_eq!(serde_json::from_str::<Action>(&jc).unwrap(), commit);
+
+        // (2) BACK-COMPAT: a pre-S5 `actions.ndjson` line still deserializes to the SAME existing variant —
+        // adding variants changes nothing about how old lines parse (the load-bearing serde discipline).
+        assert_eq!(
+            serde_json::from_str::<Action>("{\"Advance\":10}").unwrap(),
+            Action::Advance(10)
+        );
+
+        // (3) The new variants are STRICT NO-OPS in `step`: stepping them draws zero RNG and leaves the
+        // observation generation unchanged (modeled on `Advance(0)`, not on `ApplyEdit`).
+        let mut env = GeneSimEnv::new(64);
+        env.reset(7);
+        let gen_before = env.observe().generation;
+        env.step(req);
+        env.step(commit);
+        assert_eq!(
+            env.observe().generation,
+            gen_before,
+            "inert oversight actions must not advance the sim"
+        );
     }
 
     #[cfg(feature = "proptest")]
