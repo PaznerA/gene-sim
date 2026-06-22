@@ -35,6 +35,7 @@ var _restore_pos: Vector2 = Vector2.ZERO  # where to fly back to on restore
 var _dragging: bool = false
 var _drag_offset: Vector2 = Vector2.ZERO
 var _titlebar: HBoxContainer = null
+var _title_label: Label = null         # the title bar's text label (so the caller can swap the title live)
 var _body_holder: MarginContainer = null
 var _tween: Tween = null
 
@@ -73,6 +74,13 @@ func setup(p_title: String, body: Control, ui: CanvasLayer, dock: Vector2, rail:
 	position = dock
 
 
+## Swap the title bar's text live (e.g. "🌱 SPECIMEN" ↔ "🦠 SPECIMEN" per the focused specimen's species).
+func set_title(p_title: String) -> void:
+	title_text = p_title
+	if _title_label != null:
+		_title_label.text = p_title
+
+
 ## The title bar: a drag handle glyph + the title label + a minimize button. Draggable via _gui_input on the
 ## HBox itself (the bar, not the whole panel — so buttons/sliders inside the body stay interactive).
 func _make_titlebar() -> PanelContainer:
@@ -107,6 +115,7 @@ func _make_titlebar() -> PanelContainer:
 	title.add_theme_color_override("font_color", Color(0.88, 0.95, 0.88))
 	title.mouse_filter = Control.MOUSE_FILTER_PASS
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_title_label = title
 	_titlebar.add_child(title)
 
 	var mini := Button.new()

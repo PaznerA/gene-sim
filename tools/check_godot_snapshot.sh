@@ -19,6 +19,18 @@ cd "$ROOT"
 
 command -v godot >/dev/null 2>&1 || { echo "SKIP — godot not installed (pin: see tools/install_godot.sh)"; exit 0; }
 
+# ADR-017 res:// species mirror: data/species/ is the single source of truth; godot/data/species/ is a generated,
+# gitignored mirror the renderer reads via FileAccess(res://data/species/…) in dev AND in the exported PCK. Stage
+# it here (the same copy run.sh/CI do) and assert it is byte-equal to the canonical dir — RED on drift, so the
+# mirror can never silently rot vs the Rust-side truth (which the harness tests pin via CARGO_MANIFEST_DIR).
+mkdir -p godot/data/species && cp data/species/*.json godot/data/species/
+if ! diff -rq data/species godot/data/species >/dev/null 2>&1; then
+  echo "FAIL — godot/data/species is not byte-equal to data/species (ADR-017 mirror drift):"
+  diff -rq data/species godot/data/species || true
+  exit 1
+fi
+echo "SPECIES MIRROR OK — godot/data/species == data/species ($(ls data/species | wc -l | tr -d ' ') files)"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

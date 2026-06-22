@@ -28,6 +28,10 @@ __pycache__/
 
 # Godot 4.x per-script UID cache (we resolve scripts by preload path, not UID)
 *.uid
+# Generated res:// mirror of the canonical repo-root data/species/ (ADR-017): staged by run.sh / CI before
+# launch+export, byte-checked against data/species/ by the gate. Never hand-edit or commit (single source of
+# truth stays at repo-root data/species/).
+/godot/data/
 # Detached godot-sim cdylib build output
 /crates/godot-sim/target/
 # CI-staged Godot export artifacts (release.yml writes these into godot/ transiently)

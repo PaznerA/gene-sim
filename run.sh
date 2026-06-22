@@ -33,6 +33,13 @@ if ! command -v "$GODOT" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Stage the species JSON into the Godot project's res:// tree (ADR-017): the renderer reads
+# res://data/species/<stem>.json via FileAccess, which resolves cwd-independently in BOTH dev (project dir on
+# disk) and the exported PCK. data/species/ is the single source of truth; godot/data/ is a GENERATED, gitignored
+# mirror (copy, NOT symlink — ecoli.json is 226 KB of real CDS and a symlink does not survive a PCK export).
+echo "» staging species JSON → godot/data/species/"
+mkdir -p godot/data/species && cp data/species/*.json godot/data/species/
+
 # Engine args before `--`; game args (FLAGS from config + CLI args) after it. --live is always on for run.sh.
 echo "» launching: $GODOT --path godot -- --live ${FLAGS[*]:-} $*"
 exec "$GODOT" --path godot -- --live "${FLAGS[@]}" "$@"

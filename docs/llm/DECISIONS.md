@@ -581,6 +581,40 @@ the integer type, proven on two arches. − A long red period, 6+ re-pins, every
 per re-pin, a GSS2→GSS3 snapshot break, and `ParamValue::Numeric` `f64` converted at a load-time chokepoint.
 − ADR-005's no-extinction guarantee is gone (intended). The first phase (`fixed.rs`) is in and gate-green.
 
+### ADR-013 — landed re-pin ledger (implementation log, branch `auto/night-2026-06-21`, 2026-06-22)
+
+The CHEMOSTAT-J epic has landed its keystone phases as deliberate, ledgered re-pins of
+`determinism_hash_is_pinned`. Hash chain (each value is aarch64/Apple; **x86_64 portability is validated by the
+multi-ISA CI matrix on push, BEFORE merge to `main`**):
+
+- `0xf795_eac4_112f_acd5` (pre-F3 baseline)
+- → **F3** `0x272a_9b4a_7023_0cf5` — real metabolism (PoolStock i64 uptake→convert→excrete, RNG-free) + energy-funded
+  `reproduce_or_die` replacing constant-N Wright-Fisher (population emergent), Biomass+Age, carcass→detritus,
+  ledger closes every tick, OrgId→u64, MaxPopulation guard.
+- → **F4** `0x42fe_54f2_f6d8_360d` — obligate-loop machinery: free_nutrient INFLUX deleted (endogenous via
+  decomposer mineralization), E. coli re-roled Decomposer (`niche.trophic_role`), emergent MEASURED FlowMatrix
+  (S×S, row-sum==0) folded into the hash; read-only `LiveSim::flow_matrix()` export.
+- → **F3.4** `0x4e4d_0520_722a_a069` — chemostat constant tuning for a living ecosystem. Decoupled per-cell SEED
+  from CAP (`CELL_CAP_SCALE` ≫ `CELL_J_SCALE`) so solar flows continuously instead of spilling ~100% to overflow
+  from tick 1; collapsed the per-org demand permille into one floored u128 product (the old chain of /1000 divides
+  quadruple-floored a fresh org's demand to 0 → nothing ever reproduced → the gen-~240 wipeout was just AGE_MAX);
+  rebalanced UPTAKE_VMAX/K_HALF, MAINTENANCE_BASE, REPRO_THRESHOLD, OFFSPRING_ENDOWMENT; added `LIEBIG_FLOOR`.
+
+**F3.4 acceptance criterion + policy (the load-bearing decisions, per adversarial review):**
+- **Acceptance = MULTI-SPECIES ROSTER coexistence, NOT single-species immortality.** The plant + E. coli
+  (decomposer) roster settles to a stable coexistence attractor (plant ≈ 6600, decomposer ≈ 1450, flat band
+  gen ~1750–6000, ≪ MAX_POPULATION=2M); the decomposer raises plant carrying capacity ~3.5×. A decomposer-less
+  autotroph MONOCULTURE, by contrast, slowly runs down over tens of thousands of generations — and that is
+  **correct emergent ecology** (no decomposer ⇒ the nutrient cycle never closes; carbon/N lock into detritus),
+  NOT a tuning failure. It validates why F4's loop exists. At the pinned-hash config (50 gens) the world is
+  healthy and growing (1000→2959), so the re-pin encodes a live ecosystem.
+- **Policy: the decomposer loop is SOFT-MUTUALISTIC, not obligate-to-extinction** (`LIEBIG_FLOOR=350`): plants
+  subsist on light alone down to the floor; the decomposer measurably *raises* carrying capacity rather than
+  being strictly required for any survival. The test `f4_killing_the_decomposer_starves_the_plants` accordingly
+  asserts the *relative* `plants_without < plants_with`, not extinction.
+- **Open (continuation):** if a sustained non-zero single-species default is later wanted, it needs either a slow
+  abiotic nutrient-weathering influx or an always-present decomposer in the default roster — deferred, tracked.
+
 ---
 
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)

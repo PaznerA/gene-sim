@@ -149,7 +149,8 @@ impl LiveSim {
         match harness::species::load_species_file(&path) {
             Ok(built) => {
                 if built.entity_count > 0 {
-                    self.entity_count_before_species.get_or_insert(self.entity_count);
+                    self.entity_count_before_species
+                        .get_or_insert(self.entity_count);
                     self.entity_count = built.entity_count;
                 }
                 self.species = Some(built);
@@ -160,6 +161,48 @@ impl LiveSim {
                 false
             }
         }
+    }
+
+    /// Select the species the next `reset` runs from its `SpeciesSpec` JSON TEXT (`res://` boundary, ADR-017):
+    /// GDScript reads the bytes via `FileAccess(res://data/species/<stem>.json)` and passes the string; the core
+    /// does zero file I/O (inv #2/#4). An EMPTY string clears back to the default plant (restoring the player's
+    /// pre-species `entity_count`). Returns `true` on success (`false` + a `godot_error!` on invalid/un-buildable
+    /// JSON). Call before `reset`. This is the renderer's loader; [`set_species`](Self::set_species) is kept for
+    /// the harness CLI / exe-staged path (cwd-relative file lookup), so there are two byte sources, one biology
+    /// path (both funnel through `harness::species::build_species_from_str`).
+    #[func]
+    fn set_species_json(&mut self, json: GString) -> bool {
+        let json = json.to_string();
+        if json.is_empty() {
+            // Clear back to the default plant, restoring the player's pre-species population.
+            if let Some(prev) = self.entity_count_before_species.take() {
+                self.entity_count = prev;
+            }
+            self.species = None;
+            return true;
+        }
+        match harness::species::build_species_from_str(&json) {
+            Ok(built) => {
+                if built.entity_count > 0 {
+                    self.entity_count_before_species
+                        .get_or_insert(self.entity_count);
+                    self.entity_count = built.entity_count;
+                }
+                self.species = Some(built);
+                true
+            }
+            Err(e) => {
+                godot_error!("LiveSim::set_species_json: {e}");
+                false
+            }
+        }
+    }
+
+    /// The active species key (`"ecoli-core"` | `"default"` | `""`), a pure read of already-loaded data (no
+    /// biology — inv #2). The renderer can route presentation on this CORE key as the authoritative tiebreak.
+    #[func]
+    fn species_key(&self) -> GString {
+        GString::from(self.species.as_ref().map(|b| b.key.as_str()).unwrap_or(""))
     }
 
     /// CORE-computed climate preview for the main menu (ADR-012 E4): the `{day_length, insolation, temperature}`
@@ -233,6 +276,52 @@ impl LiveSim {
                 VarDictionary::new()
             }
         }
+    }
+
+    /// Observe EVERY species in the roster (the renderer's specimen view shows them all — ADR R3).
+    ///
+    /// Returns an Array of Dictionaries, one per species in `species_id` order, each
+    /// `{species_id, name, key, role, phenotype: {trait_name: value, ...}}`. A pure read-only display
+    /// projection delegating to [`harness::GeneSimEnv::observe_all`] → [`sim_core::Simulation::observe_all`]:
+    /// it draws no RNG, mutates nothing, and is never folded into the determinism hash (invariant #2/#3).
+    /// No biology is computed here — only data marshalling. Empty before `reset`.
+    #[func]
+    fn observe_species(&self) -> VarArray {
+        let mut arr = VarArray::new();
+        match self.env.as_ref() {
+            Some(env) => {
+                for obs in env.observe_all() {
+                    arr.push(&species_observation_to_dict(&obs).to_variant());
+                }
+            }
+            None => godot_error!("LiveSim::observe_species called before reset()"),
+        }
+        arr
+    }
+
+    /// The MEASURED per-generation FlowMatrix as `{s: int, j: PackedInt64Array}` (ADR-013 F4 — the relations
+    /// heatmap contract `godot/relations_heatmap.gd` reads). `j` is flat row-major: `j[i*s + j_]` = NET joules
+    /// that flowed FROM species `j_` INTO species `i` this generation (row-sum==0 by construction). Delegates
+    /// to [`harness::GeneSimEnv::flow_matrix`] → [`sim_core::Simulation::flow_matrix`] — a pure read-only
+    /// projection (no RNG, no mutation, no biology computed here, inv #2/#3). Empty (`s:0`) before `reset`.
+    #[func]
+    fn flow_matrix(&self) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        match self.env.as_ref() {
+            Some(env) => {
+                let (s, flat) = env.flow_matrix();
+                d.set("s", s as i64);
+                // Packed arrays pass by-ref into a Dictionary; marshal through a Variant (the `.to_variant()`
+                // pattern used elsewhere in this file for VarArray pushes).
+                d.set("j", &PackedInt64Array::from(flat.as_slice()).to_variant());
+            }
+            None => {
+                godot_error!("LiveSim::flow_matrix called before reset()");
+                d.set("s", 0_i64);
+                d.set("j", &PackedInt64Array::new().to_variant());
+            }
+        }
+        d
     }
 
     /// Produce the read-only GSS2 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
@@ -575,6 +664,36 @@ fn observation_to_dict(obs: &Observation) -> VarDictionary {
     }
     // Nest the phenotype dict as a Variant value (VarDictionary's V = Variant); `&Dictionary`
     // implements `AsArg<Variant>`, so pass it by reference.
+    dict.set("phenotype", &pheno);
+    dict
+}
+
+/// Convert a [`sim_core::SpeciesObservation`] into a GDScript-facing `Dictionary` (the specimen view's
+/// per-species row). Keys: `species_id` (int), `name` (string), `key` (string — the renderer's glyph
+/// tiebreak), `role` (string), `population_size` (int), `allele_freq` (float), `mean_fitness` (float — the
+/// Vitals panel reader key), `mean_energy` (float — field-named alias, == `mean_fitness`), and `phenotype`
+/// (nested `{trait_name: value}`). Pure data marshalling; no biology (invariant #2).
+fn species_observation_to_dict(obs: &sim_core::SpeciesObservation) -> VarDictionary {
+    let mut dict = VarDictionary::new();
+    dict.set("species_id", i64::from(obs.species_id));
+    dict.set("name", obs.name.as_str());
+    dict.set("key", obs.key.as_str());
+    // The role's Debug repr is presentation only (e.g. "Autotroph"/"Heterotroph") — no biology here.
+    let role = format!("{:?}", obs.role);
+    dict.set("role", role.as_str());
+    // Per-species vitals (R3 widening): pure reads carried verbatim from the core's read-only projection.
+    dict.set("population_size", i64::from(obs.population_size));
+    dict.set("allele_freq", obs.allele_freq);
+    // LOAD-BEARING key — the EXACT key the Vitals "Fitness" row reads (main.gd `_species_stat`). mean_energy
+    // is already ENERGY_FULL-normalized to [0,1] in-core, the SAME scale snapshot()'s fitness channel uses.
+    dict.set("mean_fitness", obs.mean_energy);
+    // Field-named alias (matches the struct field + the main.gd doc); equals mean_fitness by construction.
+    dict.set("mean_energy", obs.mean_energy);
+
+    let mut pheno = VarDictionary::new();
+    for (trait_, value) in &obs.phenotype.values {
+        pheno.set(format!("{trait_:?}"), *value);
+    }
     dict.set("phenotype", &pheno);
     dict
 }
