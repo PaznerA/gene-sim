@@ -617,6 +617,40 @@ multi-ISA CI matrix on push, BEFORE merge to `main`**):
 
 ---
 
+## ADR-018 — Data-licensing ruling: non-commercial BiGG accepted (gene-sim is not monetized)
+
+- **Date:** 2026-06-22
+- **Status:** Accepted (human ruling)
+- **Stage:** ADR-017 S1 (un-gates S2/S3/S6 — the OVERSIGHT earned-edit loop)
+
+### Context
+The layered-E. coli OVERSIGHT loop (ADR-017, `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`) needs the
+BiGG `e_coli_core` / `iML1515` genome-scale metabolic models to bake the single-gene knockout (FBA) landscape that
+makes an edit's impact real. BiGG models carry the UCSD academic **non-commercial** license. This stood as a
+STOP-THE-LINE against invariant #1's *rationale* (keep licensing freedom for a future closed/commercial release).
+
+### Decision
+**gene-sim will NOT be monetized or commercially released** (human ruling). The BiGG non-commercial clause is
+therefore acceptable — both for the shipped `data/species/ecoli.json` (whose sequence is public-domain NCBI CDS;
+BiGG supplied only the b-number gene roster) and for baking the FBA KO landscape into a **frozen runtime table**
+for the OVERSIGHT loop (ADR-017 S2). This un-gates S2 → S3 (`crates/oracle-fba`) → S6 (`EcoliEditModifier` wire).
+- **Invariant #1's process boundary STAYS in force** as engineering hygiene, independent of the commercial driver:
+  GPL tools remain subprocess-only, `scripts/check_license.sh` keeps gating the boundary crate list, and
+  `crates/oracle-fba` quantizes-before-return so floats/model internals never cross into the deterministic core.
+- **Attribution:** cite BiGG (King et al. 2016) + the `iML1515`/`e_coli_core` model papers in NOTICE/README per
+  the academic terms; keep the non-commercial data out of any separately-licensed artifact.
+
+### Consequences
+- **+** Unblocks the earned-edit OVERSIGHT loop — the vision's player-agency payoff — with real FBA-grounded
+  E. coli impact rather than a fabricated number.
+- **−** Forecloses a future commercial/closed release that bundles BiGG-derived data (explicitly accepted). If that
+  ever changes, the KO table would need a permissively-licensed or self-generated replacement (the `oracle-fba`
+  boundary keeps that swap localized).
+- **−** Adds an offline FBA bake dependency (cobrapy + the BiGG model) to the S2 data slice — analysis-only,
+  separate process, never linked (same pattern as the SLiM/msprime subprocesses).
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).
