@@ -38,10 +38,41 @@ in priority order (🔁 = deliberate re-pin, EXECUTED not staged — see the F3/
    tints + a nearest-species advisory strip with a provenance badge; 4th graceful-degrade state). HASH-NEUTRAL —
    `0x47a0_3c8f_6701_f240` unchanged (`species_signatures_export_is_hash_neutral`). ADR-014 in DECISIONS.md.
    **Rel-4 (sqlite-vec sidecar wire at large S) deferred** behind the roster-size trigger.
-6. **3rd species — predator (Bdellovibrio)** 🔁 — a true heterotroph predator gives the FlowMatrix real
-   off-diagonals (predation), completing plant→microbe→predator. Pin the InteractionKernel contention semantics first.
-7. **Balance & playtest** — tune the coexistence for gameplay (now plant ~6600 / decomposer ~1450); add a slow
-   abiotic nutrient-weathering influx if a sustained single-species default is wanted (ADR-013 F3.4 "Open").
+6. ✅ **DONE** — **3rd species Bdellovibrio predator** (merged `f6fa5b1`, hash-neutral): the first org-eats-org
+   predation InteractionKernel + real FlowMatrix off-diagonals, completing plant→E.coli→Bdellovibrio.
+
+---
+
+## ▶️ SANDBOX & PRESENTATION phase (the "gameplay", sandbox-first — 2026-06-22)
+
+Lead with a tuned core + graphical UI + rich descriptions + sandbox emergent-system creation; missions
+deprioritized. **GUIDING PRINCIPLE (`no-hardcoded-balance-open-system`):** do NOT tune the closed ecosystem to
+forced stability — that's anti-sim. Real systems are OPEN; contamination/immigration is the natural recovery;
+extinction is a valid emergent outcome, not a bug. (The SP-1 predator-persistence/decomposer tuning was reverted
+on this principle; the predator's overshoot-crash is real and is recovered by re-immigration, not a refuge fudge.)
+
+- [~] **SP-1 well-tuned core** — REFRAMED: not "force coexistence" but (a) correct genuine MODEL ERRORS (e.g. an
+  obligate decomposer that can't pay upkeep — recalibrate in the OPEN-system context) + (b) add REAL biological
+  mechanics (Bdellovibrio dormancy as a *feature*, not a stability fudge); accept emergent crashes/extinctions.
+  Decomposer recalibration + predator dormancy DEFERRED to the open-system framing (after contamination).
+- [ ] **SP-3 intervention panel** — 5 spatial, journaled, deterministic, conserved tools (CRISPR + PCR-amplify
+  faithful-clones + Antibiotic-cull + Nutrient-feed + Toxin-spike) + timeline event markers (`sp3-intervention-panel-impl`).
+  2nd wave: conjugation/HGT, **seed/inoculate** (→ the contamination epic), climate.
+- [ ] **SP-2 sandbox composer** — compose a run (roster/env/starting populations/edits) → run + observe; the
+  `SpeciesSpec` JSON is the vehicle.
+- [ ] 🧫 **Contamination & Immigration epic (ADR-019 DRAFT — `docs/llm/proposals/contamination-immigration-draft.md`)** —
+  contamination as the default state of reality. One journaled, RNG-free, conserved `RegionInoculate` Action (the
+  SP-3 seed tool) drops a baked contaminant `SpeciesSpec` consortium; J from a named `immigration` influx tap;
+  a `ContainmentLevel` knob (ISO-14644 ladder) deterministically derives a journaled immigration schedule.
+  Establish/displace/die-out EMERGES from the ADR-013 ledger — **nothing scripted**. **S0–S3 hash-neutral** (bake
+  Mode-A contaminants Mycoplasma/Bacillus/Pseudomonas/Staph/Cutibacterium/Aspergillus/Penicillium → RegionInoculate
+  → containment schedule → renderer panel+markers); **S4 (spore/dormancy reservoir) + S5 (Mode B obligate symbionts:
+  Carsonella/Syn3.0/Hodgkinia — `ObligateSymbiont` role + host edge) are 🔁 RE-PINS** (separate sign-off).
+- [~] **SP-4 codex** — phenology/ontology/taxonomy descriptions (`docs/llm/proposals/sp4-codex-content-draft.md` drafted:
+  E.coli K-12 + 5 anchor genes around the pyruvate node, Bdellovibrio biphasic life cycle, trophic roles/flows).
+- [ ] **Rendering & platform** (`docs/llm/proposals/rendering-platform-architecture-draft.md` drafted) — ONE
+  deterministic core → MANY read-only renderers: UE5 realistic (C-ABI cdylib + thin UE plugin / shm IPC; Niagara +
+  Grid2D) · web (sim-core→wasm32 + multi-ISA-wasm leg, or godot web export) · the perf roadmap.
 
 Full provenance of the merged night in `docs/llm/autonomous-roadmap.md` §4.
 
