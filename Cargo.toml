@@ -6,6 +6,7 @@ members = [
     "crates/sim-core",
     "crates/harness",
     "crates/oracle-slim",
+    "crates/oracle-fba",
 ]
 
 [workspace.package]

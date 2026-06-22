@@ -18,6 +18,7 @@ var _cell: float = 16.0
 var _iso = null  # iso.gd instance
 var _snap = null
 var _overlay_mode: int = 0  # 0 off · 1 density · 2 allele · 3 fitness · 4 moisture · 5 nutrients · 6 ph
+# · 7 light · 8 free_nutrient · 9 detritus (the GSS3 live-pool joule-economy planes, full fields like soil)
 
 
 func setup(w: int, h: int, cell: float, iso) -> void:
@@ -51,7 +52,7 @@ func _draw() -> void:
 		var col := _grass(x, y)
 		if has_data:
 			var v := _channel(x, y)
-			# Soil channels (>=4) are a full field → always tint; population channels only where populated.
+			# Soil (4-6) + pool (7-9) channels are full fields → always tint; population channels only where populated.
 			if _overlay_mode >= 4 or v > 0.0:
 				col = col.lerp(_inferno(v), 0.62)
 		# 3D heightfield tile: the top diamond is RAISED by the cell's terrain height; the two darker side
@@ -78,7 +79,10 @@ func _channel(x: int, y: int) -> float:
 		3: return clampf(_snap.fitness[i], 0.0, 1.0)
 		4: return clampf(_snap.soil_moisture[i], 0.0, 1.0)
 		5: return clampf(_snap.soil_nutrients[i], 0.0, 1.0)
-		_: return clampf(_snap.soil_ph[i], 0.0, 1.0)
+		6: return clampf(_snap.soil_ph[i], 0.0, 1.0)
+		7: return clampf(_snap.light[i], 0.0, 1.0)
+		8: return clampf(_snap.free_nutrient[i], 0.0, 1.0)
+		_: return clampf(_snap.detritus[i], 0.0, 1.0)  # mode 9 detritus
 
 
 func _grass(x: int, y: int) -> Color:

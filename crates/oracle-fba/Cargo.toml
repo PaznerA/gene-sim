@@ -1,0 +1,17 @@
+[package]
+name = "oracle-fba"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FBA (flux-balance) KO oracle — ADR-017 S3 boundary crate. Frozen-table lookup / subprocess-only; never links a GPL or heavy solver. Mirrors oracle-slim."
+
+[features]
+proptest = []
+
+# INVARIANT #1 (SPEC §2.1.1): this is a PROCESS-BOUNDARY crate. It MUST carry ZERO normal/build dependencies
+# (std-only) so it can never link a GPL solver (GLPK/cobrapy live behind a subprocess + a frozen offline bake).
+# Enforced by the license gate (scripts/check_license.sh — `oracle-fba` is in BOUNDARY_CRATES). For a single-gene
+# edit this crate does a FROZEN-TABLE lookup of data/ecoli_ko_table.json and returns a quantized u16 growth ratio
+# (floats never escape). A future "realistic" impl shells out to an FBA CLI exactly like oracle-slim shells to slim.
+[dependencies]

@@ -35,6 +35,8 @@ use sim_core::gp::{trait_map_for, OntologyMap};
 use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod campaign;
+pub mod firewall;
+pub mod oversight;
 pub mod replay;
 pub mod species;
 
@@ -132,17 +134,20 @@ pub enum Action {
         req_id: u32,
     },
 
-    /// **INERT SCAFFOLDING (ADR-017 S5 design; not yet load-bearing).** The CONSUMER side of the firewall: the
-    /// harness journals the QUANTIZED integer result of a background FBA solve, committed at a fixed epoch. The
-    /// payload (`growth_ratio_q` + ordered `exchange_deltas`) is carried INLINE so replay reads the impact
-    /// straight from `actions.ndjson` and NEVER re-runs the deep compute; `slipped_from` makes a deterministic
-    /// epoch slip self-describing in the journal. `content_hash` binds the quantized bytes (NOT the floats, NOT
-    /// the FBA model-version string — that belongs in provenance). Floats never cross this boundary: everything
-    /// is quantized via `fixed::to_unit_u16` inside the subprocess before it is journaled.
+    /// **The CONSUMER side of the firewall (ADR-017 S6 — LOAD-BEARING).** The harness journals the QUANTIZED
+    /// integer result of a background FBA solve, committed at a fixed epoch. The payload (`growth_ratio_q` +
+    /// ordered `exchange_deltas`) is carried INLINE so replay reads the impact straight from `actions.ndjson` and
+    /// NEVER re-runs the deep compute; `slipped_from` makes a deterministic epoch slip self-describing in the
+    /// journal. `content_hash` binds the quantized bytes (NOT the floats, NOT the FBA model-version string — that
+    /// belongs in provenance). Floats never cross this boundary: everything is quantized via `fixed::to_unit_u16`
+    /// inside the subprocess before it is journaled.
     ///
-    /// At S4/S5 the step arm is a strict NO-OP: it draws ZERO `SimRng` words and the impact is WRITTEN to no
-    /// hashed component (the F2-Strategy "expressed-but-unread → coefficient zero" precedent). S6 — a deliberate
-    /// 🛑 re-pin behind human sign-off — turns the read coefficient on via an `EcoliEditModifier`.
+    /// At S6 the step arm READS `growth_ratio_q`: it draws ZERO `SimRng` (the committed integer is read straight
+    /// from the journal) but routes the integer to [`sim_core::Simulation::commit_species_edit`], which maps it
+    /// to a strictly-positive `[0.5,1.5]` per-species DEMAND + MINERALIZATION factor consumed by the NEXT
+    /// `Advance`. A wild-type ratio (1000) maps to exactly neutral (a no-op → hash-unchanged); a committed KO
+    /// throttles the edited species (the load-bearing wire). The `exchange_deltas` are carried for the future
+    /// ordered-`ResourceField` tap; the single growth-ratio factor is the wire this slice lands.
     CommitEcoliImpact {
         /// Target species (matches the paired request). Raw `u16` scaffold; → `SpeciesId` at S5.
         species: u16,
@@ -157,11 +162,12 @@ pub enum Action {
         /// the committed integers so a tampered journal cannot inject a divergent impact silently (S5 rejects
         /// a mismatch on replay as `InvalidData`).
         content_hash: u64,
-        /// Quantized growth-ratio factor (`fixed::to_unit_u16` scale). The S6 modifier reads this as a
-        /// strictly-positive `[0.5,1.5]` permille factor; UNREAD at S4/S5.
+        /// Quantized growth-ratio factor (permille; `1000` = wild-type). READ at S6: mapped to a strictly-
+        /// positive `[0.5,1.5]` per-species DEMAND + MINERALIZATION factor by `sim_core::edit_factor_q`.
         growth_ratio_q: u16,
         /// Quantized exchange-flux deltas as `(exchange_index, signed_delta)`, in canonical exchange-index
-        /// order. The S6 modifier taps these into the decomposer's mineralize_rate; UNREAD at S4/S5.
+        /// order. Carried for the future ordered-`ResourceField` mineralize tap; not yet consumed by selection
+        /// (the single `growth_ratio_q` factor is the wire this slice lands).
         exchange_deltas: Vec<(u16, i16)>,
     },
 }
@@ -336,6 +342,28 @@ impl GeneSimEnv {
             .region_allele(region, grid_w, grid_h)
     }
 
+    /// Commit a deep-edit impact to the core (ADR-017 S6 — the load-bearing OVERSIGHT wire). Routes a firewall
+    /// [`Action::CommitEcoliImpact`]'s `(species, growth_ratio_q)` to [`sim_core::Simulation::commit_species_edit`]
+    /// so the NEXT `Advance` makes the core throttle that species' uptake + mineralization by the strictly-
+    /// positive `[0.5,1.5]` factor [`sim_core::edit_factor_q`] derives.
+    ///
+    /// The committed `growth_ratio_q` already encodes the `EditKind` grading (the `oracle-fba` frozen-table
+    /// lookup bakes Knockout/Knockdown/Activate INTO the permille before it crosses the firewall), so the core
+    /// maps it via the loss-of-function direction ([`sim_core::EditEffect::Knockout`]): a `<1000` ratio is a
+    /// penalty toward `0.5×`, `1000` is exactly neutral (a no-op → hash-unchanged). The committed INTEGER read
+    /// straight from the journal on replay is the only thing crossing into the hashed sim (the firewall's one-way
+    /// quantized crossing). Panics if called before `reset`.
+    pub fn commit_species_edit(&mut self, species: u16, growth_ratio_q: u16) {
+        self.sim
+            .as_mut()
+            .expect("GeneSimEnv::commit_species_edit called before reset")
+            .commit_species_edit(
+                sim_core::SpeciesId::new(species),
+                growth_ratio_q,
+                sim_core::EditEffect::Knockout,
+            );
+    }
+
     /// The deterministic [`sim_core::RunStats`] of the episode so far — its `hash` is the bit-identical
     /// replay artifact (SPEC §6). Folds in the same final RNG word as the one-shot path, so it must be
     /// called once at the **end** of an episode (panics if called before `reset`).
@@ -450,19 +478,35 @@ impl Env for GeneSimEnv {
                 self.last_region_edit = Some((outcome, covered));
                 self.last_edit = None;
             }
-            // ── ADR-017 S5 INERT SCAFFOLDING — strict NO-OPs (hash-neutral) ─────────────────────────────
-            // These are journaled/round-tripped but draw ZERO `SimRng` and mutate no hashed component, so the
-            // pinned literal `0x4e4d_0520_722a_a069` is unchanged (the unchanged-ness IS the neutrality proof).
-            // They are modeled on `Advance(0)`, NOT on `ApplyEdit` (which DRAWS from the stream). S5 wires the
-            // firewall buffer + the off-thread oracle-fba producer; S6 (🛑 re-pin) turns the read coefficient on.
-            // See `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
+            // ── ADR-017 S6 OVERSIGHT actions at the bare `step` level ─────────────────────────────────────
+            // The firewall BUFFERING + the off-thread oracle dispatch + the epoch-boundary drain live in the
+            // harness DRIVER (`oversight::OversightEpisode`), NOT here in the single-threaded `World` step — so
+            // the dispatch concurrency is in the env layer (inv #2), and `step` itself stays a pure CONSUMER of
+            // the journaled action stream. `RequestEcoliEdit` draws ZERO `SimRng` (modeled on `Advance(0)`);
+            // `CommitEcoliImpact` reads the committed INTEGER from the journal and sets the per-species edit
+            // factor (still zero `SimRng` — the selection effect lands on the NEXT `Advance`). See
+            // `docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
             Action::RequestEcoliEdit { .. } => {
-                // Request the deep edit: at S5 this records into the EditFirewall pending buffer and (live mode)
-                // dispatches the FBA solve off-thread. Today it is inert — no sim mutation, no RNG draw.
+                // The driver buffers the request + dispatches the oracle; the bare step is inert (no RNG, no
+                // hashed mutation) so a journaled stream containing a request replays consistently.
             }
-            Action::CommitEcoliImpact { .. } => {
-                // Commit the quantized impact: at S5 this stores the payload into a per-species committed slot
-                // read BETWEEN steps. Today the slot is unbuilt and unread — no sim mutation, no RNG draw.
+            Action::CommitEcoliImpact {
+                species,
+                growth_ratio_q,
+                ..
+            } => {
+                // ADR-017 S6 (the load-bearing wire): the firewall's committed quantized `growth_ratio_q` crosses
+                // into the hashed sim as a strictly-positive `[0.5,1.5]` per-species DEMAND + MINERALIZATION
+                // factor (the core maps + clamps it). A wild-type ratio (1000) maps to exactly neutral (a no-op →
+                // hash-unchanged — the pinned single-species PLANT run never commits a non-neutral factor); a
+                // committed KO throttles the edited species. NO RNG draw (the committed integer is read straight
+                // from the journal; selection consumes it next `Advance`). This is the one-way quantized crossing
+                // the firewall pins — replay reads the integer from `actions.ndjson`, never re-solving FBA.
+                sim.commit_species_edit(
+                    sim_core::SpeciesId::new(species),
+                    growth_ratio_q,
+                    sim_core::EditEffect::Knockout,
+                );
             }
         }
 

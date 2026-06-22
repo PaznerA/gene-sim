@@ -224,6 +224,7 @@ struct MineralizeRow {
 #[allow(clippy::type_complexity)]
 pub(crate) fn mineralize(
     registry: Res<SpeciesRegistry>,
+    edit_mod: Res<crate::EditModifierRes>,
     mut pools: ResMut<crate::PoolStock>,
     mut prov: ResMut<PoolProvenance>,
     mut flow: ResMut<FlowMatrix>,
@@ -310,8 +311,18 @@ pub(crate) fn mineralize(
             split[BudgetChannel::Maintenance as usize] + split[BudgetChannel::Defense as usize];
         let remainder = g - respired_meta; // >= 0 (split_budget conserves; both slices <= g)
                                            // Of the remainder, mineralize_rate permille → free_nutrient; the residual is respired inefficiency.
-        let mineralized = ((remainder as u128 * u128::from(strat.mineralize_rate))
+        let mut mineralized = ((remainder as u128 * u128::from(strat.mineralize_rate))
             / u128::from(fixed::PERMILLE)) as i64;
+        // ADR-017 S6: a committed deep edit also throttles MINERALIZATION (a gltA/TCA KO impairs the carbon
+        // processing that mints free_nutrient — the second F4 seam in the proposal). The SAME per-species
+        // `[0.5,1.5]` factor scales the mint; the throttled J falls back into `respired_residual` (computed below
+        // as the remainder minus the reduced mint), so the books still close. GATED on non-neutral so a no-edit
+        // run is byte-identical (the mineralize mint is unchanged → the pinned hash is unmoved).
+        let edit_factor_q = edit_mod.factor_q(r.species);
+        if edit_factor_q != crate::EDIT_FACTOR_NEUTRAL_Q {
+            mineralized = ((mineralized as u128 * u128::from(edit_factor_q))
+                / u128::from(fixed::PERMILLE)) as i64;
+        }
         let respired_residual = remainder - mineralized;
 
         // Mint mineralized J into the SAME cell's free_nutrient, capped → overflow (never silent clamp).
