@@ -27,6 +27,7 @@ pub mod ledger;
 pub mod resource;
 pub mod snapshot;
 pub mod soil;
+pub mod trophic;
 
 pub use climate::EnvParams;
 pub use det::derive_seed;
@@ -98,7 +99,7 @@ struct BaseGrowthRate(f64);
 /// once at reset but UNREAD by selection (the F2 keystone) until F3 funds metabolism from the budget — so it
 /// stays hash-neutral, proven by the unchanged pinned literal.
 #[allow(dead_code)]
-struct SpeciesEntry {
+pub(crate) struct SpeciesEntry {
     name: String,
     /// The species DATA key (mirrors [`RosterEntry::key`]) — read ONLY by the read-only [`Simulation::observe_all`]
     /// display projection so the renderer can route its per-species glyph; never a `SimRng` input, never folded
@@ -108,7 +109,7 @@ struct SpeciesEntry {
     gp_map: gp::OntologyMap,
     base_growth: f64,
     target_pop: u32,
-    strategy: gp::Strategy,
+    pub(crate) strategy: gp::Strategy,
 }
 
 /// The ordered set of species in the run (ADR R3-A). Indexed by [`SpeciesId`] (= the `Vec` position); NEVER a
@@ -118,8 +119,8 @@ struct SpeciesEntry {
 /// `#[allow(dead_code)]` until R3-B reads `entries` from the per-species selection/observe systems.
 #[derive(Resource)]
 #[allow(dead_code)]
-struct SpeciesRegistry {
-    entries: Vec<SpeciesEntry>,
+pub(crate) struct SpeciesRegistry {
+    pub(crate) entries: Vec<SpeciesEntry>,
 }
 
 /// A species to seed the run with (the boundary builds these from JSON; the core stays filesystem-free, inv #2).
@@ -166,7 +167,7 @@ struct ResourceFieldRes(resource::ResourceField);
 /// iteration order. OrgIds are NEVER reused (a slot index could repeat across a despawn+spawn and silently
 /// re-pair a lineage); births always mint a fresh, larger id.
 #[derive(Component, Clone, Copy)]
-struct OrgId(u64);
+pub(crate) struct OrgId(pub(crate) u64);
 
 /// Ordinal id of a species in the [`SpeciesRegistry`] (= its `Vec` index). `Ord`/`Hash` so the per-species
 /// Wright-Fisher (R3-B) can sort + fold by `(SpeciesId, OrgId)` without a second edit (ADR R3-A).
@@ -194,17 +195,13 @@ const CELL_J_SCALE: i64 = 1_000;
 /// Per-cell hard ceiling on any single `PoolStock` channel (`light`/`free_nutrient`/`detritus`). Influx /
 /// excretion past this routes the spill to [`ledger::Ledger::overflow`] (never silently clamped). Sized above
 /// the max seed (`UNIT_SCALE * CELL_J_SCALE = 65_535_000`) with headroom for accumulation.
-const POOL_CAP: i64 = 200_000_000;
+pub(crate) const POOL_CAP: i64 = 200_000_000;
 
 /// Per-cell solar `J` minted into `PoolStock.light` each tick by [`solar_influx`] — but only up to the cell's
 /// static `ResourceField.light` carrying-cap (so a bright cell refills, a dark cell stays poor). The ONLY
 /// source of new `J` (the INFLUX tap). free_nutrient regen toward its target is also booked as INFLUX at F3 (a
 /// documented open tap, closed endogenously by the F4 plant→detritus→decomposer→free_nutrient loop).
 const SOLAR_PER_CELL: i64 = 40_000;
-
-/// free_nutrient regen minted per tick toward the cell's static `ResourceField.free_nutrient` cap (the F3
-/// documented-open INFLUX tap; F4 makes it endogenous). Smaller than solar — nutrients are scarcer.
-const NUTRIENT_REGEN_PER_CELL: i64 = 8_000;
 
 /// Uptake saturation: the Monod-like `uptake = (Vmax·S)/(K_half + S)` taps a channel hard at high stock and
 /// gently at low stock. `VMAX` is the per-org-per-tick ceiling at infinite stock (scaled by demand); `K_HALF`
@@ -237,13 +234,13 @@ const OFFSPRING_ENDOWMENT: i64 = 400_000;
 
 /// The child's initial structural [`Biomass`], carved OUT of the [`OFFSPRING_ENDOWMENT`] (the rest seeds the
 /// child's Energy reserve). Conserved.
-const OFFSPRING_SEED_BIOMASS: i64 = 100_000;
+pub(crate) const OFFSPRING_SEED_BIOMASS: i64 = 100_000;
 
 /// Per-org Energy cap (ADR-013 F3). Convert/uptake past this routes to [`ledger::Ledger::overflow`].
 const ENERGY_CAP: i64 = 4_000_000;
 
 /// Per-org Biomass cap (ADR-013 F3). Growth past this routes to [`ledger::Ledger::overflow`].
-const BIOMASS_CAP: i64 = 4_000_000;
+pub(crate) const BIOMASS_CAP: i64 = 4_000_000;
 
 /// Trophic-efficiency NUMERATOR/DENOMINATOR (`EFF_NUM/EFF_DEN < 1`): the fraction of CONVERTED uptake that is
 /// KEPT; the residual `granted − Σ(kept)` is RESPIRED (computed as a residual, never an independent divide that
@@ -251,6 +248,24 @@ const BIOMASS_CAP: i64 = 4_000_000;
 const EFF_NUM: i64 = 7;
 /// Trophic-efficiency denominator (see [`EFF_NUM`]).
 const EFF_DEN: i64 = 10;
+
+/// **LITTERFALL** fraction NUMERATOR/DENOMINATOR (ADR-013 F4): of an AUTOTROPH's convert-RESPIRED inefficiency
+/// carbon, this fraction is instead shed to the cell `detritus` pool every tick (a living canopy rains litter
+/// even without death) — the second plant→detritus arm beside the F3 carcass deposit. Computed as a fraction
+/// of the already-floored respired residual (never an independent divide that double-floors a quantum), so the
+/// move stays a paired respired↔detritus split that conserves J. Only Autotrophs litter (decomposers shed
+/// nothing — their loss is the mineralization respired tap).
+const LITTERFALL_NUM: i64 = 4;
+/// Litterfall denominator (see [`LITTERFALL_NUM`]) — 40% of the respired inefficiency becomes detritus.
+const LITTERFALL_DEN: i64 = 10;
+
+/// **LIEBIG nutrient-limitation reference** (ADR-013 F4): the per-cell `free_nutrient` stock at which an
+/// Autotroph's LIGHT uptake is UN-throttled (gate = 1000 permille). Below it, light demand scales DOWN linearly
+/// (nutrients limit photosynthesis), so when `free_nutrient` drains toward 0 — the fate of every cell once the
+/// decomposer is gone — the plant's light uptake collapses and it starves. The obligate-loop teeth. Set high
+/// (above the per-cell seed) so the gate is ALWAYS proportional to local nutrient → decomposer mineralization
+/// CONTINUOUSLY raises nearby plant productivity (a legible, measurable coupling rather than a cliff).
+const NUTRIENT_LIMIT_REF: i64 = 40_000;
 
 /// Allocator guard (inv #6): a HARD ceiling on total live population, set FAR above any resource-supportable
 /// equilibrium so it is provably NEVER hit in the pinned config (the `max_population_is_never_hit` test).
@@ -279,12 +294,12 @@ struct DrawCount(u64);
 /// hashed state) and summed into [`ledger::LiveTotal::pools`]. Never a `HashMap` (inv #3) — indexed by
 /// `cell_index = y*width + x`.
 #[derive(Resource)]
-struct PoolStock {
-    width: u32,
-    height: u32,
-    light: Vec<i64>,
-    free_nutrient: Vec<i64>,
-    detritus: Vec<i64>,
+pub(crate) struct PoolStock {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) light: Vec<i64>,
+    pub(crate) free_nutrient: Vec<i64>,
+    pub(crate) detritus: Vec<i64>,
 }
 
 impl PoolStock {
@@ -321,14 +336,14 @@ impl PoolStock {
 /// [`ENERGY_CAP`]; any uptake/convert overflow past the cap is routed to [`ledger::Ledger::overflow`], never
 /// silently clamped. RNG-free in the recurring path — only births draw from `SimRng`.
 #[derive(Component, Clone, Copy)]
-struct Energy(i64);
+pub(crate) struct Energy(pub(crate) i64);
 
 /// Per-organism STRUCTURAL mass as an integer joule quantum (ADR-013 F3). Body size: uptake DEMAND scales with
 /// Biomass (bigger bodies eat more), Growth-slice joules accrue here, and on death the residual Biomass (plus
 /// residual Energy) deposits to the cell's `detritus` pool (carcass→detritus, conserving `J`). Capped at
 /// [`BIOMASS_CAP`]; overflow past the cap is routed to [`ledger::Ledger::overflow`]. Folded into `hash_world`.
 #[derive(Component, Clone, Copy)]
-struct Biomass(i64);
+pub(crate) struct Biomass(pub(crate) i64);
 
 /// Per-organism AGE in ticks (ADR-013 F3). Incremented once per tick (in [`metabolism`]); at [`AGE_MAX`] the
 /// organism dies of senescence (a HARD ceiling at F3; soft age→maintenance coupling is deferred). Folded into
@@ -359,16 +374,16 @@ struct ThermalTol(f64);
 /// only `Position` entering `hash_world` re-pins the hash). Inherited + dispersed by [`selection`] (S-B) so
 /// lineages cluster into emergent regions. Lives ONLY in the core (invariant #2).
 #[derive(Component, Clone, Copy)]
-struct Position {
-    x: u32,
-    y: u32,
+pub(crate) struct Position {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
 }
 
 /// Which species an organism belongs to (ADR R3-A). Heritable — offspring inherit their parent's species (R3-B);
 /// assigned at SPAWN from the registry ordinal, NEVER from `SimRng` (zero `next_u64`, the `Position` off-stream
 /// precedent), so tagging organisms is hash-neutral (not folded into `hash_world` at R3-A).
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
-struct Species(SpeciesId);
+pub(crate) struct Species(pub(crate) SpeciesId);
 
 /// Canonical world grid for per-organism positions (ADR-011). Equal to `soil::SOIL_DIMS` so an organism's
 /// cell maps 1:1 onto a soil cell (no resample for future local-soil coupling). The render snapshot resamples
@@ -439,7 +454,7 @@ fn advance_tick(mut tick: ResMut<Tick>) {
 /// The cell index of a [`Position`] on the [`PoolStock`] grid (`y*width + x`), the canonical sort key's first
 /// field. With `WORLD_DIMS == RESOURCE_DIMS` (asserted at reset) `Position` maps 1:1 to a pool cell — no
 /// resample. Pure integer (inv #3).
-fn cell_index(p: &Position, width: u32) -> u32 {
+pub(crate) fn cell_index(p: &Position, width: u32) -> u32 {
     p.y * width + p.x
 }
 
@@ -454,7 +469,7 @@ pub(crate) fn unit_f64(x: u64) -> f64 {
 /// (`[0,1000]`, the org's demand on this channel) — pure `u128`, no float/RNG (inv #3). `S` is the FROZEN
 /// start-of-tick stock. Returns the org's DEMAND on the channel (granted is apportioned later if the cell is
 /// contended).
-fn monod_demand(stock: i64, demand_permille: u64) -> i64 {
+pub(crate) fn monod_demand(stock: i64, demand_permille: u64) -> i64 {
     if stock <= 0 || demand_permille == 0 {
         return 0;
     }
@@ -475,12 +490,14 @@ fn monod_demand(stock: i64, demand_permille: u64) -> i64 {
 /// 3. CONVERTs the granted `J` via [`fixed::split_budget`] (Growth→Biomass, Reproduction/Acquisition→Energy,
 ///    Maintenance/Defense→respired), with a trophic-efficiency residual respired (finding #7);
 /// 4. EXCRETEs the inefficiency carbon to the cell `detritus` pool; caps route overflow (never silent clamp).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn metabolism(
     registry: Res<SpeciesRegistry>,
     soil_field: Res<SoilFieldRes>,
     climate_field: Res<ClimateFieldRes>,
     mut pools: ResMut<PoolStock>,
+    mut prov: ResMut<trophic::PoolProvenance>,
+    mut flow: ResMut<trophic::FlowMatrix>,
     mut ledger: ResMut<ledger::Ledger>,
     mut q: Query<(
         &OrgId,
@@ -562,9 +579,14 @@ fn metabolism(
             (
                 1,
                 frozen_nutrient[cell],
+                // ADR-013 F4: AUTOTROPHS draw free_nutrient (via affinity[1], the GrowthRate anchor) — the
+                // obligate-loop demand side. With the free_nutrient INFLUX arm deleted, this nutrient comes
+                // ONLY from decomposer mineralization, so a plant DEPENDS on the decomposer.
                 matches!(
                     role,
-                    gp::TrophicRole::Heterotroph | gp::TrophicRole::Mixotroph
+                    gp::TrophicRole::Autotroph
+                        | gp::TrophicRole::Heterotroph
+                        | gp::TrophicRole::Mixotroph
                 ),
             ),
             (
@@ -576,6 +598,15 @@ fn metabolism(
                 ),
             ),
         ];
+        // ADR-013 F4 LIEBIG CO-LIMITATION: an AUTOTROPH can only USE light to the extent free_nutrient is also
+        // available in its cell (nutrients limit photosynthesis — the obligate-loop teeth). The integer ratio
+        // `min(1, frozen_nutrient/NUTRIENT_LIMIT_REF)` (permille) GATES the plant's LIGHT demand pre-apportion.
+        // When the decomposer is dead, free_nutrient drains to 0 → the gate → 0 → the plant's light uptake →
+        // 0 → it starves. Conserving (demand-side only; ungated light stays in the pool). Non-Autotrophs
+        // (or non-light channels) are ungated (ratio = 1000).
+        let nutrient_limit = ((frozen_nutrient[cell].max(0) as u128 * u128::from(fixed::PERMILLE))
+            / u128::from(NUTRIENT_LIMIT_REF as u64))
+        .min(u128::from(fixed::PERMILLE)) as u64;
         for (c, stock, taps_channel) in taps {
             if !taps_channel {
                 continue;
@@ -586,7 +617,11 @@ fn metabolism(
             let aff_permille =
                 (u64::from(aff[c]) * u64::from(fixed::PERMILLE)) / u64::from(fixed::UNIT_SCALE);
             let p = u64::from(fixed::PERMILLE);
-            let dp = acq * aff_permille / p * body_factor / p * it.match_permille / p;
+            let mut dp = acq * aff_permille / p * body_factor / p * it.match_permille / p;
+            // Liebig gate on the Autotroph LIGHT channel only (c == 0).
+            if c == 0 && role == gp::TrophicRole::Autotroph {
+                dp = dp * nutrient_limit / p;
+            }
             demand[i][c] = monod_demand(stock, dp.min(p));
         }
     }
@@ -618,6 +653,17 @@ fn metabolism(
                 for (k, share) in shares.iter().enumerate() {
                     granted[i + k][c] = *share;
                     taken += *share;
+                    // ADR-013 F4: a free_nutrient (channel 1) uptake is attributed to the decomposer that
+                    // MINTED it (PoolProvenance) → flow[plant][decomposer]. Per-org so the apportion over
+                    // minting species is exact; the abiotic seed fraction records no edge.
+                    if c == 1 && *share > 0 {
+                        prov.withdraw_nutrient(
+                            cellu,
+                            items[i + k].species as usize,
+                            *share,
+                            &mut flow,
+                        );
+                    }
                 }
                 pool_channel_mut(&mut pools, c)[cellu] -= taken; // decrement live pool ONCE
             }
@@ -632,7 +678,12 @@ fn metabolism(
     for (i, it) in items.iter().enumerate() {
         by_org.insert(it.org, granted[i].iter().sum());
     }
-    for (id, sp, mut energy, mut biomass, mut age, _d, _t, _p) in q.iter_mut() {
+    // Per-org litterfall deposits, COLLECTED here (the q.iter_mut() walk is arbitrary order) and applied to the
+    // shared detritus pool in a SEPARATE canonical (cell, SpeciesId, OrgId) pass so the cap-overflow routing is
+    // order-pinned (ADR-013 F4, adversarial #2).
+    let mut litterfall: std::collections::BTreeMap<u64, (u32, u16, i64)> =
+        std::collections::BTreeMap::new();
+    for (id, sp, mut energy, mut biomass, mut age, _d, _t, p) in q.iter_mut() {
         age.0 = age.0.saturating_add(1);
         let granted_total = match by_org.get(&id.0) {
             Some(&g) if g > 0 => g,
@@ -661,11 +712,38 @@ fn metabolism(
         let (new_e, e_over) = credit_capped(energy.0, kept_energy, ENERGY_CAP);
         energy.0 = new_e;
 
-        ledger.respired += respired_convert;
+        // ADR-013 F4 LITTERFALL: an AUTOTROPH sheds a fraction of its convert-respired inefficiency to detritus
+        // (a living canopy rains litter even without death). A residual SPLIT of the already-floored respired
+        // value (no double-floor): `litter` → detritus, `respired_convert − litter` → respired. Decomposers
+        // shed nothing here (their loss is the mineralization respired tap).
+        let litter = if strat.role == gp::TrophicRole::Autotroph {
+            respired_convert * LITTERFALL_NUM / LITTERFALL_DEN
+        } else {
+            0
+        };
+        ledger.respired += respired_convert - litter;
         ledger.overflow += b_over + e_over;
+        if litter > 0 {
+            litterfall.insert(id.0, (cell_index(p, width), sp.0 .0, litter));
+        }
     }
-    // No live-excretion deposit at F3: ALL convert loss is RESPIRED (the documented F3 sink). The detritus pool
-    // grows only via carcass deposits in `reproduce_or_die` (the live detritus source until the F4 decomposer).
+    // Apply litterfall deposits in canonical (cell, SpeciesId, OrgId) order (the BTreeMap is OrgId-keyed; sort
+    // the rows by (cell, species, org) so a cap-saturation spill is order-pinned — adversarial #2). Each is a
+    // paired respired↔detritus split that conserves J; provenance tags the depositing species (the FlowMatrix
+    // attributes the decomposer's later harvest of it to this plant).
+    let mut litter_rows: Vec<(u32, u16, u64, i64)> = litterfall
+        .into_iter()
+        .map(|(org, (cell, sp, amt))| (cell, sp, org, amt))
+        .collect();
+    litter_rows.sort_unstable_by_key(|r| (r.0, r.1, r.2));
+    for (cell, sp, _org, amt) in litter_rows {
+        let cellu = cell as usize;
+        let headroom = (POOL_CAP - pools.detritus[cellu]).max(0);
+        let accepted = amt.min(headroom);
+        pools.detritus[cellu] += accepted;
+        prov.deposit_detritus(cellu, sp as usize, accepted);
+        ledger.overflow += amt - accepted; // detritus cap spill → overflow (nets out)
+    }
 }
 
 /// One organism's metabolism row in canonical `(cell, species, org)` order.
@@ -698,7 +776,7 @@ struct ReproRow {
 }
 
 /// Immutable per-channel pool plane (`0` light, `1` free_nutrient, `2` detritus).
-fn pool_channel(pools: &PoolStock, ch: usize) -> &[i64] {
+pub(crate) fn pool_channel(pools: &PoolStock, ch: usize) -> &[i64] {
     match ch {
         0 => &pools.light,
         1 => &pools.free_nutrient,
@@ -707,7 +785,7 @@ fn pool_channel(pools: &PoolStock, ch: usize) -> &[i64] {
 }
 
 /// Mutable per-channel pool plane (see [`pool_channel`]).
-fn pool_channel_mut(pools: &mut PoolStock, ch: usize) -> &mut [i64] {
+pub(crate) fn pool_channel_mut(pools: &mut PoolStock, ch: usize) -> &mut [i64] {
     match ch {
         0 => &mut pools.light,
         1 => &mut pools.free_nutrient,
@@ -726,11 +804,14 @@ fn credit_capped(value: i64, amount: i64, cap: i64) -> (i64, i64) {
     }
 }
 
-/// **SOLAR INFLUX** (ADR-013 F3) — the ONLY source of new `J` (the INFLUX tap). Mints [`SOLAR_PER_CELL`] into
-/// each cell's `PoolStock.light` up to the static `ResourceField.light` carrying-cap (×`CELL_J_SCALE`), and
-/// [`NUTRIENT_REGEN_PER_CELL`] into `free_nutrient` up to its static cap (the F3 documented-open nutrient tap;
-/// F4 makes it endogenous). Per-cell cap-saturation spill routes to OVERFLOW (the influx is BOOKED in full,
-/// the rejected part booked to overflow, so it nets out — finding #7). Pure integer, ZERO `SimRng` (inv #3).
+/// **SOLAR INFLUX** (ADR-013 F3→F4) — the ONLY source of new `J` (the INFLUX tap). Mints [`SOLAR_PER_CELL`]
+/// into each cell's `PoolStock.light` up to the static `ResourceField.light` carrying-cap (×`CELL_J_SCALE`).
+/// Per-cell cap-saturation spill routes to OVERFLOW (the influx is BOOKED in full, the rejected part booked to
+/// overflow, so it nets out — finding #7). Pure integer, ZERO `SimRng` (inv #3).
+///
+/// **ADR-013 F4: the `free_nutrient` INFLUX arm is DELETED here.** Solar light is the only true source;
+/// `free_nutrient` is now ENDOGENOUS, supplied ONLY by decomposer mineralization of shed detritus (see
+/// [`trophic::mineralize`]) — the obligate plant→detritus→decomposer→free_nutrient loop.
 fn solar_influx(
     field: Res<ResourceFieldRes>,
     mut pools: ResMut<PoolStock>,
@@ -742,16 +823,6 @@ fn solar_influx(
         let light_cap = (i64::from(fixed::to_unit_u16(f64::from(field.0.light[c]))) * CELL_J_SCALE)
             .min(POOL_CAP);
         mint_to_cap(&mut pools.light[c], SOLAR_PER_CELL, light_cap, &mut ledger);
-        // free_nutrient: regen toward the static nutrient cap (the documented F3-open INFLUX tap).
-        let nutrient_cap = (i64::from(fixed::to_unit_u16(f64::from(field.0.free_nutrient[c])))
-            * CELL_J_SCALE)
-            .min(POOL_CAP);
-        mint_to_cap(
-            &mut pools.free_nutrient[c],
-            NUTRIENT_REGEN_PER_CELL,
-            nutrient_cap,
-            &mut ledger,
-        );
     }
 }
 
@@ -789,6 +860,7 @@ fn reproduce_or_die(
     mut next_id: ResMut<NextOrgId>,
     registry: Res<SpeciesRegistry>,
     mut pools: ResMut<PoolStock>,
+    mut prov: ResMut<trophic::PoolProvenance>,
     mut ledger: ResMut<ledger::Ledger>,
     mut q: Query<(
         Entity,
@@ -849,6 +921,9 @@ fn reproduce_or_die(
             let headroom = (POOL_CAP - pools.detritus[cellu]).max(0);
             let accepted = residual.min(headroom);
             pools.detritus[cellu] += accepted;
+            // ADR-013 F4: tag the carcass detritus with the dead org's species so a decomposer's later harvest
+            // of it attributes flow[decomposer][this-species] in the FlowMatrix (the obligate-loop edge).
+            prov.deposit_detritus(cellu, r.species as usize, accepted);
             ledger.overflow += residual - accepted; // detritus cap spill → overflow (finding #5)
             dead.push(r.entity);
         }
@@ -1281,21 +1356,35 @@ impl Simulation {
         // (folded into hash_world so a birth-enumeration off-by-one breaks the hash locally).
         world.insert_resource(NextOrgId(next_org_id));
         world.insert_resource(DrawCount::default());
-        // The multi-species spine (ADR R3-A): the ordered species registry. Now READ by the F3 pipeline
-        // (metabolism/maintenance read each species' cached Strategy).
+        // ADR-013 F4: the MEASURED S×S FlowMatrix (per-generation, reset each tick) + the per-cell, per-species
+        // PoolProvenance ledger that attributes detritus/free_nutrient flow. Sized to the registry length; the
+        // FlowMatrix is folded into `hash_world` (a measurement off already-hashed pools/orgs), the provenance
+        // ledger is not (it is internal bookkeeping the matrix is derived from).
+        let species_count = entries.len();
+        let cells = (resource::RESOURCE_DIMS.0 as usize) * (resource::RESOURCE_DIMS.1 as usize);
+        world.insert_resource(trophic::FlowMatrix::zeroed(species_count));
+        world.insert_resource(trophic::PoolProvenance::new(cells, species_count));
+        // The multi-species spine (ADR R3-A): the ordered species registry. Now READ by the F3/F4 pipeline
+        // (metabolism/mineralize read each species' cached Strategy).
         world.insert_resource(SpeciesRegistry { entries });
 
         let mut schedule = Schedule::default();
-        // Explicit, single-threaded ordering — the determinism backbone (ADR-002, ADR-013 F3). The integer
-        // pipeline: advance → solar_influx (INFLUX tap) → metabolism (uptake/convert/excrete, RNG-free) →
-        // reproduce_or_die (maintenance debit + death FIRST + birth — the ONLY SimRng consumer) →
-        // measure_and_assert_ledger (LAST: closes the books every tick).
+        // Explicit, single-threaded ordering — the determinism backbone (ADR-002, ADR-013 F3/F4). The integer
+        // pipeline: advance → reset_flow (zero the per-gen FlowMatrix) → solar_influx (light INFLUX tap;
+        // free_nutrient is now endogenous) → metabolism (uptake/convert/excrete + litterfall + free_nutrient
+        // provenance, RNG-free) → mineralize (the F4 decomposer detritus→free_nutrient loop + FlowMatrix
+        // harvest record) → reproduce_or_die (maintenance debit + death FIRST + birth — the ONLY SimRng
+        // consumer; carcass→detritus provenance) → assert_flow_closes (row-sum==0) → measure_and_assert_ledger
+        // (LAST: closes the books every tick).
         schedule.add_systems(
             (
                 advance_tick,
+                trophic::reset_flow,
                 solar_influx,
                 metabolism,
+                trophic::mineralize,
                 reproduce_or_die,
+                trophic::assert_flow_closes,
                 measure_and_assert_ledger,
             )
                 .chain(),
@@ -1515,6 +1604,18 @@ impl Simulation {
         *self.world.resource::<ledger::Ledger>()
     }
 
+    /// The MEASURED per-generation [`FlowMatrix`](trophic::FlowMatrix) as `(s, flat_row_major_i64)` (ADR-013
+    /// F4). `flat[i*s + j]` = NET joules that flowed FROM species `j` INTO species `i` THIS generation
+    /// (row-sum==0 by construction). Read-only — a pure projection of the current recorded matrix, drawing no
+    /// RNG and mutating nothing. The renderer's relations heatmap reads exactly this contract via the
+    /// `LiveSim::flow_matrix()` passthrough. (The matrix itself IS folded into the determinism hash, but
+    /// READING it here cannot perturb the run.)
+    #[must_use]
+    pub fn flow_matrix(&self) -> (usize, Vec<i64>) {
+        let fm = self.world.resource::<trophic::FlowMatrix>();
+        (fm.s(), fm.flat().to_vec())
+    }
+
     /// Mutate the **species** genome with access to the run's single seeded RNG, then re-express the
     /// `BaseGrowthRate` so the edit changes subsequent selection dynamics (SPEC §4; invariant #2, #3, #6).
     ///
@@ -1702,6 +1803,12 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
             pools.detritus.clone(),
         )
     };
+    // ADR-013 F4: fold the MEASURED FlowMatrix into the hash in fixed (row-major) order. A measurement derived
+    // from already-hashed pools/orgs adds no NEW information, but it is folded explicitly so a flow-recording
+    // regression breaks the hash LOCALLY (the row-sum==0 + ledger gates are the semantic authority). Hash-load-
+    // bearing as of the F4 re-pin; off `hash_world` it rode until now.
+    let flow_flat: Vec<i64> = world.resource::<trophic::FlowMatrix>().flat().to_vec();
+    let flow_s = world.resource::<trophic::FlowMatrix>().s() as u64;
     // Fold in one final RNG word to capture stream advancement.
     let final_word = world.resource_mut::<SimRng>().0.next_u64();
 
@@ -1729,6 +1836,11 @@ fn hash_world(world: &mut World, config: &SimConfig, allele_freq: f64) -> u64 {
         for v in plane {
             v.hash(&mut h);
         }
+    }
+    // ADR-013 F4: the MEASURED FlowMatrix, folded in fixed row-major order (dimension first).
+    flow_s.hash(&mut h);
+    for v in &flow_flat {
+        v.hash(&mut h);
     }
     let led = world.resource::<ledger::Ledger>();
     led.initial_total.hash(&mut h);
@@ -1774,12 +1886,15 @@ mod tests {
         // `272a…0cf5` after ADR-013 F3 (energy-funded births/deaths replace constant-N Wright-Fisher; PoolStock
         // i64 uptake/convert/excrete; ledger closes every tick; metabolism RNG draw deleted → births sole RNG
         // consumer; Biomass+Age folded; OrgId→u64).
+        // `42fe…360d` after ADR-013 F4 (obligate plant→detritus→decomposer→free_nutrient loop; free_nutrient
+        // influx deleted → endogenous; E. coli re-roled Decomposer; emergent FlowMatrix S×S folded into hash;
+        // ledger still closes).
         let cfg = SimConfig {
             seed: 13_679_457_532_755_275_413,
             generations: 50,
             entity_count: 1000,
         };
-        assert_eq!(run_headless(&cfg).hash, 0x272a_9b4a_7023_0cf5);
+        assert_eq!(run_headless(&cfg).hash, 0x42fe_54f2_f6d8_360d);
     }
 
     #[test]
@@ -2817,6 +2932,386 @@ mod tests {
         );
         assert_eq!(empty.populated_cells, 0);
         assert_eq!(empty.mean, 0.0);
+    }
+
+    // ── ADR-013 F4: the obligate trophic loop + measured FlowMatrix ──────────────────────────────────
+
+    /// A synthetic genome whose single parameter expresses a chosen activity (`[0,1]`) on every trait the test
+    /// maps to it. Used to drive a Decomposer's `affinity[2]` (GlucoseUptake) + `mineralize_rate`
+    /// (AcetateOverflow) AND a plant's GrowthRate to known nonzero values without the 136-gene ecoli bake.
+    fn anchor_genome(value: f64) -> Genome {
+        Genome {
+            version: 2,
+            loci: vec![genome::Locus {
+                id: genome::LocusId(0),
+                name: "anchor".to_string(),
+                sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                parameters: vec![genome::Parameter {
+                    id: genome::ParamId(0),
+                    value: genome::ParamValue::Numeric {
+                        value,
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                }],
+                tags: genome::OntologyTags {
+                    so_term: genome::SoTermId(704),
+                    go_refs: vec![],
+                },
+            }],
+        }
+    }
+
+    /// A trait map binding every named trait to locus 0 / param 0 (the synthetic anchor). Lets one genome value
+    /// drive the plant uptake/growth anchors AND the decomposer detritus/mineralize anchors.
+    fn anchor_map(traits: &[Trait]) -> gp::OntologyMap {
+        gp::OntologyMap::new(gp::TraitMap(
+            traits
+                .iter()
+                .map(|&t| gp::TraitBinding {
+                    trait_: t,
+                    locus: gp::LocusSelector::ByIndex(genome::LocusId(0)),
+                    param: genome::ParamId(0),
+                })
+                .collect(),
+        ))
+    }
+
+    /// A 2-species obligate-loop roster: a PLANT (Autotroph, draws free_nutrient via GrowthRate, sheds litter)
+    /// plus a DECOMPOSER (taps detritus via GlucoseUptake-affinity, mineralizes via AcetateOverflow). `decomp`
+    /// toggles whether the decomposer species is present (for the kill-the-decomposer baseline).
+    fn obligate_roster(decomp: bool) -> Vec<RosterEntry> {
+        // A plant with a real Acquisition budget (LeafSize → Acquisition + light affinity) whose LIGHT uptake is
+        // Liebig-gated by free_nutrient (NUTRIENT_LIMIT_REF). With the free_nutrient INFLUX arm deleted, that
+        // nutrient comes ONLY from the decomposer — so the decomposer CONTINUOUSLY raises plant productivity,
+        // and killing it drains free_nutrient → throttles the gate → starves the plants. All five plant channel
+        // anchors bind to the single 0.9 anchor (a vigorous autotroph).
+        let mut roster = vec![RosterEntry {
+            name: "plant".to_string(),
+            key: "plant".to_string(),
+            genome: anchor_genome(0.9),
+            gp_map: anchor_map(&[
+                Trait::LeafSize,
+                Trait::GrowthRate,
+                Trait::Fecundity,
+                Trait::DroughtTolerance,
+                Trait::Reflectance,
+            ]),
+            entity_count: 3000,
+            role: gp::TrophicRole::Autotroph,
+        }];
+        if decomp {
+            roster.push(RosterEntry {
+                name: "decomposer".to_string(),
+                key: "decomposer".to_string(),
+                // Decomposer anchors: GlucoseUptake (detritus affinity), AcetateOverflow (mineralize_rate),
+                // plus budget anchors so it has a metabolism. High activity → a vigorous mineralizer.
+                genome: anchor_genome(0.9),
+                gp_map: anchor_map(&[
+                    Trait::GlucoseUptake,
+                    Trait::AcetateOverflow,
+                    Trait::GrowthRate,
+                    Trait::FermentationCapacity,
+                    Trait::RespirationMode,
+                ]),
+                entity_count: 3000,
+                role: gp::TrophicRole::Decomposer,
+            });
+        }
+        roster
+    }
+
+    /// Σ free_nutrient over all cells of the live PoolStock (the plant-available pool the loop feeds).
+    fn total_free_nutrient(sim: &Simulation) -> i64 {
+        sim.world.resource::<PoolStock>().free_nutrient.iter().sum()
+    }
+
+    /// Drain the seeded free_nutrient pool to ZERO (and book the removed J off the ledger's `initial_total`, so
+    /// the books still close). Models a world that seeds with NO plant-available nutrient — so free_nutrient is
+    /// PURELY endogenous (decomposer-minted), making the obligate loop's teeth visible at a tractable scale (the
+    /// 37-billion-J seed otherwise dwarfs the per-tick mineralization signal). Test-only.
+    fn drain_seeded_free_nutrient(sim: &mut Simulation) {
+        let removed: i64 = {
+            let pools = sim.world.resource::<PoolStock>();
+            pools.free_nutrient.iter().sum()
+        };
+        {
+            let mut pools = sim.world.resource_mut::<PoolStock>();
+            for v in &mut pools.free_nutrient {
+                *v = 0;
+            }
+        }
+        // The world simply started with `removed` fewer joules — adjust initial_total so the ledger still closes.
+        sim.world.resource_mut::<ledger::Ledger>().initial_total -= removed;
+    }
+
+    /// Live count of a given species (by registry ordinal).
+    fn species_pop(sim: &mut Simulation, sid: u16) -> usize {
+        sim.world
+            .query::<&Species>()
+            .iter(&sim.world)
+            .filter(|s| **s == Species(SpeciesId(sid)))
+            .count()
+    }
+
+    #[test]
+    fn f4_flow_matrix_rows_sum_to_zero_over_a_real_run() {
+        // The relation-conservation analogue of ledger_closes: after a multi-generation obligate-loop run, EVERY
+        // row of the MEASURED FlowMatrix sums to zero (the diagonal-pairing identity). Per-tick the in-chain
+        // assert_flow_closes already guards this; here we cross-check the final exported matrix explicitly.
+        let cfg = SimConfig {
+            seed: 71,
+            generations: 30,
+            entity_count: 600,
+        };
+        let mut sim =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        sim.step(cfg.generations);
+        let (s, flat) = sim.flow_matrix();
+        assert_eq!(s, 2, "two-species roster → 2×2 matrix");
+        assert_eq!(flat.len(), s * s);
+        for i in 0..s {
+            let row: i64 = (0..s).map(|j| flat[i * s + j]).sum();
+            assert_eq!(row, 0, "row {i} must sum to zero by construction");
+        }
+    }
+
+    #[test]
+    fn f4_obligate_loop_decomposer_mineralizes_free_nutrient() {
+        // With the free_nutrient INFLUX arm deleted, free_nutrient is ENDOGENOUS — ONLY the decomposer mints it.
+        // A run WITH a decomposer must end with strictly MORE free_nutrient than a run WITHOUT one (which can
+        // only drain its seed). The decomposer↔plant mutualism also shows as both FlowMatrix off-diagonals
+        // going nonzero when the loop runs.
+        let cfg = SimConfig {
+            seed: 19,
+            generations: 60,
+            entity_count: 600,
+        };
+        let mut with =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        drain_seeded_free_nutrient(&mut with);
+        with.step(cfg.generations);
+        let mut without =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+        drain_seeded_free_nutrient(&mut without);
+        without.step(cfg.generations);
+        assert!(
+            total_free_nutrient(&with) > total_free_nutrient(&without),
+            "the decomposer must mint free_nutrient: with {} vs without {}",
+            total_free_nutrient(&with),
+            total_free_nutrient(&without)
+        );
+        // Without a decomposer, free_nutrient stays at the drained zero (no mint, no influx arm).
+        assert_eq!(
+            total_free_nutrient(&without),
+            0,
+            "no decomposer + no influx arm ⇒ free_nutrient never appears"
+        );
+        // The obligate-loop edges are live: the decomposer harvested plant detritus (flow[1][0] != 0) and/or
+        // the plant drew decomposer-minted free_nutrient (flow[0][1] != 0).
+        let (s, flat) = with.flow_matrix();
+        assert_eq!(s, 2);
+        let any_edge = flat[1] != 0 || flat[s] != 0; // flow[0][1] (row 0 col 1) or flow[1][0] (row 1 col 0)
+        assert!(
+            any_edge,
+            "the plant↔decomposer FlowMatrix off-diagonals must be nonzero when the loop runs"
+        );
+    }
+
+    #[test]
+    fn f4_killing_the_decomposer_starves_the_plants() {
+        // OBLIGATE: kill the decomposer → free_nutrient drains to a dead minimum and the plant population ends
+        // BELOW the with-decomposer baseline (its only nutrient source is gone). Deterministic.
+        let cfg = SimConfig {
+            seed: 23,
+            generations: 150,
+            entity_count: 600,
+        };
+        let mut with =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        drain_seeded_free_nutrient(&mut with);
+        with.step(cfg.generations);
+        let mut without =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+        drain_seeded_free_nutrient(&mut without);
+        without.step(cfg.generations);
+        let plants_with = species_pop(&mut with, 0);
+        let plants_without = species_pop(&mut without, 0);
+        assert!(
+            plants_without < plants_with,
+            "no decomposer ⇒ plants starve: plants without {plants_without} vs with {plants_with}"
+        );
+        // And the no-decomposer world's free_nutrient stays at the drained zero (only drainage, no mint).
+        assert_eq!(
+            total_free_nutrient(&without),
+            0,
+            "without a mineralizer, free_nutrient never reappears"
+        );
+    }
+
+    #[test]
+    fn f4_mineralize_rate_is_gene_driven() {
+        // The pta/AcetateOverflow CRISPRi ripple lever: a decomposer with a HIGHER mineralize_rate mints MORE
+        // free_nutrient than one with a low rate, all else equal. Drives the rate off the genome (not a const).
+        let cfg = SimConfig {
+            seed: 37,
+            generations: 35,
+            entity_count: 600,
+        };
+        let roster = || {
+            vec![
+                RosterEntry {
+                    name: "plant".to_string(),
+                    key: "plant".to_string(),
+                    genome: anchor_genome(0.9),
+                    gp_map: anchor_map(&[
+                        Trait::LeafSize,
+                        Trait::GrowthRate,
+                        Trait::Fecundity,
+                        Trait::DroughtTolerance,
+                        Trait::Reflectance,
+                    ]),
+                    entity_count: 400,
+                    role: gp::TrophicRole::Autotroph,
+                },
+                RosterEntry {
+                    name: "decomposer".to_string(),
+                    key: "decomposer".to_string(),
+                    // GlucoseUptake (detritus affinity) HIGH + fixed; AcetateOverflow (mineralize_rate) = activity.
+                    genome: anchor_genome(0.9),
+                    gp_map: gp::OntologyMap::new(gp::TraitMap(vec![
+                        gp::TraitBinding {
+                            trait_: Trait::GlucoseUptake,
+                            locus: gp::LocusSelector::ByIndex(genome::LocusId(0)),
+                            param: genome::ParamId(0),
+                        },
+                        // AcetateOverflow reads locus 1 (the throttle); bind growth so it still breeds.
+                        gp::TraitBinding {
+                            trait_: Trait::AcetateOverflow,
+                            locus: gp::LocusSelector::ByIndex(genome::LocusId(1)),
+                            param: genome::ParamId(0),
+                        },
+                        gp::TraitBinding {
+                            trait_: Trait::GrowthRate,
+                            locus: gp::LocusSelector::ByIndex(genome::LocusId(0)),
+                            param: genome::ParamId(0),
+                        },
+                    ])),
+                    entity_count: 1500,
+                    role: gp::TrophicRole::Decomposer,
+                },
+            ]
+        };
+        // Build a decomposer genome with a SECOND locus carrying the mineralize throttle activity.
+        let with_throttle = |roster: Vec<RosterEntry>, throttle: f64| -> Vec<RosterEntry> {
+            roster
+                .into_iter()
+                .map(|mut e| {
+                    if e.role == gp::TrophicRole::Decomposer {
+                        e.genome.loci.push(genome::Locus {
+                            id: genome::LocusId(1),
+                            name: "pta".to_string(),
+                            sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                            parameters: vec![genome::Parameter {
+                                id: genome::ParamId(0),
+                                value: genome::ParamValue::Numeric {
+                                    value: throttle,
+                                    min: 0.0,
+                                    max: 1.0,
+                                },
+                            }],
+                            tags: genome::OntologyTags {
+                                so_term: genome::SoTermId(704),
+                                go_refs: vec![],
+                            },
+                        });
+                    }
+                    e
+                })
+                .collect()
+        };
+        let mut hi = Simulation::reset_with_roster(
+            &cfg,
+            &EnvParams::default(),
+            with_throttle(roster(), 0.9),
+        );
+        drain_seeded_free_nutrient(&mut hi);
+        hi.step(cfg.generations);
+        let mut lo = Simulation::reset_with_roster(
+            &cfg,
+            &EnvParams::default(),
+            with_throttle(roster(), 0.1),
+        );
+        drain_seeded_free_nutrient(&mut lo);
+        lo.step(cfg.generations);
+        // The high-mineralize_rate decomposer mints strictly more free_nutrient than the throttled one.
+        assert!(
+            total_free_nutrient(&hi) > total_free_nutrient(&lo),
+            "a higher pta/mineralize_rate mints more free_nutrient: hi {} vs lo {}",
+            total_free_nutrient(&hi),
+            total_free_nutrient(&lo)
+        );
+    }
+
+    #[test]
+    fn f4_flow_matrix_is_deterministic_under_shuffled_roster_seed() {
+        // The FlowMatrix is a MEASUREMENT in canonical (cell, SpeciesId, OrgId) order, so two identical runs
+        // produce byte-identical matrices AND hashes (it rides the deterministic sorted-Vec order, never the
+        // archetype/Query order). Two resets of the same roster+seed must match exactly.
+        let cfg = SimConfig {
+            seed: 55,
+            generations: 25,
+            entity_count: 600,
+        };
+        let mut a =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        a.step(cfg.generations);
+        let mut b =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        b.step(cfg.generations);
+        assert_eq!(
+            a.flow_matrix(),
+            b.flow_matrix(),
+            "FlowMatrix is deterministic"
+        );
+        assert_eq!(
+            a.run_stats().hash,
+            b.run_stats().hash,
+            "the F4 run hash is reproducible"
+        );
+    }
+
+    #[test]
+    fn f4_ledger_closes_every_tick_in_the_obligate_loop() {
+        // The mineralize move is a paired detritus-debit / (free_nutrient-credit + RESPIRED-tap) — it must
+        // CONSERVE J. Drive the obligate loop and cross-check the books close against the live total (the
+        // per-tick assert already guards it; this asserts the final state explicitly).
+        let cfg = SimConfig {
+            seed: 91,
+            generations: 45,
+            entity_count: 600,
+        };
+        let mut sim =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        sim.step(cfg.generations);
+        let pools_total = sim.world.resource::<PoolStock>().total();
+        let (mut e, mut b) = (0i64, 0i64);
+        for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
+            e += energy.0;
+            b += biomass.0;
+        }
+        let live = ledger::LiveTotal {
+            pools: pools_total,
+            energy: e,
+            biomass: b,
+            chem: 0,
+        };
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "the obligate-loop ledger must close: live {} vs expected {}",
+            live.sum(),
+            sim.ledger().expected_total()
+        );
     }
 
     #[cfg(feature = "proptest")]

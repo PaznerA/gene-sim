@@ -46,6 +46,12 @@ pub struct Niche {
     /// Parent species key — RESERVED for fork/speciation provenance (ADR-017).
     #[serde(default)]
     pub parent_key: Option<String>,
+    /// Trophic role override (ADR-013 F4): one of
+    /// `"autotroph"`|`"heterotroph"`|`"mixotroph"`|`"decomposer"` (case-insensitive at the boundary).
+    /// `None` ⇒ the boundary falls back to `gp::role_for(key)` — byte-neutral for every existing spec
+    /// (serde default). E. coli sets `"decomposer"` to close the obligate plant→detritus→microbe loop.
+    #[serde(default)]
+    pub trophic_role: Option<String>,
 }
 
 /// A genome as data: a model version + ordered loci.
@@ -97,6 +103,10 @@ pub struct BuiltSpecies {
     pub key: String,
     pub name: String,
     pub entity_count: u32,
+    /// Trophic role override carried verbatim from `niche.trophic_role` (ADR-013 F4). `None` ⇒ the roster
+    /// boundary uses `gp::role_for(key)`. Inert DATA in this crate — resolved to a `gp::TrophicRole` only at
+    /// the sim-core boundary (this crate has no dependency on `sim-core`, inv #2).
+    pub trophic_role: Option<String>,
     pub genome: Genome,
 }
 
@@ -206,6 +216,7 @@ impl SpeciesSpec {
             key: self.key.clone(),
             name: self.name.clone(),
             entity_count: self.niche.entity_count,
+            trophic_role: self.niche.trophic_role.clone(),
             genome,
         })
     }
@@ -279,6 +290,31 @@ mod tests {
         let back: SpeciesSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, spec);
         assert_eq!(back.build().expect("build").genome, g);
+    }
+
+    #[test]
+    fn niche_trophic_role_serde_default_is_none() {
+        // ADR-013 F4: the new `trophic_role` field is serde-default `None`, so every existing spec (no such
+        // key in its `niche` block) deserializes byte-neutrally — the override is opt-in DATA.
+        let n = Niche::default();
+        assert_eq!(n.trophic_role, None);
+        // A niche JSON WITHOUT the key still parses (default None) — proves existing specs are unaffected.
+        let json = r#"{ "entity_count": 5, "description": "x" }"#;
+        let parsed: Niche = serde_json::from_str(json).expect("niche parses without trophic_role");
+        assert_eq!(parsed.trophic_role, None);
+    }
+
+    #[test]
+    fn niche_trophic_role_override_round_trips_and_reaches_built_species() {
+        // The override is carried verbatim from `niche.trophic_role` into the BuiltSpecies (inert DATA in this
+        // crate — resolved to a role only at the sim-core boundary, inv #2).
+        let mut spec = SpeciesSpec::from_genome(&crate::sample_genome(), "ecoli-core", "E. coli");
+        spec.niche.trophic_role = Some("decomposer".to_string());
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let back: SpeciesSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.niche.trophic_role.as_deref(), Some("decomposer"));
+        let built = back.build().expect("build");
+        assert_eq!(built.trophic_role.as_deref(), Some("decomposer"));
     }
 
     #[test]

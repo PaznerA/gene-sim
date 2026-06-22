@@ -6,7 +6,8 @@
     "entity_count": 800,
     "description": "BiGG e_coli_core roster \u00d7 CDS GCF_000005845.2 ASM584v2 (NCBI, public domain) \u00d7 curated GO MF. 136 genes. BiGG model carries the UCSD academic non-commercial clause; only the b-number roster is used here (GPR/stoichiometry live in the Ring-1 sidecar).",
     "temp_optimum": 0.62,
-    "parent_key": null
+    "parent_key": null,
+    "trophic_role": "decomposer"
   },
   "genome": {
     "version": 2,

@@ -130,6 +130,7 @@ candidates (F5 chem-field design, S8 vector-DB sidecar design) — always design
   - [x] 2 plan BATCH 3 — authored `species-observation-widening-impl` (hash-neutral impl, lights up the panels) + `ecoli-oversight-gameloop-design`🔁 (ADR-017 S4/S5 earned-edit loop design); wrote BATCH 3 queue into §3; scheduled cron `1c70c685` (2026-06-22 22:04).
 - 2026-06-22 ~04:2x CEST — **BATCH 2 COMPLETE.** ui-panels-and-relations-view PASS (commit `64a7c9c`, gate GREEN, pure renderer → hash-neutral). BATCH 3 authored + scheduled. Literal `0xf795_eac4_112f_acd5` still held; zero re-pins merged across batches 1+2. Branch `auto/night-2026-06-21`, no pushes, main untouched. F3/F4 re-pin packages still await human sign-off.
 - 2026-06-22 (foreground, user-directed) — **F3 KEYSTONE LANDED — first deliberate RE-PIN of the session.** `f3-metabolism-keystone-impl` implemented the eb18034 design for real: PoolStock i64 uptake→convert→excrete (metabolism now RNG-free), energy-funded reproduce_or_die replacing constant-N Wright-Fisher (population emergent), Biomass+Age, carcass→detritus, ledger.closes() asserted every tick (under `--features determinism`), OrgId→u64, MaxPopulation guard (never hit). **Re-pin `0xf795_eac4_112f_acd5` → `0x272a_9b4a_7023_0cf5`**; run-to-run stable across 3 processes + check_determinism.sh; FULL GATE GREEN. ⚠ multi-ISA portability pending CI on push (single-arch local). **F3.4 follow-ups (tracked, not blockers):** (a) untuned chemostat constants → default pop slides to extinction ~gen 240, needs a SOLAR/UPTAKE/MAINTENANCE/REPRO tuning sweep for a bounded non-zero equilibrium; (b) `shipped_intro_campaign_is_solvable` `#[ignore]`d — its solution journals assumed the deleted Genotype selection, need re-authoring for F3 energetics.
+- 2026-06-22 (foreground) — **F4 LANDED — second deliberate RE-PIN.** `f4-trophic-decomposer-impl`: new `trophic.rs` (mineralize + FlowMatrix with diagonal-pairing so row-sum==0 by construction + PoolProvenance), free_nutrient INFLUX deleted → endogenous (Liebig co-limitation gates autotroph light demand by local nutrient = the obligate-loop teeth), litterfall + carcass→detritus provenance-tagged, E. coli re-roled Decomposer via `niche.trophic_role` (serde-default, byte-neutral) + `mineralize_rate` gene-anchored on pta/GO-8959. FlowMatrix folded into hash + read-only `LiveSim::flow_matrix()` so the BATCH-2 Relations heatmap is LIVE. Schedule: advance→reset_flow→solar_influx→metabolism→mineralize→reproduce_or_die→assert_flow_closes→measure_and_assert_ledger. **Re-pin `0x272a_9b4a_7023_0cf5` → `0x42fe_54f2_f6d8_360d`**; run-to-run stable across 5+ processes (debug/release/determinism); FULL GATE GREEN; 3/3 skeptics confirmed (row-sum==0, measured-not-fabricated, integer/ordered, obligate-loop real, ledger closes). ⚠ multi-ISA pending CI. Note: obligate-loop "teeth" tests use a test-only seed-drain so the per-tick signal beats the 37-billion-J seeded pools — reinforces that F3.4 tuning (pool seed vs flow scale) is needed for a balanced shipped ecosystem.
 
 ---
 
@@ -141,3 +142,33 @@ When the human returns:
    multi-ISA CI gate; **sign off the F3 then F4 re-pins** (these are the only blocked merges).
 3. Smoke-test the Godot build (`./run.sh`) for the liveliness + relations UI.
 4. Anything tagged `RED:`/`BLOCKED:` in §4 is the human's first fix target.
+
+## 6. END STATE — finish the roadmap, then MERGE + plan continuation (user directive 2026-06-22)
+
+> User: "Až proběhnou všechny batches, dokončíš i F4 a celou plánovanou roadmapu, tak rovnou merge a plán
+> na pokračování ve vývoji." → finish everything, then **merge `auto/night-2026-06-21` → `main`** and write a
+> continuation roadmap. This SUPERSEDES §5's "human signs off the re-pins" — re-pins are now executed (see §0.1).
+
+**Remaining queue to DONE** (driven in the FOREGROUND; the chain self-continues on each workflow-completion
+notification — the 22:04 BATCH 3 cron was CANCELLED to avoid a double-run). On a fresh/resumed session, restart
+from the first unchecked item:
+1. F4 impl+re-pin — `f4-trophic-decomposer-impl` (running, `wg5tk6vne`). Second deliberate re-pin (`0x272a…` → new).
+2. `species-observation-widening-impl` — hash-neutral; lights up the per-species panel "—" placeholders.
+3. **Chemostat tuning pass (F3.4+F4)** — find constants for a bounded NON-ZERO equilibrium (default pop currently
+   slides to extinction ~gen 240) → re-pin. TIME-BOXED: if not cleanly findable, merge anyway and make it
+   continuation item #1 (don't let an open-ended sweep block the merge).
+4. `ecoli-oversight-gameloop-design` — design-only; the player-agency payoff.
+
+**MERGE protocol** (when 1–4 done + full gate GREEN):
+- Push branch `auto/night-2026-06-21` → CI runs the x86_64+aarch64 multi-ISA matrix to VALIDATE the F3+F4 (+tuning)
+  re-pins cross-platform — the one thing not provable on a single local arch.
+- CI multi-ISA green → merge to `main` (`--no-ff`) → push main. **Never merge an unvalidated re-pin to main**
+  (keeps main's determinism gate green). If CI diverges → fix the stray float/isize/HashMap/rounding first.
+
+**CONTINUATION roadmap** (write in full at merge time; seed):
+- F3.4 chemostat balance (if not done) + re-author `shipped_intro_campaign_is_solvable` for F3 energetics.
+- ADR-013 F5 chemical/signal diffusion field (toxin/kin/alarm); GSS2→GSS3 snapshot bump.
+- ADR-017 S4/S5/S6 OVERSIGHT game-loop IMPL (after its design lands): earned E. coli edits ripple via the F4 loop;
+  the load-bearing EcoliEditModifier wire (S6 re-pin).
+- ADR-017 S8 relations vector-DB sidecar (sqlite-vec, view-only) over the now-live FlowMatrix.
+- A 3rd species (predator / Bdellovibrio) for a fuller trophic web (FlowMatrix gains real off-diagonals).

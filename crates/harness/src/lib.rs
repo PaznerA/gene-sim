@@ -233,6 +233,17 @@ impl GeneSimEnv {
             .observe_all()
     }
 
+    /// The MEASURED per-generation FlowMatrix as `(s, flat_row_major_i64)` (ADR-013 F4 — delegates to
+    /// [`sim_core::Simulation::flow_matrix`]; panics if called before `reset`). Read-only: a pure projection of
+    /// the recorded matrix (no RNG draw, no mutation). The renderer's relations heatmap reads this contract.
+    #[must_use]
+    pub fn flow_matrix(&self) -> (usize, Vec<i64>) {
+        self.sim
+            .as_ref()
+            .expect("GeneSimEnv::flow_matrix called before reset")
+            .flow_matrix()
+    }
+
     /// A read-only, derived per-cell [`sim_core::GridSnapshot`] of the current state (delegates to
     /// [`sim_core::Simulation::snapshot`]; panics if called before `reset`).
     ///
@@ -316,7 +327,9 @@ impl Env for GeneSimEnv {
                     genome: b.genome.clone(),
                     gp_map: OntologyMap::new(trait_map_for(&b.key)),
                     entity_count: cfg.entity_count,
-                    role: sim_core::gp::role_for(&b.key),
+                    // ADR-013 F4: honour the spec's `niche.trophic_role` override (E. coli → Decomposer),
+                    // falling back to `role_for(key)` when absent/unrecognized (the DATA-driven role seam).
+                    role: sim_core::gp::role_from_override(b.trophic_role.as_deref(), &b.key),
                 }],
             ),
             None => Simulation::reset_with_env(&cfg, &self.env),

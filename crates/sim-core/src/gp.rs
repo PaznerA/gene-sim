@@ -279,15 +279,39 @@ impl Default for TrophicRole {
 
 /// Map a species `key` → its trophic role. An ordered `match` exactly parallel to [`trait_map_for`] — the
 /// SAME key-dispatch seam already proven for [`TraitMap`] selection. Pure, never a `HashMap` (inv #3); an
-/// unknown/missing key degrades safely to the plant default. (F4 will flip `"ecoli-core" => Decomposer` for
-/// the obligate plant→detritus→E. coli loop, and an optional `Niche.trophic_role` JSON field will override
-/// this when present — both additive, deferred to keep the F2 diff one-crate.)
+/// unknown/missing key degrades safely to the plant default. ADR-013 F4 flips `"ecoli-core" => Decomposer`
+/// for the obligate plant→detritus→E. coli loop; a `Niche.trophic_role` JSON field can OVERRIDE this per spec
+/// via [`role_from_override`] (the data-driven path the boundary uses).
 #[must_use]
 pub fn role_for(key: &str) -> TrophicRole {
     match key {
-        "ecoli-core" => TrophicRole::Heterotroph,
+        "ecoli-core" => TrophicRole::Decomposer,
         _ => TrophicRole::Autotroph,
     }
+}
+
+/// Resolve a `niche.trophic_role` string into a [`TrophicRole`] (ADR-013 F4 — the DATA-driven role override).
+/// Case-insensitive, ordered `match` (never a `HashMap`, inv #3). An unknown/empty string degrades to
+/// [`role_for`] — so a typo can never silently zero a species' niche; it falls back to the key default.
+#[must_use]
+pub fn role_from_str(s: &str) -> Option<TrophicRole> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "autotroph" => Some(TrophicRole::Autotroph),
+        "heterotroph" => Some(TrophicRole::Heterotroph),
+        "mixotroph" => Some(TrophicRole::Mixotroph),
+        "decomposer" => Some(TrophicRole::Decomposer),
+        _ => None,
+    }
+}
+
+/// The role the boundary assigns a species: the `niche.trophic_role` OVERRIDE when present + recognized,
+/// else [`role_for`] of the key (ADR-013 F4). The single seam the JSON→roster boundary uses, keeping the role
+/// CATEGORICAL data (inv: never derived from genome scalars), so a CRISPR edit can't flip it.
+#[must_use]
+pub fn role_from_override(override_role: Option<&str>, key: &str) -> TrophicRole {
+    override_role
+        .and_then(role_from_str)
+        .unwrap_or_else(|| role_for(key))
 }
 
 /// The five conserved metabolic-budget channels (ADR-013 §Decision pillar 2, DECISIONS.md:537), in fixed
@@ -338,6 +362,12 @@ pub struct Strategy {
     /// [`crate::resource::RESOURCE_CHANNELS`] (light, free_nutrient, detritus). NOT a simplex — a preference
     /// profile.
     pub affinity: [u16; crate::resource::RESOURCE_CHANNELS],
+    /// Per-org MINERALIZATION fraction in permille `[0, 1000]` (ADR-013 F4): of a Decomposer's granted
+    /// detritus-J, the share re-deposited into the SAME cell's `free_nutrient` (the rest is RESPIRED as the
+    /// decomposer's own metabolism). Anchored on [`Trait::AcetateOverflow`] (pta, GO-8959 — the Layer-3
+    /// detritus/mineralization tap), so a `pta` CRISPRi Knockdown throttles per-org mineralization. Read ONLY
+    /// by the F4 `mineralize` system for a Decomposer; inert for every other role.
+    pub mineralize_rate: u16,
 }
 
 /// The channel→anchor-trait pairing (declaration-ordered, parallel to [`BudgetChannel::ALL`]). Each channel's
@@ -411,16 +441,26 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
         [v[0], v[1], v[2], v[3], v[4]]
     };
     // Affinity: a PREFERENCE profile (NOT a simplex), 1:1 with RESOURCE_CHANNELS (light, free_nutrient,
-    // detritus). LeafSize → light, GrowthRate → free_nutrient, detritus left 0.0 until F4 gives it meaning.
+    // detritus). LeafSize → light (plant light-capture), GrowthRate → free_nutrient (autotroph uptake),
+    // GlucoseUptake → detritus (ADR-013 F4: the decomposer detritus-pull, anchored on ptsG/GO-8982 — absent
+    // for a plant genome → 0.0, present for E. coli). All three quantized through the audited f64→int chokepoint.
     let affinity: [u16; crate::resource::RESOURCE_CHANNELS] = [
         fixed::to_unit_u16(p.get(Trait::LeafSize).unwrap_or(0.0).clamp(0.0, 1.0)),
         fixed::to_unit_u16(p.get(Trait::GrowthRate).unwrap_or(0.0).clamp(0.0, 1.0)),
-        fixed::to_unit_u16(0.0),
+        fixed::to_unit_u16(p.get(Trait::GlucoseUptake).unwrap_or(0.0).clamp(0.0, 1.0)),
     ];
+    // Mineralization fraction (ADR-013 F4): AcetateOverflow → pta (GO-8959), the gene-driven share of granted
+    // detritus-J a Decomposer re-deposits as free_nutrient. Quantized [0,1]→u16, then expressed as PERMILLE so
+    // it index-aligns with the budget grid. Absent for a plant genome (→ 0), so it is inert off a Decomposer.
+    let mineralize_rate = ((u64::from(fixed::to_unit_u16(
+        p.get(Trait::AcetateOverflow).unwrap_or(0.0).clamp(0.0, 1.0),
+    )) * u64::from(fixed::PERMILLE))
+        / u64::from(fixed::UNIT_SCALE)) as u16;
     Strategy {
         budget,
         role,
         affinity,
+        mineralize_rate,
     }
 }
 
@@ -637,12 +677,110 @@ mod tests {
         let s = express_strategy(&plant_map, &g, TrophicRole::Autotroph);
         assert_eq!(s.budget, [200, 240, 160, 200, 200], "pinned plant budget");
         assert_eq!(s.role, TrophicRole::Autotroph);
+        // ADR-013 F4: detritus affinity (slot 2) anchors on GlucoseUptake — absent for the plant genome → 0;
+        // mineralize_rate anchors on AcetateOverflow — also absent for a plant → 0 (inert off a Decomposer).
         assert_eq!(s.affinity, [32767, 39321, 0], "pinned plant affinity");
+        assert_eq!(
+            s.mineralize_rate, 0,
+            "plant has no AcetateOverflow → mineralize_rate 0"
+        );
         // E. coli role pin (its budget is the uniform fallback over sample_genome — anchors don't match).
         let ecoli_map = OntologyMap::new(ecoli_trait_map());
-        let se = express_strategy(&ecoli_map, &g, TrophicRole::Heterotroph);
-        assert_eq!(se.role, TrophicRole::Heterotroph);
+        let se = express_strategy(&ecoli_map, &g, TrophicRole::Decomposer);
+        assert_eq!(se.role, TrophicRole::Decomposer);
         assert_eq!(se.budget, [200, 200, 200, 200, 200]);
+    }
+
+    #[test]
+    fn f4_decomposer_mineralize_rate_and_detritus_affinity_are_gene_driven() {
+        // ADR-013 F4: a Decomposer's detritus affinity comes from GlucoseUptake (ptsG) and its mineralize_rate
+        // from AcetateOverflow (pta). A synthetic map binding BOTH to a known value drives them off the genome —
+        // proving the F4 levers are gene-driven (a pta/ptsG CRISPRi edit moves them), not constants.
+        let g = Genome {
+            version: 2,
+            loci: vec![genome::Locus {
+                id: LocusId(0),
+                name: "anchor".to_string(),
+                sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                parameters: vec![genome::Parameter {
+                    id: ParamId(0),
+                    value: genome::ParamValue::Numeric {
+                        value: 0.5,
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                }],
+                tags: genome::OntologyTags {
+                    so_term: genome::SoTermId(704),
+                    go_refs: vec![],
+                },
+            }],
+        };
+        let b = |t| TraitBinding {
+            trait_: t,
+            locus: LocusSelector::ByIndex(LocusId(0)),
+            param: ParamId(0),
+        };
+        let map = OntologyMap::new(TraitMap(vec![
+            b(Trait::GlucoseUptake),
+            b(Trait::AcetateOverflow),
+        ]));
+        let s = express_strategy(&map, &g, TrophicRole::Decomposer);
+        // GlucoseUptake=0.5 → detritus affinity = to_unit_u16(0.5) = 32767.
+        assert_eq!(
+            s.affinity[2], 32767,
+            "detritus affinity tracks GlucoseUptake (ptsG)"
+        );
+        // AcetateOverflow=0.5 → mineralize_rate = to_unit_u16(0.5)*1000/65535 = 32767*1000/65535 = 499 permille.
+        assert_eq!(
+            s.mineralize_rate, 499,
+            "mineralize_rate tracks AcetateOverflow (pta)"
+        );
+        // Knock the pta anchor down → mineralize_rate falls (the CRISPRi ripple lever).
+        let mut g_ko = g.clone();
+        if let genome::ParamValue::Numeric { value, .. } = &mut g_ko.loci[0].parameters[0].value {
+            *value = 0.1;
+        }
+        let s_ko = express_strategy(&map, &g_ko, TrophicRole::Decomposer);
+        assert!(
+            s_ko.mineralize_rate < s.mineralize_rate,
+            "knocking down pta/AcetateOverflow lowers mineralize_rate ({} -> {})",
+            s.mineralize_rate,
+            s_ko.mineralize_rate
+        );
+    }
+
+    #[test]
+    fn role_from_override_and_str_resolve() {
+        // ADR-013 F4: the DATA-driven role override. A recognized string wins; an unknown/empty/None falls back
+        // to role_for(key) — so a typo can never silently zero a niche.
+        assert_eq!(role_from_str("decomposer"), Some(TrophicRole::Decomposer));
+        assert_eq!(
+            role_from_str("AutoTroph"),
+            Some(TrophicRole::Autotroph),
+            "case-insensitive"
+        );
+        assert_eq!(
+            role_from_str("  mixotroph "),
+            Some(TrophicRole::Mixotroph),
+            "trimmed"
+        );
+        assert_eq!(role_from_str("nonsense"), None);
+        // Override present + recognized → wins over the key default.
+        assert_eq!(
+            role_from_override(Some("autotroph"), "ecoli-core"),
+            TrophicRole::Autotroph
+        );
+        // Override absent → role_for(key): ecoli-core defaults to Decomposer at F4.
+        assert_eq!(
+            role_from_override(None, "ecoli-core"),
+            TrophicRole::Decomposer
+        );
+        // Override unrecognized → falls back to role_for(key).
+        assert_eq!(
+            role_from_override(Some("bogus"), "default"),
+            TrophicRole::Autotroph
+        );
     }
 
     #[test]
@@ -661,7 +799,8 @@ mod tests {
     #[test]
     fn role_for_selects_by_key() {
         // Ordered match (inv #3), parallel to trait_map_for_selects_by_key; unknown key degrades to plant.
-        assert_eq!(role_for("ecoli-core"), TrophicRole::Heterotroph);
+        // ADR-013 F4 flips ecoli-core to Decomposer (the obligate plant→detritus→microbe loop).
+        assert_eq!(role_for("ecoli-core"), TrophicRole::Decomposer);
         assert_eq!(role_for("default"), TrophicRole::Autotroph);
         assert_eq!(role_for("unknown"), TrophicRole::Autotroph);
         assert_eq!(TrophicRole::default(), TrophicRole::Autotroph);

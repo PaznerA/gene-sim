@@ -299,6 +299,31 @@ impl LiveSim {
         arr
     }
 
+    /// The MEASURED per-generation FlowMatrix as `{s: int, j: PackedInt64Array}` (ADR-013 F4 — the relations
+    /// heatmap contract `godot/relations_heatmap.gd` reads). `j` is flat row-major: `j[i*s + j_]` = NET joules
+    /// that flowed FROM species `j_` INTO species `i` this generation (row-sum==0 by construction). Delegates
+    /// to [`harness::GeneSimEnv::flow_matrix`] → [`sim_core::Simulation::flow_matrix`] — a pure read-only
+    /// projection (no RNG, no mutation, no biology computed here, inv #2/#3). Empty (`s:0`) before `reset`.
+    #[func]
+    fn flow_matrix(&self) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        match self.env.as_ref() {
+            Some(env) => {
+                let (s, flat) = env.flow_matrix();
+                d.set("s", s as i64);
+                // Packed arrays pass by-ref into a Dictionary; marshal through a Variant (the `.to_variant()`
+                // pattern used elsewhere in this file for VarArray pushes).
+                d.set("j", &PackedInt64Array::from(flat.as_slice()).to_variant());
+            }
+            None => {
+                godot_error!("LiveSim::flow_matrix called before reset()");
+                d.set("s", 0_i64);
+                d.set("j", &PackedInt64Array::new().to_variant());
+            }
+        }
+        d
+    }
+
     /// Produce the read-only GSS2 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
     ///
     /// Read-only: it never draws from the RNG or mutates state, so taking snapshots cannot change the
