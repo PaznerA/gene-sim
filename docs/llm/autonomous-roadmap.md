@@ -93,6 +93,20 @@ Candidate next units for BATCH 3 (pick by the morning state, most foundational f
 - **ADR-017 S8 — relations vector-DB sidecar (design)**: sqlite-vec at the process boundary (inv #1),
   view-only ANN overlay on top of the on-hash FlowMatrix. The "vector-DB relations" leg of the vision.
 
+### BATCH 3 — fires 2026-06-22 22:04 CEST (`cron 4 22 22 6 *`, one-shot)
+
+Chosen from the morning state: F3/F4 await human sign-off (cannot progress autonomously), so BATCH 3 is
+autonomous-safe work that still advances the vision — one hash-neutral impl that completes the panels, plus the
+earned-edit game-loop design (the player-agency payoff).
+
+| # | Workflow | Goal | Hash | On done |
+|---|----------|------|------|---------|
+| 1 | `species-observation-widening-impl` | per-species population/allele_freq/mean_energy on SpeciesObservation via a read-only ordered pass in observe_all() → the BATCH-2 panel "—" placeholders go live for every species | ✅ neutral | commit if green + ≥2/3 skeptics confirm |
+| 2 | `ecoli-oversight-gameloop-design` 🔁 | ADR-017 S4/S5 earned-edit OVERSIGHT loop + multi-fidelity firewall (due_epoch buffer, RNG-free credit accrual, RequestEcoliEdit/CommitEcoliImpact) DESIGN + hash-neutral Action scaffolding | infra ✅ / wire ✋ | commit docs(+scaffolding) if green; STOP before the load-bearing wire |
+
+After BATCH 3: assess again and, if the human still hasn't signed off F3/F4, queue BATCH 4 from the remaining
+candidates (F5 chem-field design, S8 vector-DB sidecar design) — always design-only / hash-neutral until sign-off.
+
 ---
 
 ## 4. Progress log (append-only; the cron reads this to resume)
@@ -109,7 +123,8 @@ Candidate next units for BATCH 3 (pick by the morning state, most foundational f
 - 2026-06-21 23:2x CEST — **BATCH 1 COMPLETE.** 5/5 workflows, every gate GREEN, determinism literal `0xf795_eac4_112f_acd5` held through all 5 (zero re-pins merged). Commits on `auto/night-2026-06-21`: setup `53fb3d2` → `d7391cf` (ecoli visible) → `42dea23` (F2 strategy) → `eb18034` (F3 design⏸) → `d5906c8` (F4 design⏸) → ui-liveliness (next commit). **Two ⏸ signoff-ready re-pin packages await the human** (F3 births/deaths, F4 trophic coupling). No pushes, main untouched. Batch 2 cron (04:03) stands.
 - 2026-06-22 04:03 CEST — **BATCH 2 START.** Batch 1 confirmed complete (last commit `6d06857`); on branch `auto/night-2026-06-21`, tree clean, literal intact. No resume needed.
   - [x] 1 ui-panels-and-relations-view — **PASS** (gate GREEN; pure renderer — main.gd + new relations_heatmap.gd, ZERO Rust → hash-neutral + inv#2 by construction). Per-species cards (population/allele/fitness, "—" placeholders for not-yet-exported per-species stats), energy/pools block hidden until core exposes it; new 3rd view mode "Relations" = S×S FlowMatrix diverging heatmap reading the F4 contract, degrades to empty/labelled until F4 wires it. NOTE: Layer-B core widening (per-species population/allele/mean_energy on SpeciesObservation, hash-neutral read-only) deferred as a follow-up slice → candidate for BATCH 3.
-  - [ ] 2 plan BATCH 3 (design-only species-logic unit + cron)
+  - [x] 2 plan BATCH 3 — authored `species-observation-widening-impl` (hash-neutral impl, lights up the panels) + `ecoli-oversight-gameloop-design`🔁 (ADR-017 S4/S5 earned-edit loop design); wrote BATCH 3 queue into §3; scheduled cron `1c70c685` (2026-06-22 22:04).
+- 2026-06-22 ~04:2x CEST — **BATCH 2 COMPLETE.** ui-panels-and-relations-view PASS (commit `64a7c9c`, gate GREEN, pure renderer → hash-neutral). BATCH 3 authored + scheduled. Literal `0xf795_eac4_112f_acd5` still held; zero re-pins merged across batches 1+2. Branch `auto/night-2026-06-21`, no pushes, main untouched. F3/F4 re-pin packages still await human sign-off.
 
 ---
 
