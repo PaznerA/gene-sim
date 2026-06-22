@@ -236,7 +236,8 @@ pub struct OversightOutcome {
     /// The complete journaled action stream — exactly what is written to `actions.ndjson` so a replay reproduces
     /// the episode (including the committed impacts, read straight from the journal, NEVER re-solving FBA).
     pub journal: Vec<Action>,
-    /// The final [`sim_core::RunStats::hash`] — at S5 byte-identical to the pinned literal (commits are identity).
+    /// The final [`sim_core::RunStats::hash`]. A neutral/slip-capped commit leaves it at the no-oversight value;
+    /// a committed NON-neutral edit (S6) deterministically moves it (the load-bearing wire). Replay-exact.
     pub hash: u64,
     /// The final credit ledger (for the INSPECT view / tests).
     pub ledger: CreditLedger,
@@ -302,8 +303,14 @@ impl<O: Oracle> OversightEpisode<O> {
         for action in actions {
             match action {
                 Action::Advance(n) => {
-                    journal.push(Action::Advance(*n));
+                    // ADR-017 S6: journal ONE `Advance(1)` per generation, so an epoch-boundary commit is spliced
+                    // at EXACTLY the generation it landed on — a record's `Advance(n)` block whose commit fires
+                    // mid-block (e.g. gen 10 of 15) would otherwise replay with the commit applied AFTER the whole
+                    // block (gen 15), changing WHEN the throttle takes effect → a record≠replay break. Per-gen
+                    // segmentation makes the journal a faithful, replay-exact transcript of when each commit
+                    // applies. (At S5 this was invisible — the commit was a no-op; S6 makes the timing load-bearing.)
                     for _ in 0..*n {
+                        journal.push(Action::Advance(1));
                         self.env.step(Action::Advance(1));
                         self.generation += 1;
                         // Credit accrual: quantize THIS gen, difference the integers vs the previous sample.
@@ -311,7 +318,8 @@ impl<O: Oracle> OversightEpisode<O> {
                         self.ledger
                             .accrue_gen(&self.prev_sample, &now, &self.policy);
                         self.prev_sample = now;
-                        // Epoch boundary? Drain due commits in (species, req_id) order, splice into the journal.
+                        // Epoch boundary? Drain due commits in (species, req_id) order, splice into the journal
+                        // RIGHT HERE so the commit's journal position is the generation it took effect at.
                         self.drain_boundaries_into(&mut journal);
                     }
                 }
@@ -413,7 +421,8 @@ impl<O: Oracle> OversightEpisode<O> {
     }
 
     /// Drain every epoch boundary newly crossed by the current `generation`, splicing the committed impacts into
-    /// `journal` and applying each (an IDENTITY modifier at S5) to the env so the journal stays in step.
+    /// `journal` and applying each to the env (ADR-017 S6: `step` commits the per-species edit factor) so the
+    /// journal stays in step. A NEUTRAL-ratio commit is a no-op; a non-neutral KO throttles the edited species.
     fn drain_boundaries_into(&mut self, journal: &mut Vec<Action>) {
         let current_epoch = epoch_of(self.generation);
         while self.last_drained_epoch < current_epoch {
@@ -421,7 +430,7 @@ impl<O: Oracle> OversightEpisode<O> {
             let epoch = self.last_drained_epoch;
             for commit in self.firewall.drain_epoch(epoch, &self.mailbox) {
                 journal.push(commit.clone());
-                self.env.step(commit); // S5: applies the identity modifier (no-op) — hash unchanged
+                self.env.step(commit); // S6: `step` commits the deep-edit factor (neutral = no-op)
             }
         }
     }

@@ -1,15 +1,21 @@
-//! The FIREWALL determinism acceptance test (ADR-017 S5 deliverable, folded into `tools/gate.sh`).
+//! The FIREWALL determinism acceptance test (ADR-017 S5 deliverable; S6 turns the read coefficient ON).
 //!
 //! Drives the REAL `oversight::OversightEpisode` record→replay path (NOT a hand-rolled buffer) and asserts the
-//! SEVEN properties the design pins. The headline: the OVERSIGHT episode's `RunStats::hash` is byte-identical
-//! whether the oracle is ABSENT, SLOW, PRESENT-returning-A, PRESENT-returning-different-bytes-B, or
-//! NEVER-RETURNING — for the same `(seed, actions)` — UNTIL the impact commits, and (because S5 applies an
-//! IDENTITY modifier, coefficient 1.0) even AFTER. That hash also equals a NO-OVERSIGHT baseline episode's hash,
-//! so the entire firewall + credit economy is hash-neutral by construction.
+//! SEVEN properties the design pins. **S6 (the load-bearing wire) is now LIVE:** a committed non-neutral
+//! `growth_ratio_q` crosses the firewall into the hashed sim as a strictly-positive `[0.5,1.5]` per-species
+//! DEMAND + MINERALIZATION factor, so a real edit MOVES the hash. The firewall's determinism guarantee is no
+//! longer "the committed slot is unread" (the S5 coefficient-zero claim); it is the load-bearing S6 contract:
 //!
-//! The committed slot is WRITTEN to the journal but UNREAD by selection (coefficient zero — the F2-Strategy
-//! expressed-but-unread precedent). S6 (the deliberate 🛑 re-pin, human sign-off) is the only thing that flips
-//! the read coefficient on; this test is written now so S6 INHERITS it.
+//! > The committed payload is a QUANTIZED INTEGER journaled at a fixed `Tick`-counted epoch. WHICH integer
+//! > commits (and at WHICH epoch, within the slip window) is a deterministic function of `(seed, actions, the
+//! > oracle's quantized answer)` ONLY — never of wall-clock arrival. **Replay reads the committed integer
+//! > straight from `actions.ndjson` and reproduces the recorded hash byte-for-byte without ever re-running the
+//! > FBA solve.** An ABSENT/never-returning oracle slips deterministically to the NEUTRAL sentinel (a no-op →
+//! > equals the no-oversight baseline); a PRESENT oracle commits its real factor (deterministic, replay-exact).
+//!
+//! So the S6 invariances are: ABSENT == baseline (slip-to-neutral); each PRESENT oracle is internally
+//! deterministic and replay-exact; and replay NEVER touches the oracle. A non-neutral commit deliberately
+//! differs from baseline — that difference IS the wire working.
 
 use crispr::EditKind;
 use genome::LocusId;
@@ -132,84 +138,99 @@ fn baseline_hash() -> u64 {
     run_with(AbsentOracle, generous_policy(), &advances).hash
 }
 
-/// PROPERTY 1 — PRESENCE/ABSENCE/DIFFERENT-BYTES INVARIANCE. The episode hash is identical for an absent, a
-/// fixed, and a chaotic oracle, AND equals the no-oversight baseline (the committed slot is UNREAD — coefficient
-/// zero, the identity modifier).
+/// PROPERTY 1 — S6 PRESENCE/ABSENCE SEMANTICS. An ABSENT oracle slips deterministically to the NEUTRAL sentinel,
+/// so its hash equals the no-oversight baseline (a neutral commit is a no-op). A PRESENT oracle commits its REAL
+/// quantized factor, which DELIBERATELY moves the hash off the baseline (the wire is load-bearing) — and a
+/// DIFFERENT payload moves it to a DIFFERENT hash (the committed integer is read). Each is internally
+/// deterministic (record run==run).
 #[test]
-fn presence_absence_different_bytes_all_equal_baseline() {
+fn presence_moves_hash_absence_equals_baseline() {
     let base = baseline_hash();
     let absent = run_with(AbsentOracle, generous_policy(), &input_actions()).hash;
     let fake_a = run_with(FakeOracleA, generous_policy(), &input_actions()).hash;
+    let fake_a2 = run_with(FakeOracleA, generous_policy(), &input_actions()).hash;
     let chaos = run_with(ChaosOracle { n: 0 }, generous_policy(), &input_actions()).hash;
 
+    // ABSENT → every request slips to the neutral sentinel → equal to the no-oversight baseline.
     assert_eq!(
         absent, base,
-        "absent oracle must equal the no-oversight baseline"
+        "an absent oracle slips to neutral → equals the no-oversight baseline (no-op commit)"
     );
-    assert_eq!(
+    // PRESENT non-neutral → the committed factor crosses the firewall and MOVES the hash (S6 — the wire works).
+    assert_ne!(
         fake_a, base,
-        "a fixed non-neutral payload (committed) must not move the hash (identity modifier)"
+        "a committed non-neutral factor MUST move the hash (S6 — the read coefficient is on)"
     );
+    // The committed integer is READ: a different payload → a different hash.
+    assert_ne!(
+        fake_a, chaos,
+        "a different committed payload must produce a different hash"
+    );
+    // Still internally deterministic: the same oracle + inputs reproduce the same hash.
     assert_eq!(
-        chaos, base,
-        "a chaotic oracle returning different bytes each call must not move the hash"
+        fake_a, fake_a2,
+        "the same oracle + inputs is deterministic run==run"
     );
 }
 
-/// PROPERTY 2 — WALL-CLOCK / LATENCY INDEPENDENCE. Two episodes that differ ONLY in oracle latency (instant vs a
-/// payload that slips through the firewall) produce the IDENTICAL hash AND the SAME committed journal. There is
-/// no `Instant`/`SystemTime` on the dispatch→commit path (the commit epoch is decided by epoch-counting).
+/// PROPERTY 2 — WALL-CLOCK INDEPENDENCE OF THE RECORDED JOURNAL. The commit epoch is decided by `Tick`-counting,
+/// NOT by which thread message arrives first — so for a FIXED payload the RECORDED journal (the committed
+/// integers AND their epochs/`slipped_from`) is a deterministic function of `(seed, actions)` only, identical
+/// run-to-run, and replay reproduces the hash byte-for-byte. There is no `Instant`/`SystemTime` on the
+/// dispatch→commit path. (A genuinely slipping-but-resolving arrival is exercised by the firewall unit tests
+/// `slow_oracle_slips_with_self_describing_journal`; the slip-to-neutral case is property 5.)
 #[test]
-fn latency_independence_same_hash_and_journal() {
-    // "Instant" arrival: FakeOracleA deposits immediately.
-    let instant = run_with(FakeOracleA, generous_policy(), &input_actions());
-    // "Slow" arrival modeled by an oracle that produces the SAME payload but only after the request would have
-    // slipped at least once — here AbsentOracle forces slip-to-neutral; to compare a SLIP that still resolves,
-    // we use a one-shot delayed oracle that returns the same payload as FakeOracleA but None on the first call.
-    struct DelayedA {
-        seen: std::collections::BTreeSet<u32>,
-    }
-    impl Oracle for DelayedA {
-        fn produce(&mut self, r: u32, _s: u16, _l: u32) -> Option<EcoliImpact> {
-            // Returns None the first time it is asked about a req_id; but the driver only calls produce ONCE per
-            // request at dispatch time, so to genuinely model latency we deposit nothing here and rely on the
-            // firewall's mailbox-empty SLIP. Insert to record we were asked.
-            self.seen.insert(r);
-            None
-        }
-    }
-    // A genuinely slipping-but-resolving case is exercised by the unit tests (firewall::slow_oracle_slips...);
-    // here the load-bearing assertion is that latency cannot change the RECORDED hash. AbsentOracle (the maximal
-    // latency = never) must still equal the instant case's hash, because both commit identity-modifier impacts.
-    let slow = run_with(AbsentOracle, generous_policy(), &input_actions());
-    let delayed = run_with(
-        DelayedA {
-            seen: Default::default(),
-        },
-        generous_policy(),
-        &input_actions(),
-    );
+fn recorded_journal_is_wall_clock_independent_for_a_fixed_payload() {
+    let a = run_with(FakeOracleA, generous_policy(), &input_actions());
+    let b = run_with(FakeOracleA, generous_policy(), &input_actions());
 
+    // The recorded journal — committed integers AND their epochs/slip flags — is byte-identical run-to-run (the
+    // commit timing comes from epoch-counting, never wall-clock).
     assert_eq!(
-        instant.hash, slow.hash,
-        "latency cannot change the hash (identity modifier)"
+        a.journal, b.journal,
+        "a fixed payload records a byte-identical journal (commit epoch is Tick-counted, not wall-clock)"
     );
-    assert_eq!(
-        instant.hash, delayed.hash,
-        "a delayed-then-slipped payload cannot change the hash"
-    );
+    assert_eq!(a.hash, b.hash, "and a deterministic hash");
 
-    // Every variant's journal has the SAME number of committed impacts (one per accepted request) and the same
-    // request/commit structure — solver speed changes neither the result NOR its timing in the journal.
+    // One committed impact per accepted request (the journal terminates with a paired commit for each).
     let count_commits = |o: &harness::oversight::OversightOutcome| {
         o.journal
             .iter()
             .filter(|a| matches!(a, Action::CommitEcoliImpact { .. }))
             .count()
     };
-    assert_eq!(count_commits(&instant), 2);
-    assert_eq!(count_commits(&slow), 2);
-    assert_eq!(count_commits(&delayed), 2);
+    assert_eq!(count_commits(&a), 2);
+
+    // Every committed impact records a deterministic due_epoch (a function of the request generation + lead), so
+    // a slower solver that produced the SAME bytes would record the SAME commit epoch (no wall-clock dependence
+    // within the slip window).
+    let commit_epochs: Vec<(u32, Option<u32>)> = a
+        .journal
+        .iter()
+        .filter_map(|x| match x {
+            Action::CommitEcoliImpact {
+                due_epoch,
+                slipped_from,
+                ..
+            } => Some((*due_epoch, *slipped_from)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        commit_epochs,
+        b.journal
+            .iter()
+            .filter_map(|x| match x {
+                Action::CommitEcoliImpact {
+                    due_epoch,
+                    slipped_from,
+                    ..
+                } => Some((*due_epoch, *slipped_from)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        "the committed epochs are a deterministic function of the Tick stream, not arrival time"
+    );
 }
 
 /// PROPERTY 3 — REPLAY NEVER RE-RUNS FBA. Record an episode (journal with inline-quantized commits) to disk, then
@@ -352,9 +373,10 @@ fn req_id_is_deterministic_across_record_runs() {
 /// Also: a borderline-credit request replays to the SAME accept/refuse decision (the journaled-spend rule).
 #[test]
 fn economy_accrual_is_hash_neutral_and_spend_decision_is_journaled() {
-    // With a NON-zero cost, accrual governs whether requests are affordable. The hash must STILL equal the
-    // baseline (the economy is off-hash; only WHICH requests get journaled changes, and a committed impact is an
-    // identity modifier regardless).
+    // With an UNaffordable cost, every request is refused → NO commits are journaled → the stream is a pure
+    // advance, so the hash equals the no-oversight baseline (the credit economy itself is off-hash — it only
+    // governs WHICH requests get journaled, never folds bytes into `hash_world`). This stays true under S6:
+    // when nothing commits, nothing crosses the firewall.
     let strict = CreditPolicy {
         per_gen_cap: 50,
         ecoli_edit_cost: 1_000_000, // unaffordable — all requests refused

@@ -511,9 +511,10 @@ fn write_episode_snapshots_and_injections(
                 );
                 injections.push((generation, format!("{} @region", edit_label(edit)), applied));
             }
-            // ADR-017 S5 INERT SCAFFOLDING: oversight actions step through as strict no-ops (zero RNG, no
-            // hashed mutation) so a recorded episode containing them replays consistently. They produce no
-            // injection marker today; S5's demo OVERSIGHT episode stamps request→commit on the timeline.
+            // ADR-017 S6: oversight actions step through from the journal. `RequestEcoliEdit` draws zero RNG;
+            // `CommitEcoliImpact` applies the committed deep-edit factor (neutral = no-op) — the committed
+            // INTEGER is read straight from the journal, never re-solving FBA. They produce no injection marker
+            // today; the demo OVERSIGHT episode stamps request→commit on the timeline.
             os @ (Action::RequestEcoliEdit { .. } | Action::CommitEcoliImpact { .. }) => {
                 env.step(os.clone());
             }

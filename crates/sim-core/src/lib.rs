@@ -155,6 +155,100 @@ struct SoilFieldRes(soil::SoilField);
 #[derive(Resource)]
 struct ClimateFieldRes(climate::ClimateField);
 
+/// The per-species DEEP-EDIT modifier (ADR-017 S6 — the load-bearing OVERSIGHT wire). One INTEGER PERMILLE
+/// factor per [`SpeciesId`] (Vec index = ordinal), in the strictly-positive band `[500, 1500]` (`1000` = neutral
+/// `1.0×`). [`metabolism`] reads it as ONE extra demand permille factor for the EDITED species (the same
+/// pre-apportion DEMAND seam the soil/climate `match_permille` rides — never an f64 multiply on the granted-J
+/// path, the F3 invariant), so a committed E. coli knockout deterministically THROTTLES that species' uptake →
+/// it grows less → its population drops → (via the F4 decomposer loop) the ripple reaches the plant.
+///
+/// **DEFAULTS to all-neutral `1000`** so a run with NO committed edit is BYTE-IDENTICAL to the pre-S6 demand
+/// math: a `× 1000/1000` permille factor leaves the single combined-permille product unchanged. NOT folded into
+/// [`hash_world`] (the factor only ever reaches the hash THROUGH its coupling effect on the already-hashed
+/// Energy/Biomass/pools — like soil/climate). So the pinned single-species PLANT config (no edit, all-neutral)
+/// keeps `0x4e4d_0520_722a_a069`; activating a NON-neutral factor is the deliberate re-pin owned by a later
+/// phase (this slice WIRES it but the pinned run never sets a non-neutral factor).
+#[derive(Resource)]
+pub(crate) struct EditModifierRes {
+    /// Per-`SpeciesId` permille factor in `[EDIT_FACTOR_MIN_Q, EDIT_FACTOR_MAX_Q]`; `1000` = neutral. Indexed by
+    /// the species ordinal — an ordered `Vec`, NEVER a `HashMap` iterated in sim logic (inv #3).
+    factor_q: Vec<u16>,
+}
+
+/// Minimum strictly-positive edit factor (permille): a full growth-lethal knockout (`growth_ratio_q == 0`) maps
+/// to `0.5×` demand, a real but bounded penalty (never zero — selection stays strictly positive, ADR-005 spirit).
+pub(crate) const EDIT_FACTOR_MIN_Q: u16 = 500;
+/// Neutral edit factor (permille) — `1.0×`, the demand math is unchanged. A wild-type ratio (`1000`) or a
+/// never-edited species sits here, keeping the no-edit run byte-identical.
+pub(crate) const EDIT_FACTOR_NEUTRAL_Q: u16 = 1000;
+/// Maximum edit factor (permille) — `1.5×`, the ceiling an `Activate` (over-expression) edit lifts demand to.
+pub(crate) const EDIT_FACTOR_MAX_Q: u16 = 1500;
+
+impl EditModifierRes {
+    /// A fresh all-neutral modifier sized to `species_count` (every species `1.0×` until a commit lands).
+    fn neutral(species_count: usize) -> Self {
+        Self {
+            factor_q: vec![EDIT_FACTOR_NEUTRAL_Q; species_count.max(1)],
+        }
+    }
+
+    /// The committed permille factor for `sid` (neutral `1000` for an out-of-range/unedited species).
+    fn factor_q(&self, sid: u16) -> u16 {
+        self.factor_q
+            .get(sid as usize)
+            .copied()
+            .unwrap_or(EDIT_FACTOR_NEUTRAL_Q)
+    }
+}
+
+/// How a committed deep edit acts on transcription (mirrors `crispr::EditKind` / `oracle_fba::EditKind` BY VALUE
+/// so sim-core carries no dependency on either — the same VALUE-only boundary discipline `oracle-fba` uses).
+/// Maps a committed FBA growth-ratio + edit verb to a strictly-positive `[0.5,1.5]` demand factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditEffect {
+    /// Full loss of function — the KO ratio applies directly (a lethal `q==0` → `0.5×`).
+    Knockout,
+    /// Partial loss of function — same monotone map (the ratio is already graded toward WT by the oracle).
+    Knockdown,
+    /// Gain of function — lifts demand ABOVE neutral toward the `1.5×` ceiling.
+    Activate,
+}
+
+/// Map a committed deep-edit impact → a strictly-positive `[500, 1500]` PERMILLE demand factor, **integer /
+/// fixed-point only** (no transcendental), clamped to the band (ADR-017 S6, the pinned mapping):
+///
+/// * `Knockout` / `Knockdown`: `factor_q = EDIT_FACTOR_MIN_Q + (growth_ratio_q · (NEUTRAL − MIN)) / 1000`
+///   — a linear lift off the `0.5×` floor toward `1.0×` neutral. `growth_ratio_q == 1000` (wild-type) → `1000`
+///   (exactly neutral, a no-op); `growth_ratio_q == 0` (lethal KO) → `500` (the strong penalty). Pure `u32`
+///   intermediate, floored ONCE, so it is byte-identical on every platform (the `oracle-fba` quantize contract).
+/// * `Activate`: lifts ABOVE neutral toward the ceiling — `factor_q = NEUTRAL + (growth_ratio_q · (MAX −
+///   NEUTRAL)) / 1000`, so a full-strength activate (`q == 1000`) → `1500` (`1.5×`) and a neutral activate
+///   (`q == 1000` is the over-expression magnitude here) lifts; `q == 0` collapses to neutral.
+///
+/// The result is CLAMPED into `[EDIT_FACTOR_MIN_Q, EDIT_FACTOR_MAX_Q]` so a malformed payload can never escape
+/// the strictly-positive band (selection is never zeroed — the firewall's quantized input is bounded `[0,1000]`
+/// but the clamp is the hard guarantee).
+#[must_use]
+pub fn edit_factor_q(growth_ratio_q: u16, effect: EditEffect) -> u16 {
+    // Clamp the oracle's growth ratio defensively to its `[0,1000]` permille domain before the integer map.
+    let scale = fixed::PERMILLE; // u32 permille denominator (1000)
+    let q = u32::from(growth_ratio_q).min(scale);
+    let neutral = u32::from(EDIT_FACTOR_NEUTRAL_Q);
+    let factor = match effect {
+        // Loss-of-function: lift off the 0.5× floor toward 1.0× as the residual growth ratio rises.
+        EditEffect::Knockout | EditEffect::Knockdown => {
+            let span = neutral - u32::from(EDIT_FACTOR_MIN_Q); // 500
+            u32::from(EDIT_FACTOR_MIN_Q) + (q * span) / scale
+        }
+        // Gain-of-function: lift above 1.0× toward the 1.5× ceiling as the activation magnitude rises.
+        EditEffect::Activate => {
+            let span = u32::from(EDIT_FACTOR_MAX_Q) - neutral; // 500
+            neutral + (q * span) / scale
+        }
+    };
+    factor.clamp(u32::from(EDIT_FACTOR_MIN_Q), u32::from(EDIT_FACTOR_MAX_Q)) as u16
+}
+
 /// The STATIC per-cell resource field (ADR-013 F1→F3): light / free_nutrient / detritus (`f32` `[0,1]`),
 /// generated off the `SimRng` stream. At F3 it is the render/cap/seed SOURCE — [`PoolStock`] is seeded from it
 /// at reset and [`solar_influx`] reads its per-cell carrying caps each tick — while the mutable joule pools
@@ -173,6 +267,22 @@ pub(crate) struct OrgId(pub(crate) u64);
 /// Wright-Fisher (R3-B) can sort + fold by `(SpeciesId, OrgId)` without a second edit (ADR R3-A).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpeciesId(u16);
+
+impl SpeciesId {
+    /// Construct a [`SpeciesId`] from its raw ordinal (the harness firewall carries `species: u16`, ADR-017 S6).
+    /// Public so the env layer can route a committed deep edit to the right registry slot; the inner field stays
+    /// private so a `SpeciesId` is only ever a registry ordinal.
+    #[must_use]
+    pub fn new(ordinal: u16) -> Self {
+        Self(ordinal)
+    }
+
+    /// The raw ordinal (= the [`SpeciesRegistry`] Vec index).
+    #[must_use]
+    pub fn ordinal(self) -> u16 {
+        self.0
+    }
+}
 
 /// Full-scale energy quantum (ADR-013 F0b): one "unit" of organism energy is `ENERGY_FULL` integer joules.
 /// Energy migrates from `f64` to the conserved `i64` currency the CHEMOSTAT-J economy will denominate
@@ -522,6 +632,7 @@ fn metabolism(
     registry: Res<SpeciesRegistry>,
     soil_field: Res<SoilFieldRes>,
     climate_field: Res<ClimateFieldRes>,
+    edit_mod: Res<EditModifierRes>,
     mut pools: ResMut<PoolStock>,
     mut prov: ResMut<trophic::PoolProvenance>,
     mut flow: ResMut<trophic::FlowMatrix>,
@@ -640,6 +751,11 @@ fn metabolism(
             / u128::from(NUTRIENT_LIMIT_REF as u64))
         .min(u128::from(fixed::PERMILLE)) as u64)
             .max(LIEBIG_FLOOR); // SOFT co-limitation: never below the floor (plants survive on light alone).
+                                // ADR-017 S6: the committed deep-edit demand factor for THIS species (permille, `1000` = neutral). A
+                                // knockout/knockdown drops it toward `500` → less demand → less uptake → the edited species grows less.
+                                // GATED on non-neutral so a no-edit run NEVER executes the extra multiply (byte-identical demand math →
+                                // the pinned single-species PLANT hash is unmoved; the factor reaches the hash only THROUGH coupling).
+        let edit_factor_q = edit_mod.factor_q(it.species);
         for (c, stock, taps_channel) in taps {
             if !taps_channel {
                 continue;
@@ -664,7 +780,14 @@ fn metabolism(
                 * u128::from(body_factor)
                 * u128::from(it.match_permille)
                 * u128::from(liebig);
-            let dp = (num / (p * p * p * p)) as u64; // floor ONCE over the combined permille product
+            let mut dp = (num / (p * p * p * p)) as u64; // floor ONCE over the combined permille product
+                                                         // ADR-017 S6: scale demand by the committed edit factor (permille). Skipped entirely at the neutral
+                                                         // `1000` so the no-edit path is byte-identical (the pinned hash is unmoved); when a knockout commits,
+                                                         // `dp · edit_factor_q / 1000` throttles uptake pre-apportion (never an f64 multiply on the granted-J
+                                                         // path — the F3 invariant; the floored integer demand is the only consumer downstream).
+            if edit_factor_q != EDIT_FACTOR_NEUTRAL_Q {
+                dp = ((u128::from(dp) * u128::from(edit_factor_q)) / p) as u64;
+            }
             demand[i][c] = monod_demand(stock, dp.min(fixed::PERMILLE as u64));
         }
     }
@@ -1401,6 +1524,12 @@ impl Simulation {
                                                            // World climate from the player's params — off the SimRng stream; unused by selection until E3 (so
                                                            // inserting it here is hash-neutral, proven by the unchanged pinned literal). ADR-012 Phase E.
         world.insert_resource(ClimateFieldRes(climate::ClimateField::from_params(env)));
+        // ADR-017 S6: the per-species deep-edit modifier, all-NEUTRAL at reset (`1.0×`). Sized to the registry so
+        // every species has a slot the firewall commit can set. A `× 1000/1000` factor leaves metabolism's
+        // demand math byte-identical, so inserting it here is hash-neutral for the no-edit run (proven by the
+        // unchanged pinned literal). NOT folded into `hash_world` — like soil/climate it reaches the hash only
+        // THROUGH its coupling effect on Energy/Biomass once a non-neutral factor is committed.
+        world.insert_resource(EditModifierRes::neutral(entries.len()));
         // Per-cell resource pools (ADR-013 F1): the STATIC f32 field, generated off the SimRng stream (disjoint
         // derive_seed family). At F3 it is the render/cap/seed source — `PoolStock` is seeded from it and
         // `solar_influx` reads its per-cell carrying caps.
@@ -1764,6 +1893,29 @@ impl Simulation {
     #[must_use]
     pub fn species_strategy(&self, sid: SpeciesId) -> &gp::Strategy {
         &self.world.resource::<SpeciesRegistry>().entries[sid.0 as usize].strategy
+    }
+
+    /// Commit a deep-edit growth-ratio (ADR-017 S6 — the load-bearing OVERSIGHT wire). Maps the firewall's
+    /// committed `growth_ratio_q` (permille, `1000` = wild-type) + the [`EditEffect`] verb to a strictly-positive
+    /// `[0.5,1.5]` PERMILLE demand factor via [`edit_factor_q`] and stores it for `sid`, so the NEXT `step` makes
+    /// [`metabolism`] throttle that species' uptake. This is the consumer side of the determinism firewall: the
+    /// committed INTEGER (read straight from the journal on replay, never re-solved) is the only thing that
+    /// crosses into the hashed sim. A neutral commit (`growth_ratio_q == 1000` knockout, or any wild-type) maps
+    /// to exactly `1000` → the demand math is untouched → hash-neutral. A no-op for an out-of-range `sid`
+    /// (defensive: the registry length is fixed at reset). Pure integer / fixed-point, no RNG draw.
+    pub fn commit_species_edit(&mut self, sid: SpeciesId, growth_ratio_q: u16, effect: EditEffect) {
+        let factor = edit_factor_q(growth_ratio_q, effect);
+        let mut res = self.world.resource_mut::<EditModifierRes>();
+        if let Some(slot) = res.factor_q.get_mut(sid.0 as usize) {
+            *slot = factor;
+        }
+    }
+
+    /// The committed deep-edit demand factor (permille; `1000` = neutral) for `sid` — read-only, for the INSPECT
+    /// view + tests. Neutral for an unedited / out-of-range species.
+    #[must_use]
+    pub fn species_edit_factor_q(&self, sid: SpeciesId) -> u16 {
+        self.world.resource::<EditModifierRes>().factor_q(sid.0)
     }
 
     /// The run's conserved-energy [`Ledger`](ledger::Ledger) (ADR-013 F0a; read-only copy). Empty until the
@@ -3484,6 +3636,160 @@ mod tests {
             total_free_nutrient(&without),
             0,
             "without a mineralizer, free_nutrient never reappears"
+        );
+    }
+
+    #[test]
+    fn edit_factor_q_maps_growth_ratio_to_strictly_positive_band() {
+        // ADR-017 S6: the pinned integer mapping. Loss-of-function lifts off the 0.5× floor toward 1.0×; a
+        // wild-type ratio is exactly neutral (a no-op); Activate lifts above neutral toward 1.5×. Always clamped
+        // strictly positive (never zeroed selection).
+        // Knockout / Knockdown: 0.5 + 0.5·(q/1000).
+        assert_eq!(edit_factor_q(0, EditEffect::Knockout), EDIT_FACTOR_MIN_Q); // lethal KO → 0.5×
+        assert_eq!(
+            edit_factor_q(1000, EditEffect::Knockout),
+            EDIT_FACTOR_NEUTRAL_Q
+        ); // WT → 1.0× (no-op)
+        assert_eq!(edit_factor_q(500, EditEffect::Knockout), 750); // mid → 0.75×
+        assert_eq!(edit_factor_q(500, EditEffect::Knockdown), 750); // same monotone map
+                                                                    // Activate lifts ABOVE neutral toward the 1.5× ceiling.
+        assert_eq!(edit_factor_q(1000, EditEffect::Activate), EDIT_FACTOR_MAX_Q); // full activate → 1.5×
+        assert_eq!(
+            edit_factor_q(0, EditEffect::Activate),
+            EDIT_FACTOR_NEUTRAL_Q
+        ); // no magnitude → neutral
+           // The whole band is strictly positive and bounded, for every input + verb (integer, no transcendental).
+        for q in [0u16, 1, 250, 333, 500, 667, 999, 1000, 60000] {
+            for eff in [
+                EditEffect::Knockout,
+                EditEffect::Knockdown,
+                EditEffect::Activate,
+            ] {
+                let f = edit_factor_q(q, eff);
+                assert!(
+                    (EDIT_FACTOR_MIN_Q..=EDIT_FACTOR_MAX_Q).contains(&f),
+                    "factor {f} for (q={q}, {eff:?}) escaped the [{EDIT_FACTOR_MIN_Q},{EDIT_FACTOR_MAX_Q}] band"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn committed_neutral_edit_does_not_move_the_run_hash() {
+        // A wild-type-ratio commit (growth_ratio_q == 1000) maps to exactly the neutral 1000 permille → the
+        // demand math is untouched → the run is byte-identical to no commit at all. This is the per-run analogue
+        // of the pinned-literal neutrality proof: WIRING the modifier costs nothing until a non-neutral factor
+        // commits.
+        let cfg = SimConfig {
+            seed: 41,
+            generations: 25,
+            entity_count: 600,
+        };
+        let mk =
+            || Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+        let mut control = mk();
+        control.step(cfg.generations);
+        let mut edited = mk();
+        // Commit a NEUTRAL impact on the decomposer (sid 1): a wild-type ratio → factor 1000 → no-op.
+        edited.commit_species_edit(
+            SpeciesId::new(1),
+            EDIT_FACTOR_NEUTRAL_Q,
+            EditEffect::Knockout,
+        );
+        assert_eq!(
+            edited.species_edit_factor_q(SpeciesId::new(1)),
+            EDIT_FACTOR_NEUTRAL_Q,
+            "a wild-type ratio commits the neutral factor"
+        );
+        edited.step(cfg.generations);
+        assert_eq!(
+            control.run_stats().hash,
+            edited.run_stats().hash,
+            "a neutral-factor commit must not move the run hash"
+        );
+    }
+
+    #[test]
+    fn committed_ko_throttles_the_edited_decomposer_and_ripples_to_the_plant() {
+        // ADR-017 S6 PAYOFF (the load-bearing wire — the proposal's §4 ripple, end to end). A committed
+        // growth-lethal gltA KO (growth_ratio_q == 0) on the DECOMPOSER (sid 1) commits the 0.5× factor, which
+        // throttles BOTH seams: (1) its DEMAND (less uptake → it grows + reproduces less → fewer decomposers),
+        // and (2) its MINERALIZATION mint (a TCA KO impairs carbon processing → it mints less free_nutrient).
+        // Less mineralization → less free_nutrient flows into the Liebig-gated plant (sid 0) → the F4 loop
+        // weakens → the plant population declines vs a no-edit control. Robust signals are CUMULATIVE over the
+        // trajectory (the per-tick snapshot oscillates; the population/flow integrals smooth it). Deterministic.
+        let cfg = SimConfig {
+            seed: 23,
+            generations: 150,
+            entity_count: 600,
+        };
+        let mk = || {
+            let mut s =
+                Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(true));
+            // Drain the seeded free_nutrient so free_nutrient is PURELY decomposer-minted (the F4 teeth are
+            // visible at a tractable scale — the same harness the F4 tests use).
+            drain_seeded_free_nutrient(&mut s);
+            s
+        };
+        // flow[0][1] = net J the decomposer (sid 1) mineralizes INTO the plant (sid 0) this generation.
+        let mineralization_edge = |sim: &Simulation| -> i64 {
+            let (_s, flat) = sim.flow_matrix();
+            flat[1] // row 0 (plant) col 1 (decomposer) in the 2×2 matrix
+        };
+        // Step one generation at a time, accumulating (Σ plant pop, Σ decomposer pop, Σ mineralization-into-plant).
+        let drive = |sim: &mut Simulation| -> (i128, i128, i128) {
+            let (mut cum_plant, mut cum_decomp, mut cum_flow) = (0i128, 0i128, 0i128);
+            for _ in 0..cfg.generations {
+                sim.step(1);
+                cum_plant += species_pop(sim, 0) as i128;
+                cum_decomp += species_pop(sim, 1) as i128;
+                cum_flow += i128::from(mineralization_edge(sim));
+            }
+            (cum_plant, cum_decomp, cum_flow)
+        };
+
+        let mut control = mk();
+        let (control_plant, control_decomp, control_flow) = drive(&mut control);
+
+        let mut edited = mk();
+        // Commit the gltA KO on the decomposer: growth_ratio_q == 0 → factor 0.5× (the strongest penalty).
+        edited.commit_species_edit(SpeciesId::new(1), 0, EditEffect::Knockout);
+        assert_eq!(
+            edited.species_edit_factor_q(SpeciesId::new(1)),
+            EDIT_FACTOR_MIN_Q,
+            "a lethal KO commits the 0.5× floor factor"
+        );
+        let (edited_plant, edited_decomp, edited_flow) = drive(&mut edited);
+
+        // (1) DIRECT EFFECT: the edited decomposer is throttled (fewer decomposer-organism-generations).
+        assert!(
+            edited_decomp < control_decomp,
+            "KO must throttle the decomposer: edited Σpop {edited_decomp} vs control {control_decomp}"
+        );
+        // (2) RIPPLE: the throttled decomposer mineralizes strictly LESS into the plant over the run.
+        assert!(
+            edited_flow < control_flow,
+            "a throttled decomposer mineralizes less into the plant: edited Σflow {edited_flow} vs control {control_flow}"
+        );
+        // (3) RIPPLE TO THE PLANT (the F4 payoff): weaker mineralization → the Liebig-gated plant declines.
+        assert!(
+            edited_plant < control_plant,
+            "the plant must respond to weakened mineralization: edited Σpop {edited_plant} vs control {control_plant}"
+        );
+
+        // (4) RUN-TO-RUN STABLE (deterministic): a second edited run reproduces the outcome + hash bit-for-bit.
+        let mut edited2 = mk();
+        edited2.commit_species_edit(SpeciesId::new(1), 0, EditEffect::Knockout);
+        let (e2_plant, e2_decomp, e2_flow) = drive(&mut edited2);
+        assert_eq!(
+            (edited_plant, edited_decomp, edited_flow),
+            (e2_plant, e2_decomp, e2_flow),
+            "the committed-KO outcome must be deterministic run-to-run"
+        );
+        assert_eq!(
+            edited.run_stats().hash,
+            edited2.run_stats().hash,
+            "the committed-KO run hash must be deterministic run-to-run"
         );
     }
 
