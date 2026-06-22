@@ -6,9 +6,12 @@ shader_type canvas_item;
 // The sprite uses NEAREST filtering so each texel renders as one crisp cell block.
 
 // layer: 0 density, 1 allele_freq, 2 fitness (sampled from TEXTURE);
-//        3 soil_moisture, 4 soil_nutrients, 5 soil_ph (sampled from soil_tex).
+//        3 soil_moisture, 4 soil_nutrients, 5 soil_ph (sampled from soil_tex);
+//        6 light, 7 free_nutrient, 8 detritus (sampled from pool_tex — the GSS3 joule-economy field).
+// Three banks of 3 channels each: bank 0 population (TEXTURE), 1 soil (soil_tex), 2 pool (pool_tex).
 uniform int layer = 0;
 uniform sampler2D soil_tex : filter_nearest;  // R=moisture G=nutrients B=pH (the R1.0 soil field)
+uniform sampler2D pool_tex : filter_nearest;  // R=light G=free_nutrient B=detritus (the GSS3 pool field)
 uniform float opacity = 0.78;   // overall overlay strength
 uniform float alpha_gamma = 1.6;  // >1 fades low population values further toward transparent
 
@@ -29,19 +32,17 @@ vec3 inferno(float t) {
 }
 
 void fragment() {
-	bool is_soil = layer >= 3;
-	vec3 d = is_soil ? texture(soil_tex, UV).rgb : texture(TEXTURE, UV).rgb;
-	int ch = is_soil ? layer - 3 : layer;
-	float v = ch == 1 ? d.g : (ch == 2 ? d.b : d.r);
-	v = clamp(v, 0.0, 1.0);
+	int bank = layer / 3;  // 0 pop (density/allele/fitness), 1 soil, 2 pool
+	int ch = layer - bank * 3;
+	vec3 d = bank == 2 ? texture(pool_tex, UV).rgb
+		: (bank == 1 ? texture(soil_tex, UV).rgb : texture(TEXTURE, UV).rgb);
+	float v = clamp(ch == 1 ? d.g : (ch == 2 ? d.b : d.r), 0.0, 1.0);
 
-	float a;
-	if (is_soil) {
-		// Soil is a FULL field (every cell) — uniform alpha, value shown via colour.
-		a = 0.7 * opacity;
-	} else {
-		// Population is SPARSE — fade low/empty cells toward transparent (gamma-shaped).
-		a = v <= 0.0 ? 0.0 : (0.16 + 0.64 * pow(v, alpha_gamma)) * opacity;
-	}
+	// Soil + pool are FULL fields (every cell has a value) → uniform alpha, value shown via colour.
+	// Population is SPARSE → fade low/empty cells toward transparent (gamma-shaped).
+	bool full_field = bank >= 1;
+	float a = full_field
+		? 0.7 * opacity
+		: (v <= 0.0 ? 0.0 : (0.16 + 0.64 * pow(v, alpha_gamma)) * opacity);
 	COLOR = vec4(inferno(v), a);
 }

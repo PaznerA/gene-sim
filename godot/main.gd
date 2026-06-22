@@ -11,7 +11,8 @@ extends Node2D
 ##   --run  <dir>          Play snap_*.bin in <dir> as a live run (windowed; auto-advances, loops).
 ##   --shot <out.png>      Render one frame to a PNG then quit (needs a display; for verification).
 ##   --gen  <n>            With --run/--shot: pick the snapshot whose generation == n (else the last).
-##   --layer <0..3>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness).
+##   --layer <0..9>        With --shot: preselect the data layer (0 off / 1 density / 2 allele / 3 fitness /
+##                         4 soil_moisture / 5 soil_nutrients / 6 soil_ph / 7 light / 8 free_nutrient / 9 detritus).
 ##   --zoom  <f>           With --shot: preset the zoom scope (1 field … 6 cells).
 ##   --ortho               Render the ecosystem orthographically (flat); ISOMETRIC (CPU diamonds) is the default.
 ##   --live [--seed N]     Drive an OPEN-ENDED SANDBOX run live via the LiveSim gdext node (build the cdylib
@@ -46,7 +47,15 @@ const PillRail := preload("res://pill_rail.gd")
 const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
 
-const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph"]
+const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph",
+	"light", "free_nutrient", "detritus"]  # GSS3 live-pool joule-economy planes appended after soil_ph
+# Optional per-channel legend captions (the joule economy made readable at a glance). Falls back to
+# "<name>   low → high" for any channel not listed here. Renderer-only labelling (inv #2).
+const OVERLAY_LEGENDS := {
+	"light": "light   dark → bright",
+	"free_nutrient": "nutrient   drained → rich",
+	"detritus": "detritus   clean → litter",
+}
 # View modes (Rel-UI.0): the top toggle cycles Ecosystem → Specimen → Relations. The Relations view renders the
 # emergent S×S FlowMatrix (core-measured inter-species joule flows) as a heatmap; it is renderer-only VIEW state
 # (a third _view_mode value) and degrades gracefully until the F4 core wires the matrix (see _flow_matrix_or_empty).
@@ -2481,7 +2490,7 @@ func _on_click() -> void:
 			_fill_detail(str((_specimen_list()[hit] as Dictionary).get("label", "specimen")), [])
 
 
-## The per-cell stat lines (population channels + R1.0 soil channels) for the detail panel.
+## The per-cell stat lines (population channels + R1.0 soil channels + GSS3 pool channels) for the detail panel.
 func _cell_lines(snap, i: int) -> Array:
 	return [
 		"density        %.3f" % snap.density[i],
@@ -2490,6 +2499,9 @@ func _cell_lines(snap, i: int) -> Array:
 		"soil moisture  %.3f" % snap.soil_moisture[i],
 		"soil nutrients %.3f" % snap.soil_nutrients[i],
 		"soil pH        %.3f" % snap.soil_ph[i],
+		"light          %.3f" % snap.light[i],
+		"free_nutrient  %.3f" % snap.free_nutrient[i],
+		"detritus       %.3f" % snap.detritus[i],
 	]
 
 
@@ -2555,9 +2567,10 @@ func _update_overlay(snap) -> void:
 	_overlay.scale = Vector2(_cell, _cell)
 	var mat := _overlay.material as ShaderMaterial
 	if mat != null:
-		# layer 0..2 sample the population texture; 3..5 sample the soil texture (R1.0 made visible).
+		# layer 0..2 sample the population texture; 3..5 the soil texture (R1.0); 6..8 the pool texture (GSS3).
 		mat.set_shader_parameter("layer", _overlay_mode - 1)
 		mat.set_shader_parameter("soil_tex", ImageTexture.create_from_image(snap.to_soil_image()))
+		mat.set_shader_parameter("pool_tex", ImageTexture.create_from_image(snap.to_pool_image()))
 
 
 func _refresh_hud() -> void:
@@ -2582,7 +2595,8 @@ func _refresh_hud() -> void:
 	if _legend != null:
 		_legend.set_active(_overlay_mode != 0)
 		if _overlay_mode != 0 and _legend_label != null:
-			_legend_label.text = "%s   low → high" % OVERLAY_NAMES[_overlay_mode]
+			var nm: String = OVERLAY_NAMES[_overlay_mode]
+			_legend_label.text = OVERLAY_LEGENDS.get(nm, "%s   low → high" % nm)
 
 
 ## Name the current zoom scope from the magnification (HUD only).

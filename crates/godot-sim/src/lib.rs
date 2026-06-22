@@ -55,7 +55,7 @@ fn resolve_species_path(name: &str) -> Option<std::path::PathBuf> {
 /// `LiveSim` — the one Godot node the live-sim feature exposes (ADR-010).
 ///
 /// A thin `RefCounted` wrapper over [`harness::GeneSimEnv`]. GDScript drives it with
-/// `reset(seed)` → `step(n)` → `observe()` and reads `snapshot(w, h)` bytes (GSS2, parsed by the
+/// `reset(seed)` → `step(n)` → `observe()` and reads `snapshot(w, h)` bytes (GSS3, parsed by the
 /// existing `godot/snapshot.gd`). All biology runs in the embedded Rust core (invariant #2).
 #[derive(GodotClass)]
 #[class(base=RefCounted)]
@@ -324,7 +324,7 @@ impl LiveSim {
         d
     }
 
-    /// Produce the read-only GSS2 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
+    /// Produce the read-only GSS3 snapshot bytes for a `w × h` grid (parsed by `godot/snapshot.gd`).
     ///
     /// Read-only: it never draws from the RNG or mutates state, so taking snapshots cannot change the
     /// determinism hash (invariant #3). The bytes are exactly
@@ -638,10 +638,10 @@ fn region_dict(applied: bool, detail: &str, generation: i64, covered: u32) -> Va
     d
 }
 
-/// Build the GSS2 snapshot bytes from the env's live `Simulation` (read-only — invariant #3).
+/// Build the GSS3 snapshot bytes from the env's live `Simulation` (read-only — invariant #3).
 ///
 /// [`harness::GeneSimEnv::snapshot`] delegates to [`sim_core::Simulation::snapshot`] (no RNG draw,
-/// no mutation); [`sim_core::GridSnapshot::write_snapshot_bytes`] emits the exact GSS2 layout that
+/// no mutation); [`sim_core::GridSnapshot::write_snapshot_bytes`] emits the exact GSS3 layout that
 /// `godot/snapshot.gd` parses.
 fn snapshot_bytes(env: &mut GeneSimEnv, w: u32, h: u32) -> Vec<u8> {
     env.snapshot(w, h).write_snapshot_bytes()

@@ -827,6 +827,25 @@ pub(crate) fn pool_channel(pools: &PoolStock, ch: usize) -> &[i64] {
     }
 }
 
+/// Off-hash render projection: nearest-cell resample of an `i64` pool plane → `f32` in `[0,1]` by [`POOL_CAP`].
+/// The integer nearest-cell map is bit-identical IN SPIRIT to [`soil::SoilField::sample_to`]; the only float
+/// math is the display-only `/POOL_CAP` normalization divide, centralized HERE so the one audited chokepoint
+/// lives in a single place. Pure read — never round-trips back into integer sim state, never draws RNG (inv #3).
+pub(crate) fn pool_sample_to(
+    plane: &[i64],
+    pw: u32,
+    ph: u32,
+    tx: u32,
+    ty: u32,
+    target_w: u32,
+    target_h: u32,
+) -> f32 {
+    let sx = ((u64::from(tx) * u64::from(pw)) / u64::from(target_w)).min(u64::from(pw) - 1);
+    let sy = ((u64::from(ty) * u64::from(ph)) / u64::from(target_h)).min(u64::from(ph) - 1);
+    let idx = (sy * u64::from(pw) + sx) as usize;
+    (plane[idx] as f64 / POOL_CAP as f64) as f32
+}
+
 /// Mutable per-channel pool plane (see [`pool_channel`]).
 pub(crate) fn pool_channel_mut(pools: &mut PoolStock, ch: usize) -> &mut [i64] {
     match ch {
@@ -1573,8 +1592,10 @@ impl Simulation {
     /// (no `HashMap` iteration affecting output — invariant #3).
     ///
     /// Channels (each `width * height`, row-major, in `[0, 1]`): `density` = per-cell count / busiest-cell
-    /// count; `allele_freq` = mean [`Genotype`] in the cell; `fitness` = mean [`Energy`] in the cell.
-    /// Empty cells are `0` on every channel. Now reflects REAL spatial structure (clusters/clines from
+    /// count; `allele_freq` = mean [`Genotype`] in the cell; `fitness` = mean [`Energy`] in the cell;
+    /// `soil_moisture`/`soil_nutrients`/`soil_ph` = the static `SoilField` resampled; `light`/`free_nutrient`/
+    /// `detritus` = the LIVE [`PoolStock`] joule planes resampled and normalized by [`POOL_CAP`].
+    /// Empty cells are `0` on the population channels. Now reflects REAL spatial structure (clusters/clines from
     /// inherited dispersal), not a derived layout.
     ///
     /// # Panics
@@ -1643,6 +1664,41 @@ impl Simulation {
             }
         }
 
+        // Read-only borrow of the LIVE pools (Bevy resource) — no RNG, no mutation (inv #3). Resample
+        // world→render with the SAME nearest-cell integer map soil::sample_to uses; normalize by POOL_CAP.
+        // PoolStock IS already folded into hash_world (line ~1909): reading its already-hashed values into a
+        // separate display buffer adds NOTHING to the hash — the projection is downstream of the tick, never
+        // upstream. Uses pools.width/pools.height (PoolStock carries its own dims) — not a dims literal.
+        let pools = self.world.resource::<PoolStock>();
+        let mut light = vec![0.0f32; cells];
+        let mut free_nutrient = vec![0.0f32; cells];
+        let mut detritus = vec![0.0f32; cells];
+        for y in 0..height {
+            for x in 0..width {
+                let c = (y as usize) * (width as usize) + (x as usize);
+                light[c] =
+                    pool_sample_to(&pools.light, pools.width, pools.height, x, y, width, height);
+                free_nutrient[c] = pool_sample_to(
+                    &pools.free_nutrient,
+                    pools.width,
+                    pools.height,
+                    x,
+                    y,
+                    width,
+                    height,
+                );
+                detritus[c] = pool_sample_to(
+                    &pools.detritus,
+                    pools.width,
+                    pools.height,
+                    x,
+                    y,
+                    width,
+                    height,
+                );
+            }
+        }
+
         GridSnapshot {
             width,
             height,
@@ -1654,6 +1710,9 @@ impl Simulation {
             soil_moisture,
             soil_nutrients,
             soil_ph,
+            light,
+            free_nutrient,
+            detritus,
         }
     }
 
@@ -2950,6 +3009,40 @@ mod tests {
         assert_eq!(bytes_a, bytes_b);
         // And repeated snapshots from the SAME sim are identical (no hidden state).
         assert_eq!(a.snapshot(32, 32), a.snapshot(32, 32));
+    }
+
+    #[test]
+    fn snapshot_pool_channels_in_unit_range_and_byte_identical() {
+        // GSS3: the 3 live-pool channels (light/free_nutrient/detritus) resample PoolStock and normalize by
+        // POOL_CAP, so every value is in [0,1], sized to the render grid, and byte-identical across two reset
+        // runs of the same (seed, generation, grid) — the off-hash projection is deterministic (inv #3).
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 25,
+            entity_count: 400,
+        };
+        let mut a = Simulation::reset(&cfg);
+        a.step(25);
+        let snap = a.snapshot(16, 16);
+        let cells = 16 * 16;
+        for plane in [&snap.light, &snap.free_nutrient, &snap.detritus] {
+            assert_eq!(plane.len(), cells, "pool plane must cover the render grid");
+            for &v in plane {
+                assert!((0.0..=1.0).contains(&v), "pool channel out of [0,1]: {v}");
+            }
+        }
+        // light is seeded above zero everywhere (solar carrying-cap), so it is not an all-zero plane.
+        assert!(
+            snap.light.iter().any(|&v| v > 0.0),
+            "light pool should be non-zero somewhere"
+        );
+
+        let mut b = Simulation::reset(&cfg);
+        b.step(25);
+        let snap_b = b.snapshot(16, 16);
+        assert_eq!(snap.light, snap_b.light);
+        assert_eq!(snap.free_nutrient, snap_b.free_nutrient);
+        assert_eq!(snap.detritus, snap_b.detritus);
     }
 
     #[test]
