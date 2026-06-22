@@ -165,6 +165,10 @@ pub(crate) struct ChemField {
     /// Pre-allocated double-buffer scratch, ONE plane reused (zeroed) per channel in [`diffuse_and_decay`].
     /// Internal state only — zero between ticks, never folded into the hash.
     scratch: Vec<i32>,
+    /// Pre-allocated source-snapshot buffer reused per channel in [`diffuse_and_decay`] (perf, hash-neutral):
+    /// holds the frozen pre-diffusion plane read while scattering into `scratch`. Internal scratch — overwritten
+    /// each use, never carried state, never hashed.
+    src_buf: Vec<i32>,
 }
 
 impl ChemField {
@@ -179,6 +183,7 @@ impl ChemField {
             kin: vec![0; cells],
             alarm: vec![0; cells],
             scratch: vec![0; cells],
+            src_buf: vec![0; cells],
         }
     }
 
@@ -308,8 +313,12 @@ pub(crate) fn diffuse_and_decay(mut chem: ResMut<ChemField>, mut ledger: ResMut<
         for v in &mut chem.scratch {
             *v = 0;
         }
-        // Snapshot the live plane so the read is frozen while we scatter into scratch.
-        let src: Vec<i32> = chem.plane(ch).to_vec();
+        // Snapshot the live plane so the read is frozen while we scatter into scratch. Reuse the persistent
+        // `src_buf` (taken out to avoid a simultaneous borrow with `scratch`) instead of a per-channel `to_vec`
+        // — byte-identical bytes, no per-tick allocation (the `scratch` swap precedent).
+        let mut src = std::mem::take(&mut chem.src_buf);
+        src.clear();
+        src.extend_from_slice(chem.plane(ch));
         for cy in 0..h {
             for cx in 0..w {
                 let c = (cy * w + cx) as usize;
@@ -341,7 +350,8 @@ pub(crate) fn diffuse_and_decay(mut chem: ResMut<ChemField>, mut ledger: ResMut<
         let buf = std::mem::take(&mut chem.scratch);
         chem.plane_mut(ch).copy_from_slice(&buf[..cells]);
         chem.scratch = buf;
-        // HARD assert under determinism: diffusion moved no J across the world boundary, so Σ is unchanged.
+        chem.src_buf = src; // restore the reused source-snapshot buffer for the next channel/tick
+                            // HARD assert under determinism: diffusion moved no J across the world boundary, so Σ is unchanged.
         let after = chem.channel_total(ch);
         assert_chem_conserved(ch, before, after);
     }
@@ -398,30 +408,41 @@ fn assert_chem_conserved(ch: usize, before: i64, after: i64) {
 /// collect-then-sort idiom) so within-tick emit order is fixed; per-cell [`CHEM_CAP`] saturation routes the
 /// rejected part to [`ledger::Ledger::overflow`]. Mutates Energy via an OrgId-keyed map applied in a second
 /// pass (never mutate-during-query — inv #3).
+/// One organism's `emit_chem` row in canonical `(cell, SpeciesId, OrgId)` order.
+struct EmitRow {
+    cell: u32,
+    species: u16,
+    org: u64,
+    energy: i64,
+}
+
+/// REUSABLE per-tick scratch row buffer for [`emit_chem`] (perf optimization, hash-neutral): the system rebuilds
+/// it every tick over the living set; holding the backing allocation in a resource (cleared + refilled, never
+/// carried state) amortizes the per-tick `Vec` reallocation to zero. NEVER hashed.
+#[derive(Resource, Default)]
+pub(crate) struct ChemEmitScratch {
+    rows: Vec<EmitRow>,
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) fn emit_chem(
     mut chem: ResMut<ChemField>,
     mut kin_prov: ResMut<KinProvenance>,
     mut ledger: ResMut<ledger::Ledger>,
+    mut scratch: ResMut<ChemEmitScratch>,
     mut q: Query<(&OrgId, &Species, &mut Energy, &Position)>,
 ) {
     let width = chem.width;
     // ── Canonical (cell, SpeciesId, OrgId) order over the LIVING set (inv #3). ──
-    struct EmitRow {
-        cell: u32,
-        species: u16,
-        org: u64,
-        energy: i64,
-    }
-    let mut rows: Vec<EmitRow> = q
-        .iter()
-        .map(|(id, sp, e, p)| EmitRow {
-            cell: cell_index(p, width),
-            species: sp.0 .0,
-            org: id.0,
-            energy: e.0,
-        })
-        .collect();
+    // Reuse the persistent scratch row buffer (cleared + refilled; backing allocation survives across ticks).
+    let mut rows = std::mem::take(&mut scratch.rows);
+    rows.clear();
+    rows.extend(q.iter().map(|(id, sp, e, p)| EmitRow {
+        cell: cell_index(p, width),
+        species: sp.0 .0,
+        org: id.0,
+        energy: e.0,
+    }));
     rows.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
 
     // Per-org J spent (debited from Energy in a second pass). Each is a PAIRED move: the J leaves Energy and
@@ -470,6 +491,8 @@ pub(crate) fn emit_chem(
             }
         }
     }
+    // Return the reused row buffer to the scratch resource (its allocation survives to the next tick).
+    scratch.rows = rows;
 }
 
 /// **ASSERT CHEM CONSERVED (semantic)** (ADR-013 F5) — re-derives the chem book across the whole tick: the
@@ -615,13 +638,16 @@ pub(crate) fn flee_direction(
 /// Read-only accessors for sensing (used by `metabolism` / `reproduce_or_die`). The frozen planes are cloned
 /// by the caller at start-of-tick (the `frozen_light` discipline) so within-tick emit never affects sense.
 impl ChemField {
-    /// Clone the toxin plane (start-of-tick frozen snapshot for the demand/drain sense).
-    pub(crate) fn frozen_toxin(&self) -> Vec<i32> {
-        self.toxin.clone()
+    /// Snapshot the toxin plane into a REUSED buffer (perf, hash-neutral): `clear()` + `extend_from_slice`
+    /// reuses the caller's backing allocation but yields the IDENTICAL bytes as [`frozen_toxin`](Self::frozen_toxin).
+    pub(crate) fn frozen_toxin_into(&self, buf: &mut Vec<i32>) {
+        buf.clear();
+        buf.extend_from_slice(&self.toxin);
     }
-    /// Clone the alarm plane (start-of-tick frozen snapshot for the flee-dispersal sense).
-    pub(crate) fn frozen_alarm(&self) -> Vec<i32> {
-        self.alarm.clone()
+    /// Snapshot the alarm plane into a REUSED buffer (see [`frozen_toxin_into`](Self::frozen_toxin_into)).
+    pub(crate) fn frozen_alarm_into(&self, buf: &mut Vec<i32>) {
+        buf.clear();
+        buf.extend_from_slice(&self.alarm);
     }
     /// Off-hash render projection: nearest-cell resample of an i32 chem plane → f32 in `[0,1]` by [`CHEM_CAP`].
     /// Mirrors [`crate::pool_sample_to`] exactly (the single audited `/CHEM_CAP` display divide). Pure read.

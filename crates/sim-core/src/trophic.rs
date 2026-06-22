@@ -97,6 +97,14 @@ pub(crate) struct PoolProvenance {
     detritus_by_species: Vec<i64>,
     /// Species-attributed free_nutrient per cell (minted by decomposer mineralization).
     nutrient_by_species: Vec<i64>,
+    /// Reusable per-withdraw apportion scratch (perf optimization, hash-neutral): the `weights`, `shares`, and
+    /// largest-remainder `rem` buffers are owned here and reused across every [`withdraw`](Self::withdraw) call
+    /// so the per-share provenance apportion pays no per-call heap allocation. Internal scratch — zeroed/cleared
+    /// before each use, never read as state, never hashed.
+    #[allow(clippy::type_complexity)]
+    scratch_w: Vec<u64>,
+    scratch_s: Vec<i64>,
+    scratch_rem: Vec<(u128, usize)>,
 }
 
 impl PoolProvenance {
@@ -106,6 +114,9 @@ impl PoolProvenance {
             s,
             detritus_by_species: vec![0i64; cells * s],
             nutrient_by_species: vec![0i64; cells * s],
+            scratch_w: Vec::new(),
+            scratch_s: Vec::new(),
+            scratch_rem: Vec::new(),
         }
     }
 
@@ -131,6 +142,7 @@ impl PoolProvenance {
     /// source's slot and recording `flow[dest][src] += share` for each biotic source. The UNATTRIBUTED
     /// remainder (abiotic seed) records no flow. `plane` selects detritus (0) / nutrient (1). Pure integer,
     /// ordered by species index (inv #3).
+    #[allow(clippy::too_many_arguments)]
     fn withdraw(
         plane: &mut [i64],
         s: usize,
@@ -138,21 +150,26 @@ impl PoolProvenance {
         dest_species: usize,
         withdrawn: i64,
         flow: &mut FlowMatrix,
+        weights: &mut Vec<u64>,
+        shares: &mut Vec<i64>,
+        rem: &mut Vec<(u128, usize)>,
     ) {
         if withdrawn <= 0 || s == 0 {
             return;
         }
         let base = cell * s;
         // Biotic stock available in this cell, in species order (the canonical apportion index, inv #3).
-        let weights: Vec<u64> = (0..s).map(|sp| plane[base + sp].max(0) as u64).collect();
+        weights.clear();
+        weights.extend((0..s).map(|sp| plane[base + sp].max(0) as u64));
         let biotic_total: i64 = weights.iter().map(|&w| w as i64).sum();
         if biotic_total <= 0 {
             return; // all abiotic seed → no species provenance → no flow recorded
         }
         // Apportion only the BIOTIC fraction of the withdrawal (capped at the biotic stock); the rest is
-        // abiotic and carries no edge.
+        // abiotic and carries no edge. Buffer-reusing `apportion_into` is bit-identical to `apportion`.
         let attributable = withdrawn.min(biotic_total);
-        let shares = fixed::apportion(attributable, &weights);
+        shares.resize(s, 0);
+        fixed::apportion_into(attributable, weights, shares, rem);
         for (sp, share) in shares.iter().enumerate() {
             if *share <= 0 {
                 continue;
@@ -177,6 +194,9 @@ impl PoolProvenance {
             dest_species,
             withdrawn,
             flow,
+            &mut self.scratch_w,
+            &mut self.scratch_s,
+            &mut self.scratch_rem,
         );
     }
 
@@ -195,6 +215,9 @@ impl PoolProvenance {
             dest_species,
             withdrawn,
             flow,
+            &mut self.scratch_w,
+            &mut self.scratch_s,
+            &mut self.scratch_rem,
         );
     }
 }
@@ -272,7 +295,12 @@ pub(crate) fn mineralize(
     }
 
     // ── Pass 2: per-cell APPORTION available detritus across co-located decomposers (canonical order). ──
+    // Reuse the `weights`/`shares`/`rem_scratch` buffers across every cell group (hash-neutral: `apportion_into`
+    // is bit-identical to `apportion`; only the buffer ownership moved out of the loop).
     let mut granted = vec![0i64; n];
+    let mut weights: Vec<u64> = Vec::new();
+    let mut shares: Vec<i64> = Vec::new();
+    let mut rem_scratch: Vec<(u128, usize)> = Vec::new();
     let mut i = 0usize;
     while i < n {
         let cell = rows[i].cell;
@@ -280,12 +308,15 @@ pub(crate) fn mineralize(
         while jj < n && rows[jj].cell == cell {
             jj += 1;
         }
-        let weights: Vec<u64> = (i..jj).map(|k| demand[k].max(0) as u64).collect();
+        let group = jj - i;
+        weights.clear();
+        weights.extend((i..jj).map(|k| demand[k].max(0) as u64));
         let total_demand: i64 = weights.iter().map(|&w| w as i64).sum();
         if total_demand > 0 {
             let cellu = cell as usize;
             let available = pools.detritus[cellu].min(total_demand);
-            let shares = fixed::apportion(available, &weights);
+            shares.resize(group, 0);
+            fixed::apportion_into(available, &weights, &mut shares, &mut rem_scratch);
             let mut taken = 0i64;
             for (k, share) in shares.iter().enumerate() {
                 granted[i + k] = *share;
@@ -298,6 +329,10 @@ pub(crate) fn mineralize(
 
     // ── Pass 3: SPLIT each grant (respire maint/defense + (1−mineralize_rate) residual; mint the rest as
     //    free_nutrient), record provenance flow. Canonical order; integer; conserves J. ──
+    // Reuse the convert-split buffers across decomposers (perf, hash-neutral: `split_budget_into` is bit-identical).
+    let mut split: Vec<i64> = Vec::new();
+    let mut split_w: Vec<u64> = Vec::new();
+    let mut split_rem: Vec<(u128, usize)> = Vec::new();
     for (idx, r) in rows.iter().enumerate() {
         let g = granted[idx];
         if g <= 0 {
@@ -306,7 +341,7 @@ pub(crate) fn mineralize(
         let cellu = r.cell as usize;
         let strat = &registry.entries[r.species as usize].strategy;
         // Maintenance + Defense slices are the decomposer's OWN metabolism → respired (split_budget conserves).
-        let split = fixed::split_budget(g, &strat.budget);
+        fixed::split_budget_into(g, &strat.budget, &mut split, &mut split_w, &mut split_rem);
         let respired_meta =
             split[BudgetChannel::Maintenance as usize] + split[BudgetChannel::Defense as usize];
         let remainder = g - respired_meta; // >= 0 (split_budget conserves; both slices <= g)

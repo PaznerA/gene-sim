@@ -256,7 +256,41 @@ pub fn edit_factor_q(growth_ratio_q: u16, effect: EditEffect) -> u16 {
 /// at reset and [`solar_influx`] reads its per-cell carrying caps each tick — while the mutable joule pools
 /// live in `PoolStock`. Read by the F3 pipeline (no longer hash-neutral via its coupling to the live pools).
 #[derive(Resource)]
+#[allow(dead_code)] // the static seed/cap source; the live tick path now reads the PRECOMPUTED SolarLightCap.
 struct ResourceFieldRes(resource::ResourceField);
+
+/// PRECOMPUTED per-cell solar light carrying-cap (perf optimization, hash-neutral): the static
+/// [`ResourceField`] never changes across the run, so `min(to_unit_u16(light[c]) * CELL_CAP_SCALE, POOL_CAP)`
+/// is constant. Computing it ONCE at reset (instead of re-flooring an f64 for every cell every tick in
+/// [`solar_influx`]) yields the IDENTICAL integer cap → byte-identical mint order/values. Indexed `y*w + x`.
+#[derive(Resource)]
+struct SolarLightCap(Vec<i64>);
+
+/// REUSABLE per-tick scratch buffers for [`metabolism`] (perf optimization, hash-neutral). The hot system
+/// rebuilds these every tick from the LIVING set; holding their backing allocations in a resource (cleared +
+/// refilled, never read as carried state) amortizes the per-tick `Vec` reallocation to zero once the population
+/// stabilizes. NEVER folded into `hash_world`; the CONTENTS are fully overwritten each tick so reuse is
+/// byte-identical to allocating fresh.
+#[derive(Resource, Default)]
+struct MetabolismScratch {
+    items: Vec<MetabolismItem>,
+    frozen_light: Vec<i64>,
+    frozen_nutrient: Vec<i64>,
+    frozen_detritus: Vec<i64>,
+    frozen_toxin: Vec<i32>,
+    demand: Vec<[i64; resource::RESOURCE_CHANNELS]>,
+    granted: Vec<[i64; resource::RESOURCE_CHANNELS]>,
+}
+
+/// REUSABLE per-tick scratch buffers for [`reproduce_or_die`]'s canonical-order row vector + the two frozen
+/// chem-plane snapshots (perf optimization, hash-neutral; the [`MetabolismScratch`] rationale). Cleared +
+/// refilled each tick; never carried state.
+#[derive(Resource, Default)]
+struct ReproScratch {
+    rows: Vec<ReproRow>,
+    frozen_toxin: Vec<i32>,
+    frozen_alarm: Vec<i32>,
+}
 
 /// Stable per-organism id, assigned monotonically from [`NextOrgId`] (ADR-013 F3 — widened to `u64` now that
 /// population is unbounded). Gives a deterministic hash/sort order independent of ECS query/archetype
@@ -636,6 +670,7 @@ fn metabolism(
     climate_field: Res<ClimateFieldRes>,
     edit_mod: Res<EditModifierRes>,
     kin_prov: Res<chem::KinProvenance>,
+    mut scratch: ResMut<MetabolismScratch>,
     mut pools: ResMut<PoolStock>,
     mut chem: ResMut<chem::ChemField>,
     mut prov: ResMut<trophic::PoolProvenance>,
@@ -663,56 +698,67 @@ fn metabolism(
     // ADR-013 F5: FREEZE the chem toxin plane at start-of-tick (the `frozen_light` discipline) so within-tick
     // emit/mint order never affects within-tick sense — archetype-reorder safe. A fresh deposit is sensed
     // in-cell only NEXT tick (after diffusion). KinProvenance is read-only here (own-species marker lookup).
-    let frozen_toxin = chem.frozen_toxin();
+    // Reuse the persistent frozen-toxin buffer (byte-identical snapshot of the start-of-tick toxin plane).
+    let mut frozen_toxin = std::mem::take(&mut scratch.frozen_toxin);
+    chem.frozen_toxin_into(&mut frozen_toxin);
     // ── Canonical order: (cell_index, SpeciesId, OrgId). Built ONCE over the LIVING set (inv #3). ──
     // BLOCKER #1 fix: the ADR-011/012 soil+climate match factor is re-expressed as an INTEGER permille that
     // scales DEMAND (pre-apportion) — NOT an f64 multiply on the granted J. The f64 factor is computed once
     // per org, normalized to a [0,1] match, and quantized via the single audited `fixed::to_unit_u16`
     // chokepoint; the single floored GRANTED value is then both the pool debit and the org credit (no f64 ever
     // touches hashed Energy/Biomass). This preserves spatial selection as a REAL integer energetic advantage.
-    let mut items: Vec<MetabolismItem> = q
-        .iter()
-        .map(|(id, sp, _e, biomass, _a, d, t, p)| {
-            let local_soil = soil_field.0.sample_at(p.x, p.y);
-            // Both modifiers return a strictly-positive [0.5,1.5] band; product ∈ [0.25,2.25]. Map to a [0,1]
-            // match by `(factor - 0.25)/2.0` (linear, monotone), quantize ONCE to the u16 grid → an integer
-            // match permille. A better trait↔environment match ⇒ a higher permille ⇒ more demand.
-            let factor = soil_mod.fitness_factor(local_soil, d.0)
-                * clim_mod.fitness_factor(clim_sample, t.0);
-            let match_unit = ((factor - 0.25) / 2.0).clamp(0.0, 1.0);
-            let match_permille = (u64::from(fixed::to_unit_u16(match_unit))
-                * u64::from(fixed::PERMILLE))
-                / u64::from(fixed::UNIT_SCALE);
-            // ADR-013 F5: sense the org's OWN cell chem, FROZEN at start-of-tick. Toxin suppress + kin boost are
-            // INTEGER PERMILLE factors folded into the SAME demand product (the EditModifier precedent). Both
-            // return the NEUTRAL 1000 in a chem-free cell → the byte-identical pre-F5 demand math.
-            let cell = cell_index(p, width);
-            let tox_suppress = chem_mod.toxin_suppress_permille(frozen_toxin[cell as usize]);
-            let kin_own = kin_prov.own(cell as usize, sp.0 .0 as usize);
-            let kin_boost = chem_mod.kin_boost_permille(kin_own);
-            MetabolismItem {
-                cell,
-                species: sp.0 .0,
-                org: id.0,
-                // Bigger bodies demand more (size→uptake feedback); floor at seed biomass so a fresh org eats.
-                body: biomass.0.max(OFFSPRING_SEED_BIOMASS),
-                // Floor at a baseline so a poor match still eats a little (no zeroed weight — ADR-005 spirit).
-                match_permille: match_permille.max(u64::from(fixed::PERMILLE) / 4),
-                tox_suppress,
-                kin_boost,
-            }
-        })
-        .collect();
+    // Reuse the persistent scratch buffers (cleared + refilled; the backing allocation survives across ticks).
+    let mut items = std::mem::take(&mut scratch.items);
+    items.clear();
+    items.extend(q.iter().map(|(id, sp, _e, biomass, _a, d, t, p)| {
+        let local_soil = soil_field.0.sample_at(p.x, p.y);
+        // Both modifiers return a strictly-positive [0.5,1.5] band; product ∈ [0.25,2.25]. Map to a [0,1]
+        // match by `(factor - 0.25)/2.0` (linear, monotone), quantize ONCE to the u16 grid → an integer
+        // match permille. A better trait↔environment match ⇒ a higher permille ⇒ more demand.
+        let factor =
+            soil_mod.fitness_factor(local_soil, d.0) * clim_mod.fitness_factor(clim_sample, t.0);
+        let match_unit = ((factor - 0.25) / 2.0).clamp(0.0, 1.0);
+        let match_permille = (u64::from(fixed::to_unit_u16(match_unit))
+            * u64::from(fixed::PERMILLE))
+            / u64::from(fixed::UNIT_SCALE);
+        // ADR-013 F5: sense the org's OWN cell chem, FROZEN at start-of-tick. Toxin suppress + kin boost are
+        // INTEGER PERMILLE factors folded into the SAME demand product (the EditModifier precedent). Both
+        // return the NEUTRAL 1000 in a chem-free cell → the byte-identical pre-F5 demand math.
+        let cell = cell_index(p, width);
+        let tox_suppress = chem_mod.toxin_suppress_permille(frozen_toxin[cell as usize]);
+        let kin_own = kin_prov.own(cell as usize, sp.0 .0 as usize);
+        let kin_boost = chem_mod.kin_boost_permille(kin_own);
+        MetabolismItem {
+            cell,
+            species: sp.0 .0,
+            org: id.0,
+            // Bigger bodies demand more (size→uptake feedback); floor at seed biomass so a fresh org eats.
+            body: biomass.0.max(OFFSPRING_SEED_BIOMASS),
+            // Floor at a baseline so a poor match still eats a little (no zeroed weight — ADR-005 spirit).
+            match_permille: match_permille.max(u64::from(fixed::PERMILLE) / 4),
+            tox_suppress,
+            kin_boost,
+        }
+    }));
     items.sort_unstable_by_key(|it| (it.cell, it.species, it.org));
 
-    // ── Pass 1: per-org DEMAND against the FROZEN stock (clone the three channels start-of-tick). ──
-    let frozen_light = pools.light.clone();
-    let frozen_nutrient = pools.free_nutrient.clone();
-    let frozen_detritus = pools.detritus.clone();
+    // ── Pass 1: per-org DEMAND against the FROZEN stock (snapshot the three channels start-of-tick into the
+    //    reused frozen buffers — `copy_from_slice` reuses the backing allocation, byte-identical to a clone). ──
+    let mut frozen_light = std::mem::take(&mut scratch.frozen_light);
+    let mut frozen_nutrient = std::mem::take(&mut scratch.frozen_nutrient);
+    let mut frozen_detritus = std::mem::take(&mut scratch.frozen_detritus);
+    frozen_light.clear();
+    frozen_light.extend_from_slice(&pools.light);
+    frozen_nutrient.clear();
+    frozen_nutrient.extend_from_slice(&pools.free_nutrient);
+    frozen_detritus.clear();
+    frozen_detritus.extend_from_slice(&pools.detritus);
 
     // Per-channel demand vector, indexed parallel to `items` (canonical order → finding #6 apportion index).
     let n = items.len();
-    let mut demand = vec![[0i64; resource::RESOURCE_CHANNELS]; n];
+    let mut demand = std::mem::take(&mut scratch.demand);
+    demand.clear();
+    demand.resize(n, [0i64; resource::RESOURCE_CHANNELS]);
     for (i, it) in items.iter().enumerate() {
         let strat = &registry.entries[it.species as usize].strategy;
         // Acquisition permille scales demand; body size scales it further. demand_permille folds affinity.
@@ -822,8 +868,16 @@ fn metabolism(
     }
 
     // ── Pass 2: per-cell APPORTION the actual available J across co-located demanders (canonical order). ──
-    // Group item indices by (channel, cell) and apportion the live pool ONCE per (channel, cell).
-    let mut granted = vec![[0i64; resource::RESOURCE_CHANNELS]; n];
+    // Group item indices by (channel, cell) and apportion the live pool ONCE per (channel, cell). The `weights`,
+    // `shares`, and largest-remainder `rem_scratch` buffers are REUSED across every (channel, cell) group so the
+    // inner loop pays no per-group heap allocation (hash-neutral: `apportion_into` is bit-identical to
+    // `apportion`; only the buffer ownership moved out of the loop).
+    let mut granted = std::mem::take(&mut scratch.granted);
+    granted.clear();
+    granted.resize(n, [0i64; resource::RESOURCE_CHANNELS]);
+    let mut weights: Vec<u64> = Vec::new();
+    let mut shares: Vec<i64> = Vec::new();
+    let mut rem_scratch: Vec<(u128, usize)> = Vec::new();
     for c in 0..resource::RESOURCE_CHANNELS {
         // Walk items in canonical order; items in the same cell are CONTIGUOUS (cell is the primary key).
         let mut i = 0usize;
@@ -834,16 +888,15 @@ fn metabolism(
                 j += 1;
             }
             // items[i..j] share this cell. Sum their channel-c demand and apportion the available stock.
-            let weights: Vec<u64> = items[i..j]
-                .iter()
-                .enumerate()
-                .map(|(k, _)| demand[i + k][c].max(0) as u64)
-                .collect();
+            let group = j - i;
+            weights.clear();
+            weights.extend((0..group).map(|k| demand[i + k][c].max(0) as u64));
             let total_demand: i64 = weights.iter().map(|&w| w as i64).sum();
             if total_demand > 0 {
                 let cellu = cell as usize;
                 let available = pool_channel(&pools, c)[cellu].min(total_demand);
-                let shares = fixed::apportion(available, &weights);
+                shares.resize(group, 0);
+                fixed::apportion_into(available, &weights, &mut shares, &mut rem_scratch);
                 let mut taken = 0i64;
                 for (k, share) in shares.iter().enumerate() {
                     granted[i + k][c] = *share;
@@ -883,6 +936,11 @@ fn metabolism(
     // order-pinned (the litterfall precedent). Each is a paired respired↔toxin split that conserves J.
     let mut toxin_mints: std::collections::BTreeMap<u64, (u32, i64)> =
         std::collections::BTreeMap::new();
+    // Reusable convert-split buffers (perf, hash-neutral): `split_budget_into` is bit-identical to
+    // `split_budget`; only the per-org output/scratch ownership moves out of the loop.
+    let mut split: Vec<i64> = Vec::new();
+    let mut split_w: Vec<u64> = Vec::new();
+    let mut split_rem: Vec<(u128, usize)> = Vec::new();
     for (id, sp, mut energy, mut biomass, mut age, _d, _t, p) in q.iter_mut() {
         age.0 = age.0.saturating_add(1);
         let granted_total = match by_org.get(&id.0) {
@@ -891,7 +949,13 @@ fn metabolism(
         };
         // CONVERT: split granted J across the 5 budget channels (conserved by split_budget).
         let strat = &registry.entries[sp.0 .0 as usize].strategy;
-        let split = fixed::split_budget(granted_total, &strat.budget);
+        fixed::split_budget_into(
+            granted_total,
+            &strat.budget,
+            &mut split,
+            &mut split_w,
+            &mut split_rem,
+        );
         let to_growth = split[gp::BudgetChannel::Growth as usize];
         let to_acq = split[gp::BudgetChannel::Acquisition as usize];
         let to_repro = split[gp::BudgetChannel::Reproduction as usize];
@@ -974,6 +1038,15 @@ fn metabolism(
         prov.deposit_detritus(cellu, sp as usize, accepted);
         ledger.overflow += amt - accepted; // detritus cap spill → overflow (nets out)
     }
+
+    // Return the reused buffers to the scratch resource so their backing allocations survive to the next tick.
+    scratch.items = items;
+    scratch.frozen_light = frozen_light;
+    scratch.frozen_nutrient = frozen_nutrient;
+    scratch.frozen_detritus = frozen_detritus;
+    scratch.demand = demand;
+    scratch.granted = granted;
+    scratch.frozen_toxin = frozen_toxin;
 }
 
 /// One organism's metabolism row in canonical `(cell, species, org)` order.
@@ -1069,7 +1142,7 @@ fn credit_capped(value: i64, amount: i64, cap: i64) -> (i64, i64) {
 /// `free_nutrient` is now ENDOGENOUS, supplied ONLY by decomposer mineralization of shed detritus (see
 /// [`trophic::mineralize`]) — the obligate plant→detritus→decomposer→free_nutrient loop.
 fn solar_influx(
-    field: Res<ResourceFieldRes>,
+    light_cap: Res<SolarLightCap>,
     mut pools: ResMut<PoolStock>,
     mut ledger: ResMut<ledger::Ledger>,
 ) {
@@ -1078,11 +1151,14 @@ fn solar_influx(
         // light: mint SOLAR_PER_CELL, capped by the static field's per-cell carrying capacity. The cap uses
         // CELL_CAP_SCALE (>> the seed's CELL_J_SCALE) so a cell seeded partly-full has real headroom for solar
         // to flow in tick after tick — the F3.4 fix that turns solar from a 100%-overflow no-op into the live
-        // source the chemostat runs on.
-        let light_cap = (i64::from(fixed::to_unit_u16(f64::from(field.0.light[c])))
-            * CELL_CAP_SCALE)
-            .min(POOL_CAP);
-        mint_to_cap(&mut pools.light[c], SOLAR_PER_CELL, light_cap, &mut ledger);
+        // source the chemostat runs on. PRECOMPUTED once at reset (SolarLightCap) — the static field is constant,
+        // so this is the IDENTICAL integer cap with no per-tick f64 re-floor (hash-neutral perf optimization).
+        mint_to_cap(
+            &mut pools.light[c],
+            SOLAR_PER_CELL,
+            light_cap.0[c],
+            &mut ledger,
+        );
     }
 }
 
@@ -1120,6 +1196,7 @@ fn reproduce_or_die(
     mut next_id: ResMut<NextOrgId>,
     registry: Res<SpeciesRegistry>,
     kin_prov: Res<chem::KinProvenance>,
+    mut repro_scratch: ResMut<ReproScratch>,
     mut pools: ResMut<PoolStock>,
     mut chem: ResMut<chem::ChemField>,
     mut prov: ResMut<trophic::PoolProvenance>,
@@ -1143,28 +1220,31 @@ fn reproduce_or_die(
     // ADR-013 F5: FREEZE the chem toxin + alarm planes at start-of-tick (the `frozen_light` discipline) so the
     // maintenance/death/birth passes all read a stable field — within-pass deposits (death-alarm) never feed
     // back into this tick's sense. Toxin → lethal maintenance drain (kin-spared); alarm → flee dispersal.
-    let frozen_toxin = chem.frozen_toxin();
-    let frozen_alarm = chem.frozen_alarm();
+    // Reuse the persistent frozen buffers (byte-identical snapshots of the start-of-tick planes).
+    let mut frozen_toxin = std::mem::take(&mut repro_scratch.frozen_toxin);
+    let mut frozen_alarm = std::mem::take(&mut repro_scratch.frozen_alarm);
+    chem.frozen_toxin_into(&mut frozen_toxin);
+    chem.frozen_alarm_into(&mut frozen_alarm);
     // ── Build ONE canonical (cell, SpeciesId, OrgId) order over the LIVING set (inv #3, finding #5). ──
-    let mut rows: Vec<ReproRow> = q
-        .iter()
-        .map(
-            |(entity, id, sp, energy, biomass, age, g, d, t, p)| ReproRow {
-                cell: cell_index(p, width),
-                species: sp.0 .0,
-                org: id.0,
-                entity,
-                energy: energy.0,
-                biomass: biomass.0,
-                age: age.0,
-                genotype: g.0,
-                drought: d.0,
-                thermal: t.0,
-                px: p.x,
-                py: p.y,
-            },
-        )
-        .collect();
+    // Reuse the persistent scratch row buffer (cleared + refilled; backing allocation survives across ticks).
+    let mut rows = std::mem::take(&mut repro_scratch.rows);
+    rows.clear();
+    rows.extend(q.iter().map(
+        |(entity, id, sp, energy, biomass, age, g, d, t, p)| ReproRow {
+            cell: cell_index(p, width),
+            species: sp.0 .0,
+            org: id.0,
+            entity,
+            energy: energy.0,
+            biomass: biomass.0,
+            age: age.0,
+            genotype: g.0,
+            drought: d.0,
+            thermal: t.0,
+            px: p.x,
+            py: p.y,
+        },
+    ));
     rows.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
 
     // ── Step 1+2: maintenance debit, then death (carcass→detritus) — all RNG-free, canonical order. ──
@@ -1334,6 +1414,10 @@ fn reproduce_or_die(
             Species(SpeciesId(c.species)),
         ));
     }
+    // Return the reused buffers to the scratch resource (their allocations survive to the next tick).
+    repro_scratch.rows = rows;
+    repro_scratch.frozen_toxin = frozen_toxin;
+    repro_scratch.frozen_alarm = frozen_alarm;
 }
 
 /// Mutate a `[0,1]` heritable scalar by a small symmetric integer step derived from a `SimRng` word — no
@@ -1679,6 +1763,18 @@ impl Simulation {
         };
         world.insert_resource(ledger);
         world.insert_resource(pools);
+        // PRECOMPUTE the per-cell solar light cap ONCE (the static field is constant for the run) so the hot
+        // `solar_influx` tick path is pure integer with no per-cell f64 re-floor (hash-neutral perf opt).
+        let solar_light_cap: Vec<i64> = resource_field
+            .light
+            .iter()
+            .map(|&v| (i64::from(fixed::to_unit_u16(f64::from(v))) * CELL_CAP_SCALE).min(POOL_CAP))
+            .collect();
+        world.insert_resource(SolarLightCap(solar_light_cap));
+        // Reusable per-tick scratch buffers for the hot systems (perf, hash-neutral — see the resource docs).
+        world.insert_resource(MetabolismScratch::default());
+        world.insert_resource(ReproScratch::default());
+        world.insert_resource(chem::ChemEmitScratch::default());
         world.insert_resource(ResourceFieldRes(resource_field));
         // ADR-013 F5: the chemical/signal field (toxin/kin/alarm), seeded ALL-ZERO — chem is ENDOGENOUS
         // (emitted by organisms, never seed-generated), so it draws NO derive_seed / SimRng. Because Σchem == 0

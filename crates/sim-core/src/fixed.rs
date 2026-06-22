@@ -33,18 +33,43 @@ pub const UNIT_SCALE: u16 = u16::MAX;
 /// on every platform. A non-positive `total` yields all zeros (the substrate never apportions a debit; the
 /// caller handles withdrawals explicitly).
 pub fn apportion(total: i64, weights: &[u64]) -> Vec<i64> {
+    let mut out = vec![0i64; weights.len()];
+    let mut remainders: Vec<(u128, usize)> = Vec::new();
+    apportion_into(total, weights, &mut out, &mut remainders);
+    out
+}
+
+/// Buffer-reusing core of [`apportion`] — BYTE-IDENTICAL to it, but writes into a caller-owned `out` slice and
+/// reuses a caller-owned `remainders` scratch `Vec`, so a hot per-tick loop that apportions thousands of small
+/// groups pays ZERO per-call heap allocation (the perf-optimization seam; the integer math, the floor, and the
+/// `(remainder desc, index asc)` tie-break are unchanged → the apportionment is bit-for-bit the same as
+/// [`apportion`]). `out` MUST be exactly `weights.len()` long; it is fully overwritten (no stale carry).
+pub fn apportion_into(
+    total: i64,
+    weights: &[u64],
+    out: &mut [i64],
+    remainders: &mut Vec<(u128, usize)>,
+) {
     let n = weights.len();
-    let mut out = vec![0i64; n];
+    debug_assert_eq!(
+        out.len(),
+        n,
+        "apportion_into: out must match weights length"
+    );
+    for o in out.iter_mut() {
+        *o = 0;
+    }
     if n == 0 || total <= 0 {
-        return out;
+        return;
     }
     let sum: u128 = weights.iter().map(|&w| u128::from(w)).sum();
     if sum == 0 {
-        return out;
+        return;
     }
     let total_u = total as u128;
     // Floor share + fractional remainder per index, tracking how many quanta remain to distribute.
-    let mut remainders: Vec<(u128, usize)> = Vec::with_capacity(n);
+    remainders.clear();
+    remainders.reserve(n);
     let mut allocated: u128 = 0;
     for (i, &w) in weights.iter().enumerate() {
         let numer = total_u * u128::from(w);
@@ -64,7 +89,6 @@ pub fn apportion(total: i64, weights: &[u64]) -> Vec<i64> {
         leftover -= 1;
         k += 1;
     }
-    out
 }
 
 /// Split `total` joules across an allocation `budget` of permille shares (typically summing to [`PERMILLE`],
@@ -73,6 +97,22 @@ pub fn apportion(total: i64, weights: &[u64]) -> Vec<i64> {
 pub fn split_budget(total: i64, budget: &[u16]) -> Vec<i64> {
     let w: Vec<u64> = budget.iter().map(|&b| u64::from(b)).collect();
     apportion(total, &w)
+}
+
+/// Buffer-reusing core of [`split_budget`] — BYTE-IDENTICAL to it (same widen→`apportion` path), but writes the
+/// shares into a caller-owned `out` and reuses caller-owned `w`/`rem` scratch, so a hot per-org per-tick convert
+/// pays ZERO heap allocation (the [`apportion_into`] discipline). `out` is resized to `budget.len()`.
+pub fn split_budget_into(
+    total: i64,
+    budget: &[u16],
+    out: &mut Vec<i64>,
+    w: &mut Vec<u64>,
+    rem: &mut Vec<(u128, usize)>,
+) {
+    w.clear();
+    w.extend(budget.iter().map(|&b| u64::from(b)));
+    out.resize(budget.len(), 0);
+    apportion_into(total, w, out, rem);
 }
 
 /// Normalize arbitrary non-negative `weights` into a permille budget summing to EXACTLY [`PERMILLE`] (1000),

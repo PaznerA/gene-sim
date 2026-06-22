@@ -741,19 +741,39 @@ Source: `cargo bench -p sim-core` (`crates/sim-core/benches/tick.rs`), run via `
 The perf gate (§10.7) fails on a regression **below the CURRENT baseline**. Re-baseline at each stage that
 changes the hot path, in the same slice (this is anticipated — see the Stage 0 row note).
 
-### Current baseline — R1.1 exit: Wright-Fisher selection + soil-coupled `EnvironmentModifier`
+### Current baseline — post-F5 full F3→F4→F5 pipeline (energy-funded births/deaths + obligate trophic loop + chem field), after the hash-neutral scratch-buffer pass
 | Workload (entities × generations) | Median wall time | Throughput |
 |---|---|---|
-| 1 000 × 50  | **1.737 ms** | ~29 M organism-updates/s |
-| 5 000 × 50  | **10.88 ms** | ~23 M organism-updates/s |
-| 10 000 × 50 | **25.79 ms** | ~19 M organism-updates/s |
+| 1 000 × 50  | **61.7 ms** | ~0.81 M organism-updates/s |
+| 5 000 × 50  | **295.4 ms** | ~0.85 M organism-updates/s |
+| 10 000 × 50 | **590.8 ms** | ~0.85 M organism-updates/s |
 
-**Headline (current):** ~**19 M organism-updates/s** at 10 k entities — unchanged from the Stage 1 baseline.
-R1.1 wired a per-parent `EnvironmentModifier::fitness_factor` call into the selection hot loop (soil → drought
-coupling), which adds a few f64 ops per parent: a **fixed-ish overhead** that shows as ~+6 % on the smallest
-workload (1 k) but is within noise at 10 k (the headline). Re-baselined in-slice per ADR-005's hot-path rule;
-the prior Stage-1 row (1.645 / 10.48 / 25.97 ms) is superseded. Same cheap win still tracked (F1: `BTreeMap`
-→ `Vec` write-back); the `EnvironmentModifier` is static-dispatched (a unit struct), so it already inlines.
+**Headline (current):** ~**0.85 M organism-updates/s** at 10 k entities. The ~25× slowdown vs the stale R1.1
+row is the real cost of the post-F0b biology, NOT a regression: F3 replaced constant-N Wright-Fisher with a
+variable-N energy-funded births/deaths chemostat (per-cell Monod uptake, largest-remainder apportionment over
+co-located demanders, per-org `split_budget` convert, conserved-J ledger asserted every tick), F4 added the
+decomposer mineralization loop + the measured `FlowMatrix`, and F5 added the toxin/kin/alarm diffusion field —
+and the `entities_N` count is the SPAWN count; population then grows over the 50 generations, so each "tick"
+processes well more than N orgs. (The R1.1 row is kept under Historical for the record.)
+
+**Hash-neutral perf pass (this baseline):** an allocation-elimination sweep that preserved the EXACT integer
+sequence (`determinism_hash_is_pinned` = `0x47a0_3c8f_6701_f240`, byte-identical throughout). Changes, all
+reusing scratch across ticks or hoisting a constant out of the hot loop — never touching iteration/accumulation
+order or any value: (1) `fixed::apportion_into` / `split_budget_into` — buffer-reusing cores of `apportion` /
+`split_budget`, called per-(cell,channel) and per-org, that write into caller-owned `out`/scratch (bit-identical
+math); wired into `metabolism` pass-2/pass-3, `mineralize`, and `PoolProvenance::withdraw`. (2) `SolarLightCap`
+— the static `ResourceField` light cap (`min(to_unit_u16(light)·CELL_CAP_SCALE, POOL_CAP)`) is constant, so it
+is precomputed ONCE at reset instead of re-flooring an f64 per cell per tick in `solar_influx`. (3) Per-tick
+`Vec` clones turned into reused buffers held in `MetabolismScratch` / `ReproScratch` / `ChemEmitScratch` (the
+`items`/`rows`/`demand`/`granted` row vectors + the `frozen_light/nutrient/detritus/toxin/alarm` plane
+snapshots, now `clear()`+refill / `extend_from_slice`), and the per-channel `src` clone in `diffuse_and_decay`
+(reused `ChemField.src_buf`). Net: 1 k −13 %, 5 k −8 %, 10 k −6 % vs the pre-pass post-F5 numbers (70.9 / 321.2
+/ 631.4 ms), all p < 0.05.
+
+**Deferred (would re-pin — NOT taken here):** the remaining per-tick `BTreeMap`s (`by_org`, `maint_energy`,
+`parent_debit`, `spent`, `litterfall`, `toxin_mints`) are OrgId-keyed lookup/collect maps; swapping them for a
+sorted-`Vec` + binary-search is allocation-lighter but is a structural change worth its own slice, and any
+mis-step there moves the hash — so it is left as a follow-up, not folded into this hash-neutral pass.
 
 ### Historical — Stage 0 (slice S0): empty deterministic loop (no selection)
 | 1 000 × 50 → **302.6 µs** · 5 000 × 50 → **1.438 ms** · 10 000 × 50 → **2.856 ms** (~175 M updates/s). |
