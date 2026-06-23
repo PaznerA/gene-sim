@@ -456,13 +456,13 @@ const LIEBIG_FLOOR: u64 = 350;
 /// equilibrium so it is provably NEVER hit in the pinned config (the `max_population_is_never_hit` test).
 /// Keeping it non-load-bearing avoids the "skip births in OrgId order" hidden-selection trap — if it ever bound,
 /// it would impose an OrgId-correlated selection gradient, which inv #6 forbids.
-const MAX_POPULATION: u32 = 2_000_000;
+pub(crate) const MAX_POPULATION: u32 = 2_000_000;
 
 /// Monotonic OrgId allocator (ADR-013 F3): the id the NEXT spawned organism receives. Bumped at every spawn
 /// (initial + birth); NEVER reset mid-run, NEVER reuses a despawned id. A `Resource` so the single-threaded
 /// schedule threads it deterministically (inv #3).
 #[derive(Resource)]
-struct NextOrgId(u64);
+pub(crate) struct NextOrgId(pub(crate) u64);
 
 /// Cumulative `SimRng` draw counter (ADR-013 F3, finding #4): incremented at EVERY `next_u64` the sim path
 /// consumes (births only at F3), and folded into `hash_world` alongside `final_word`. A birth-enumeration
@@ -534,24 +534,24 @@ pub(crate) struct Biomass(pub(crate) i64);
 /// organism dies of senescence (a HARD ceiling at F3; soft age→maintenance coupling is deferred). Folded into
 /// `hash_world` (per-org heritable-adjacent state that affects the death set).
 #[derive(Component, Clone, Copy)]
-struct Age(u32);
+pub(crate) struct Age(pub(crate) u32);
 
 /// Per-individual heritable scalar in `[0, 1]` — the "allele" under selection. Seeded at spawn from
 /// [`SimRng`] so individuals vary; resampled each generation by [`selection`]. Higher fitness ⇒ more copies.
 #[derive(Component, Clone, Copy)]
-struct Genotype(f64);
+pub(crate) struct Genotype(pub(crate) f64);
 
 /// Per-individual **heritable** drought tolerance in `[0, 1]` (roadmap R1.0a). Seeded at spawn as standing
 /// variation; inherited (NOT resampled) from the fitness-sampled parent each generation by [`selection`], so
 /// soil-coupled selection (R1.1) can shift the population's drought distribution to match the terrain.
 #[derive(Component, Clone, Copy)]
-struct DroughtTol(f64);
+pub(crate) struct DroughtTol(pub(crate) f64);
 
 /// Per-individual **heritable** thermal tolerance in `[0, 1]` (ADR-012 Phase E E3). Standing variation seeded
 /// at spawn (after drought, fixed draw order); inherited (NOT resampled) from the fitness-sampled parent; the
 /// climate's `TemperatureMatchModifier` favours warm-adapted individuals in warm climates. Folded into the hash.
 #[derive(Component, Clone, Copy)]
-struct ThermalTol(f64);
+pub(crate) struct ThermalTol(pub(crate) f64);
 
 /// Per-individual cell position on the canonical [`WORLD_DIMS`] world grid (ADR-011, real spatial biology —
 /// no longer a render-only OrgId hash). Seeded at spawn from a DISJOINT off-`SimRng` derive_seed family
@@ -1261,6 +1261,7 @@ fn reproduce_or_die(
     mut pools: ResMut<PoolStock>,
     mut chem: ResMut<chem::ChemField>,
     mut prov: ResMut<trophic::PoolProvenance>,
+    mut reservoir: ResMut<trophic::SporeReservoir>,
     mut ledger: ResMut<ledger::Ledger>,
     mut q: Query<(
         Entity,
@@ -1343,6 +1344,16 @@ fn reproduce_or_die(
             // Carcass → detritus: residual Energy (post-maintenance) + Biomass deposits to the cell pool, split
             // alarm/detritus + cap-spill→overflow by the SHARED `deposit_carcass` helper (SP-3.0 extraction).
             let residual = energy_after.max(0) + r.biomass.max(0);
+            // ADR-019 S4 STARVATION/SENESCENCE SPORULATION ARM: a spore-former routes a deterministic survival
+            // fraction of its residual J into the dormant reservoir (a paired live-J move) INSTEAD of all-to-
+            // detritus, exactly ONCE before `deposit_carcass` takes the remainder (so spore_share + carcass ==
+            // residual, mirroring deposit_carcass's accepted+overflow==residual invariant). Non-spore-former →
+            // the split is never called → byte-identical to the pre-S4 carcass deposit.
+            let carcass = if strat.spore_former {
+                trophic::sporulation_split(&mut reservoir, cellu, r.species as usize, residual)
+            } else {
+                residual
+            };
             deposit_carcass(
                 &mut pools,
                 &mut chem,
@@ -1350,7 +1361,7 @@ fn reproduce_or_die(
                 &mut ledger,
                 cellu,
                 r.species as usize,
-                residual,
+                carcass,
             );
             dead.push(r.entity);
         }
@@ -1493,6 +1504,7 @@ fn mutate_unit(value: f64, word: u64) -> f64 {
 fn measure_and_assert_ledger(
     pools: Res<PoolStock>,
     chem: Res<chem::ChemField>,
+    reservoir: Res<trophic::SporeReservoir>,
     ledger: Res<ledger::Ledger>,
     q: Query<(&Energy, &Biomass)>,
 ) {
@@ -1508,6 +1520,8 @@ fn measure_and_assert_ledger(
         biomass,
         // ADR-013 F5: chem is now a LIVE bucket — the toxin/kin/alarm planes (i32 milli == J, widened to i64).
         chem: chem.total(),
+        // ADR-019 S4: spore is the FIFTH live bucket — the dormant reservoir (zero on a spore-former-free run).
+        spore: reservoir.total(),
     };
     #[cfg(feature = "determinism")]
     ledger::assert_ledger_closes(&ledger, &live);
@@ -1847,6 +1861,11 @@ impl Simulation {
         let cells = (resource::RESOURCE_DIMS.0 as usize) * (resource::RESOURCE_DIMS.1 as usize);
         world.insert_resource(trophic::FlowMatrix::zeroed(species_count));
         world.insert_resource(trophic::PoolProvenance::new(cells, species_count));
+        // ADR-019 S4: the per-cell, per-species DORMANT spore reservoir (the dormancy/germination substrate),
+        // a structural twin of PoolProvenance/KinProvenance. Starts ALL-ZERO (no org has sporulated yet), so it
+        // adds 0 to the ledger's initial_total and is NOT folded into hash_world (it reaches the hash only via
+        // its coupling effect on Energy/Biomass/OrgIds when a germling spawns) → hash-neutral on the pinned run.
+        world.insert_resource(trophic::SporeReservoir::new(cells, species_count));
         // ADR-013 F5: the per-species KIN attribution (the legible kin-SELECTION mechanic — own-species boost,
         // not generic crowding), REUSING the PoolProvenance flat `[cell*S + species]` mechanism. Starts zero;
         // NOT folded into hash_world (internal bookkeeping the demand/maintenance sense reads from).
@@ -1883,6 +1902,7 @@ impl Simulation {
                 metabolism,
                 trophic::mineralize,
                 chem::emit_chem,
+                trophic::germinate,
                 reproduce_or_die,
                 trophic::predation,
                 chem::assert_chem_conserved_system,
@@ -2323,6 +2343,11 @@ impl Simulation {
         self.world
             .resource_mut::<chem::KinProvenance>()
             .grow_to(cells, new_len);
+        // ADR-019 S4: grow the dormant spore reservoir alongside the other species-indexed planes so a newly
+        // registered spore-former addresses a valid slot (re-lays the flat plane; no-op on the pinned run).
+        self.world
+            .resource_mut::<trophic::SporeReservoir>()
+            .grow_to(cells, new_len);
         SpeciesId((new_len - 1) as u16)
     }
 
@@ -2585,8 +2610,27 @@ impl Simulation {
             .take(kills)
             .map(|v| (v.cell as usize, v.entity, v.residual))
             .collect();
+        // ADR-019 S4 CULL SPORULATION ARM — the headline counter-play. For a SPORE-FORMER victim ONLY, split
+        // each victim's residual J: a deterministic survival fraction → the per-cell dormant reservoir (a paired
+        // live-J move, STRUCTURALLY cull-immune — a resource plane the census never enumerates), the remainder →
+        // the existing carcass→detritus path. The org is STILL despawned (it leaves the vegetative population);
+        // its J splits spore-vs-detritus instead of all-detritus. A NON-spore-former → spore_share == 0 → this is
+        // byte-identical to the pre-S4 cull. (region_cull is a public Action, NOT a scheduled system, so the
+        // pinned single-plant run — which never culls and has no spore-former — is byte-unaffected either way.)
+        let spore_former = self.world.resource::<SpeciesRegistry>().entries[sid.0 as usize]
+            .strategy
+            .spore_former;
         for &(cellu, _entity, residual) in &victims {
-            self.cull_deposit(cellu, sid.0 as usize, residual);
+            let carcass = if spore_former {
+                self.world.resource_scope(
+                    |_world, mut reservoir: bevy_ecs::prelude::Mut<trophic::SporeReservoir>| {
+                        trophic::sporulation_split(&mut reservoir, cellu, sid.0 as usize, residual)
+                    },
+                )
+            } else {
+                residual
+            };
+            self.cull_deposit(cellu, sid.0 as usize, carcass);
         }
         for &(_cellu, entity, _residual) in &victims {
             self.world.despawn(entity);
@@ -4198,6 +4242,7 @@ mod tests {
         // Recompute the live total from the world and assert the ledger closes against it.
         let pools_total = sim.world.resource::<PoolStock>().total();
         let chem_total = sim.world.resource::<chem::ChemField>().total(); // ADR-013 F5: chem is a live bucket
+        let spore_total = sim.world.resource::<trophic::SporeReservoir>().total(); // ADR-019 S4
         let (mut e, mut b) = (0i64, 0i64);
         for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
             e += energy.0;
@@ -4208,6 +4253,7 @@ mod tests {
             energy: e,
             biomass: b,
             chem: chem_total,
+            spore: spore_total,
         };
         assert!(
             ledger::ledger_closes(&sim.ledger(), &live),
@@ -4899,6 +4945,7 @@ mod tests {
         // And the ledger still closes with the injected + decayed toxin fully accounted (the F5 four-bucket close).
         let pools_total = toxic.world.resource::<PoolStock>().total();
         let chem_total = toxic.world.resource::<chem::ChemField>().total();
+        let spore_total = toxic.world.resource::<trophic::SporeReservoir>().total(); // ADR-019 S4
         let (mut e, mut b) = (0i64, 0i64);
         for (energy, biomass) in toxic
             .world
@@ -4913,6 +4960,7 @@ mod tests {
             energy: e,
             biomass: b,
             chem: chem_total,
+            spore: spore_total,
         };
         assert!(
             ledger::ledger_closes(&toxic.ledger(), &live),
@@ -5271,6 +5319,7 @@ mod tests {
         sim.step(cfg.generations);
         let pools_total = sim.world.resource::<PoolStock>().total();
         let chem_total = sim.world.resource::<chem::ChemField>().total(); // ADR-013 F5: chem is a live bucket
+        let spore_total = sim.world.resource::<trophic::SporeReservoir>().total(); // ADR-019 S4
         let (mut e, mut b) = (0i64, 0i64);
         for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
             e += energy.0;
@@ -5281,6 +5330,7 @@ mod tests {
             energy: e,
             biomass: b,
             chem: chem_total,
+            spore: spore_total,
         };
         assert!(
             ledger::ledger_closes(&sim.ledger(), &live),
@@ -5290,10 +5340,11 @@ mod tests {
         );
     }
 
-    /// Measure the live `J` total of a sim (the four conserved buckets) — the `ledger_closes` left side.
+    /// Measure the live `J` total of a sim (the five conserved buckets) — the `ledger_closes` left side.
     fn measure_live(sim: &mut Simulation) -> ledger::LiveTotal {
         let pools = sim.world.resource::<PoolStock>().total();
         let chem = sim.world.resource::<chem::ChemField>().total();
+        let spore = sim.world.resource::<trophic::SporeReservoir>().total(); // ADR-019 S4
         let (mut e, mut b) = (0i64, 0i64);
         for (energy, biomass) in sim.world.query::<(&Energy, &Biomass)>().iter(&sim.world) {
             e += energy.0;
@@ -5304,6 +5355,7 @@ mod tests {
             energy: e,
             biomass: b,
             chem,
+            spore,
         }
     }
 
@@ -5833,6 +5885,197 @@ mod tests {
             sim.ledger().intervention,
             0,
             "no SP-3 method invoked → the intervention tap stays zero"
+        );
+    }
+
+    /// Register a synthetic SPORE-FORMER decomposer (ADR-019 S4): the same decomposer anchors as
+    /// [`register_contaminant_decomposer`] PLUS the `SporulationCapacity` anchor, so `Strategy.spore_former` is
+    /// `true`. `activity` drives every anchor off the one genome value (the `anchor_genome`/`anchor_map` seam).
+    fn register_spore_former(sim: &mut Simulation, key: &str, activity: f64) -> SpeciesId {
+        sim.register_species(
+            key.to_string(),
+            key.to_string(),
+            anchor_genome(activity),
+            anchor_map(&[
+                Trait::GlucoseUptake,
+                Trait::AcetateOverflow,
+                Trait::GrowthRate,
+                Trait::FermentationCapacity,
+                Trait::RespirationMode,
+                Trait::SporulationCapacity, // the S4 marker → Strategy.spore_former == true
+            ]),
+            gp::TrophicRole::Decomposer,
+        )
+    }
+
+    /// Total banked spore J in the reservoir for one species (across all cells) — the S4 dormancy bucket.
+    fn species_spore_j(sim: &Simulation, sid: SpeciesId) -> i64 {
+        let r = sim.world.resource::<trophic::SporeReservoir>();
+        let cells = {
+            let p = sim.world.resource::<PoolStock>();
+            (p.width as usize) * (p.height as usize)
+        };
+        (0..cells).map(|c| r.stock(c, sid.0 as usize)).sum()
+    }
+
+    #[test]
+    fn s4_cull_of_a_spore_former_banks_a_reservoir_conserving_j_and_ledger_closes() {
+        // ADR-019 S4 (the headline counter-play): culling a SPORE-FORMER routes SPORE_SURVIVAL_PERMILLE of each
+        // victim's residual into the dormant reservoir (a paired live-J move, NOT a mint), the rest to detritus.
+        // The org STILL despawns (it leaves the vegetative population), but its J splits spore-vs-detritus — so a
+        // reservoir is left behind, live J is UNCHANGED, no tap moves, and ledger_closes holds.
+        let cfg = SimConfig {
+            seed: 71,
+            generations: 0,
+            entity_count: 100,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let sid = register_spore_former(&mut sim, "bacillus", 0.9);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 30,
+        }; // whole grid
+           // Seed a propagule of the spore-former so there is something to cull (RNG-free immigration).
+        let count = 40u32;
+        let endow_j = 500_000i64;
+        let placed = sim.region_inoculate(sid, region, count, endow_j);
+        assert_eq!(placed, count);
+        let n_before = species_pop(&mut sim, sid.0) as i64;
+        assert!(n_before > 0, "the spore-former propagule is present");
+        let spore_before = species_spore_j(&sim, sid);
+        assert_eq!(spore_before, 0, "no spore banked before the cull");
+        let before_live = measure_live(&mut sim).sum();
+        let before_taps = (sim.ledger().intervention, sim.ledger().immigration);
+
+        // Cull the WHOLE propagule (strength 1000 → kills the entire census).
+        let killed = sim.region_cull(sid, region, 1000);
+        assert_eq!(
+            killed as i64, n_before,
+            "a 1000-permille cull takes the whole census"
+        );
+        assert_eq!(
+            species_pop(&mut sim, sid.0),
+            0,
+            "every culled org leaves the vegetative population (a spore is NOT a vegetative org)"
+        );
+        // A reservoir was BANKED — the structural cull-immunity: the resource plane survives the org census.
+        let spore_after = species_spore_j(&sim, sid);
+        assert!(
+            spore_after > 0,
+            "the cull leaves a dormant reservoir (the survival fraction of the culled residual)"
+        );
+        // CONSERVATION: a cull mints NOTHING — neither tap moves, and live J (now incl. the spore bucket) is
+        // unchanged (the residual split store→spore+detritus, none lost/minted).
+        assert_eq!(
+            (sim.ledger().intervention, sim.ledger().immigration),
+            before_taps,
+            "a spore-forming cull mints no J (it is a paired bucket move)"
+        );
+        let after_live = measure_live(&mut sim).sum();
+        assert_eq!(
+            after_live, before_live,
+            "live J (incl. the spore bucket) is unchanged by the cull"
+        );
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold right after a spore-forming cull: live {} vs expected {}",
+            live.sum(),
+            sim.ledger().expected_total()
+        );
+    }
+
+    #[test]
+    fn s4_cull_then_regerminate_when_conditions_return() {
+        // ADR-019 S4 (the demo beat — the MECHANIC, not a forced equilibrium per §0.6): a spore-former culled to
+        // ZERO vegetative orgs leaves a reservoir; when its role-appropriate pool channel (detritus, for a
+        // decomposer) is favourable, `germinate` withdraws from the reservoir and respawns vegetative orgs. We
+        // assert the MECHANIC — a cull leaves a reservoir that CAN regerminate, draining as it does — never that
+        // the species ultimately persists.
+        let cfg = SimConfig {
+            seed: 73,
+            generations: 0,
+            entity_count: 60,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        let sid = register_spore_former(&mut sim, "bacillus", 0.9);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 30,
+        };
+        // Inoculate, then cull the whole propagule → a banked reservoir, zero vegetative orgs.
+        let placed = sim.region_inoculate(sid, region, 30, 600_000);
+        assert_eq!(placed, 30);
+        let killed = sim.region_cull(sid, region, 1000);
+        assert!(killed > 0);
+        assert_eq!(
+            species_pop(&mut sim, sid.0),
+            0,
+            "culled to zero vegetative orgs"
+        );
+        let spore_banked = species_spore_j(&sim, sid);
+        assert!(spore_banked > 0, "a reservoir is banked");
+
+        // The carcass→detritus deposit from the cull leaves detritus favourable in the culled cells, so the very
+        // next tick `germinate` should respawn vegetative orgs from the reservoir (RNG-free, same cell).
+        let pop_before = species_pop(&mut sim, sid.0);
+        sim.step(1);
+        let pop_after = species_pop(&mut sim, sid.0);
+        assert!(
+            pop_after > pop_before,
+            "germination respawns vegetative orgs from the dormant reservoir when conditions return \
+             ({pop_before} -> {pop_after})"
+        );
+        // The reservoir DRAINED by the germinated endowment (a paired move spore→org, not a mint).
+        let spore_after = species_spore_j(&sim, sid);
+        assert!(
+            spore_after < spore_banked,
+            "germination withdraws from the reservoir (drained {spore_banked} -> {spore_after})"
+        );
+        // And the books still close across the sporulate→germinate round-trip (the per-tick assert already
+        // guards this; cross-check explicitly).
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes must hold across the cull→regerminate round-trip: live {} vs expected {}",
+            live.sum(),
+            sim.ledger().expected_total()
+        );
+    }
+
+    #[test]
+    fn s4_cull_then_regerminate_is_run_to_run_stable() {
+        // ADR-019 S4 determinism (inv #3): the whole spore mechanic is integer / RNG-free / canonical-ordered, so
+        // two identical inoculate→cull→germinate runs produce a byte-identical hash AND identical reservoir state.
+        let cfg = SimConfig {
+            seed: 73,
+            generations: 0,
+            entity_count: 60,
+        };
+        let run = || {
+            let mut sim = Simulation::reset(&cfg);
+            let sid = register_spore_former(&mut sim, "bacillus", 0.9);
+            let region = Region {
+                cx: 16,
+                cy: 16,
+                radius: 30,
+            };
+            sim.region_inoculate(sid, region, 30, 600_000);
+            sim.region_cull(sid, region, 1000);
+            sim.step(12); // let germination + metabolism run
+            (sim.run_stats().hash, species_spore_j(&sim, sid))
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(
+            a.0, b.0,
+            "the spore mechanic replays bit-identically (hash)"
+        );
+        assert_eq!(
+            a.1, b.1,
+            "the dormant reservoir is byte-identical across runs"
         );
     }
 

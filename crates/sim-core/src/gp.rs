@@ -48,6 +48,15 @@ pub enum Trait {
     // exactly like the E. coli microbe traits; a predator species expresses it through its own `TraitMap`.
     /// Predation capacity (host-cell invasion / peptidoglycan-remodeling attack rate) — predator.
     PredationCapacity,
+
+    // ── Spore-former trait (ADR-019 S4 — the dormancy/germination mechanic) — the sporulation-cascade phenotype
+    // (spo0A master regulator / sigF-sigE-sigG / the mold brlA→abaA→wetA conidiation cascade), expressed via a
+    // spore-former species' own `TraitMap`. Deliberately NOT in [`Trait::ALL`] (the 9-trait plant order),
+    // exactly like the E. coli microbe + predator traits — so the plant phenotype vector, CSV header, and hash
+    // stay byte-unperturbed. A non-zero value marks the species a SPORE-FORMER ([`Strategy::spore_former`]); a
+    // genome lacking the anchor expresses `0.0` → NOT a spore-former (the inert-off-role guarantee).
+    /// Sporulation capacity (the spo0A/sigF endospore or brlA conidiation cascade) — spore-former marker.
+    SporulationCapacity,
 }
 
 impl Trait {
@@ -86,6 +95,7 @@ impl Trait {
             Trait::AcetateOverflow => "acetate_overflow",
             Trait::FermentationCapacity => "fermentation_capacity",
             Trait::PredationCapacity => "predation_capacity",
+            Trait::SporulationCapacity => "sporulation_capacity",
         }
     }
 }
@@ -423,6 +433,13 @@ pub struct Strategy {
     /// `mineralize_rate` is inert off a Decomposer. Keeps predator demand OUT of metabolism's resource-channel
     /// apportion (a predator taps no abiotic pool — the kernel is its sole income).
     pub predation_rate: u16,
+    /// Is this species a SPORE-FORMER (ADR-019 S4)? Gene-anchored on [`Trait::SporulationCapacity`] (the
+    /// spo0A/sigF endospore or brlA conidiation cascade), set `true` iff the expressed sporulation trait is
+    /// non-zero — exactly the inert-off-role precedent of `predation_rate`/`mineralize_rate`. Read ONLY by the
+    /// S4 sporulation arms ([`crate::trophic::sporulation_split`] in `region_cull` + `reproduce_or_die`) and the
+    /// [`crate::trophic::germinate`] pass. `false` for every plant/ecoli/predator genome (no anchor → `0` →
+    /// `false`), so both sporulation branches and germination are byte-identical no-ops on a non-spore-former.
+    pub spore_former: bool,
 }
 
 /// The channel→anchor-trait pairing (declaration-ordered, parallel to [`BudgetChannel::ALL`]). Each channel's
@@ -534,12 +551,22 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
             .unwrap_or(0.0)
             .clamp(0.0, 1.0),
     );
+    // Spore-former marker (ADR-019 S4): SporulationCapacity → the spore/germination mechanic's enabling flag,
+    // `true` iff the expressed sporulation trait quantizes above zero (parallel to predation_rate's anchor read).
+    // Absent for any non-spore-former genome (→ 0 → false), so it is inert exactly like predation_rate off a
+    // Predator. A spo0A/brlA-anchored cascade off-state (SporulationCapacity→0) drives it to false.
+    let spore_former = fixed::to_unit_u16(
+        p.get(Trait::SporulationCapacity)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+    ) > 0;
     Strategy {
         budget,
         role,
         affinity,
         mineralize_rate,
         predation_rate,
+        spore_former,
     }
 }
 
@@ -893,6 +920,66 @@ mod tests {
             TrophicRole::Autotroph,
         );
         assert_eq!(s_plant.predation_rate, 0, "no anchor → predation_rate 0");
+    }
+
+    #[test]
+    fn s4_spore_former_flag_is_gene_anchored_and_inert_without_the_anchor() {
+        // ADR-019 S4: spore_former is `true` iff SporulationCapacity (the spo0A/sigF or brlA cascade) expresses
+        // non-zero — exactly the inert-off-role precedent of predation_rate/mineralize_rate. A synthetic map
+        // binding the anchor marks the species a spore-former; knocking the anchor to 0 clears the flag; a plant
+        // genome (no anchor) is NEVER a spore-former (byte-neutral on the pinned single-plant run).
+        let g = Genome {
+            version: 2,
+            loci: vec![genome::Locus {
+                id: LocusId(0),
+                name: "anchor".to_string(),
+                sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                parameters: vec![genome::Parameter {
+                    id: ParamId(0),
+                    value: genome::ParamValue::Numeric {
+                        value: 0.7,
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                }],
+                tags: genome::OntologyTags {
+                    so_term: genome::SoTermId(704),
+                    go_refs: vec![],
+                },
+            }],
+        };
+        let b = |t| TraitBinding {
+            trait_: t,
+            locus: LocusSelector::ByIndex(LocusId(0)),
+            param: ParamId(0),
+        };
+        let map = OntologyMap::new(TraitMap(vec![b(Trait::SporulationCapacity)]));
+        let s = express_strategy(&map, &g, TrophicRole::Decomposer);
+        assert!(
+            s.spore_former,
+            "a non-zero SporulationCapacity marks the species a spore-former"
+        );
+        // Knock the cascade anchor fully off (the off-state) → not a spore-former.
+        let mut g_off = g.clone();
+        if let genome::ParamValue::Numeric { value, .. } = &mut g_off.loci[0].parameters[0].value {
+            *value = 0.0;
+        }
+        let s_off = express_strategy(&map, &g_off, TrophicRole::Decomposer);
+        assert!(
+            !s_off.spore_former,
+            "SporulationCapacity → 0 (cascade off) clears the spore-former flag"
+        );
+        // A plant genome (no SporulationCapacity binding) is NEVER a spore-former — the inert-off-role guarantee
+        // that keeps the pinned single-plant run byte-neutral.
+        let s_plant = express_strategy(
+            &OntologyMap::new(default_plant_trait_map()),
+            &genome::sample_genome(),
+            TrophicRole::Autotroph,
+        );
+        assert!(
+            !s_plant.spore_former,
+            "no SporulationCapacity anchor → not a spore-former (pinned-run byte-neutrality)"
+        );
     }
 
     #[test]

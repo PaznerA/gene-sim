@@ -241,6 +241,7 @@ mod tests {
             affinity: [60000, 0, 0],
             mineralize_rate: 0,
             predation_rate: 0,
+            spore_former: false,
         };
         let row = signature_row(&strat, &[], 0, 0); // no flow matrix → Block B all zero
         assert_eq!(row.len(), SIGNATURE_DIMS);

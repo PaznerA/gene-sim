@@ -31,8 +31,9 @@ use bevy_ecs::prelude::*;
 use crate::fixed;
 use crate::gp::{self, BudgetChannel, TrophicRole};
 use crate::{
-    cell_index, credit_capped, ledger, Biomass, Energy, OrgId, Position, Species, SpeciesRegistry,
-    BODY_FACTOR_FLOOR, ENERGY_CAP, MAINTENANCE_FLOOR, POOL_CAP,
+    cell_index, credit_capped, ledger, Age, Biomass, DroughtTol, Energy, Genotype, NextOrgId,
+    OrgId, Position, Species, SpeciesId, SpeciesRegistry, ThermalTol, BODY_FACTOR_FLOOR,
+    ENERGY_CAP, MAINTENANCE_FLOOR, OFFSPRING_SEED_BIOMASS, POOL_CAP,
 };
 
 /// The MEASURED S×S net-integer J flow matrix for the current generation (ADR-013 F4). Row-major:
@@ -261,6 +262,277 @@ impl PoolProvenance {
             &mut self.scratch_s,
             &mut self.scratch_rem,
         );
+    }
+}
+
+// ── ADR-019 S4: the SPORE/DORMANCY reservoir + sporulation split + germination ──────────────────────────────
+//
+// A spore-former species (gene-anchored on `Trait::SporulationCapacity` → `Strategy.spore_former`) banks a
+// DETERMINISTIC INTEGER FRACTION of a dying/culled org's residual J into a per-cell, per-species reservoir
+// INSTEAD of (all of) carcass→detritus — a SECOND live-J bucket that PERSISTS across ticks and is INVISIBLE to
+// region_cull's live-org census (cull-immunity is STRUCTURAL: a resource plane is not an ECS org). When local
+// conditions return, `germinate` withdraws from the reservoir and spawns vegetative orgs RNG-FREE (the
+// region_inoculate precedent: neutral-0.5 traits as a CONSTANT, OrgIds from the monotonic `NextOrgId`, ZERO
+// next_u64 draws → the spawn stream is unchanged). Spore J is CONSERVED end-to-end — every move is a PAIRED
+// bucket transfer (org→spore+detritus on sporulate; spore→org on germinate), so `ledger_closes` holds via a
+// FIFTH `LiveTotal.spore` bucket with NO new tap. All `i64`, flat `[cell*s + species]` (never a HashMap, inv
+// #3), walked in canonical `(cell, SpeciesId)` order — the proven `PoolProvenance`/`KinProvenance` substrate.
+
+/// Survival fraction (permille) of a spore-former's residual J that is BANKED into the reservoir on a
+/// death/cull, the remainder routed through the existing carcass→detritus path (ADR-019 S4). A REAL mechanic,
+/// not balance-forcing: a high fraction means more seed survives a cull, but whether the species ULTIMATELY
+/// persists stays fully emergent (banked spores must still germinate against the conserved ADR-013 economy and
+/// can starve out if the niche stays occupied). A tuning lever (§0.6: NOT tuned to force persistence).
+pub(crate) const SPORE_SURVIVAL_PERMILLE: i64 = 700;
+
+/// The local pool-channel stock (role-appropriate: detritus for decomposers/molds, light for an autotroph) at
+/// or above which germination conditions are deemed FAVORABLE (ADR-019 S4). An integer comparison on the frozen
+/// i64 pool stock. A tuning lever.
+pub(crate) const GERMINATION_THRESHOLD: i64 = 1;
+
+/// The J a single germling is endowed from the reservoir (ADR-019 S4): one vegetative org is spawned per this
+/// much banked spore J (split into seed Biomass + residual Energy, the region_inoculate carve-out). A tuning
+/// lever; sized so a banked reservoir can seed a viable fresh org.
+pub(crate) const GERM_ENDOW_J: i64 = 200_000;
+
+/// Max germlings spawned per (cell, species) per `germinate` tick (ADR-019 S4) — a bounded batch (order-stable,
+/// MAX_POPULATION-safe) rather than a drain-the-whole-reservoir bloom when conditions return. A tuning lever.
+pub(crate) const GERM_BATCH_CAP: i64 = 4;
+
+/// The per-cell, per-species DORMANT spore reservoir (ADR-019 S4) — a structural twin of [`PoolProvenance`] /
+/// [`crate::chem::KinProvenance`] (the proven flat-`Vec` conserved-J seam). Flat `[cell * s + species]`,
+/// PERSISTS across ticks, integer, never a `HashMap` (inv #3). A SEPARATE live-J bucket folded into
+/// [`ledger::LiveTotal::spore`] (so the books close) but NOT into `hash_world` (it reaches the hash only through
+/// its coupling effect on already-hashed Energy/Biomass/OrgIds when a germling spawns — the deliberate divergence
+/// that keeps the all-zero pinned run hash-neutral). Sporulation [`deposit`](Self::deposit)s into it; germination
+/// [`withdraw`](Self::withdraw)s from it.
+#[derive(Resource, Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SporeReservoir {
+    s: usize,
+    /// Banked dormant spore J per cell, in species order: flat `[cell * s + species]`.
+    spore_j: Vec<i64>,
+}
+
+impl SporeReservoir {
+    /// A zeroed reservoir for `cells` cells and `s` species.
+    pub(crate) fn new(cells: usize, s: usize) -> Self {
+        Self {
+            s,
+            spore_j: vec![0i64; cells * s],
+        }
+    }
+
+    /// Bank `amount` (>0) of dormant spore J to (`cell`, `species`). A no-op for a non-positive amount or an
+    /// out-of-range species (defensive).
+    pub(crate) fn deposit(&mut self, cell: usize, species: usize, amount: i64) {
+        if amount > 0 && species < self.s {
+            self.spore_j[cell * self.s + species] += amount;
+        }
+    }
+
+    /// Withdraw up to `amount` of banked spore J from (`cell`, `species`), returning the J ACTUALLY withdrawn
+    /// (capped at the available stock — never goes negative). A non-positive request / out-of-range species
+    /// withdraws nothing.
+    pub(crate) fn withdraw(&mut self, cell: usize, species: usize, amount: i64) -> i64 {
+        if amount <= 0 || species >= self.s {
+            return 0;
+        }
+        let idx = cell * self.s + species;
+        let taken = amount.min(self.spore_j[idx].max(0));
+        self.spore_j[idx] -= taken;
+        taken
+    }
+
+    /// The banked spore J at (`cell`, `species`). `0` for an out-of-range species. Pure read.
+    pub(crate) fn stock(&self, cell: usize, species: usize) -> i64 {
+        if species < self.s {
+            self.spore_j[cell * self.s + species]
+        } else {
+            0
+        }
+    }
+
+    /// `Σ` over all cells/species of the banked dormant spore J — the [`ledger::LiveTotal::spore`] bucket.
+    /// Integer addition is commutative so the sum is order-independent (inv #3).
+    pub(crate) fn total(&self) -> i64 {
+        self.spore_j.iter().copied().sum()
+    }
+
+    /// Grow to `new_s ≥ s` species for `cells` cells (ADR-019: a `RegionInoculate` may register a new
+    /// spore-former mid-run), re-laying the flat `[cell*s + species]` plane so every existing cell's banked spore
+    /// block is preserved and the new species columns start zero. A no-op if `new_s <= s`. Only ever called on an
+    /// inoculated run (the pinned config never inoculates → the dimension is unchanged → hash-neutral).
+    pub(crate) fn grow_to(&mut self, cells: usize, new_s: usize) {
+        if new_s <= self.s {
+            return;
+        }
+        let mut spore_j = vec![0i64; cells * new_s];
+        for c in 0..cells {
+            for sp in 0..self.s {
+                spore_j[c * new_s + sp] = self.spore_j[c * self.s + sp];
+            }
+        }
+        self.s = new_s;
+        self.spore_j = spore_j;
+    }
+}
+
+/// **SPORULATION SPLIT** (ADR-019 S4) — the shared accounting for routing a spore-former's residual J at a
+/// death/cull. Splits `residual` (>0) via [`fixed::apportion`] into `[spore_share, carcass_remainder]` by the
+/// pinned [`SPORE_SURVIVAL_PERMILLE`] permille (the SAME largest-remainder idiom `region_cull` uses for its
+/// kill/spare COUNT split, applied here to J), banks `spore_share` into the reservoir, and RETURNS the
+/// `carcass_remainder` for the caller to route through the existing `deposit_carcass` path. A PAIRED bucket
+/// move (live org J → live spore J + live detritus J), never a mint. Conserves exactly: `spore_share +
+/// carcass_remainder == residual`. RNG-free, integer (inv #3). A non-positive `residual` banks nothing and
+/// returns `0`; a non-spore-former NEVER calls this (the caller gates on `Strategy.spore_former`), so it is a
+/// byte-identical no-op on every plant/ecoli/predator org.
+pub(crate) fn sporulation_split(
+    reservoir: &mut SporeReservoir,
+    cell: usize,
+    species: usize,
+    residual: i64,
+) -> i64 {
+    if residual <= 0 {
+        return 0;
+    }
+    let split = fixed::apportion(
+        residual,
+        &[
+            SPORE_SURVIVAL_PERMILLE as u64,
+            (fixed::PERMILLE as i64 - SPORE_SURVIVAL_PERMILLE) as u64,
+        ],
+    );
+    let spore_share = split[0];
+    reservoir.deposit(cell, species, spore_share);
+    residual - spore_share // the carcass remainder → the caller's deposit_carcass (conserves: Σ == residual)
+}
+
+/// The role-appropriate pool channel `germinate` reads to judge "conditions returned" (ADR-019 S4): an
+/// `Autotroph` germinates on local `light`, every other (decomposer mold / Bacillus-style) role on local
+/// `detritus` — the SAME role→channel intuition `metabolism`/`mineralize` use. Pure, ordered, no HashMap.
+fn germination_stock(role: TrophicRole, pools: &crate::PoolStock, cell: usize) -> i64 {
+    match role {
+        TrophicRole::Autotroph | TrophicRole::Mixotroph => pools.light[cell],
+        _ => pools.detritus[cell],
+    }
+}
+
+/// One pending germling spawn, collected during the canonical `(cell, SpeciesId)` reservoir walk and applied via
+/// `Commands` AFTER the walk (the reproduce_or_die never-mutate-during-query discipline).
+struct Germling {
+    species: u16,
+    energy: i64,
+    biomass: i64,
+    px: u32,
+    py: u32,
+}
+
+/// **GERMINATE** (ADR-019 S4) — the dormant-reservoir → vegetative-org reseed pass, modeled on [`mineralize`]
+/// (canonical-order, integer, no `HashMap`, `if … is_empty() { return }` no-op skeleton). Inserted into the tick
+/// `.chain()` AFTER [`mineralize`] (so it reads THIS tick's refilled pools to judge "conditions returned") and
+/// BEFORE `reproduce_or_die` (so a fresh germling immediately participates in the same tick's maintenance/birth
+/// and OrgId interleaving). RNG-free (ZERO `next_u64` draws → births stay the SOLE RNG consumer), all `i64`.
+///
+/// Walks the [`SporeReservoir`] in canonical `(cell, SpeciesId)` order over its flat indexed plane. For each
+/// (cell, species) with banked stock `> 0`: if the species' role-appropriate pool channel is ≥
+/// [`GERMINATION_THRESHOLD`] AND the stock affords at least one [`GERM_ENDOW_J`] germling, germinate `n =
+/// min(stock / GERM_ENDOW_J, GERM_BATCH_CAP)` orgs (MAX_POPULATION-bounded — over-cap leaves the J dormant, no
+/// leak): [`withdraw`](SporeReservoir::withdraw) `n*GERM_ENDOW_J`, spawn n orgs EXACTLY like `region_inoculate`
+/// (Energy/Biomass split from the withdrawn J, Age 0, neutral-0.5 heritable traits as a CONSTANT not a draw,
+/// OrgId from the monotonic [`NextOrgId`], Position = the spore's own cell). A spore-former-free run keeps the
+/// reservoir all-zero → the non-zero set is empty → early no-op → HASH-NEUTRAL on the pinned plant run.
+#[allow(clippy::type_complexity)]
+pub(crate) fn germinate(
+    registry: Res<SpeciesRegistry>,
+    mut commands: Commands,
+    mut next_id: ResMut<NextOrgId>,
+    mut reservoir: ResMut<SporeReservoir>,
+    pools: Res<crate::PoolStock>,
+    q: Query<&Species>,
+) {
+    let s = registry.entries.len();
+    if s == 0 {
+        return;
+    }
+    let cells = (pools.width as usize) * (pools.height as usize);
+    // Current live population (the MAX_POPULATION guard — germination, like a birth, must respect the cap).
+    let mut population = q.iter().count() as u32;
+
+    // Walk the reservoir in canonical (cell, SpeciesId) order over the flat indexed plane (inv #3 — never a
+    // HashMap). Collect germlings; apply spawns AFTER the walk (never mutate-during-query for the spawn set).
+    let mut germlings: Vec<Germling> = Vec::new();
+    let mut any = false;
+    for cell in 0..cells {
+        for species in 0..s {
+            let stock = reservoir.stock(cell, species);
+            if stock <= 0 {
+                continue;
+            }
+            any = true;
+            let strat = &registry.entries[species].strategy;
+            // Conditions returned? Role-appropriate local pool channel ≥ the threshold (integer compare on the
+            // frozen i64 stock — RNG-free). Unfavorable → the spore stays dormant, J stays in the reservoir.
+            if germination_stock(strat.role, &pools, cell) < GERMINATION_THRESHOLD {
+                continue;
+            }
+            // How many germlings the stock affords, bounded by the per-tick batch cap.
+            let affordable = stock / GERM_ENDOW_J;
+            if affordable <= 0 {
+                continue;
+            }
+            let mut n = affordable.min(GERM_BATCH_CAP);
+            // MAX_POPULATION guard (inv #6): never germinate past the cap; the un-germinated J stays dormant.
+            let headroom = (crate::MAX_POPULATION as i64 - population as i64).max(0);
+            n = n.min(headroom);
+            if n <= 0 {
+                continue;
+            }
+            // Withdraw exactly n*GERM_ENDOW_J (paired move: reservoir → new orgs); spawn n vegetative orgs.
+            let withdrawn = reservoir.withdraw(cell, species, n * GERM_ENDOW_J);
+            // Each germling gets GERM_ENDOW_J (the last carries any rounding remainder so Σ == withdrawn exactly).
+            let cellu_x = (cell % (pools.width as usize)) as u32;
+            let cellu_y = (cell / (pools.width as usize)) as u32;
+            for k in 0..n {
+                // Distribute the withdrawn J as floor(GERM_ENDOW_J) each, the last germling absorbing the
+                // remainder so the spawned Σ equals `withdrawn` EXACTLY (conserved — no minted/lost quantum).
+                let endow = if k == n - 1 {
+                    withdrawn - GERM_ENDOW_J * (n - 1)
+                } else {
+                    GERM_ENDOW_J
+                };
+                let seed_biomass = OFFSPRING_SEED_BIOMASS.min(endow);
+                let seed_energy = endow - seed_biomass;
+                germlings.push(Germling {
+                    species: species as u16,
+                    energy: seed_energy,
+                    biomass: seed_biomass,
+                    px: cellu_x,
+                    py: cellu_y,
+                });
+                population += 1;
+            }
+        }
+    }
+    if !any {
+        return; // reservoir all-zero (the spore-former-free / pinned run) → byte-identical no-op.
+    }
+    // Spawn the collected germlings (Commands defers application — never mutates-during-query, inv #3). OrgIds
+    // minted IN ORDER from the monotonic NextOrgId; heritable traits seed at a neutral 0.5 CONSTANT (NOT a draw,
+    // the region_inoculate precedent → ZERO next_u64 draws → the spawn stream is unchanged).
+    for g in germlings {
+        let org = next_id.0;
+        next_id.0 += 1;
+        commands.spawn((
+            OrgId(org),
+            Energy(g.energy),
+            Biomass(g.biomass),
+            Age(0),
+            Genotype(0.5),
+            DroughtTol(0.5),
+            ThermalTol(0.5),
+            Position { x: g.px, y: g.py },
+            Species(SpeciesId::new(g.species)),
+        ));
     }
 }
 
@@ -877,5 +1149,73 @@ mod tests {
         // Guard: the detritus slot the decomposer taps is the last RESOURCE_CHANNEL (a compile-time sanity that
         // affinity[2] is the detritus channel the F4 design names).
         assert_eq!(crate::resource::RESOURCE_CHANNELS, 3);
+    }
+
+    #[test]
+    fn spore_reservoir_deposit_withdraw_caps_at_stock_and_totals() {
+        // ADR-019 S4: deposit/withdraw are paired integer bucket moves; withdraw never goes negative (caps at
+        // the available stock); total() sums the flat plane in an order-independent way.
+        let mut r = SporeReservoir::new(2, 3); // 2 cells, 3 species
+        r.deposit(0, 1, 500);
+        r.deposit(1, 2, 200);
+        assert_eq!(r.stock(0, 1), 500);
+        assert_eq!(r.stock(1, 2), 200);
+        assert_eq!(r.total(), 700);
+        // Withdraw less than stock → exact.
+        assert_eq!(r.withdraw(0, 1, 300), 300);
+        assert_eq!(r.stock(0, 1), 200);
+        // Withdraw MORE than stock → capped at the remaining stock, never negative.
+        assert_eq!(r.withdraw(0, 1, 9999), 200);
+        assert_eq!(r.stock(0, 1), 0);
+        assert_eq!(r.total(), 200); // only cell1/sp2 remains
+                                    // Defensive no-ops: non-positive amount, out-of-range species.
+        assert_eq!(r.withdraw(1, 2, 0), 0);
+        assert_eq!(r.withdraw(1, 9, 100), 0);
+        r.deposit(1, 9, 100); // out-of-range species → no-op
+        assert_eq!(r.total(), 200);
+    }
+
+    #[test]
+    fn sporulation_split_banks_the_survival_fraction_and_conserves() {
+        // ADR-019 S4: the split routes SPORE_SURVIVAL_PERMILLE of the residual into the reservoir and returns the
+        // carcass remainder; spore_share + remainder == residual EXACTLY (a paired move, no minted/lost quantum).
+        let mut r = SporeReservoir::new(1, 1);
+        let residual = 1000;
+        let carcass = sporulation_split(&mut r, 0, 0, residual);
+        let banked = r.stock(0, 0);
+        assert_eq!(
+            banked + carcass,
+            residual,
+            "conserved: spore + carcass == residual"
+        );
+        // With permille 700 the largest-remainder split is exactly [700, 300].
+        assert_eq!(banked, residual * SPORE_SURVIVAL_PERMILLE / 1000);
+        assert_eq!(carcass, residual - banked);
+        // A non-positive residual banks nothing and returns 0.
+        let mut r2 = SporeReservoir::new(1, 1);
+        assert_eq!(sporulation_split(&mut r2, 0, 0, 0), 0);
+        assert_eq!(r2.total(), 0);
+    }
+
+    #[test]
+    fn spore_reservoir_grow_to_preserves_existing_blocks() {
+        // ADR-019 S4: grow_to re-lays the flat [cell*s + species] plane, preserving every existing cell block and
+        // zeroing the new species columns (the PoolProvenance/KinProvenance grow precedent).
+        let mut r = SporeReservoir::new(2, 2);
+        r.deposit(0, 1, 11);
+        r.deposit(1, 0, 22);
+        r.grow_to(2, 4); // 2 → 4 species
+        assert_eq!(
+            r.stock(0, 1),
+            11,
+            "existing block preserved across the re-lay"
+        );
+        assert_eq!(r.stock(1, 0), 22);
+        assert_eq!(r.stock(0, 3), 0, "new species column starts zero");
+        assert_eq!(r.total(), 33, "no J minted or lost in the re-lay");
+        // A no-op shrink (new_s <= s) leaves it unchanged.
+        let before = r.clone();
+        r.grow_to(2, 4);
+        assert_eq!(r, before);
     }
 }

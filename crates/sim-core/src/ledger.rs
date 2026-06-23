@@ -91,13 +91,19 @@ pub struct LiveTotal {
     /// `Σ` chemical/signal-field joules (ADR-013 F5) — `ChemField::total()`, the toxin/kin/alarm planes
     /// (i32 milli == J, widened to i64). Zero on a chem-free run (no species emits).
     pub chem: i64,
+    /// `Σ` DORMANT spore joules banked in [`crate::trophic::SporeReservoir`] (ADR-019 S4) — a FIFTH live bucket.
+    /// Sporulation MOVES org Energy/Biomass into this bucket (a paired transfer, not a mint); germination MOVES
+    /// it back into a fresh org's Energy+Biomass. Both stay inside `Σ` live J, so `expected_total()` is
+    /// UNCHANGED (no new tap term) and the books close by construction. Zero on a run with no spore-former (the
+    /// reservoir stays all-zero) → `sum()` byte-identical to F5's path.
+    pub spore: i64,
 }
 
 impl LiveTotal {
-    /// The total live `J` in the world: `pools + energy + biomass + chem`.
+    /// The total live `J` in the world: `pools + energy + biomass + chem + spore`.
     #[must_use]
     pub fn sum(&self) -> i64 {
-        self.pools + self.energy + self.biomass + self.chem
+        self.pools + self.energy + self.biomass + self.chem + self.spore
     }
 }
 
@@ -122,12 +128,13 @@ pub fn assert_ledger_closes(ledger: &Ledger, live: &LiveTotal) {
     let expected = ledger.expected_total();
     assert!(
         measured == expected,
-        "ledger_closes VIOLATED: measured live J = {measured} (pools={} + energy={} + biomass={} + chem={}) \
+        "ledger_closes VIOLATED: measured live J = {measured} (pools={} + energy={} + biomass={} + chem={} + spore={}) \
          != expected {expected} (initial={} + influx={} + immigration={} + intervention={} − respired={} − overflow={} − chem_decay={}); leak of {} J",
         live.pools,
         live.energy,
         live.biomass,
         live.chem,
+        live.spore,
         ledger.initial_total,
         ledger.influx,
         ledger.immigration,
@@ -227,18 +234,23 @@ mod tests {
     }
 
     #[test]
-    fn live_total_sums_all_four_buckets_incl_chem() {
-        // ADR-013 F5: chem is now a LIVE bucket (the toxin/kin/alarm field). Σ folds it in.
+    fn live_total_sums_all_five_buckets_incl_chem_and_spore() {
+        // ADR-013 F5 + ADR-019 S4: chem (toxin/kin/alarm) and spore (dormant reservoir) are LIVE buckets. Σ folds
+        // both in.
         let live = LiveTotal {
             pools: 400,
             energy: 250,
             biomass: 100,
             chem: 75,
+            spore: 30,
         };
-        assert_eq!(live.sum(), 825);
+        assert_eq!(live.sum(), 855);
         // A chem-free run still closes with chem == 0 (byte-identical to F4's J path).
         let chem_free = LiveTotal { chem: 0, ..live };
-        assert_eq!(chem_free.sum(), 750);
+        assert_eq!(chem_free.sum(), 780);
+        // A spore-free run (no spore-former) is byte-identical to F5's four-bucket path.
+        let spore_free = LiveTotal { spore: 0, ..live };
+        assert_eq!(spore_free.sum(), 825);
     }
 
     #[test]
@@ -257,12 +269,14 @@ mod tests {
             energy: 250,
             biomass: 100,
             chem: 0,
+            spore: 0,
         }; // 1150
         let leaky = LiveTotal {
             pools: 799,
             energy: 250,
             biomass: 100,
             chem: 0,
+            spore: 0,
         }; // 1149
         assert!(ledger_closes(&l, &ok));
         assert!(!ledger_closes(&l, &leaky), "a lost quantum must not close");
@@ -307,6 +321,7 @@ mod tests {
                 energy,
                 biomass,
                 chem: 0,
+                spore: 0,
             }
         };
 
@@ -392,6 +407,7 @@ mod tests {
             energy,
             biomass: 0,
             chem,
+            spore: 0,
         };
         ledger.initial_total = mk(pools, energy, chem).sum();
         assert_ledger_closes(&ledger, &mk(pools, energy, chem));
@@ -418,5 +434,57 @@ mod tests {
         // The decayed J is GONE from the live total but ACCOUNTED in the tap (the books still close).
         assert_eq!(mk(pools, energy, chem).sum(), ledger.expected_total());
         assert_eq!(ledger.chem_decay, decay);
+    }
+
+    /// ADR-019 S4: the FIVE-bucket close with a non-zero spore reservoir. SPORULATE is a paired move (org
+    /// Energy/Biomass → spore + detritus, Σ live unchanged); GERMINATE is the reverse paired move (spore → new
+    /// org Energy+Biomass). NO new tap term — `expected_total()` is unchanged across the round-trip — so the
+    /// books close BY CONSTRUCTION; the assert is the guard that catches an unpaired sporulate/germinate.
+    #[test]
+    fn synthetic_fixture_closes_across_a_sporulate_germinate_round_trip() {
+        let mut ledger = Ledger::default();
+        // World: one cell's detritus pool + one vegetative org (Energy, Biomass) + a dormant spore reservoir.
+        let mut detritus: i64 = 200;
+        let mut org_energy: i64 = 300;
+        let mut org_biomass: i64 = 100;
+        let mut spore: i64 = 0;
+        let mk = |pools: i64, energy: i64, biomass: i64, spore: i64| LiveTotal {
+            pools,
+            energy,
+            biomass,
+            chem: 0,
+            spore,
+        };
+        ledger.initial_total = mk(detritus, org_energy, org_biomass, spore).sum();
+        assert_ledger_closes(&ledger, &mk(detritus, org_energy, org_biomass, spore));
+
+        // SPORULATE (on death/cull): the org's residual J splits — a survival fraction → the spore reservoir,
+        // the remainder → detritus (carcass). A paired move across THREE live buckets, no tap. The org leaves.
+        let residual = org_energy + org_biomass; // 400
+        let spore_share = residual * 700 / 1000; // SPORE_SURVIVAL_PERMILLE = 700 → 280
+        let carcass = residual - spore_share; // 120
+        org_energy = 0;
+        org_biomass = 0;
+        spore += spore_share; // → 280, banked dormant
+        detritus += carcass; // → 320
+        assert_ledger_closes(&ledger, &mk(detritus, org_energy, org_biomass, spore));
+        assert_eq!(spore, 280);
+
+        // GERMINATE: when conditions return, the reservoir endows a fresh org — spore → org Energy+Biomass (a
+        // seed Biomass carved out, the rest Energy). The reverse paired move; Σ live unchanged, no tap.
+        let endow = 280; // GERM_ENDOW_J worth withdrawn from the reservoir
+        spore -= endow; // → 0
+        let seed_biomass = 100; // OFFSPRING_SEED_BIOMASS-style carve-out
+        org_biomass = seed_biomass;
+        org_energy = endow - seed_biomass; // 180
+        assert_ledger_closes(&ledger, &mk(detritus, org_energy, org_biomass, spore));
+
+        // The round-trip conserved EXACTLY: expected_total never moved (no tap), and the live total returned to
+        // its pre-sporulation value modulo the carcass J now sitting in detritus.
+        assert_eq!(
+            mk(detritus, org_energy, org_biomass, spore).sum(),
+            ledger.expected_total()
+        );
+        assert_eq!(ledger.expected_total(), ledger.initial_total);
     }
 }
