@@ -969,13 +969,21 @@ impl LiveSim {
     /// `replay(dir)` reproduces the live run. Returns `false` before `reset` or on an I/O error.
     #[func]
     fn save_session(&mut self, dir: GString) -> bool {
-        if self.env.is_none() {
+        let Some(env) = self.env.as_ref() else {
             godot_error!("LiveSim::save_session called before reset()");
             return false;
-        }
+        };
+        // ADR-019 R2: persist the FULL run composition, not just population + climate. Without the roster /
+        // selected species / registered consortium / containment, a journaled RegionInoculate (or a multi-
+        // species/non-default run) reloads against an EMPTY registry and diverges the hash. The roster /
+        // species / containment ride on the binding; the consortium is read back from the live env.
         let env_config = harness::replay::EnvConfig {
             entity_count: self.entity_count,
             env: self.env_params, // persist the climate so the saved session replays under it (ADR-012)
+            roster: self.roster.clone(),
+            species: self.species.clone(),
+            consortium: env.registered_consortium().to_vec(),
+            containment: self.containment.clone(),
         };
         match harness::replay::save_journal(dir.to_string(), &env_config, self.seed, &self.journal)
         {
@@ -1003,14 +1011,47 @@ impl LiveSim {
                 return d;
             }
         };
-        self.entity_count = seed_json.entity_count;
-        self.env_params = seed_json.env_params(); // restore the saved climate (ADR-012)
+        // ADR-019 R2: rebuild the FULL run composition (roster / selected species / registered consortium /
+        // containment) from the saved seed.json, not just population + climate. WITHOUT re-applying these, a
+        // journaled RegionInoculate resolves against an empty registry and spawns nothing on replay (it DID
+        // spawn live) → the reloaded run diverges from the live one. A pre-R2 save (no new fields) rebuilds the
+        // historical single-species EnvConfig, so an old session.json still loads (serde-default).
+        let env_config = match seed_json.env_config() {
+            Ok(c) => c,
+            Err(e) => {
+                godot_error!("LiveSim::load_session: corrupt species in save: {e}");
+                let mut d = VarDictionary::new();
+                d.set("ok", false);
+                d.set("detail", e.to_string());
+                return d;
+            }
+        };
+        self.entity_count = env_config.entity_count;
+        self.env_params = env_config.env; // restore the saved climate (ADR-012)
         let mut env = GeneSimEnv::new(self.entity_count);
         env.set_environment(self.env_params);
+        // Re-apply the composition BEFORE reset, exactly as the live session did (so the replay registry matches).
+        if !env_config.roster.is_empty() {
+            env.set_roster(env_config.roster.clone());
+        }
+        if let Some(species) = &env_config.species {
+            env.set_species(species.clone());
+        }
+        for built in &env_config.consortium {
+            env.register_contaminant(built.clone());
+        }
+        if let Some((level, cfg)) = &env_config.containment {
+            env.set_containment(*level, cfg.clone());
+        }
         env.reset(seed_json.seed);
         for action in &actions {
             let _ = env.step(action.clone());
         }
+        // Restore the binding's composition so a LATER save re-extends the SAME session faithfully (the roster /
+        // species / containment ride on the binding; the consortium is read back from the env at save time).
+        self.roster = env_config.roster;
+        self.species = env_config.species;
+        self.containment = env_config.containment;
         self.seed = seed_json.seed;
         self.journal = actions;
         let obs = env.observe();

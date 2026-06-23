@@ -231,6 +231,22 @@ impl SpeciesSpec {
         })
     }
 
+    /// A FULLY-LOSSLESS [`SpeciesSpec`] from a built species (ADR-019 R2 replay-persistence): the inverse of
+    /// [`build`](Self::build) that also carries the `niche` fields [`from_genome`](Self::from_genome) drops
+    /// (`entity_count`, `trophic_role`, `host_key`). So `from_built(&b).build()? == b` for the niche fields the
+    /// roster/consortium boundary reads — letting a saved session persist a built species as JSON and rebuild
+    /// the IDENTICAL `BuiltSpecies` on replay (keys + endowments intact). Other niche fields
+    /// (`description`/`temp_optimum`/`parent_key`) are NOT carried back into `BuiltSpecies` by `build`, so they
+    /// are intentionally defaulted here — they never affect the sim.
+    #[must_use]
+    pub fn from_built(built: &BuiltSpecies) -> Self {
+        let mut spec = Self::from_genome(&built.genome, &built.key, &built.name);
+        spec.niche.entity_count = built.entity_count;
+        spec.niche.trophic_role = built.trophic_role.clone();
+        spec.niche.host_key = built.host_key.clone();
+        spec
+    }
+
     /// The inverse of [`build`](Self::build): a [`SpeciesSpec`] from an in-memory [`Genome`] — for the editor's
     /// SAVE and the golden round-trip test. Lossless: `from_genome(g, ..).build()?.genome == g`.
     #[must_use]
@@ -300,6 +316,33 @@ mod tests {
         let back: SpeciesSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, spec);
         assert_eq!(back.build().expect("build").genome, g);
+    }
+
+    #[test]
+    fn from_built_round_trips_the_niche_fields_replay_persistence() {
+        // ADR-019 R2: from_built must carry the niche fields from_genome drops (entity_count / trophic_role /
+        // host_key) so a saved session rebuilds the IDENTICAL BuiltSpecies (keys + endowments intact) across the
+        // serde boundary. This is the property the whole replay/load persistence fix relies on.
+        let g = crate::sample_genome();
+        let mut spec = SpeciesSpec::from_genome(&g, "contaminant", "Contaminant");
+        spec.niche.entity_count = 321;
+        spec.niche.trophic_role = Some("decomposer".to_string());
+        spec.niche.host_key = Some("default".to_string());
+        let built = spec.build().expect("build");
+
+        // from_built → serde → build must reproduce every field BuiltSpecies::build reads back.
+        let persisted = SpeciesSpec::from_built(&built);
+        let json = serde_json::to_string(&persisted).expect("serialize");
+        let back: SpeciesSpec = serde_json::from_str(&json).expect("deserialize");
+        let rebuilt = back.build().expect("rebuild");
+        assert_eq!(
+            rebuilt, built,
+            "from_built must rebuild an identical BuiltSpecies"
+        );
+        assert_eq!(rebuilt.key, "contaminant");
+        assert_eq!(rebuilt.entity_count, 321);
+        assert_eq!(rebuilt.trophic_role.as_deref(), Some("decomposer"));
+        assert_eq!(rebuilt.host_key.as_deref(), Some("default"));
     }
 
     #[test]

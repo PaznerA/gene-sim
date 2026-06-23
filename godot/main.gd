@@ -27,7 +27,8 @@ extends Node2D
 ##   ,/. step · 1/2/3 zoom scope · wheel zoom (brush: wheel = radius) · arrows pan.
 ## Brush (live, ADR-011 / SP-3.6): with B on, hover paints a disc on the map; click/drag applies the ACTIVE
 ##   intervention tool to ONLY that region — CRISPR (apply_edit_region) / PCR (pcr_amplify) / Antibiotic (cull) /
-##   Nutrient (nutrient) / Toxin (toxin). The disc COLOUR signals the active tool; POSITION MATTERS (the brush
+##   Nutrient (nutrient) / Toxin (toxin) / Inoculate (inoculate — seed a contaminant, ADR-019). The disc COLOUR
+##   signals the active tool; POSITION MATTERS (the brush
 ##   cell → RegionSpec → Region::contains in the core picks the orgs/cells). Biology stays in the core (inv #2).
 ## Mouse (windowed): drag = pan · hover = cell/plant tooltip · click = pin detail (cell stats + genome
 ##   ontology in ecosystem; focus + detail a plant in specimen).
@@ -180,7 +181,7 @@ var _brush_radius: int = 4  # brush disc radius in world cells
 var _brush_cell: Vector2i = Vector2i(-1, -1)  # hovered world cell
 var _brush_painting: bool = false  # a left-button drag-paint stroke is in progress (SP-3.6 drag-to-paint)
 var _brush_button: Button
-# SP-3.6 intervention TOOL PALETTE: one active tool of the 5 (CRISPR / PCR / Antibiotic / Nutrient / Toxin).
+# SP-3.6 intervention TOOL PALETTE: one active tool of the 6 (CRISPR / PCR / Antibiotic / Nutrient / Toxin / Inoculate).
 # Selecting a tool swaps the per-tool param sub-panel + retints the brush; the brush then paints THAT tool's
 # Action at the hovered cell. Biology stays in the core (inv #2) — these only issue the journaled Action + read
 # the verdict. The ButtonGroup keeps exactly one selected.
@@ -202,8 +203,8 @@ const TOOL_TINTS := [
 # The `tool` string each marker carries (timeline.gd keys its colour/glyph off these).
 const TOOL_KEYS := ["crispr", "pcr", "cull", "nutrient", "toxin", "inoculate"]
 var _active_tool: int = TOOL_CRISPR
-var _tool_buttons: Array = []  # the 5 palette toggle Buttons (radio via a shared ButtonGroup)
-var _tool_panels: Array = []   # the 5 per-tool param sub-VBoxes (only the active one is visible)
+var _tool_buttons: Array = []  # the 6 palette toggle Buttons (radio via a shared ButtonGroup)
+var _tool_panels: Array = []   # the 6 per-tool param sub-VBoxes (only the active one is visible)
 # PCR params
 var _pcr_species: OptionButton
 var _pcr_count: SpinBox
@@ -220,9 +221,21 @@ var _toxin_channel: OptionButton
 var _toxin_amount: SpinBox
 # Inoculate (ADR-019 S3 contamination seed) params: which baked contaminant to drop + the per-disc dose. The
 # species KEYS the picker/menu offer (kebab file stems under res://data/species/ that bake a contaminant
-# SpeciesSpec). Discovered at UI build so a new bake lights up automatically (no biology in GDScript — these
-# are just file stems; the core builds the genome from the JSON bytes, inv #2).
-const CONTAMINANT_KEYS := ["mycoplasma", "bacillus"]
+# SpeciesSpec). DISCOVERED at UI build (see _discover_contaminant_keys) so a new airborne bake lights up
+# automatically (no biology in GDScript — these are just file stems; the core builds the genome from the JSON
+# bytes, inv #2). The discovery scans res://data/species/ and drops the NON-airborne stems below: the player
+# species (default plant / ecoli / bdellovibrio) and the obligate symbionts (carsonella / syn3), which can
+# never airborne-arrive (Mode B, host-targeted — the core's expand_schedule HARD-FILTERS them too). What
+# remains is exactly the 7 baked airborne Mode-A contaminants (bacillus/pseudomonas/staph/cutibacterium/
+# aspergillus-niger/penicillium/mycoplasma). Mirrors the core's ConsortiumConfig::default_mode_a subset.
+const NON_AIRBORNE_STEMS := ["default", "ecoli", "bdellovibrio", "carsonella", "syn3"]
+# Fallback when a res:// directory scan is unavailable (e.g. an odd export): the 7 known baked airborne keys.
+const CONTAMINANT_KEYS_FALLBACK := [
+	"bacillus", "pseudomonas", "staph", "cutibacterium", "aspergillus-niger", "penicillium", "mycoplasma"]
+# The core's ConsortiumConfig::default_mode_a kebab keys — the non-empty consortium the MENU seeds when the
+# player picks a containment level > Sealed, so "Open" actually contaminates (mirrors immigration.rs).
+const DEFAULT_MODE_A_KEYS := ["bacillus", "pseudomonas", "aspergillus-niger"]
+var _contaminant_keys: Array = []  # discovered airborne contaminant stems (filled by _discover_contaminant_keys)
 var _inoc_species: OptionButton  # the contaminant the seed brush drops (and a fired schedule references)
 var _inoc_count: SpinBox         # organisms per inoculation disc
 var _inoc_endow: SpinBox         # joules per inoculated organism (minted from the core's `immigration` tap)
@@ -489,10 +502,15 @@ func _on_menu_start(cfg: Dictionary) -> void:
 		# ADR-017: run the selected species (e.g. "ecoli") before reset; "" keeps the abstract plant.
 		_species_stem = _apply_species(_roster_active_stem(roster) if not roster.is_empty() else species_stem)
 	# Containment (ADR-019 S3): push the up-front level BEFORE reset so its immigration schedule expands
-	# deterministically. Sealed (0) → empty schedule → hash-neutral. Reuse the _on_apply_containment_pressed shape:
-	# empty/default consortium keys by default (the menu only chooses the LEVEL; the consortium menu lives in-run).
-	_apply_menu_containment(int(cfg.get("containment", 0)))
+	# deterministically. Sealed (0) → empty schedule → hash-neutral. For level > 0 the menu seeds the core's
+	# default Mode-A consortium so "Open"/"Clean"/"Lab" actually contaminate (R1 fix); the in-run CONTAMINATION
+	# panel still lets the player recompose it.
+	var seeded_consortium: Array = _apply_menu_containment(int(cfg.get("containment", 0)))
 	_do_reset(_seed)
+	# The fresh reset rebuilt the core env (empty registry). Register the seeded consortium NOW so a fired
+	# schedule event can resolve its key against a loaded genome (mirrors _on_apply_containment_pressed).
+	for key in seeded_consortium:
+		_ensure_contaminant_registered(str(key))
 	_populate_locus_picker()  # refresh the edit-target picker for the new species' genome (ADR-017)
 	_populate_species_pickers()  # refresh the PCR/Antibiotic target-species pickers for the new roster (SP-3.6)
 	# Mission is a MENU choice now (off by default = free-play sandbox). Apply it + (re)activate its UI on Start;
@@ -584,19 +602,39 @@ func _roster_active_stem(roster: Array) -> String:
 	return "" if stem == "default" else stem
 
 
-## SP-2: push the menu's up-front ContainmentLevel to the core BEFORE reset (ADR-019 S3). Reuses the
-## _on_apply_containment_pressed call shape with an EMPTY/default consortium (the menu chooses only the LEVEL;
-## the in-run CONTAMINATION panel composes the consortium). Sealed (0) → empty schedule → hash-neutral. The
-## schedule expands deterministically at reset off the off-stream IMMG family (zero SimRng draws, inv #3).
-func _apply_menu_containment(level: int) -> void:
+## SP-2: push the menu's up-front ContainmentLevel to the core BEFORE reset (ADR-019 S3). The menu chooses only
+## the LEVEL; when that level is > Sealed we seed the core's DEFAULT consortium (DEFAULT_MODE_A_KEYS, mirroring
+## ConsortiumConfig::default_mode_a) so "Open"/"Clean"/"Lab" actually contaminate — R1 fix: previously this
+## always pushed an EMPTY consortium, so expand_schedule returned Vec::new() for n_species==0 regardless of level
+## and the menu choice was a silent no-op. Sealed (0) → empty consortium → empty schedule → hash-neutral. The
+## schedule expands deterministically at reset off the off-stream IMMG family (zero SimRng draws, inv #3). The
+## in-run CONTAMINATION panel still lets the player recompose the full consortium. Returns the seeded keys so the
+## caller can register them AFTER reset (a fresh core env has an empty registry — a fired schedule event must
+## resolve its key against a loaded genome, exactly like _on_apply_containment_pressed).
+func _apply_menu_containment(level: int) -> Array:
 	if _live == null or not _live.has_method("set_containment"):
-		return
+		return []
 	_containment_level = clampi(level, 0, CONTAINMENT_LABELS.size() - 1)
 	if _containment_selector != null:
 		_containment_selector.select(_containment_level)
-	var keys := PackedStringArray()  # empty consortium by default (the menu sets only the level)
+	# Sealed (0) → empty consortium (hash-neutral). level > 0 → the core's default Mode-A consortium, filtered to
+	# stems whose res:// JSON actually bakes (the core does the real serde/build at register time; inv #2).
+	var keys := PackedStringArray()
+	if _containment_level > 0:
+		for key in DEFAULT_MODE_A_KEYS:
+			if FileAccess.file_exists("res://data/species/%s.json" % key):
+				keys.append(key)
+		# Reflect the seeded consortium in the in-run panel's checkboxes (kept in sync; built later, so guard).
+		for key in keys:
+			var cb: CheckBox = _consortium_checks.get(key, null)
+			if cb != null:
+				cb.button_pressed = true
 	var endow := int(_containment_endow.value) if _containment_endow != null else 120000
 	_live.set_containment(_containment_level, keys, _containment_radius, endow, _containment_horizon)
+	var seeded: Array = []
+	for key in keys:
+		seeded.append(str(key))
+	return seeded
 
 
 # ──────────────────────────── live mode (P5): drive the sim via the LiveSim gdext node ────────────────────
@@ -747,8 +785,9 @@ func _populate_locus_picker() -> void:
 		_locus_ids.append(int((l as Dictionary).get("id", 0)))
 
 
-## The unified 5-TOOL intervention palette (SP-3.6): a radio row of CRISPR / PCR / Antibiotic / Nutrient / Toxin,
-## a swapped per-tool param sub-panel, the shared region brush (drag to paint — POSITION MATTERS), and one status
+## The unified 6-TOOL intervention palette (SP-3.6/ADR-019): a radio row of CRISPR / PCR / Antibiotic / Nutrient /
+## Toxin / Inoculate, a swapped per-tool param sub-panel, the shared region brush (drag to paint — POSITION
+## MATTERS), and one status
 ## readout. Reuses 100% of the existing brush + region plumbing; each tool issues ONE journaled Action through a
 ## LiveSim #[func] and reads the verdict (biology stays in the core, inv #2).
 func _build_intervention_ui(ui: CanvasLayer) -> void:
@@ -758,7 +797,7 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 	col.add_theme_constant_override("separation", 5)
 	body.add_child(col)
 
-	# Tool palette: 5 radio toggles (one active). Selecting a tool swaps its param sub-panel + retints the brush.
+	# Tool palette: 6 radio toggles (one active). Selecting a tool swaps its param sub-panel + retints the brush.
 	var palette := HBoxContainer.new()
 	palette.add_theme_constant_override("separation", 3)
 	col.add_child(palette)
@@ -858,7 +897,7 @@ func _build_contamination_ui(ui: CanvasLayer) -> void:
 	# core at reset). These are just file stems — no biology in GDScript (inv #2).
 	col.add_child(_dim_label("Consortium (schedule):"))
 	_consortium_checks.clear()
-	for key in CONTAMINANT_KEYS:
+	for key in _discover_contaminant_keys():
 		var cb := CheckBox.new()
 		cb.text = key
 		cb.tooltip_text = "Include %s in the deterministic immigration schedule" % key
@@ -905,7 +944,7 @@ func _on_apply_containment_pressed() -> void:
 	# Collect the checked consortium keys whose res:// JSON exists (file-existence check only — the core does the
 	# real serde/build at register time; no biology in GDScript, inv #2).
 	var keys := PackedStringArray()
-	for key in CONTAMINANT_KEYS:
+	for key in _discover_contaminant_keys():
 		var cb: CheckBox = _consortium_checks.get(key, null)
 		if cb != null and cb.button_pressed:
 			if FileAccess.file_exists("res://data/species/%s.json" % key):
@@ -1050,7 +1089,7 @@ func _build_inoculate_params() -> VBoxContainer:
 	var r1 := HBoxContainer.new()
 	r1.add_child(_dim_label("Contaminant:"))
 	_inoc_species = OptionButton.new()
-	for key in CONTAMINANT_KEYS:
+	for key in _discover_contaminant_keys():
 		_inoc_species.add_item(key)
 		_inoc_species.set_item_metadata(_inoc_species.item_count - 1, key)
 	r1.add_child(_inoc_species)
@@ -1102,6 +1141,32 @@ func _picker_species_id(ob: OptionButton) -> int:
 	if ob == null or ob.selected < 0:
 		return 0
 	return int(ob.get_item_metadata(ob.selected))
+
+
+## A human-readable label for the species a picker resolves to (R2-minor: surface the RESOLVED target so a
+## reordered roster / an implicit default-to-0 is legible in the status line, not a silent mistarget). Maps the
+## picker's selected SpeciesId metadata back to its name+key via _panel_species_list (SpeciesId-ordered). When the
+## picker has no explicit selection it resolves to species 0 — the label says so ("species 0 (default)"). Pure
+## read of already-observed core data (inv #2); the core still owns the actual targeting.
+func _picker_target_label(ob: OptionButton) -> String:
+	var sid := _picker_species_id(ob)
+	var implicit := (ob == null or ob.selected < 0)
+	for row in _panel_species_list():
+		var d: Dictionary = row
+		if int(d.get("species_id", -1)) == sid:
+			var nm := str(d.get("name", "species"))
+			var key := str(d.get("key", "default"))
+			return "%s [%s]%s" % [nm, key, "  (implicit default)" if implicit else ""]
+	return "species %d%s" % [sid, "  (implicit default)" if implicit else ""]
+
+
+## Annotate a core tool outcome's `detail` with the RESOLVED target species (R2-minor) so the status line shows
+## WHAT actually got hit, not just the core's verdict. Pure renderer-side string prefix on a copy of the outcome
+## (inv #2 — the core's targeting is unchanged; this only makes it legible). Leaves a non-Dictionary outcome alone.
+func _with_target(outcome: Dictionary, ob: OptionButton) -> Dictionary:
+	var d := outcome.duplicate()
+	d["detail"] = "→ %s · %s" % [_picker_target_label(ob), str(outcome.get("detail", ""))]
+	return d
 
 
 func _on_guide_submitted(_text: String) -> void:
@@ -1226,14 +1291,17 @@ func _apply_active_tool() -> void:
 			var sid := _picker_species_id(_pcr_species)
 			var cnt := int(_pcr_count.value) if _pcr_count != null else 1
 			var endow := int(_pcr_endow.value) if _pcr_endow != null else 0
-			_record_tool_outcome(TOOL_PCR, _live.pcr_amplify(sid, cx, cy, r, cnt, endow))
+			# R2-minor: surface the RESOLVED target in the status so a reordered roster / implicit default-to-0
+			# is legible, not a silent mistarget. Renderer-only annotation; the core owns the actual targeting.
+			_record_tool_outcome(TOOL_PCR, _with_target(_live.pcr_amplify(sid, cx, cy, r, cnt, endow), _pcr_species))
 		TOOL_ANTIBIOTIC:
 			if not _live.has_method("cull"):
 				_flash_status("✗ Antibiotic unsupported by this build", false)
 				return
 			var sid2 := _picker_species_id(_cull_species)
 			var strength := int(_cull_strength.value) if _cull_strength != null else 0
-			_record_tool_outcome(TOOL_ANTIBIOTIC, _live.cull(sid2, cx, cy, r, strength))
+			# R2-minor: surface the RESOLVED cull target in the status (see PCR above).
+			_record_tool_outcome(TOOL_ANTIBIOTIC, _with_target(_live.cull(sid2, cx, cy, r, strength), _cull_species))
 		TOOL_NUTRIENT:
 			if not _live.has_method("nutrient"):
 				_flash_status("✗ Nutrient unsupported by this build", false)
@@ -1306,6 +1374,31 @@ func _ensure_contaminant_registered(key: String) -> bool:
 		return false
 	_registered_contaminants[key] = true
 	return true
+
+
+## Discover the baked AIRBORNE contaminant stems by scanning res://data/species/ (the docstring's promise, made
+## real — R1/R4): list the *.json stems, drop NON_AIRBORNE_STEMS (the player species + the obligate symbionts,
+## which can never airborne-arrive), and return the rest sorted (stable, deterministic UI order — inv #3 hygiene).
+## These are just file stems; the core builds every genome from the JSON bytes (inv #2). Falls back to the 7
+## known baked keys if the directory cannot be opened (an odd export). Memoized into _contaminant_keys.
+func _discover_contaminant_keys() -> Array:
+	if not _contaminant_keys.is_empty():
+		return _contaminant_keys
+	var found: Array = []
+	var dir := DirAccess.open("res://data/species")
+	if dir != null:
+		for fname in dir.get_files():
+			if not fname.ends_with(".json"):
+				continue
+			var stem := fname.get_basename()
+			if NON_AIRBORNE_STEMS.has(stem):
+				continue
+			found.append(stem)
+		found.sort()  # stable UI order regardless of the filesystem's listing order (inv #3 hygiene)
+	if found.is_empty():
+		found = CONTAMINANT_KEYS_FALLBACK.duplicate()  # scan unavailable → the known baked airborne set
+	_contaminant_keys = found
+	return _contaminant_keys
 
 
 ## Update the hovered brush cell from the mouse (world → cell, clamped to the world/live grid) + refresh preview.

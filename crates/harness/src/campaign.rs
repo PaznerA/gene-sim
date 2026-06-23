@@ -465,10 +465,7 @@ mod tests {
         // Write journals only for scenarios a (index 0) and b (index 1); leave c (index 2) without one.
         for i in 0..2 {
             let s = &campaign.scenarios[i];
-            let env = EnvConfig {
-                entity_count: s.entity_count,
-                env: s.env(),
-            };
+            let env = EnvConfig::bare(s.entity_count, s.env());
             save_journal(dir.join(i.to_string()), &env, s.seed, &[Action::Advance(3)]).unwrap();
         }
         let result = evaluate_campaign(&campaign, &dir);
