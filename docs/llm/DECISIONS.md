@@ -930,6 +930,52 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-023 — Emergent-discovery D0 scorer + D1 trace: `crates/discovery` (std+serde) + the harness capture seam
+
+- **Date:** 2026-06-23
+- **Status:** Accepted (D0/D1 phase; the search loop D2+ and the surrogate model D3 are later).
+- **Context:** the roadmap epic ([emergent-discovery-harness-draft.md](proposals/emergent-discovery-harness-draft.md),
+  memory `autonomous-emergent-run-discovery-ml`) wants to autonomously SEARCH the (config + edit) space, SCORE each
+  run for "interestingness", and SAVE the gems as bit-identically-replayable showcases. The load-bearing first piece
+  is a reproducible SCORER; everything else is search plumbing. The metric set was pinned by the
+  `emergent-scorer-design` 3-lens panel → [discovery-scorer-spec.md](proposals/discovery-scorer-spec.md).
+- **Decision:**
+  - **New crate `crates/discovery`** (added to the workspace members) — **std + serde ONLY** (no `sim-core`, no
+    `harness` dep): it scores a PLAIN `PerGenTrace` it is handed, so the scorer stays on the clean side of the
+    capture seam (inv #1/#5). It is NOT a zero-dep BOUNDARY crate (it links serde, MIT/Apache-2.0, GPL-clean for
+    trace I/O) → intentionally absent from `BOUNDARY_CRATES`; the GPL scan still covers its closure.
+  - **D0 scorer** (`src/ecology.rs`): six INTEGER, RNG-free, basis-point metrics over the stable window — M1
+    coexistence, M2 integer-Simpson evenness, M3 amp+turns **dynamism** (single-boom-capped), M4 FlowMatrix-aggregate
+    trophic structure (edges/roles/octave-log flow), M5 saturating **events** (booms/crashes/takeovers/established-
+    immigrations), M6 a **multiplicative survival GATE** (anti-instant-death) — combined `Q = (ΣWᵢmᵢ/WSUM)·m6` →
+    `[0, 1_000_000]`. `InterestingnessScorer` trait (inv #5 pluggable); `DefaultScorer` id `"ecology-d0"`; a 12-dim
+    integer fingerprint + `novelty_l1` + `final_score` (novelty applied as a save-time MULTIPLIER, gem persistence is
+    D2). The lone `f64` is the fenced `q16` capture quantization; no RNG, no HashMap-iteration.
+  - **D1 capture seam in `crates/harness`** (`src/capture.rs` `capture_trace`): drives a live `GeneSimEnv`
+    (reset → step → `observe_all()` + `flow_matrix()` per gen) into a `PerGenTrace` — the harness (which already
+    depends on sim-core) owns the engine touch; `discovery` stays clean. `harness → discovery` is the only new edge.
+- **Determinism / hash (inv #3):** **HASH-NEUTRAL — pinned literal `0x47a0_3c8f_6701_f240` unchanged.** Capture
+  READS only `observe_all()`/`flow_matrix()` (pure `&self`, zero `SimRng`, never folded into `hash_world`); proven by
+  `harness/tests/trace_capture.rs` (a real predator/prey run scored both ways asserts captured-hash == plain-hash, and
+  the pinned single-species config one-gen-at-a-time under the exact capture reads still hashes `0x47a0…`) +
+  `per_gen_stats_preserves_determinism_hash`. The score path is integer end-to-end → byte-reproducible cross-platform.
+- **Pinned `ScoreParams` (inv #7 — the tunable starting point; the struct lets every value change without code):**
+  weights `[W1=14, W2=14, W3=22, W4=18, W5=18]` (M3 dynamism + M5 events = 40/86 → **drama outranks forced
+  stability**, encoding memory `no-hardcoded-balance-open-system`; M6 the multiplicative gate that does NOT penalize
+  END-state extinction — only EARLY total collapse). `SCALE=10_000`, `SCORE_SCALE=1_000_000`, `BURN_IN_BP=2000`,
+  `PERSIST_BP=8000`, `RICH_CAP=6`, `TURN_TARGET=8`, `EDGE_TARGET=4`, `BOOM_K=3`, `CRASH_K=4`, `POP_FLOOR=5`,
+  `CRASH_FROM=20`, `EVENT_SAT=6×SCALE`, `NOV_SAT=3×SCALE`, `NOV_FLOOR=4000`, `DEDUP_MIN=SCALE`, `FP_DIMS=12`.
+- **Invariants:** **#1** std+serde, GPL-clean, the capture engine touch is in the harness not the scorer; **#2** the
+  scorer only READS exported numbers (no genome/genotype→phenotype); **#3** integer/RNG-free/off-hash (above); **#4**
+  headless; **#5** the metric set is pluggable behind `InterestingnessScorer`; **#6** config/operator level. Verified
+  3/3 on every dimension; a 7-archetype synthetic oracle + a real grounded run assert the contract (live limit-cycle
+  **A = 784_500** strictly beats frozen coexistence **F = 355_000**).
+- **Consequences:** runs can now be SCORED reproducibly. FOLLOW-UP: D2 (the gradient-free → evolutionary search loop +
+  the gem library / novelty dedup persistence), D3 (the surrogate "brute-force gradient" model), D4 (the autonomous
+  night-batch + the showcase gallery), anchored on the `data/presets/primordial.json` starter.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

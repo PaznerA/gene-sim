@@ -4,6 +4,7 @@ members = [
     "crates/genome",
     "crates/crispr",
     "crates/sim-core",
+    "crates/discovery",
     "crates/harness",
     "crates/oracle-slim",
     "crates/oracle-fba",
