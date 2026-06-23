@@ -57,6 +57,8 @@ mod tests {
             "cutibacterium",
             "aspergillus-niger",
             "penicillium",
+            "carsonella",
+            "syn3",
         ] {
             let path = format!(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/{}.json"),
@@ -155,6 +157,84 @@ mod tests {
             pheno.get(Trait::PredationCapacity),
             Some(1.0),
             "PredationCapacity expresses off the lytic attack-machinery anchor (the hit/attack lever)"
+        );
+    }
+
+    #[test]
+    fn shipped_carsonella_species_loads() {
+        // ADR-019 S5 (Mode B obligate symbiont): the baked real Carsonella ruddii Pv ENDOSYMBIONT genome
+        // (scripts/bake_carsonella_species.py: curated translation-core + amino-acid-provisioning roster × real
+        // NCBI GCF_000010365.1 CDS) must load + build. Data-not-code: the gate catches a broken/incomplete re-bake.
+        // The niche declares the OBLIGATE-SYMBIONT role + the host_key; it resolves through gp::role_from_override
+        // → ObligateSymbiont. The two S5 anchors (tuf → GrowthRate, GO-6414; the leucine/aa-biosynthesis
+        // provisioning locus → SymbiosisCapacity, GO-8652) must be present so host_draw_rate resolves non-zero.
+        use sim_core::gp::{
+            express_strategy, role_from_override, symbiont_trait_map, OntologyMap, TrophicRole,
+        };
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/species/carsonella.json"
+        );
+        let built = load_species_file(path).expect("data/species/carsonella.json should load");
+        assert_eq!(built.key, "carsonella");
+        assert_eq!(
+            built.trophic_role.as_deref(),
+            Some("symbiont"),
+            "the niche declares the obligate-symbiont role"
+        );
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::ObligateSymbiont,
+            "the declared override must resolve to ObligateSymbiont at the boundary"
+        );
+        assert_eq!(
+            built.host_key.as_deref(),
+            Some("default"),
+            "the symbiont declares its host species key (the coupling target)"
+        );
+        assert!(built.genome.is_valid());
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Carsonella locus carries a real CDS"
+        );
+        // The host-coupling exchange lever resolves off the baked GO-8652 provisioning anchor (wild-type 1.0),
+        // so a symbiont built from the shipped genome has a NON-ZERO host_draw_rate (it can actually couple).
+        let map = OntologyMap::new(symbiont_trait_map());
+        let s = express_strategy(&map, &built.genome, TrophicRole::ObligateSymbiont);
+        assert!(
+            s.host_draw_rate > 0,
+            "the shipped Carsonella genome expresses a non-zero host_draw_rate (the coupling lever resolves)"
+        );
+    }
+
+    #[test]
+    fn shipped_syn3_species_loads() {
+        // ADR-019 S5 (Mode B): the baked JCVI-Syn3.0 minimal-cell genome (scripts/bake_syn3_species.py: curated
+        // minimal-essential roster × real NCBI GCF_000027325.1 CDS — the Syn3.0 minimization-lineage template;
+        // no wild Syn3.0 assembly exists, documented in the baker header) must load + build. The niche declares
+        // the obligate-symbiont role (the rich-medium niche AS the host abstraction) + the host_key.
+        use sim_core::gp::{
+            express_strategy, role_from_override, symbiont_trait_map, OntologyMap, TrophicRole,
+        };
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/syn3.json");
+        let built = load_species_file(path).expect("data/species/syn3.json should load");
+        assert_eq!(built.key, "syn3");
+        assert_eq!(
+            role_from_override(built.trophic_role.as_deref(), &built.key),
+            TrophicRole::ObligateSymbiont,
+            "the declared override must resolve to ObligateSymbiont at the boundary"
+        );
+        assert_eq!(built.host_key.as_deref(), Some("default"));
+        assert!(built.genome.is_valid());
+        assert!(
+            built.genome.loci.iter().all(|l| !l.sequence.is_empty()),
+            "every Syn3.0 locus carries a real CDS"
+        );
+        let map = OntologyMap::new(symbiont_trait_map());
+        let s = express_strategy(&map, &built.genome, TrophicRole::ObligateSymbiont);
+        assert!(
+            s.host_draw_rate > 0,
+            "the shipped Syn3.0 genome expresses a non-zero host_draw_rate (the coupling lever resolves)"
         );
     }
 

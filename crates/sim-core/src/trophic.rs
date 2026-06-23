@@ -31,8 +31,8 @@ use bevy_ecs::prelude::*;
 use crate::fixed;
 use crate::gp::{self, BudgetChannel, TrophicRole};
 use crate::{
-    cell_index, credit_capped, ledger, Age, Biomass, DroughtTol, Energy, Genotype, NextOrgId,
-    OrgId, Position, Species, SpeciesId, SpeciesRegistry, ThermalTol, BODY_FACTOR_FLOOR,
+    cell_index, credit_capped, deposit_carcass, ledger, Age, Biomass, DroughtTol, Energy, Genotype,
+    NextOrgId, OrgId, Position, Species, SpeciesId, SpeciesRegistry, ThermalTol, BODY_FACTOR_FLOOR,
     ENERGY_CAP, MAINTENANCE_FLOOR, OFFSPRING_SEED_BIOMASS, POOL_CAP,
 };
 
@@ -1038,6 +1038,342 @@ pub(crate) fn predation(
         }
         if let Some(&kept) = pred_credit.get(&id.0) {
             // Predator gains the kept J into Energy; past the cap → overflow (never a silent clamp).
+            let (new_e, over) = credit_capped(energy.0, kept, ENERGY_CAP);
+            energy.0 = new_e;
+            ledger.overflow += over;
+        }
+    }
+    for e in &to_despawn {
+        commands.entity(*e).despawn();
+    }
+}
+
+// ── ADR-019 S5: the obligate-symbiont HOST-COUPLING interaction kernel — the host→symbiont J draw ─────────────
+//
+// An `ObligateSymbiont` (Carsonella / Syn3.0) earns its joules ONLY here (its role taps no abiotic pool in
+// `metabolism`, exactly like a `Predator`). The kernel is modeled cell-for-cell on the proven `predation`
+// skeleton: a FROZEN start-of-tick HOST census (per cell, per declared host species), per-cell `apportion` of
+// symbiont demand, and a paired conserved transfer (host J → symbiont − efficiency-tax → respired). V1 ships the
+// HOST→SYMBIONT DRAW ARM ONLY (a single conserved transfer like predation); "provisioning" is modeled as a
+// benign-low net draw (low `host_draw_rate` + the 7/10 efficiency tax) so coexistence is reachable, not a pure
+// parasitic drain — the genuine bidirectional reverse credit-back is a documented S5b stretch (sign-off, not v1).
+// RNG-free (DrawCount untouched → births stay the sole RNG consumer), all `i64`, no `HashMap` iterated (BTreeMap
+// for the org-keyed host-debit set), walked in canonical `(cell, SpeciesId, OrgId)` order (inv #3). On a
+// symbiont-free roster the symbiont row vector is empty → early `return` (the mineralize/predation no-op
+// precedent) → it moves no value and draws nothing → HASH-NEUTRAL on the pinned plant run. PINNED schedule slot:
+// immediately BEFORE `predation`, both on independently-frozen start-of-tick snapshots, so "host dies → symbiont
+// starves next tick" is a clean one-tick-lag emergent cascade.
+
+/// A symbiont's `host_coupling` row, snapshotted in canonical `(cell, SpeciesId, OrgId)` order. `host` is the
+/// symbiont's declared host species (resolved at register-time, cached on the registry entry).
+struct SymbiontRow {
+    cell: u32,
+    species: u16,
+    host: u16,
+    org: u64,
+    body: i64,
+}
+
+/// A host org's frozen drawable-J row, snapshotted in canonical `(cell, SpeciesId, OrgId)` order BEFORE any
+/// symbiont draws (within-tick draws never re-feed this tick's demand — the `frozen_prey_j` discipline).
+struct HostRow {
+    cell: u32,
+    species: u16,
+    org: u64,
+    entity: Entity,
+    /// Frozen `Energy + Biomass` (its drawable J) at start-of-system.
+    frozen_j: i64,
+    energy: i64,
+    biomass: i64,
+}
+
+/// A pending debit applied to a host org after the canonical walk (never mutate-during-query). `drawn >= 0`;
+/// the host loses `drawn` J Energy-first-then-Biomass.
+struct HostDebit {
+    drawn: i64,
+}
+
+/// **HOST COUPLING** (ADR-019 S5 KEYSTONE) — obligate symbionts draw kept-J from their co-located declared HOST
+/// on a FROZEN start-of-tick census, apportioned across co-located symbionts sharing a host (largest-remainder,
+/// ties→lowest canonical index). Runs AFTER `metabolism`+`mineralize` (so it reads this tick's post-uptake host
+/// Energy) and immediately BEFORE `predation` (the pinned slot). RNG-free, all `i64`, no `HashMap` iterated.
+///
+/// FOUR PASSES (deterministic, canonical `(cell, SpeciesId, OrgId)` order):
+/// 1. BUILD the symbiont row vector (`role == ObligateSymbiont`, with a resolved host). Empty → early `return`.
+/// 2. FREEZE the start-of-tick co-located HOST census per cell, keyed by host species
+///    (`frozen_host_j[cell*s + host]` = Σ that host's `Energy+Biomass`) + the per-cell ordered host-org list.
+/// 3. DEMAND per symbiont: Monod on its `frozen_host_j[cell, host]` (a Holling-II saturating response), folding
+///    `host_draw_rate · body_factor · edit_factor` into ONE demand permille (EditModifier GATED on non-neutral).
+/// 4. CONSUME + ATTRIBUTE: per (cell, host species), apportion the host's available frozen J across co-located
+///    symbionts ([`fixed::apportion_into`]); debit host Energy-first-then-Biomass; the symbiont GAINS `kept =
+///    drawn · EFF_NUM/EFF_DEN` (the 7/10 trophic efficiency), the tax `drawn − kept` → respired; record
+///    `flow[symbiont][host] += kept` — a MEASURED host↔symbiont off-diagonal. A host drained sub-floor with no
+///    body left dies via the standard carcass path (its residual → detritus); the host normally survives the
+///    benign draw and integrates normally next tick.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn host_coupling(
+    registry: Res<SpeciesRegistry>,
+    edit_mod: Res<crate::EditModifierRes>,
+    mut commands: Commands,
+    mut pools: ResMut<crate::PoolStock>,
+    mut prov: ResMut<PoolProvenance>,
+    mut chem: ResMut<crate::chem::ChemField>,
+    mut flow: ResMut<FlowMatrix>,
+    mut ledger: ResMut<ledger::Ledger>,
+    mut q: Query<(
+        Entity,
+        &OrgId,
+        &Species,
+        &mut Energy,
+        &mut Biomass,
+        &Position,
+    )>,
+) {
+    let s = registry.entries.len();
+    let width = pools.width;
+    // ── Pass 1: build the canonical SYMBIONT row vector. A symbiont-free roster (or a symbiont with no resolved
+    //    host) → empty → early return (the mineralize/predation no-op precedent; the hash-neutrality anchor). ──
+    let mut symbionts: Vec<SymbiontRow> = q
+        .iter()
+        .filter_map(|(_e, id, sp, _en, biomass, p)| {
+            let entry = &registry.entries[sp.0 .0 as usize];
+            if entry.strategy.role != TrophicRole::ObligateSymbiont {
+                return None;
+            }
+            // The symbiont's declared host (resolved at register-time). Hostless → it draws nothing (it will
+            // starve via the conserved economy) — exclude it from the row vector so the pass stays a no-op for it.
+            let host = entry.host?;
+            Some(SymbiontRow {
+                cell: cell_index(p, width),
+                species: sp.0 .0,
+                host: host.ordinal(),
+                org: id.0,
+                body: biomass.0.max(crate::OFFSPRING_SEED_BIOMASS),
+            })
+        })
+        .collect();
+    if symbionts.is_empty() {
+        return;
+    }
+    symbionts.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
+
+    // ── Pass 2: FREEZE the start-of-tick HOST census in canonical order (BEFORE any symbiont draws). A host is a
+    //    live org whose species == some symbiont's declared host. Within-tick draws never re-feed this tick's
+    //    demand (the `frozen_prey_j` discipline). ──
+    let cells = (pools.width as usize) * (pools.height as usize);
+    let mut hosts: Vec<HostRow> = q
+        .iter()
+        .filter_map(|(e, id, sp, energy, biomass, p)| {
+            // Only census a species that is SOME symbiont's host (cheap ordered scan over the small registry).
+            let is_host = symbionts.iter().any(|r| r.host == sp.0 .0);
+            if !is_host {
+                return None;
+            }
+            let frozen_j = energy.0.max(0) + biomass.0.max(0);
+            if frozen_j <= 0 {
+                return None;
+            }
+            Some(HostRow {
+                cell: cell_index(p, width),
+                species: sp.0 .0,
+                org: id.0,
+                entity: e,
+                frozen_j,
+                energy: energy.0,
+                biomass: biomass.0,
+            })
+        })
+        .collect();
+    if hosts.is_empty() {
+        return; // symbionts present but no host co-located anywhere — no transfer, no-op (they starve emergently).
+    }
+    hosts.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
+
+    // Per-cell, per-host-species frozen drawable J (the Monod stock S), flat `[cell*s + host_species]` (never a
+    // HashMap — inv #3). A symbiont only draws from its OWN declared host species' frozen stock in its cell.
+    let mut frozen_host_j = vec![0i64; cells * s];
+    for r in &hosts {
+        frozen_host_j[r.cell as usize * s + r.species as usize] += r.frozen_j;
+    }
+
+    // ── Pass 3: per-symbiont DEMAND (Monod on the frozen host J of its declared host species → Holling-II). ──
+    let n = symbionts.len();
+    let mut demand = vec![0i64; n];
+    for (i, r) in symbionts.iter().enumerate() {
+        let strat = &registry.entries[r.species as usize].strategy;
+        let cell = r.cell as usize;
+        let stock = frozen_host_j[cell * s + r.host as usize];
+        // demand_permille = host_draw_rate · body, both on permille grids (the predation demand shape).
+        let rate_permille = (u64::from(strat.host_draw_rate) * u64::from(fixed::PERMILLE))
+            / u64::from(fixed::UNIT_SCALE);
+        let body_factor = (((r.body as u128 * u128::from(fixed::PERMILLE))
+            / (crate::BIOMASS_CAP as u128))
+            .min(1000) as u64)
+            .max(BODY_FACTOR_FLOOR);
+        let p = u64::from(fixed::PERMILLE);
+        let mut dp = rate_permille * body_factor / p;
+        // ADR-019 S5 OVERSIGHT: a committed edit on the SYMBIONT throttles its host-coupling draw (a provisioning-
+        // locus knockdown). The SAME per-species `[0.5,1.5]` factor scales the demand. GATED on non-neutral so a
+        // no-edit run is byte-identical (the symbiont-free pinned hash is unmoved).
+        let edit_factor_q = edit_mod.factor_q(r.species);
+        if edit_factor_q != crate::EDIT_FACTOR_NEUTRAL_Q {
+            dp = dp * u64::from(edit_factor_q) / u64::from(fixed::PERMILLE);
+        }
+        demand[i] = crate::monod_demand(stock, dp.min(p));
+    }
+
+    // ── Pass 4: CONSUME + ATTRIBUTE — a CONSERVING two-level per-(cell, host-species) apportion (the predation
+    //    skeleton). Per (cell, host species): apportion the host's TOTAL grant (Σ co-located symbionts' demand,
+    //    capped at the host's frozen J) across the host orgs by frozen_j (each host gives ≤ its frozen_j EXACTLY),
+    //    and back-split each host's `drawn` across the symbionts by their demand share, so the FlowMatrix edge +
+    //    symbiont credit are attributed per (symbiont, host species) with no over-draw. Conserves J exactly. ──
+    let mut host_debit: std::collections::BTreeMap<u64, HostDebit> =
+        std::collections::BTreeMap::new();
+    let mut symb_credit: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+
+    let mut host_w: Vec<u64> = Vec::new();
+    let mut host_drawn: Vec<i64> = Vec::new(); // per cell-host: total J this host org loses this tick
+    let mut symb_w: Vec<u64> = Vec::new();
+    let mut symb_share: Vec<i64> = Vec::new(); // per cell-symbiont: how much of THIS host it draws
+    let mut rem: Vec<(u128, usize)> = Vec::new();
+
+    // Walk the symbiont rows grouped by cell (canonical order → cells contiguous). Within a cell, sub-group by
+    // the declared host species so each (cell, host) pair shares its host stock independently.
+    let mut si = 0usize;
+    while si < n {
+        let cell = symbionts[si].cell;
+        let mut sj = si;
+        while sj < n && symbionts[sj].cell == cell {
+            sj += 1;
+        }
+        // The slice of host rows in this cell (hosts globally sorted by (cell, species, org)).
+        let host_lo = hosts.partition_point(|r| r.cell < cell);
+        let host_hi = hosts.partition_point(|r| r.cell <= cell);
+        let cell_hosts = &hosts[host_lo..host_hi];
+        // Sub-group the cell's symbionts by declared host species (they are NOT sorted by host within the cell,
+        // but the canonical (cell, species, org) order is a TOTAL order; we scan all distinct host ids present).
+        // Collect the distinct host species in this cell's symbiont group, in ascending order (deterministic).
+        let mut host_ids: Vec<u16> = (si..sj).map(|k| symbionts[k].host).collect();
+        host_ids.sort_unstable();
+        host_ids.dedup();
+        for hid in host_ids {
+            // The host orgs of this declared species in this cell.
+            let group_hosts: Vec<&HostRow> =
+                cell_hosts.iter().filter(|r| r.species == hid).collect();
+            if group_hosts.is_empty() {
+                continue; // this host species is not present in the cell → its symbionts draw nothing (starve)
+            }
+            // The symbionts in this cell that draw from THIS host species, in canonical order.
+            let group_symb: Vec<usize> = (si..sj).filter(|&k| symbionts[k].host == hid).collect();
+            // Total grant = Σ this host species' co-located symbionts' demand, capped at the host's frozen J.
+            let stock = frozen_host_j[cell as usize * s + hid as usize];
+            let total_demand: i64 = group_symb.iter().map(|&k| demand[k].max(0)).sum();
+            if total_demand <= 0 || stock <= 0 {
+                continue;
+            }
+            let cell_grant = stock.min(total_demand);
+            // (1) Apportion the cell's total grant across the host orgs by frozen_j (each gives ≤ its frozen_j).
+            host_w.clear();
+            host_w.extend(group_hosts.iter().map(|r| r.frozen_j.max(0) as u64));
+            host_drawn.clear();
+            host_drawn.resize(group_hosts.len(), 0);
+            fixed::apportion_into(cell_grant, &host_w, &mut host_drawn, &mut rem);
+            // Symbiont demand weights for the per-host back-split (canonical symbiont order within the group).
+            symb_w.clear();
+            symb_w.extend(group_symb.iter().map(|&k| demand[k].max(0) as u64));
+            for (hidx, hr) in group_hosts.iter().enumerate() {
+                let drawn = host_drawn[hidx];
+                if drawn <= 0 {
+                    continue;
+                }
+                // Record the host debit (it loses exactly `drawn`, Energy-first-then-Biomass, applied below).
+                host_debit
+                    .entry(hr.org)
+                    .or_insert(HostDebit { drawn: 0 })
+                    .drawn += drawn;
+                // (2) Back-split this host's `drawn` across the group's symbionts by their demand share, so the
+                // symbiont credit + FlowMatrix edge are attributed per (symbiont, host species). Σ symb_share == drawn.
+                symb_share.resize(group_symb.len(), 0);
+                fixed::apportion_into(drawn, &symb_w, &mut symb_share, &mut rem);
+                for (kk, &k) in group_symb.iter().enumerate() {
+                    let take = symb_share[kk];
+                    if take <= 0 {
+                        continue;
+                    }
+                    let symb_species = symbionts[k].species as usize;
+                    let symb_org = symbionts[k].org;
+                    // Belt-and-suspenders: a symbiont never draws from itself (its host species differs by
+                    // construction — an ObligateSymbiont is never another symbiont's host in this slice).
+                    debug_assert!(
+                        hr.org != symb_org && hr.species != symbionts[k].species,
+                        "host_coupling self-draw guard: host org/species must differ from the symbiont"
+                    );
+                    // The symbiont GAINS kept = take · EFF_NUM/EFF_DEN; the tax (take − kept) → respired (a
+                    // residual, never an independent divide that double-floors — the predation precedent).
+                    let kept = take * crate::EFF_NUM / crate::EFF_DEN;
+                    let tax = take - kept;
+                    ledger.respired += tax;
+                    *symb_credit.entry(symb_org).or_insert(0) += kept;
+                    // FlowMatrix: net assimilated J flowed FROM the host species INTO the symbiont species (the
+                    // host↔symbiont off-diagonal; the diagonal pairing keeps the symbiont row summing to 0).
+                    flow.record(symb_species, hr.species as usize, kept);
+                }
+            }
+        }
+        si = sj;
+    }
+
+    // Apply host debits: Energy-first-then-Biomass; a host drained to a sub-floor residual with no body left dies
+    // (its residual → carcass→detritus, the standard conserved death path). The benign draw normally leaves the
+    // host alive to integrate next tick.
+    let mut to_despawn: Vec<Entity> = Vec::new();
+    for r in &hosts {
+        let Some(d) = host_debit.get(&r.org) else {
+            continue;
+        };
+        if d.drawn <= 0 {
+            continue;
+        }
+        let drawn = d.drawn.min(r.frozen_j); // never draw more than the frozen drawable J (apportion guarantees)
+        let new_energy = r.energy - drawn.min(r.energy.max(0));
+        let energy_drawn = r.energy - new_energy;
+        let biomass_drawn = drawn - energy_drawn;
+        let new_biomass = r.biomass - biomass_drawn;
+        let residual = new_energy.max(0) + new_biomass.max(0);
+        let dead = residual <= 0 || (new_energy < MAINTENANCE_FLOOR && new_biomass <= 0);
+        if dead {
+            if residual > 0 {
+                let cellu = r.cell as usize;
+                deposit_carcass(
+                    &mut pools,
+                    &mut chem,
+                    &mut prov,
+                    &mut ledger,
+                    cellu,
+                    r.species as usize,
+                    residual,
+                );
+            }
+            to_despawn.push(r.entity);
+        }
+    }
+
+    // Apply the surviving-host debits + symbiont credits via the live query (AFTER the walk; never mutate-during-
+    // query for the despawned set). Despawns are deferred through Commands.
+    let despawn_set: std::collections::BTreeSet<Entity> = to_despawn.iter().copied().collect();
+    for (entity, id, _sp, mut energy, mut biomass, _p) in q.iter_mut() {
+        if despawn_set.contains(&entity) {
+            continue; // about to despawn; its J already deposited as carcass
+        }
+        if let Some(d) = host_debit.get(&id.0) {
+            // Surviving host: debit Energy-first-then-Biomass by the drawn amount.
+            let drawn = d.drawn.min(energy.0.max(0) + biomass.0.max(0));
+            let from_energy = drawn.min(energy.0.max(0));
+            energy.0 -= from_energy;
+            biomass.0 -= drawn - from_energy;
+        }
+        if let Some(&kept) = symb_credit.get(&id.0) {
+            // Symbiont gains the kept J into Energy; past the cap → overflow (never a silent clamp).
             let (new_e, over) = credit_capped(energy.0, kept, ENERGY_CAP);
             energy.0 = new_e;
             ledger.overflow += over;

@@ -57,6 +57,16 @@ pub enum Trait {
     // genome lacking the anchor expresses `0.0` → NOT a spore-former (the inert-off-role guarantee).
     /// Sporulation capacity (the spo0A/sigF endospore or brlA conidiation cascade) — spore-former marker.
     SporulationCapacity,
+
+    // ── Obligate-symbiont trait (ADR-019 S5 — the host-coupling mechanic) — the amino-acid-provisioning /
+    // host-exchange capacity (e.g. Carsonella's retained aromatic-amino-acid biosynthesis that it trades the
+    // psyllid host for shelter), expressed via an obligate symbiont's own `TraitMap`. Deliberately NOT in
+    // [`Trait::ALL`] (the 9-trait plant order), exactly like the E. coli microbe + predator + spore-former
+    // traits — so the plant phenotype vector, CSV header, and hash stay byte-unperturbed. A non-zero value
+    // drives [`Strategy::host_draw_rate`] (the host-coupling exchange rate); a genome lacking the anchor
+    // expresses `0.0` → `host_draw_rate == 0` (the inert-off-role guarantee).
+    /// Symbiosis capacity (the host-coupling amino-acid-exchange machinery) — obligate-symbiont lever.
+    SymbiosisCapacity,
 }
 
 impl Trait {
@@ -96,6 +106,7 @@ impl Trait {
             Trait::FermentationCapacity => "fermentation_capacity",
             Trait::PredationCapacity => "predation_capacity",
             Trait::SporulationCapacity => "sporulation_capacity",
+            Trait::SymbiosisCapacity => "symbiosis_capacity",
         }
     }
 }
@@ -257,14 +268,37 @@ pub fn bdellovibrio_trait_map() -> TraitMap {
     ])
 }
 
+/// The obligate-symbiont (Carsonella / Syn3.0) per-species [`TraitMap`] (ADR-019 S5). `GrowthRate` (the
+/// selection-driving trait) anchors on a retained translation-core gene (`tuf`/EF-Tu — the symbiont still funds
+/// its own growth from kept host-J). `SymbiosisCapacity` — the host-coupling exchange lever — anchors on the
+/// AMINO-ACID-PROVISIONING molecular function (GO-8652, "amino acid biosynthetic process"): Carsonella's
+/// retained aromatic-amino-acid / leucine biosynthesis is exactly the metabolite trade that JUSTIFIES the
+/// coupling and is the codex story of genome reduction. A provisioning-locus CRISPRi Knockdown (activity→0)
+/// drives `SymbiosisCapacity` → 0 → `host_draw_rate` → 0 (the OVERSIGHT lever, exactly like `hit`→`predation_rate`).
+/// Ordered (inv #3). A PURE ADDITION — it touches neither plant nor ecoli/predator express paths.
+#[must_use]
+pub fn symbiont_trait_map() -> TraitMap {
+    let b = |t, go| TraitBinding {
+        trait_: t,
+        locus: LocusSelector::ByGoAnchor(GoTermId(go)),
+        param: ParamId(0),
+    };
+    TraitMap(vec![
+        b(Trait::GrowthRate, 6414), // translation elongation (EF-Tu / tuf — the retained growth backbone)
+        b(Trait::SymbiosisCapacity, 8652), // amino-acid biosynthesis (the host-provisioning exchange lever)
+    ])
+}
+
 /// Select the per-species [`TraitMap`] by the species `key` (ADR-017 "RUN E. coli"). A pure, ordered `match`
 /// (never a `HashMap` — inv #3): `"ecoli-core"` → [`ecoli_trait_map`]; `"bdellovibrio"` → [`bdellovibrio_trait_map`];
-/// EVERY other key → the default plant map, so an unknown/missing key degrades safely to the historical behaviour.
+/// `"carsonella"`/`"syn3"` → [`symbiont_trait_map`]; EVERY other key → the default plant map, so an unknown/missing
+/// key degrades safely to the historical behaviour.
 #[must_use]
 pub fn trait_map_for(key: &str) -> TraitMap {
     match key {
         "ecoli-core" => ecoli_trait_map(),
         "bdellovibrio" => bdellovibrio_trait_map(),
+        "carsonella" | "syn3" => symbiont_trait_map(),
         _ => default_plant_trait_map(),
     }
 }
@@ -312,6 +346,14 @@ pub enum TrophicRole {
     /// metabolism apportion), so the [`crate::trophic::predation`] kernel is its SOLE income — that is the
     /// STRUCTURAL guarantee a dedicated role buys (a `Heterotroph + affinity` would double-dip the abiotic taps).
     Predator,
+    /// Earns ONLY by drawing kept-J from a co-located HOST organism — the ADR-019 S5 obligate endosymbiont
+    /// (e.g. *Candidatus* Carsonella ruddii inside its psyllid bacteriocyte). APPENDED after `Predator` so every
+    /// existing discriminant is unperturbed. Like `Predator`, it taps NO abiotic resource channel — the
+    /// [`crate::trophic::host_coupling`] pass is its SOLE income — which is the STRUCTURAL "cannot free-live"
+    /// guarantee: a NEW variant falls THROUGH all three [`crate::metabolism`] abiotic taps (light / free_nutrient
+    /// / detritus, each gated on `Autotroph|Heterotroph|Mixotroph|Decomposer`), so it draws zero abiotic J with
+    /// NO metabolism edit. Hostless ⇒ no income ⇒ it starves below the maintenance floor (emergent death).
+    ObligateSymbiont,
 }
 
 impl Default for TrophicRole {
@@ -326,7 +368,9 @@ impl Default for TrophicRole {
 /// `Mixotroph`, `Predator`}. This encodes Bdellovibrio's gram-negative-bacteria host range — it invades the
 /// periplasm of OTHER BACTERIA, not plant cells (`Autotroph`), and there is NO intraguild/hyper-predation in
 /// this slice (`Predator` is not prey). `Mixotroph` (algal/plant-ish) is excluded pending the taxonomy owner.
-/// E. coli is a `Decomposer` → eligible prey, so the F6 predator closes plant→microbe→predator.
+/// E. coli is a `Decomposer` → eligible prey, so the F6 predator closes plant→microbe→predator. ADR-019 S5:
+/// an `ObligateSymbiont` is NOT prey either (it falls through the `matches!` automatically — a Bdellovibrio
+/// co-located with an endosymbiont sheltered inside its host cannot eat it; the host is the cullable target).
 #[must_use]
 pub fn is_prey(role: TrophicRole) -> bool {
     matches!(role, TrophicRole::Heterotroph | TrophicRole::Decomposer)
@@ -342,6 +386,9 @@ pub fn role_for(key: &str) -> TrophicRole {
     match key {
         "ecoli-core" => TrophicRole::Decomposer,
         "bdellovibrio" => TrophicRole::Predator,
+        // ADR-019 S5: the obligate endosymbionts (the JSON override is the load-bearing path; these are the
+        // key defaults, mirroring `"bdellovibrio" => Predator`).
+        "carsonella" | "syn3" => TrophicRole::ObligateSymbiont,
         _ => TrophicRole::Autotroph,
     }
 }
@@ -357,6 +404,10 @@ pub fn role_from_str(s: &str) -> Option<TrophicRole> {
         "mixotroph" => Some(TrophicRole::Mixotroph),
         "decomposer" => Some(TrophicRole::Decomposer),
         "predator" => Some(TrophicRole::Predator),
+        // ADR-019 S5: the obligate-symbiont role (accept the common spellings the data may use).
+        "symbiont" | "obligate_symbiont" | "obligatesymbiont" => {
+            Some(TrophicRole::ObligateSymbiont)
+        }
         _ => None,
     }
 }
@@ -440,6 +491,14 @@ pub struct Strategy {
     /// [`crate::trophic::germinate`] pass. `false` for every plant/ecoli/predator genome (no anchor → `0` →
     /// `false`), so both sporulation branches and germination are byte-identical no-ops on a non-spore-former.
     pub spore_former: bool,
+    /// Per-org HOST-COUPLING draw rate on the fixed `u16` grid `[0, UNIT_SCALE]` (ADR-019 S5, parallel to
+    /// [`Strategy::predation_rate`]): gene-anchored on [`Trait::SymbiosisCapacity`] (the host-exchange /
+    /// amino-acid-provisioning machinery), so a CRISPRi Knockdown of that locus throttles the coupling rate
+    /// (the OVERSIGHT lever). Read ONLY by the S5 [`crate::trophic::host_coupling`] system for a
+    /// [`TrophicRole::ObligateSymbiont`]; INERT (`== 0`) for every other role — absent anchor → `0`, exactly
+    /// like `predation_rate` is inert off a Predator. A symbiont taps no abiotic pool, so this coupling draw is
+    /// its SOLE income (the host→symbiont arm); a benign-low value lets coexistence be reachable, not a pure drain.
+    pub host_draw_rate: u16,
 }
 
 /// The channel→anchor-trait pairing (declaration-ordered, parallel to [`BudgetChannel::ALL`]). Each channel's
@@ -481,6 +540,19 @@ const CHANNEL_TRAITS_PREDATOR: [(BudgetChannel, Trait); 5] = [
     (BudgetChannel::Maintenance, Trait::GrowthRate),
     (BudgetChannel::Defense, Trait::PredationCapacity),
 ];
+/// The OBLIGATE-SYMBIONT (Carsonella / Syn3.0) channel anchors (ADR-019 S5) — a PURE ADDITION leaving the
+/// plant/E. coli/predator anchor tables untouched. A reduced, host-dependent endosymbiont funds a LEAN budget:
+/// `Growth` + `Maintenance` anchor on `GrowthRate` (the kept host-J funds growth + upkeep), the other three
+/// channels anchor on `SymbiosisCapacity` so a symbiont that invests in the host-exchange machinery also keeps a
+/// valid simplex (the F6-predator pattern). The kernel reads the dedicated `host_draw_rate`, not this budget —
+/// this table only ensures the kept-J it gains splits over a valid 1000-permille simplex.
+const CHANNEL_TRAITS_SYMBIONT: [(BudgetChannel, Trait); 5] = [
+    (BudgetChannel::Acquisition, Trait::SymbiosisCapacity),
+    (BudgetChannel::Growth, Trait::GrowthRate),
+    (BudgetChannel::Reproduction, Trait::SymbiosisCapacity),
+    (BudgetChannel::Maintenance, Trait::GrowthRate),
+    (BudgetChannel::Defense, Trait::SymbiosisCapacity),
+];
 
 /// The uniform fallback budget (`[200; 5]`, Σ = 1000) substituted when every channel anchor expresses `0.0`
 /// (so `normalize_permille` would return all-zero). Keeps a cached [`Strategy`] ALWAYS a valid 1000-simplex.
@@ -512,6 +584,7 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
             &CHANNEL_TRAITS_ECOLI
         }
         TrophicRole::Predator => &CHANNEL_TRAITS_PREDATOR,
+        TrophicRole::ObligateSymbiont => &CHANNEL_TRAITS_SYMBIONT,
         TrophicRole::Autotroph => &CHANNEL_TRAITS,
     };
     // Raw channel weights on the u16 grid, ordered by BudgetChannel::ALL.
@@ -560,6 +633,15 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
             .unwrap_or(0.0)
             .clamp(0.0, 1.0),
     ) > 0;
+    // Host-coupling draw rate (ADR-019 S5): SymbiosisCapacity → the S5 host_coupling kernel's per-org draw-rate
+    // lever, quantized [0,1]→u16 directly on the grid (parallel to predation_rate). Absent for any non-symbiont
+    // genome (→ 0), so it is inert off an ObligateSymbiont — exactly like predation_rate off a Predator. A
+    // SymbiosisCapacity-anchored CRISPRi Knockdown (→0) drives it to 0 (the OVERSIGHT lever).
+    let host_draw_rate = fixed::to_unit_u16(
+        p.get(Trait::SymbiosisCapacity)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+    );
     Strategy {
         budget,
         role,
@@ -567,6 +649,7 @@ pub fn express_strategy(map: &OntologyMap, genome: &Genome, role: TrophicRole) -
         mineralize_rate,
         predation_rate,
         spore_former,
+        host_draw_rate,
     }
 }
 
@@ -979,6 +1062,106 @@ mod tests {
         assert!(
             !s_plant.spore_former,
             "no SporulationCapacity anchor → not a spore-former (pinned-run byte-neutrality)"
+        );
+    }
+
+    #[test]
+    fn s5_host_draw_rate_is_gene_anchored_and_inert_without_the_anchor() {
+        // ADR-019 S5: host_draw_rate is the host-coupling exchange lever, anchored on SymbiosisCapacity (the
+        // amino-acid-provisioning machinery) — exactly the inert-off-role precedent of predation_rate. A
+        // synthetic map binding the anchor drives the rate off the genome; knocking it to 0 zeroes the rate; a
+        // plant genome (no anchor) is NEVER a coupler (byte-neutral on the pinned single-plant run).
+        let g = Genome {
+            version: 2,
+            loci: vec![genome::Locus {
+                id: LocusId(0),
+                name: "anchor".to_string(),
+                sequence: genome::DnaSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                parameters: vec![genome::Parameter {
+                    id: ParamId(0),
+                    value: genome::ParamValue::Numeric {
+                        value: 0.5,
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                }],
+                tags: genome::OntologyTags {
+                    so_term: genome::SoTermId(704),
+                    go_refs: vec![],
+                },
+            }],
+        };
+        let b = |t| TraitBinding {
+            trait_: t,
+            locus: LocusSelector::ByIndex(LocusId(0)),
+            param: ParamId(0),
+        };
+        let map = OntologyMap::new(TraitMap(vec![b(Trait::SymbiosisCapacity)]));
+        let s = express_strategy(&map, &g, TrophicRole::ObligateSymbiont);
+        // SymbiosisCapacity=0.5 → host_draw_rate = to_unit_u16(0.5) = 32767.
+        assert_eq!(
+            s.host_draw_rate, 32767,
+            "host_draw_rate tracks SymbiosisCapacity (the host-exchange lever)"
+        );
+        assert_eq!(s.role, TrophicRole::ObligateSymbiont);
+        // The symbiont budget is a valid 1000-simplex (the lean CHANNEL_TRAITS_SYMBIONT table).
+        assert_eq!(
+            s.budget.iter().map(|&x| u32::from(x)).sum::<u32>(),
+            fixed::PERMILLE,
+            "symbiont budget must be a 1000-permille simplex"
+        );
+        // Knock the provisioning anchor down → host_draw_rate falls (the CRISPRi throttle lever).
+        let mut g_ko = g.clone();
+        if let genome::ParamValue::Numeric { value, .. } = &mut g_ko.loci[0].parameters[0].value {
+            *value = 0.0;
+        }
+        let s_ko = express_strategy(&map, &g_ko, TrophicRole::ObligateSymbiont);
+        assert_eq!(
+            s_ko.host_draw_rate, 0,
+            "knocking SymbiosisCapacity to 0 zeroes the host-coupling draw rate"
+        );
+        // A plant genome (no SymbiosisCapacity binding) is NEVER a coupler — the inert-off-role guarantee.
+        let s_plant = express_strategy(
+            &OntologyMap::new(default_plant_trait_map()),
+            &genome::sample_genome(),
+            TrophicRole::Autotroph,
+        );
+        assert_eq!(
+            s_plant.host_draw_rate, 0,
+            "no SymbiosisCapacity anchor → host_draw_rate 0 (pinned-run byte-neutrality)"
+        );
+    }
+
+    #[test]
+    fn s5_symbiont_role_and_map_dispatch_by_key() {
+        // ADR-019 S5: the data-driven seams light up for the obligate-symbiont keys without new roster plumbing.
+        assert_eq!(role_for("carsonella"), TrophicRole::ObligateSymbiont);
+        assert_eq!(role_for("syn3"), TrophicRole::ObligateSymbiont);
+        assert_eq!(
+            role_from_str("symbiont"),
+            Some(TrophicRole::ObligateSymbiont)
+        );
+        assert_eq!(
+            role_from_str("Obligate_Symbiont"),
+            Some(TrophicRole::ObligateSymbiont),
+            "case-insensitive"
+        );
+        assert_eq!(trait_map_for("carsonella"), symbiont_trait_map());
+        assert_eq!(trait_map_for("syn3"), symbiont_trait_map());
+        // The niche.trophic_role override path the JSON boundary uses.
+        assert_eq!(
+            role_from_override(Some("symbiont"), "carsonella"),
+            TrophicRole::ObligateSymbiont
+        );
+        assert_eq!(
+            role_from_override(None, "carsonella"),
+            TrophicRole::ObligateSymbiont
+        );
+        // An ObligateSymbiont is NOT eligible prey (a Bdellovibrio co-located with an endosymbiont cannot eat
+        // it — the host is the cullable target). The is_prey fall-through is the mechanism.
+        assert!(
+            !is_prey(TrophicRole::ObligateSymbiont),
+            "an endosymbiont sheltered in its host is provably not eaten by a co-located predator"
         );
     }
 

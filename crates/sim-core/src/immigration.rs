@@ -169,7 +169,18 @@ pub fn expand_schedule(
     world_h: u32,
 ) -> Vec<ScheduledInoculation> {
     let n_events = level.event_count();
-    let n_species = config.species_keys.len() as u64;
+    // ADR-019 S5 STRUCTURAL AIRBORNE BLOCK — an ObligateSymbiont can NEVER airborne-arrive (it is Mode B,
+    // host-targeted, not Mode A airborne). HARD-FILTER any symbiont key out of the consortium BEFORE expanding,
+    // so a mis-configured consortium that lists a symbiont key cannot violate the "cannot free-live" biology: a
+    // symbiont arrives ONLY via an explicit host-targeted RegionInoculate (the host-presence gate there enforces
+    // co-location). A pure ordered filter — never a HashMap (inv #3); byte-neutral for every Mode-A consortium
+    // (no symbiont key present → the Vec is unchanged → the schedule is identical).
+    let airborne_keys: Vec<&String> = config
+        .species_keys
+        .iter()
+        .filter(|k| crate::gp::role_for(k) != crate::gp::TrophicRole::ObligateSymbiont)
+        .collect();
+    let n_species = airborne_keys.len() as u64;
     // OFF: no events, no consortium, or a zero horizon → empty schedule (the Sealed default is byte-neutral).
     if n_events == 0 || n_species == 0 || config.horizon == 0 || world_w == 0 || world_h == 0 {
         return Vec::new();
@@ -186,7 +197,7 @@ pub fn expand_schedule(
         let w_cy = derive_seed(master_seed, base + 3);
         let w_count = derive_seed(master_seed, base + 4);
 
-        let species_key = config.species_keys[(w_species % n_species) as usize].clone();
+        let species_key = airborne_keys[(w_species % n_species) as usize].clone();
         let due_epoch = (w_epoch % u64::from(config.horizon)) as u32;
         let cx = (w_cx % u64::from(world_w)) as u32;
         let cy = (w_cy % u64::from(world_h)) as u32;
@@ -251,6 +262,39 @@ mod tests {
         assert!(
             sched.is_empty(),
             "Sealed must produce no immigration events"
+        );
+    }
+
+    #[test]
+    fn obligate_symbiont_key_is_hard_blocked_from_airborne_arrival() {
+        // ADR-019 S5 STRUCTURAL AIRBORNE BLOCK: a mis-configured consortium that lists an ObligateSymbiont key
+        // (carsonella/syn3) can NEVER airborne-arrive — the key is HARD-FILTERED before expansion, so the schedule
+        // never schedules it (a symbiont arrives ONLY via an explicit host-targeted RegionInoculate). The Mode-A
+        // contaminant keys are unaffected (the filter is byte-neutral for any symbiont-free consortium).
+        let dirty = ConsortiumConfig {
+            species_keys: vec![
+                "bacillus".to_string(),
+                "carsonella".to_string(), // a symbiont key sneaked into the consortium
+                "syn3".to_string(),
+            ],
+            ..cfg()
+        };
+        let sched = expand_schedule(99, ContainmentLevel::Open, &dirty, 32, 32);
+        assert!(!sched.is_empty(), "the Mode-A keys still schedule");
+        assert!(
+            sched
+                .iter()
+                .all(|s| s.event.species_key != "carsonella" && s.event.species_key != "syn3"),
+            "no ObligateSymbiont key may ever airborne-arrive (the structural Mode-B block)"
+        );
+        // A symbiont-ONLY dirty consortium expands to an EMPTY schedule (every key filtered → nothing to seed).
+        let only_symbiont = ConsortiumConfig {
+            species_keys: vec!["carsonella".to_string(), "syn3".to_string()],
+            ..cfg()
+        };
+        assert!(
+            expand_schedule(99, ContainmentLevel::Open, &only_symbiont, 32, 32).is_empty(),
+            "a symbiont-only consortium can never airborne-seed (all keys hard-blocked)"
         );
     }
 

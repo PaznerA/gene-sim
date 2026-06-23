@@ -116,6 +116,13 @@ pub(crate) struct SpeciesEntry {
     base_growth: f64,
     target_pop: u32,
     pub(crate) strategy: gp::Strategy,
+    /// The declared HOST species for an [`gp::TrophicRole::ObligateSymbiont`] (ADR-019 S5) — resolved from the
+    /// `niche.host_key` string at the JSON→roster boundary to a registry [`SpeciesId`], and read by the S5
+    /// [`trophic::host_coupling`] pass to find the symbiont's sole income source. `None` for EVERY non-symbiont
+    /// (and for a symbiont whose host_key did not resolve) → the coupling pass finds no host → the symbiont
+    /// draws 0 and starves (the emergent "cannot free-live" guarantee). CATEGORICAL data cached at register —
+    /// never re-derived from drifting scalars, so a CRISPR edit cannot flip the host.
+    pub(crate) host: Option<SpeciesId>,
 }
 
 /// The ordered set of species in the run (ADR R3-A). Indexed by [`SpeciesId`] (= the `Vec` position); NEVER a
@@ -147,6 +154,11 @@ pub struct RosterEntry {
     /// The species' trophic role (ADR-013 F2) — CATEGORICAL data carried in from the JSON→roster boundary
     /// via [`gp::role_for`], NOT derived from genome scalars. Defaulted to `Autotroph` at existing call sites.
     pub role: gp::TrophicRole,
+    /// The declared HOST species KEY for an [`gp::TrophicRole::ObligateSymbiont`] (ADR-019 S5 — `niche.host_key`),
+    /// resolved to a registry [`SpeciesId`] at `reset_with_roster`/`register_species` against the species already
+    /// in the roster. `None` for every non-symbiont (serde-default at the boundary). Defaulted to `None` at
+    /// existing call sites so every pre-S5 roster build is byte-identical.
+    pub host_key: Option<String>,
 }
 
 /// The static per-cell soil field as a resource (ADR-011 S-G): LOCAL soil-coupled selection samples each
@@ -1201,7 +1213,7 @@ fn mint_to_cap(cell: &mut i64, amount: i64, cap: i64, ledger: &mut ledger::Ledge
 /// Pure integer, ZERO `SimRng` (inv #3). Conserves `J` BY CONSTRUCTION: every quantum of `residual` lands in
 /// detritus, the alarm plane, or the overflow tap. A non-positive `residual` is a clean no-op.
 #[allow(clippy::too_many_arguments)]
-fn deposit_carcass(
+pub(crate) fn deposit_carcass(
     pools: &mut PoolStock,
     chem: &mut chem::ChemField,
     prov: &mut trophic::PoolProvenance,
@@ -1690,6 +1702,7 @@ impl Simulation {
                 gp_map,
                 entity_count: config.entity_count,
                 role: gp::TrophicRole::default(), // plant default (Autotroph) for the single-species path.
+                host_key: None,
             }],
         )
     }
@@ -1713,11 +1726,26 @@ impl Simulation {
         // Seed the single RNG ONCE for the whole episode (inv. #3 — never re-seeded mid-run).
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
+        // ADR-019 S5: resolve each obligate symbiont's declared `host_key` to a registry SpeciesId against the
+        // roster's own key list (ordered, never a HashMap, inv #3). `None`/unresolved → `None` (the symbiont then
+        // draws no host income and starves — the emergent "cannot free-live" guarantee). Built BEFORE the map so
+        // the host ordinal is a pure function of roster order. Byte-neutral for every pre-S5 roster (all `None`).
+        let roster_keys: Vec<&str> = roster.iter().map(|r| r.key.as_str()).collect();
+        let host_for = |r: &RosterEntry| -> Option<SpeciesId> {
+            r.host_key.as_deref().and_then(|hk| {
+                roster_keys
+                    .iter()
+                    .position(|k| *k == hk)
+                    .map(|i| SpeciesId(i as u16))
+            })
+        };
+        let hosts: Vec<Option<SpeciesId>> = roster.iter().map(host_for).collect();
         // Express each species' genome → phenotype ONCE through its OWN map (invariant #2); base_growth =
         // GrowthRate (name-keyed, resolves under any species map). Build the ordered registry (inv #3).
         let entries: Vec<SpeciesEntry> = roster
             .into_iter()
-            .map(|r| {
+            .zip(hosts)
+            .map(|(r, host)| {
                 let base_growth = r
                     .gp_map
                     .express(&r.genome)
@@ -1735,6 +1763,7 @@ impl Simulation {
                     base_growth,
                     target_pop: r.entity_count,
                     strategy,
+                    host,
                 }
             })
             .collect();
@@ -1880,10 +1909,14 @@ impl Simulation {
         // free_nutrient is now endogenous) → metabolism (uptake/convert/excrete + litterfall + free_nutrient
         // provenance, RNG-free) → mineralize (the F4 decomposer detritus→free_nutrient loop + FlowMatrix
         // harvest record) → reproduce_or_die (maintenance debit + death FIRST + birth — the ONLY SimRng
-        // consumer; carcass→detritus provenance) → predation (ADR-013 F6: Bdellovibrio consume co-located prey J
-        // on a frozen census; AFTER reproduce_or_die so it owns its kills' despawn + carcass deposit; writes the
-        // first org-eats-org FlowMatrix off-diagonal; RNG-free no-op on a predator-free roster) →
-        // assert_flow_closes (row-sum==0) → measure_and_assert_ledger (LAST: closes the books every tick).
+        // consumer; carcass→detritus provenance) → host_coupling (ADR-019 S5: obligate symbionts draw kept-J from
+        // their co-located declared HOST on a frozen census; immediately BEFORE predation, both on independently-
+        // frozen snapshots so "host dies → symbiont starves next tick" is a clean one-tick-lag cascade; writes a
+        // host↔symbiont FlowMatrix off-diagonal; RNG-free no-op on a symbiont-free roster) → predation (ADR-013 F6:
+        // Bdellovibrio consume co-located prey J on a frozen census; AFTER reproduce_or_die so it owns its kills'
+        // despawn + carcass deposit; writes the first org-eats-org FlowMatrix off-diagonal; RNG-free no-op on a
+        // predator-free roster) → assert_flow_closes (row-sum==0) → measure_and_assert_ledger (LAST: closes the
+        // books every tick).
         // ADR-013 F5 inserts 3 chem stages + 1 assert into this chain (all single-threaded, integer, no
         // HashMap): reset_chem_scratch (zero the reused double-buffer; ChemField PERSISTS cross-tick) right after
         // reset_flow; diffuse_and_decay (reflecting Σ-conserved stencil THEN the chem_decay tap; cell-only,
@@ -1904,6 +1937,7 @@ impl Simulation {
                 chem::emit_chem,
                 trophic::germinate,
                 reproduce_or_die,
+                trophic::host_coupling,
                 trophic::predation,
                 chem::assert_chem_conserved_system,
                 trophic::assert_flow_closes,
@@ -2302,6 +2336,7 @@ impl Simulation {
         genome: Genome,
         gp_map: gp::OntologyMap,
         role: gp::TrophicRole,
+        host_key: Option<&str>,
     ) -> SpeciesId {
         if let Some(sid) = self.species_id_for_key(&key) {
             return sid; // already registered — never duplicate a species
@@ -2312,6 +2347,11 @@ impl Simulation {
             .unwrap_or(0.5);
         // Express the ecological Strategy ONCE (the reset_with_roster precedent) — pure, ZERO SimRng.
         let strategy = gp::express_strategy(&gp_map, &genome, role);
+        // ADR-019 S5: resolve a declared host_key to an already-registered SpeciesId (ordered scan, inv #3).
+        // `None`/unresolved → `None` → the symbiont finds no host income and starves (the "cannot free-live"
+        // guarantee). A symbiont inoculated before its host registers resolves to `None` here, but the
+        // host-presence inoculation gate already enforces "the host must exist to ESTABLISH", so this is safe.
+        let host = host_key.and_then(|hk| self.species_id_for_key(hk));
         let entry = SpeciesEntry {
             name,
             key,
@@ -2320,6 +2360,7 @@ impl Simulation {
             base_growth,
             target_pop: 0, // a contaminant has no reset spawn; it arrives only via region_inoculate
             strategy,
+            host,
         };
         let new_len = {
             let mut reg = self.world.resource_mut::<SpeciesRegistry>();
@@ -2401,14 +2442,50 @@ impl Simulation {
         if cells.is_empty() {
             return 0; // the disc covers no grid cell
         }
+        // ADR-019 S5 HOST-REQUIRED INOCULATION GATE — an ObligateSymbiont ESTABLISHES only where a compatible
+        // HOST is co-located in the region disc; else a CLEAN NO-OP (it cannot free-live — the Carsonella
+        // biology). Activates ONLY for the symbiont role (every OTHER role keeps the EXACT current spawn path →
+        // byte-neutral). Census the symbiont's declared HOST species' living orgs INSIDE the disc; if NONE → no-op
+        // (the region_pcr_amplify / region_cull "no local template → no-op" precedent). If a host IS present,
+        // RESTRICT placement to the host-occupied cells (round-robin) so the very next host_coupling tick finds it
+        // co-located. A pure ordered ECS read filtered by host SpeciesId + region.contains — ZERO SimRng draws.
+        let (role, host) = {
+            let entry = &self.world.resource::<SpeciesRegistry>().entries[sid.0 as usize];
+            (entry.strategy.role, entry.host)
+        };
+        let mut place_cells = cells; // default: the whole disc (every non-symbiont keeps the current path)
+        if role == gp::TrophicRole::ObligateSymbiont {
+            let Some(host_sid) = host else {
+                return 0; // a symbiont with no resolved host can never establish (cannot free-live)
+            };
+            // Census the host species' living orgs inside the disc; collect the host-occupied cells in canonical
+            // cell_index order (deduped), so placement is a pure ordered function of state.
+            let mut host_cells: Vec<(u32, u32)> = Vec::new();
+            for (sp, p) in self
+                .world
+                .query::<(&Species, &Position)>()
+                .iter(&self.world)
+            {
+                if sp.0 == host_sid && region.contains(p.x, p.y) {
+                    host_cells.push((p.x, p.y));
+                }
+            }
+            if host_cells.is_empty() {
+                return 0; // no co-located host → the symbiont cannot establish (clean no-op, never a panic)
+            }
+            // Restrict + canonicalize: keep the in-region cells that ARE host-occupied, in cell_index order.
+            host_cells.sort_unstable_by_key(|&(x, y)| y * width + x);
+            host_cells.dedup();
+            place_cells = host_cells;
+        }
         // Split endow_j into a seed Biomass (carved out, clamped) + the residual Energy — CONSERVED (Σ == endow_j).
         let seed_biomass = OFFSPRING_SEED_BIOMASS.min(endow_j);
         let seed_energy = endow_j - seed_biomass;
         // Mint count·endow_j into the world via the immigration tap (the conserved arrival accounting).
         self.world.resource_mut::<ledger::Ledger>().immigration += endow_j * i64::from(count);
-        // Spawn count orgs round-robin across the in-region cells in (cell_index, slot) order; OrgIds monotonic.
+        // Spawn count orgs round-robin across the placement cells in (cell_index, slot) order; OrgIds monotonic.
         for slot in 0..count {
-            let (x, y) = cells[(slot as usize) % cells.len()];
+            let (x, y) = place_cells[(slot as usize) % place_cells.len()];
             let org = {
                 let mut next = self.world.resource_mut::<NextOrgId>();
                 let id = next.0;
@@ -2566,6 +2643,20 @@ impl Simulation {
         let species_count = self.world.resource::<SpeciesRegistry>().entries.len();
         if sid.0 as usize >= species_count {
             return 0; // not registered — defensive no-op
+        }
+        // ADR-019 S5 STRUCTURAL CULL-IMMUNITY (role-only, categorical) — an endosymbiont sheltered inside a host
+        // bacteriocyte is shielded from a generic antibiotic/region cull: you must remove the HOST. This parallels
+        // the S4 spore reservoir's structural immunity (a property of WHAT the species IS, not a per-tick spatial
+        // scan). Gene/role-anchored, so a CRISPR edit cannot flip it. The FORCED counter-play: cull the HOST
+        // species (host orgs ARE normal cullable prey) → host population drops → the symbiont loses its sole income
+        // → it starves (emergent, see host_coupling). region_cull is a public Action the pinned config never
+        // issues, so this guard is byte-neutral on the pinned run regardless.
+        if self.world.resource::<SpeciesRegistry>().entries[sid.0 as usize]
+            .strategy
+            .role
+            == gp::TrophicRole::ObligateSymbiont
+        {
+            return 0;
         }
         let width = self.world.resource::<PoolStock>().width;
         // CENSUS the species' in-region living orgs: collect (cell, org, entity, residual=Energy+Biomass), SORT
@@ -3392,6 +3483,7 @@ mod tests {
                     gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                     entity_count: 60,
                     role: gp::TrophicRole::default(),
+                    host_key: None,
                 },
                 RosterEntry {
                     name: "b".to_string(),
@@ -3400,6 +3492,7 @@ mod tests {
                     gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                     entity_count: 40,
                     role: gp::TrophicRole::default(),
+                    host_key: None,
                 },
             ]
         };
@@ -3453,6 +3546,7 @@ mod tests {
                 gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                 entity_count: 50,
                 role: gp::TrophicRole::Autotroph,
+                host_key: None,
             },
             RosterEntry {
                 name: "microbe-b".to_string(),
@@ -3461,6 +3555,7 @@ mod tests {
                 gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                 entity_count: 50,
                 role: gp::TrophicRole::Heterotroph,
+                host_key: None,
             },
         ];
         let cfg = SimConfig {
@@ -3534,6 +3629,7 @@ mod tests {
                 gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                 entity_count: 4,
                 role: gp::TrophicRole::Autotroph,
+                host_key: None,
             },
             RosterEntry {
                 name: "beta".to_string(),
@@ -3542,6 +3638,7 @@ mod tests {
                 gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                 entity_count: 4,
                 role: gp::TrophicRole::Heterotroph,
+                host_key: None,
             },
         ];
         let cfg = SimConfig {
@@ -3597,6 +3694,7 @@ mod tests {
                 gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                 entity_count: 10,
                 role: gp::TrophicRole::Autotroph,
+                host_key: None,
             },
             RosterEntry {
                 name: "empty".to_string(),
@@ -3605,6 +3703,7 @@ mod tests {
                 gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
                 entity_count: 0,
                 role: gp::TrophicRole::Heterotroph,
+                host_key: None,
             },
         ];
         let cfg = SimConfig {
@@ -4481,6 +4580,7 @@ mod tests {
             ]),
             entity_count: 3000,
             role: gp::TrophicRole::Autotroph,
+            host_key: None,
         }];
         if decomp {
             roster.push(RosterEntry {
@@ -4498,6 +4598,7 @@ mod tests {
                 ]),
                 entity_count: 3000,
                 role: gp::TrophicRole::Decomposer,
+                host_key: None,
             });
         }
         roster
@@ -4533,6 +4634,7 @@ mod tests {
                 ])),
                 entity_count: 180, // predators start SPARSE (dense seeding instant-crashes prey then itself)
                 role: gp::TrophicRole::Predator,
+                host_key: None,
             });
         }
         roster
@@ -5196,6 +5298,7 @@ mod tests {
                     ]),
                     entity_count: 400,
                     role: gp::TrophicRole::Autotroph,
+                    host_key: None,
                 },
                 RosterEntry {
                     name: "decomposer".to_string(),
@@ -5222,6 +5325,7 @@ mod tests {
                     ])),
                     entity_count: 1500,
                     role: gp::TrophicRole::Decomposer,
+                    host_key: None,
                 },
             ]
         };
@@ -5379,6 +5483,7 @@ mod tests {
                 Trait::RespirationMode,
             ]),
             gp::TrophicRole::Decomposer,
+            None,
         )
     }
 
@@ -5905,6 +6010,7 @@ mod tests {
                 Trait::SporulationCapacity, // the S4 marker → Strategy.spore_former == true
             ]),
             gp::TrophicRole::Decomposer,
+            None,
         )
     }
 
@@ -6076,6 +6182,251 @@ mod tests {
         assert_eq!(
             a.1, b.1,
             "the dormant reservoir is byte-identical across runs"
+        );
+    }
+
+    // ── ADR-019 S5: obligate-symbiont host-coupling integration tests ─────────────────────────────────────────
+
+    /// Register a synthetic OBLIGATE SYMBIONT (ADR-019 S5) whose GrowthRate + SymbiosisCapacity both anchor on
+    /// one genome value (the `anchor_genome`/`anchor_map` seam) → a non-zero `Strategy.host_draw_rate`, with its
+    /// declared `host_key` resolved against the running roster. `activity` drives the coupling rate.
+    fn register_symbiont(
+        sim: &mut Simulation,
+        key: &str,
+        host_key: &str,
+        activity: f64,
+    ) -> SpeciesId {
+        sim.register_species(
+            key.to_string(),
+            key.to_string(),
+            anchor_genome(activity),
+            anchor_map(&[Trait::GrowthRate, Trait::SymbiosisCapacity]),
+            gp::TrophicRole::ObligateSymbiont,
+            Some(host_key),
+        )
+    }
+
+    #[test]
+    fn s5_symbiont_establishes_only_with_a_co_located_host() {
+        // ADR-019 S5: the host-required inoculation gate. A symbiont whose declared host is NOT co-located in the
+        // disc is a CLEAN NO-OP (0 placed); a symbiont whose declared host IS present establishes (placed > 0, on
+        // host-occupied cells). Assert the MECHANIC (host-dependence), not a forced equilibrium.
+        let cfg = SimConfig {
+            seed: 11,
+            generations: 0,
+            entity_count: 0,
+        };
+        // The plant (key "plant") is the obligate_roster primary (resident orgs across the grid).
+        let mut sim =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+        sim.step(3); // let the plant population settle into cells
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 30, // the whole grid
+        };
+        // (a) A symbiont whose declared host species is ABSENT (an unregistered key → host resolves to None) can
+        // never establish, anywhere — the structural "cannot free-live" guarantee. A clean no-op, never a panic.
+        let orphan = register_symbiont(&mut sim, "orphan-symbiont", "no-such-host", 0.5);
+        let no_host = sim.region_inoculate(orphan, region, 8, 500_000);
+        assert_eq!(
+            no_host, 0,
+            "a symbiont with no co-located/resolvable host CANNOT establish (the cannot-free-live gate)"
+        );
+        assert_eq!(
+            species_pop(&mut sim, orphan.ordinal()),
+            0,
+            "no orphan symbiont org was spawned"
+        );
+        // (b) A symbiont declaring the present "plant" host → it establishes where its host is (placed > 0).
+        let symb = register_symbiont(&mut sim, "carsonella", "plant", 0.5);
+        let placed = sim.region_inoculate(symb, region, 12, 500_000);
+        assert_eq!(
+            placed, 12,
+            "the symbiont establishes where its host is present"
+        );
+        assert_eq!(species_pop(&mut sim, symb.ordinal()), 12);
+        // Every spawned symbiont sits on a host-occupied cell (so the very next host_coupling tick finds it).
+        let host = sim.species_id_for_key("plant").expect("plant registered");
+        let width = sim.world.resource::<PoolStock>().width;
+        let host_cells: std::collections::BTreeSet<u32> = sim
+            .world
+            .query::<(&Species, &Position)>()
+            .iter(&sim.world)
+            .filter(|(sp, _)| sp.0 == host)
+            .map(|(_, p)| p.y * width + p.x)
+            .collect();
+        let symb_off_host = sim
+            .world
+            .query::<(&Species, &Position)>()
+            .iter(&sim.world)
+            .filter(|(sp, _)| sp.0 == symb)
+            .filter(|(_, p)| !host_cells.contains(&(p.y * width + p.x)))
+            .count();
+        assert_eq!(
+            symb_off_host, 0,
+            "every symbiont is placed on a host-occupied cell (co-located for the next coupling tick)"
+        );
+    }
+
+    #[test]
+    fn s5_host_coupling_conserves_j_records_a_flow_edge_and_ledger_closes() {
+        // ADR-019 S5: the host↔symbiont J flux is a PAIRED conserved move (host debited `drawn`, symbiont credited
+        // `kept = drawn·7/10`, the tax respired) → ledger_closes holds, and a MEASURED host↔symbiont off-diagonal
+        // appears in the FlowMatrix (flow[symbiont][host] > 0). Assert the MECHANIC, not a forced equilibrium.
+        let cfg = SimConfig {
+            seed: 23,
+            generations: 0,
+            entity_count: 0,
+        };
+        let mut sim =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+        sim.step(5); // warm up the host population so it carries J to draw
+        let host = sim.species_id_for_key("plant").expect("plant registered");
+        let symb = register_symbiont(&mut sim, "carsonella", "plant", 0.8);
+        let placed = sim.region_inoculate(
+            symb,
+            Region {
+                cx: 16,
+                cy: 16,
+                radius: 30,
+            },
+            40,
+            900_000,
+        );
+        assert!(placed > 0, "the symbiont established on the host");
+        // Ledger closes right after inoculation (the immigration tap is the only mint).
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes after symbiont inoculation"
+        );
+        // Step so host_coupling runs: the symbiont draws kept-J from the co-located host. ledger_closes EVERY tick
+        // (the in-chain measure_and_assert_ledger already guards it; cross-check the final state).
+        sim.step(8);
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes holds across the host-coupling pass (the flux is a paired conserved move)"
+        );
+        // A MEASURED host→symbiont edge: flow[symbiont][host] > 0 at least once during the run. Drive a single
+        // tick and read the per-gen FlowMatrix (reset each tick) so the edge is observable.
+        let (s, flat) = {
+            sim.step(1);
+            sim.flow_matrix()
+        };
+        let edge = flat[symb.ordinal() as usize * s + host.ordinal() as usize];
+        assert!(
+            edge > 0,
+            "the MEASURED FlowMatrix carries a host→symbiont off-diagonal (flow[symbiont][host] = {edge})"
+        );
+        // Every row still sums to zero (the diagonal-pairing identity — assert_flow_closes guards it in-chain).
+        for i in 0..s {
+            let row: i64 = (0..s).map(|j| flat[i * s + j]).sum();
+            assert_eq!(row, 0, "flow row {i} sums to zero");
+        }
+    }
+
+    #[test]
+    fn s5_symbiont_is_cull_immune_at_the_environment_layer_but_dies_when_its_host_dies() {
+        // ADR-019 S5: STRUCTURAL role-only cull-immunity — a generic region_cull CANNOT clear the endosymbiont
+        // (you must remove the HOST). Culling the symbiont directly kills 0; culling the HOST collapses the
+        // symbiont's sole income → it starves over a few ticks (emergent, NOT scripted). Assert the MECHANIC.
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 0,
+            entity_count: 0,
+        };
+        let mut sim =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+        sim.step(5);
+        let host = sim.species_id_for_key("plant").expect("plant registered");
+        let symb = register_symbiont(&mut sim, "carsonella", "plant", 0.8);
+        let region = Region {
+            cx: 16,
+            cy: 16,
+            radius: 30,
+        };
+        // Endow each symbiont WELL BELOW REPRO_THRESHOLD (300k) so it CANNOT bloom on its arrival reserve alone —
+        // it must EARN income from the host coupling to persist, which is what makes "host lost → starve" a LEDGER
+        // decision, not a scripted despawn. A modest reserve burns down over the maintenance debit in ~tens of ticks.
+        let placed = sim.region_inoculate(symb, region, 40, 80_000);
+        assert!(placed > 0);
+        let before = species_pop(&mut sim, symb.ordinal());
+        // (a) A direct cull of the symbiont kills NOTHING — structural endosymbiont immunity.
+        let killed = sim.region_cull(symb, region, 1000);
+        assert_eq!(
+            killed, 0,
+            "a generic antibiotic cull CANNOT clear an endosymbiont (role-only structural immunity)"
+        );
+        assert_eq!(
+            species_pop(&mut sim, symb.ordinal()),
+            before,
+            "no symbiont org was removed by the cull"
+        );
+        // The FORCED counter-play: cull the HOST (host orgs ARE normal cullable prey). Wipe the host in-region.
+        let host_killed = sim.region_cull(host, region, 1000);
+        assert!(
+            host_killed > 0,
+            "the host IS cullable (the only way to clear the symbiont is to remove its host)"
+        );
+        assert_eq!(
+            species_pop(&mut sim, host.ordinal()),
+            0,
+            "the radius-30 cull wipes the whole-grid host population (the symbiont's sole income source)"
+        );
+        // With its host gone, the symbiont draws 0 income and integrates below the maintenance floor → it starves.
+        // Emergent over the maintenance debit (no scripted despawn). Run long enough for the cascade.
+        sim.step(160);
+        let symb_after = species_pop(&mut sim, symb.ordinal());
+        assert!(
+            symb_after < before,
+            "host lost → the symbiont loses its sole income and dies back (emergent: {before} → {symb_after})"
+        );
+        // ledger_closes throughout the host-loss cascade.
+        let live = measure_live(&mut sim);
+        assert!(
+            ledger::ledger_closes(&sim.ledger(), &live),
+            "ledger_closes through the emergent host-loss → symbiont-starvation cascade"
+        );
+    }
+
+    #[test]
+    fn s5_host_coupling_is_run_to_run_stable() {
+        // ADR-019 S5 determinism (inv #3): the whole host-coupling mechanic is integer / RNG-free / canonical-
+        // ordered, so two identical inoculate→couple runs produce a byte-identical hash AND identical populations.
+        let cfg = SimConfig {
+            seed: 47,
+            generations: 0,
+            entity_count: 0,
+        };
+        let run = || {
+            let mut sim =
+                Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+            sim.step(5);
+            let symb = register_symbiont(&mut sim, "carsonella", "plant", 0.8);
+            sim.region_inoculate(
+                symb,
+                Region {
+                    cx: 16,
+                    cy: 16,
+                    radius: 30,
+                },
+                40,
+                900_000,
+            );
+            sim.step(15);
+            (sim.run_stats().hash, species_pop(&mut sim, symb.ordinal()))
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(
+            a.0, b.0,
+            "the host-coupling mechanic replays bit-identically (hash)"
+        );
+        assert_eq!(
+            a.1, b.1,
+            "the symbiont population is byte-identical across runs"
         );
     }
 

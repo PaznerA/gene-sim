@@ -4,6 +4,42 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### ADR-019 S5 — obligate-symbiont mode (feat, Mode B, 🔁 RE-PIN pending; sim-core/genome) — likely HASH-NEUTRAL
+The first Mode-B obligate symbiont: a host-dependent endosymbiont that **cannot free-live** and earns its joules
+ONLY by drawing kept-J from a co-located host. Emergent host-dependence, NOT a forced equilibrium (§0.6).
+- **New role** `gp::TrophicRole::ObligateSymbiont` (APPENDED after `Predator` → existing discriminants
+  unperturbed). The "cannot free-live" guarantee is STRUCTURAL + FREE: a new variant falls THROUGH all three
+  `metabolism` abiotic taps (gated on `Autotroph|Heterotroph|Mixotroph|Decomposer`) → taps no abiotic channel, no
+  metabolism edit needed. Declared as DATA (`niche.trophic_role: "symbiont"`) resolved by `role_from_str`/
+  `role_from_override`; key defaults `"carsonella"`/`"syn3"`.
+- **Host-coupling kernel** `trophic::host_coupling` — a per-cell, RNG-free, `(cell,SpeciesId,OrgId)`-ordered,
+  integer/`fixed::apportion` paired-conserved transfer modeled on `predation`: frozen start-of-tick HOST census →
+  Monod demand on `host_draw_rate·body·edit` → host debited Energy-first-then-Biomass, symbiont credited
+  `kept = drawn·7/10`, the tax → `respired`; records a MEASURED `flow[symbiont][host]` off-diagonal (rows still
+  sum to 0). V1 = the host→symbiont DRAW arm only (benign-low net draw; bidirectional credit-back is an S5b
+  stretch). Pinned schedule slot: immediately BEFORE `predation`, both on independently-frozen snapshots → a clean
+  one-tick-lag "host dies → symbiont starves" cascade. `Strategy.host_draw_rate: u16` (gene-anchored on new
+  `Trait::SymbiosisCapacity`, NOT in `Trait::ALL`) — inert `0` for every non-symbiont (the predation_rate precedent).
+- **Host-required inoculation gate** (`region_inoculate`): a symbiont ESTABLISHES only where its declared host is
+  co-located in the disc (else a clean no-op — the `region_cull`/`region_pcr` no-template precedent), placed ON
+  host-occupied cells. **Structural cull-immunity** (`region_cull`): a role-only categorical guard — a generic
+  antibiotic CANNOT clear an endosymbiont (the forced counter-play is to cull the HOST). **Airborne block**
+  (`immigration::expand_schedule`): a symbiont key is HARD-FILTERED from any airborne schedule (Mode B, not Mode A).
+- **Data** (real provenance, build+round-trip tested): `scripts/bake_carsonella_species.py` → `carsonella.json`
+  (*Ca.* Carsonella ruddii Pv, RefSeq GCF_000010365.1, curated translation core + amino-acid-provisioning roster,
+  16 real CDS) and `scripts/bake_syn3_species.py` → `syn3.json` (JCVI-Syn3.0, baked off the M. genitalium G37
+  minimal-cell template — provenance documented honestly; 16 CDS). Both `niche.trophic_role: "symbiont"` +
+  `niche.host_key`; godot mirrors written. New `niche.host_key` (serde-default `None`) on `Niche`/`BuiltSpecies`.
+- **Conserved + deterministic:** all `i64`/fixed-point, no `HashMap` iterated, ZERO `SimRng` draws (births stay
+  the sole consumer); `ledger_closes` holds every tick (a paired internal move, no new tap). Tests: symbiont
+  establishes only with a host, is cull-immune at the environment layer, dies when its host dies, the host↔symbiont
+  flux is conserved + appears in the FlowMatrix, run-to-run stable.
+- **🔁 RE-PIN pending (Repin phase decides empirically):** the pinned single-species PLANT config registers no
+  symbiont → the `host_coupling` row vector is empty → early `return`; the new variant is appended + never
+  instantiated; `SymbiosisCapacity` is NOT in `Trait::ALL`; `host_draw_rate` is `0` for the plant; `niche.host_key`
+  serde-defaults `None`. Pinned literal `0x47a0_3c8f_6701_f240` **VERIFIED UNCHANGED** by `determinism_hash_is_pinned`
+  + the determinism gate. STOP for human review before merge.
+
 ### ADR-019 — contamination & immigration CORE (feat, S1+S2, HASH-NEUTRAL)
 The SP-3-deferred seed/inoculate tool, promoted into the clean-room epic: deterministic, journaled arrivals.
 - **S1** `Action::RegionInoculate { species_key, region, count, endow_j }` (serde-additive — existing
