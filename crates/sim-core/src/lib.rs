@@ -26,6 +26,7 @@ pub mod fixed;
 pub mod gp;
 pub mod immigration;
 pub mod ledger;
+pub mod par;
 pub mod resource;
 pub mod signature;
 pub mod snapshot;
