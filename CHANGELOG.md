@@ -4,6 +4,29 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Emergent-discovery D0 scorer + D1 trace — `crates/discovery` + harness capture seam (feat, discovery) — HASH-NEUTRAL
+ADR-023. The first phase of the autonomous emergent-run discovery epic: a reproducible INTERESTINGNESS SCORER + the
+per-generation trace it reads. **ZERO sim hash impact → pinned literal `0x47a0_3c8f_6701_f240` byte-identical**
+(capture READS only `observe_all()`/`flow_matrix()`, both proven zero-`SimRng`/off-`hash_world`; a real predator/prey
+run scored both ways asserts captured-hash == plain-hash; full `tools/gate.sh` GREEN). Adversarially verified 3/3 on
+every dimension; the metric set was pinned by a 3-lens design panel (`docs/llm/proposals/discovery-scorer-spec.md`).
+- **`crates/discovery`** (NEW, std + serde ONLY — no sim-core/harness dep, GPL-clean): a `PerGenTrace` it is handed →
+  an integer interestingness score. Six basis-point, RNG-free metrics over the stable window — M1 coexistence, M2
+  integer-Simpson evenness, M3 amp+turns **dynamism** (single-boom-capped), M4 FlowMatrix-aggregate trophic structure,
+  M5 saturating **events** (booms/crashes/takeovers/established-immigrations), M6 a **multiplicative survival gate**
+  (anti-instant-death, does NOT penalize end-state extinction). Combined `Q=(ΣWᵢmᵢ/86)·m6 ∈ [0,1_000_000]`. The
+  `InterestingnessScorer` trait (pluggable, inv #5), `DefaultScorer` (`"ecology-d0"`), a 12-dim fingerprint +
+  `novelty_l1` + `final_score`. Weights `[14,14,22,18,18]` favour drama over forced stability (memory:
+  `no-hardcoded-balance-open-system`); all thresholds live in a tunable `ScoreParams` (ADR-pinned). The only `f64` is
+  the fenced `q16` capture quantization; no RNG, no HashMap-iteration; `ScoreVec` is `Eq` (byte-reproducible).
+- **`crates/harness/src/capture.rs`** (`capture_trace`): the D1 seam — drives a live `GeneSimEnv` into a `PerGenTrace`
+  off-hash. The harness owns the engine touch so `discovery` stays clean (`harness → discovery` is the only new edge).
+- **Test oracle:** a 7-archetype synthetic contract + a real grounded run. Live limit-cycle **A=784,500** STRICTLY
+  beats frozen coexistence **F=355,000** (a 429k margin) — formally encoding "a living system beats a tuned-stable
+  one". Instant-death / monoculture / single-boom all score ~0. 12 discovery tests + the harness hash-neutrality test.
+- **Next (D2+):** the gradient-free→evolutionary search loop + the gem library, the surrogate model, the night-batch
+  showcase gallery — anchored on the Primordial starter.
+
 ### Ecosystem map — per-cell MORPHOTYPE glyphs at the Cells scope (feat, renderer) — HASH-NEUTRAL
 Completes the ADR-021 follow-up (per-zoom-scope refinement). The map sized + coloured each cell by its dominant
 species but drew them all as the SAME rod (the primary species' template) → microbe cells read as uniform coloured

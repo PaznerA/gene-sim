@@ -512,6 +512,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "discovery"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "disqualified"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -809,6 +816,7 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "crispr",
+ "discovery",
  "genome",
  "serde",
  "serde_json",

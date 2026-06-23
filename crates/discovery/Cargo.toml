@@ -1,0 +1,20 @@
+[package]
+name = "discovery"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Emergent-discovery scoring (D0) + trace types (D1). A std+serde crate that READS a plain PerGenTrace export and emits an integer interestingness score — no sim-core / harness dependency, so the scorer stays on the clean side of the capture seam (inv #1/#5). Genome logic lives in sim-core; this crate only reads exported numbers (inv #2). Every metric is an integer/quantized, RNG-free function of the trace (inv #3)."
+
+[features]
+# Dev/feature gate for this crate's own property tests only (mirrors relations-index / oracle-fba).
+proptest = []
+
+# INVARIANT #1/#5 (SPEC §2.1.1, §2.1.5): the scorer takes a PLAIN `PerGenTrace` (defined here) — it carries NO
+# dependency on `sim-core` or `harness`, so the metric set is pluggable behind `InterestingnessScorer` WITHOUT
+# the scorer ever touching biology or the engine. Deps are std + serde ONLY (serde = MIT/Apache-2.0, GPL-clean,
+# for trace I/O). NOT a zero-dep BOUNDARY crate (it links serde, on purpose) — the GPL scan
+# (scripts/check_license.sh, assertion A) covers it; it is intentionally absent from BOUNDARY_CRATES. Pinned via
+# the workspace serde (inv #7).
+[dependencies]
+serde = { workspace = true }

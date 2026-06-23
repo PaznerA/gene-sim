@@ -35,6 +35,7 @@ use sim_core::gp::{trait_map_for, OntologyMap};
 use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod campaign;
+pub mod capture;
 pub mod firewall;
 pub mod oversight;
 pub mod replay;
