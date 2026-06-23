@@ -896,6 +896,40 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-022 — Relations node-link GRAPH (default view) + `--roster` / `--steps` shot flags
+
+- **Date:** 2026-06-23
+- **Status:** Accepted.
+- **Context:** the Relations view shipped only the S×S FlowMatrix HEATMAP. Users read "relations" as a
+  node-link GRAPH of the trophic web and did not recognise the matrix as one ("I don't see a graph, only a
+  2D panel"). Separately, every headless `--shot`/`--check` path was single-species (`--species <stem>`), so
+  a MULTI-species map / graph (the thing that actually shows per-species size contrast + measured flows) could
+  not be rendered for verification without the interactive menu.
+- **Decision:** (a) add `godot/relations_graph.gd` — species as ring-laid NODES (radius ∝ √population, colour
+  via the shared `species_visual_map.gd` morphotype table so the graph + field agree), EDGES = the
+  core-MEASURED FlowMatrix net joule flows drawn source→sink (arrowhead at the gainer, thickness/opacity ∝
+  |J|/max-abs), oriented EXACTLY like `main.gd._format_flow_summary` (`flat[b*s+a]`, higher-index sink). A
+  `🕸 Graph / ▦ Matrix` segmented toggle swaps the two; **Graph is the DEFAULT** representation (the user's
+  expectation). Fed by `_refresh_relations` from `observe_species()` (names/keys/roles/population, SpeciesId
+  order = FlowMatrix index order, by construction). (b) add two opt-in headless shot conveniences:
+  `--roster "stem:count,stem:count,…"` (parsed in `_apply_cli_environment`, armed via the EXISTING
+  `_apply_roster` **before** `_do_reset` — the load-bearing seed-once order) and `--steps N` (advance the
+  deterministic core N gens before capture so populations establish + the FlowMatrix accumulates flows).
+- **Determinism / hash (inv #3):** **HASH-NEUTRAL — pinned literal `0x47a0_3c8f_6701_f240` unchanged.** ZERO
+  Rust touched (the graph + toggle + feed are all `godot/*.gd`; `--roster`/`--steps` only drive existing core
+  entry points). The flags are OPT-IN — the no-flag pinned config is byte-identical (`determinism_hash_is_pinned`
+  + reproducible-at-pinned-config green; full `tools/gate.sh` GREEN; godot `channels=13`/`glyphs=13`/`codex=OK`).
+- **Invariants:** **#2** biology stays in the core — the graph only PROJECTS the measured FlowMatrix + the
+  exported populations into nodes/edges (the only arithmetic is display scaling + ring layout, identical in kind
+  to `relations_heatmap.gd`'s `_max_abs` ramp); **#4** the `--roster`/`--steps` flags keep the headless paths
+  multi-species-capable; **#1/#5/#6** untouched. Adversarially verified 3/3 (no-biology, hash-neutral,
+  index-alignment, draw-safe-degrades, roster-armed-before-reset, ux-faithful).
+- **Consequences:** the trophic web reads as a graph at a glance (and the matrix is one click away); multi-species
+  shots are now scriptable (unblocks the map size-contrast verification + future discovery showcases). FOLLOW-UP:
+  optional guild-coloured nodes; a force-directed layout when S grows large (the ring suffices for small rosters).
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

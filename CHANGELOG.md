@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Relations node-link GRAPH (default) + `--roster` / `--steps` shot flags (feat, renderer/tooling) — HASH-NEUTRAL
+ADR-022. The Relations view shipped only the S×S FlowMatrix heatmap; users expected a node-link GRAPH of the
+trophic web. **ZERO Rust touched → pinned literal `0x47a0_3c8f_6701_f240` byte-identical** (full `tools/gate.sh`
+GREEN; godot `channels=13`/`glyphs=13`/`codex=OK`). Adversarially verified 3/3 on every dimension.
+- **`godot/relations_graph.gd`** (NEW) — species as ring-laid NODES (radius ∝ √population, colour via the shared
+  `species_visual_map.gd` morphotype table so the graph + field agree), EDGES = the core-MEASURED FlowMatrix net
+  joule flows drawn source→sink (arrowhead at the gainer, thickness/opacity ∝ |J|/max-abs), oriented exactly like
+  `_format_flow_summary`. Pure projection of core exports (inv #2); the only arithmetic is display scaling + ring
+  layout. Degrades to nodes-only on a degenerate matrix; file-replay mirrors the heatmap placeholder.
+- **`🕸 Graph / ▦ Matrix` toggle** in the Relations panel — Graph is the DEFAULT representation (the user's
+  expectation); both read the same measured data. Fed by `_refresh_relations` from `observe_species()`
+  (names/keys/roles/population in SpeciesId order = FlowMatrix index order).
+- **`--roster "stem:count,…"` + `--steps N` shot flags** — the headless/`--shot` paths were single-species
+  (`--species`); these arm a MULTI-species roster (via the existing `_apply_roster`, BEFORE `_do_reset` — the
+  load-bearing seed-once order) + advance N gens so the ecosystem develops. Lets `--shot` render a real
+  multi-species map + the relations graph with measured predator/prey flows (also unblocks map size-contrast
+  verification). Opt-in → the no-flag pinned config hash is untouched.
+- Visually verified by a multi-species shot: plant→E.coli (thick detritus) + E.coli→Bdellovibrio (thin predation)
+  edges matching the narrated Primary-flows line, nodes sized by population + colored by morphotype.
+
 ### Specimen testing-unblock — inject button + brush→variant + extinct-struck-through + Load Starter (feat, renderer/tooling) — HASH-NEUTRAL
 Three presentation/gameplay quick-wins that unblock manual testing of the specimen view. **ZERO Rust touched →
 pinned literal `0x47a0_3c8f_6701_f240` byte-identical** (`determinism_hash_is_pinned` + reproducible-at-pinned-config
