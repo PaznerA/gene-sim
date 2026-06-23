@@ -242,10 +242,7 @@ fn replay_consumes_committed_impacts_without_rerunning_fba() {
 
     let dir = std::env::temp_dir().join(format!("gene_sim_firewall_replay_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let env_config = EnvConfig {
-        entity_count: ENTITIES,
-        env: sim_core::EnvParams::default(),
-    };
+    let env_config = EnvConfig::bare(ENTITIES, sim_core::EnvParams::default());
     save_journal(&dir, &env_config, SEED, &recorded.journal).expect("save journal");
 
     // Read the recorded journal back and replay it with a PanicOracle: the commits ride in the journal, so the

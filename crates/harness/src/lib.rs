@@ -469,6 +469,16 @@ impl GeneSimEnv {
         }
     }
 
+    /// The registered contaminant CONSORTIUM in insertion order (ADR-019 S1 + R2 — read-only). The boundary
+    /// (renderer SAVE) reads this so a saved session can PERSIST the keys + genomes a journaled
+    /// [`Action::RegionInoculate`] resolves against, and a LOAD/replay re-`register_contaminant`s them BEFORE
+    /// replaying the journal (without that, a journaled inoculate resolves nothing on replay and the hash
+    /// diverges — the R2 break). An ordered `Vec`, never iterated as a `HashMap` in sim logic (inv #3).
+    #[must_use]
+    pub fn registered_consortium(&self) -> &[BuiltSpecies] {
+        &self.consortium
+    }
+
     /// Set the climate the **next** `reset` builds the world under (ADR-012 Phase E). Does not disturb a run in
     /// progress. The renderer/CLI feeds this from the main menu; default is the neutral world.
     pub fn set_environment(&mut self, env: EnvParams) {
