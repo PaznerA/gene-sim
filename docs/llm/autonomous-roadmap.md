@@ -225,3 +225,23 @@ gate → commit; respect dependencies; on resume, restart from the first uncheck
 
 After the queue: plan the next session (the UE5/web renderer from `rendering-platform-architecture-draft.md`,
 remaining open-system work). Append all results to §4.
+
+### §8. MIDNIGHT SESSION RESULTS (2026-06-23, main `e09667c`, literal `0x47a0` held all night — every slice hash-neutral)
+
+- [x] 1 SP-3 intervention panel — DONE (`1c60d9a`, merged `4c95c5e`). 5 tools (CRISPR/PCR-clones/cull/nutrient/toxin) + `intervention` ledger tap + timeline markers.
+- [x] 2 contamination S3 renderer — DONE (`9235168`, merged `4c95c5e`). Containment knob + consortium menu + seed brush + immigration markers.
+- [x] 3 remaining contaminant bakes — DONE (`67684f5`, merged `4c95c5e`). All 7 Mode-A contaminants baked → default consortium complete.
+- [x] 4 SP-2 sandbox composer — DONE (`d437711`, merged `e7eb40e`). Multi-species roster + containment on one screen.
+- [~] 5 SP-4 codex UI — **DEFERRED (gate RED)**: GDScript parse error + the codex JSON isn't staged into res:// (run.sh/release.yml/check_godot_snapshot only mirror data/species). RE-RUN with: (a) fix the parse error, (b) stage data/codex in run.sh + release.yml (.deb+.zip) + check_godot_snapshot.sh + a byte-equality check. The codex CONTENT draft is on main.
+- [x] 6 S4 spore/dormancy — DONE (`1beed98`, merged `e09667c`). Cull leaves a regerminating spore bank; 5th ledger bucket; hash-neutral.
+- [x] 7 S5 obligate symbionts — DONE (`ce5d1cf`, merged `e09667c`). ObligateSymbiont role + host-coupling FlowMatrix edge + host-gated inoculation + cull-immunity; Carsonella/Syn3.0; hash-neutral.
+- [ ] 8 predator dormancy + decomposer recalibration — **DEFERRED to next session (human-present)**: the §0.6 feature-vs-balance-fudge line is subtle here (I reverted a forced-persistence attempt once); Bdellovibrio dormancy as a real feature is fine, decomposer recalibration only if a genuine model error — better with the human's framing.
+
+NOTE: the contamination-epic adversarial-verify skeptics repeatedly hit a content-filter false-positive on pathogen biology (Bacillus/symbiont/cull). Those slices were verified INDEPENDENTLY (gate + literal + ledger_closes + conservation tests) — the verdict gap is a filter artifact, not a determinism gap.
+
+### NEXT SESSION (priority order)
+1. **SP-4 codex UI re-run** (hash-neutral) — with the parse fix + the res:// staging (run.sh/release.yml/gate).
+2. **§7 item 8 — open-system predator/decomposer** (🔁, human-present): Bdellovibrio dormancy as a feature; decomposer recalibration only if a model error; accept emergent dynamics (§0.6).
+3. **UE5 / web renderer** (from `rendering-platform-architecture-draft.md`): the C-ABI/IPC boundary, the web/wasm path (+ a wasm leg on the multi-ISA gate), the perf roadmap.
+4. **OVERSIGHT in-game UI** (earn/spend/trigger E. coli edits) + a richer KO table.
+5. **Contamination polish**: a symbiont S5b bidirectional provisioning edge; loaded-session immigration markers (the `journal_actions` export).
