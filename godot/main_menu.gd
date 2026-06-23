@@ -7,11 +7,31 @@ extends CanvasLayer
 ## LiveSim.preview_climate — this script never computes climate itself. Loaded by path (no class_name; ADR-010):
 ##   const MainMenu := preload("res://main_menu.gd")
 
-signal start_run(cfg)  # { seed:int, lat:float, lon:float, temp:float, season:int, entities:int, mission:bool }
+signal start_run(cfg)  # { seed, lat, lon, temp, season, entities, mission, species, roster:[{stem,count}], containment }
 
 const SEASONS := ["Spring", "Summer", "Autumn", "Winter"]
-# Species the run can use (ADR-017). [label, file stem under data/species/]; "" = the default abstract plant.
-const SPECIES := [["Plant (abstract)", ""], ["E. coli K-12 core", "ecoli"]]
+# SP-2: the multi-species ROSTER master list. [label, file stem under data/species/]. Each stem is the FILE name
+# under res://data/species/<stem>.json that bakes a SpeciesSpec; the CORE derives the species key from the spec
+# (so the plant's stem is "default" but its core key is "" — the renderer only moves the inert file stem, inv #2).
+# Verified present under both data/species/ and godot/data/species/.
+const ALL_SPECIES := [
+	["Plant (abstract)", "default"],
+	["E. coli K-12 core", "ecoli"],
+	["Bdellovibrio (predator)", "bdellovibrio"],
+	["Mycoplasma", "mycoplasma"],
+	["Bacillus", "bacillus"],
+	["Pseudomonas", "pseudomonas"],
+	["Staphylococcus", "staph"],
+	["Cutibacterium", "cutibacterium"],
+	["Aspergillus niger", "aspergillus-niger"],
+	["Penicillium", "penicillium"],
+]
+# ContainmentLevel ladder (ADR-019 S3, ISO-14644): index = the ordinal pushed to LiveSim.set_containment / the core
+# sim_core::ContainmentLevel (0 Sealed · 1 Clean · 2 Lab · 3 Open). Default Sealed (0) = empty schedule = hash-neutral.
+# Mirrors main.gd CONTAINMENT_LABELS + the godot-sim set_containment ladder.
+const CONTAINMENT_LABELS := ["🔒 Sealed (OFF)", "Clean (ISO 7)", "Lab (ISO 8)", "☣ Open"]
+const ROSTER_DEFAULT_COUNT := 1000  # per-species starting count default (the player overrides per row)
+const ROSTER_COUNT_MAX := 20000
 
 var _live: Object = null
 var _seed: int = 42
@@ -30,7 +50,13 @@ var _temp_val: Label = null
 var _ent_val: Label = null
 var _season_btn: Button = null
 var _mission_chk: CheckBox = null
-var _species_btn: OptionButton = null
+# SP-2 ROSTER state: the dynamic species-row composer (replaces the single _species_btn). Each row is
+# {species: OptionButton over ALL_SPECIES, count: SpinBox, row: HBoxContainer}. Row order is the canonical,
+# load-bearing key (menu-row order == roster Vec order == SpeciesId order in the core, inv #3) — a reorder is a
+# DIFFERENT but still-deterministic run.
+var _roster_box: VBoxContainer = null
+var _roster_rows: Array = []
+var _containment_btn: OptionButton = null
 var _preview: Label = null
 
 
@@ -141,13 +167,28 @@ func _build() -> void:
 	season_row.add_child(next)
 	col.add_child(_labeled("Season", season_row))
 
-	# --- SPECIES (ADR-017): the abstract plant (default) or the real E. coli K-12 core genome (136 genes).
-	_species_btn = OptionButton.new()
-	for i in SPECIES.size():
-		_species_btn.add_item(SPECIES[i][0], i)
-	_species_btn.selected = 0
-	_species_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	col.add_child(_labeled("Species", _species_btn))
+	# --- ROSTER (SP-2): compose the run from N species, each with its own starting count. Dynamic add/remove rows
+	# over the 10 baked stems. Seeded with ONE default Plant/"default"/1000 row, so the default composer == today's
+	# single-plant default (hash-neutral). The renderer assembles {stem,count} dicts — biology stays in core (inv #2).
+	_roster_box = VBoxContainer.new()
+	_roster_box.add_theme_constant_override("separation", 4)
+	col.add_child(_labeled("Roster (species + starting count)", _roster_box))
+	_roster_rows = []
+	_add_roster_row(0, ROSTER_DEFAULT_COUNT)  # one default Plant row
+	var add_btn := Button.new()
+	add_btn.text = "+ Add species"
+	add_btn.tooltip_text = "Add another species to the roster (spawns at reset; order is load-bearing)"
+	add_btn.pressed.connect(_on_add_species)
+	col.add_child(add_btn)
+
+	# --- CONTAINMENT (ADR-019 S3): the up-front "design your consortium, then watch it get contaminated" choice.
+	# Default Sealed (0) = empty schedule = hash-neutral. The selected ordinal maps 1:1 to ContainmentLevel.
+	_containment_btn = OptionButton.new()
+	for i in CONTAINMENT_LABELS.size():
+		_containment_btn.add_item(CONTAINMENT_LABELS[i], i)
+	_containment_btn.selected = 0  # Sealed
+	_containment_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	col.add_child(_labeled("Containment", _containment_btn))
 
 	# --- MISSION toggle: off by default = free-play sandbox; on = the suppress-the-zone challenge.
 	_mission_chk = CheckBox.new()
@@ -168,6 +209,66 @@ func _build() -> void:
 	start.add_theme_font_size_override("font_size", 16)
 	start.pressed.connect(_on_start)
 	col.add_child(start)
+
+
+# ──────────────────────────── ROSTER rows (SP-2 composer) ─────────────────────────────────────────────────
+
+## Append one roster row to _roster_box: [species OptionButton over ALL_SPECIES + count SpinBox + "✕" remove].
+## `stem_idx` preselects the species (index into ALL_SPECIES); `count` seeds the SpinBox. The row's widgets are
+## tracked in _roster_rows so _on_start can read each (selected stem, count) in row order. Renderer-only (inv #2).
+func _add_roster_row(stem_idx: int, count: int) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+
+	var species := OptionButton.new()
+	for i in ALL_SPECIES.size():
+		species.add_item(ALL_SPECIES[i][0], i)
+	species.selected = clampi(stem_idx, 0, ALL_SPECIES.size() - 1)
+	species.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(species)
+
+	var cnt := SpinBox.new()
+	cnt.min_value = 0
+	cnt.max_value = ROSTER_COUNT_MAX
+	cnt.step = 50
+	cnt.value = clampi(count, 0, ROSTER_COUNT_MAX)
+	cnt.custom_minimum_size = Vector2(110, 0)
+	row.add_child(cnt)
+
+	var rm := Button.new()
+	rm.text = "✕"
+	rm.tooltip_text = "Remove this species from the roster"
+	row.add_child(rm)
+
+	var entry := {"species": species, "count": cnt, "row": row}
+	rm.pressed.connect(_on_remove_species.bind(entry))
+	_roster_rows.append(entry)
+	_roster_box.add_child(row)
+
+
+## "+ Add species": append a fresh row defaulting to the first stem NOT already in the roster (so a quick compose
+## doesn't dup the plant), falling back to index 0 when all are used.
+func _on_add_species() -> void:
+	var used := {}
+	for e in _roster_rows:
+		used[int((e["species"] as OptionButton).selected)] = true
+	var pick := 0
+	for i in ALL_SPECIES.size():
+		if not used.has(i):
+			pick = i
+			break
+	_add_roster_row(pick, ROSTER_DEFAULT_COUNT)
+
+
+## Remove a roster row (frees its widgets + drops it from _roster_rows). Guards a minimum of one row so the run
+## always has at least one species to spawn.
+func _on_remove_species(entry: Dictionary) -> void:
+	if _roster_rows.size() <= 1:
+		return  # keep at least one species
+	_roster_rows.erase(entry)
+	var row: Node = entry["row"]
+	if row != null:
+		row.queue_free()
 
 
 var _last_value_label: Label = null  # set by _add_slider so the caller can keep the readout label
@@ -273,9 +374,24 @@ func _on_start() -> void:
 		# Empty/garbage field: fall back to the last seed but write it back so the run uses exactly what the
 		# field now shows (no silent "why didn't my seed take" surprise).
 		_seed_edit.text = str(seed_val)
-	var species_stem: String = ""
-	if _species_btn != null:
-		species_stem = SPECIES[_species_btn.selected][1]
+	# SP-2: assemble the roster [{stem,count}] from the rows, in row order (the load-bearing key). Drop count==0
+	# rows, but never empty the roster (keep ≥1 so the run always spawns something).
+	var roster: Array = []
+	for e in _roster_rows:
+		var idx: int = int((e["species"] as OptionButton).selected)
+		var stem: String = ALL_SPECIES[clampi(idx, 0, ALL_SPECIES.size() - 1)][1]
+		var count: int = int((e["count"] as SpinBox).value)
+		if count > 0:
+			roster.append({"stem": stem, "count": count})
+	if roster.is_empty() and not _roster_rows.is_empty():
+		# Every row was zeroed: keep the first row so the run is non-empty (per-species counts are authoritative,
+		# but an all-zero roster would spawn nothing).
+		var first: Dictionary = _roster_rows[0]
+		var fidx: int = int((first["species"] as OptionButton).selected)
+		roster.append({"stem": ALL_SPECIES[clampi(fidx, 0, ALL_SPECIES.size() - 1)][1], "count": ROSTER_DEFAULT_COUNT})
+	# Back-compat: legacy/CLI single-species readers still see cfg.species == the first roster stem.
+	var species_stem: String = String(roster[0]["stem"]) if not roster.is_empty() else "default"
+	var containment: int = _containment_btn.selected if _containment_btn != null else 0
 	start_run.emit(
 		{
 			"seed": seed_val,
@@ -286,6 +402,8 @@ func _on_start() -> void:
 			"entities": int(_entities.value),
 			"mission": _mission_chk.button_pressed,
 			"species": species_stem,
+			"roster": roster,
+			"containment": containment,
 		}
 	)
 	queue_free()

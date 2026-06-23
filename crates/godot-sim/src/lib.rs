@@ -74,6 +74,13 @@ struct LiveSim {
     /// The species the next `reset` runs (ADR-017 "RUN E. coli"). `None` = the default plant; `Some` runs a
     /// loaded JSON `SpeciesSpec` (e.g. E. coli) through its per-species trait map. Set via `set_species`.
     species: Option<genome::spec::BuiltSpecies>,
+    /// The MULTI-SPECIES ROSTER the next `reset` spawns (SP-2, ADR-020). An ordered `Vec` of
+    /// `(BuiltSpecies, starting_count)` pairs the composer assembles via [`set_roster`](Self::set_roster). When
+    /// non-empty it takes PRECEDENCE over `species` at `reset` (forwarded to `GeneSimEnv::set_roster`, which
+    /// spawns the whole roster through one `reset_with_roster` — the single RNG seeded once, inv #3). Empty by
+    /// default → the pinned single-species-plant path is never perturbed (hash-neutral). Pure config: GDScript
+    /// hands inert JSON + int counts, the core builds every genome→phenotype (inv #2).
+    roster: Vec<(genome::spec::BuiltSpecies, u32)>,
     /// The `entity_count` before a species' niche overrode it, so clearing the species (`set_species("")`)
     /// restores the player's count instead of leaving the microbe's stale.
     entity_count_before_species: Option<u32>,
@@ -97,6 +104,7 @@ impl IRefCounted for LiveSim {
             seed: 0,
             journal: Vec::new(),
             species: None,
+            roster: Vec::new(),
             entity_count_before_species: None,
             containment: None,
             base,
@@ -206,6 +214,46 @@ impl LiveSim {
         }
     }
 
+    /// Set the MULTI-SPECIES ROSTER the next `reset` spawns (SP-2, ADR-020 — the composer boundary). `jsons` and
+    /// `counts` are zipped POSITIONALLY (by index): each `SpeciesSpec` JSON text is built + validated through the
+    /// SAME core path as [`set_species_json`](Self::set_species_json) / `register_contaminant_json`
+    /// (`harness::species::build_species_from_str` — biology stays in Rust, inv #2/#4) and paired with
+    /// `count.max(0)`. The ROW ORDER is load-bearing: it becomes the SpeciesId spawn order (a reorder is a
+    /// different-but-deterministic run, inv #3). On ANY build error: a `godot_error!` + return `false` WITHOUT
+    /// mutating the stored roster (graceful — `main.gd` can fall back to the default plant). On success the new
+    /// roster replaces the old and `true` is returned. An EMPTY `jsons` array CLEARS the roster (== `clear_roster`).
+    /// Does NOT touch `entity_count` (each row carries its own count). Call before `reset`.
+    #[func]
+    fn set_roster(&mut self, jsons: PackedStringArray, counts: PackedInt32Array) -> bool {
+        if jsons.is_empty() {
+            self.roster.clear();
+            return true;
+        }
+        // Build EVERY entry into a staging Vec first so a failure leaves the stored roster untouched (graceful).
+        let mut built: Vec<(genome::spec::BuiltSpecies, u32)> = Vec::with_capacity(jsons.len());
+        for i in 0..jsons.len() {
+            let json = jsons.get(i).map(|s| s.to_string()).unwrap_or_default();
+            // A missing count for a given index falls back to 0 (a zero-count row is a no-op at spawn, not an error).
+            let count = counts.get(i).unwrap_or(0).max(0) as u32;
+            match harness::species::build_species_from_str(&json) {
+                Ok(b) => built.push((b, count)),
+                Err(e) => {
+                    godot_error!("LiveSim::set_roster: entry {i} failed to build: {e}");
+                    return false;
+                }
+            }
+        }
+        self.roster = built;
+        true
+    }
+
+    /// Clear the multi-species roster (SP-2) — the next `reset` falls back to the `set_species` / default-plant
+    /// precedence. Leaves `entity_count` untouched. Call before `reset`.
+    #[func]
+    fn clear_roster(&mut self) {
+        self.roster.clear();
+    }
+
     /// The active species key (`"ecoli-core"` | `"default"` | `""`), a pure read of already-loaded data (no
     /// biology — inv #2). The renderer can route presentation on this CORE key as the authoritative tiebreak.
     #[func]
@@ -241,6 +289,12 @@ impl LiveSim {
     fn reset(&mut self, seed: i64) -> VarDictionary {
         let mut env = GeneSimEnv::new(self.entity_count);
         env.set_environment(self.env_params); // build the world under the player's climate (ADR-012)
+        // SP-2 (ADR-020): a composed ROSTER takes PRECEDENCE (roster > species > default plant), mirroring the
+        // harness arm. Forwarded by clone; the harness maps each (built, count) to a RosterEntry and seeds the
+        // single RNG once over the full population (inv #3). Empty by default → skipped → pinned path untouched.
+        if !self.roster.is_empty() {
+            env.set_roster(self.roster.clone());
+        }
         if let Some(built) = &self.species {
             env.set_species(built.clone()); // ADR-017: run the selected species (e.g. E. coli) instead of plant
         }
@@ -690,7 +744,14 @@ impl LiveSim {
     /// (carcass→detritus, conserved — no tap minted). RNG-free, journaled (inv #3). Cell-scoped (inv #6); biology
     /// in the core (inv #2). Returns `{applied, detail, generation, covered}` (`covered` = orgs killed).
     #[func]
-    fn cull(&mut self, species: i64, cx: i64, cy: i64, radius: i64, strength: i64) -> VarDictionary {
+    fn cull(
+        &mut self,
+        species: i64,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+        strength: i64,
+    ) -> VarDictionary {
         let Some(env) = self.env.as_mut() else {
             godot_error!("LiveSim::cull called before reset()");
             return region_dict(false, "not reset", 0, 0);
@@ -724,7 +785,14 @@ impl LiveSim {
     /// (inv #6); biology in the core (inv #2). Returns `{applied, detail, generation, covered}` (`covered` = 0;
     /// `detail` reports the minted J).
     #[func]
-    fn nutrient(&mut self, channel: i64, cx: i64, cy: i64, radius: i64, amount_j: i64) -> VarDictionary {
+    fn nutrient(
+        &mut self,
+        channel: i64,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+        amount_j: i64,
+    ) -> VarDictionary {
         let Some(env) = self.env.as_mut() else {
             godot_error!("LiveSim::nutrient called before reset()");
             return region_dict(false, "not reset", 0, 0);
@@ -757,7 +825,14 @@ impl LiveSim {
     /// `CHEM_CAP` spill → overflow). RNG-free, journaled (inv #3). Cell-scoped (inv #6); biology in the core
     /// (inv #2). Returns `{applied, detail, generation, covered}` (`covered` = 0; `detail` reports the minted milli).
     #[func]
-    fn toxin(&mut self, channel: i64, cx: i64, cy: i64, radius: i64, amount_milli: i64) -> VarDictionary {
+    fn toxin(
+        &mut self,
+        channel: i64,
+        cx: i64,
+        cy: i64,
+        radius: i64,
+        amount_milli: i64,
+    ) -> VarDictionary {
         let Some(env) = self.env.as_mut() else {
             godot_error!("LiveSim::toxin called before reset()");
             return region_dict(false, "not reset", 0, 0);

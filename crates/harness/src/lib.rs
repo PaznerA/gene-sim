@@ -312,6 +312,14 @@ pub struct GeneSimEnv {
     /// The species the **next** `reset` runs (ADR-017 "RUN E. coli"). `None` = the default plant genome +
     /// map (byte-identical). `Some(built)` runs `built.genome` through `trait_map_for(built.key)`.
     species: Option<BuiltSpecies>,
+    /// The MULTI-SPECIES ROSTER the **next** `reset` spawns (SP-2, ADR-020). An ordered `Vec` of
+    /// `(BuiltSpecies, starting_count)` pairs — the player's composed consortium. When non-empty it takes
+    /// PRECEDENCE over [`species`](Self::set_species): each entry becomes a [`sim_core::RosterEntry`] (same
+    /// inline construction as the single-species path, but with the per-species count) and the run spawns via
+    /// [`Simulation::reset_with_roster`], seeding the single `SimRng` ONCE over the full population (inv #3).
+    /// Empty by default → the pinned config never enters this arm (hash-neutral; the literal is untouched).
+    /// An ordered `Vec`, never a `HashMap` iterated in sim logic — the ROW ORDER is the load-bearing spawn key.
+    roster: Vec<(BuiltSpecies, u32)>,
     /// Available CONTAMINANT species, keyed by `species_key` (ADR-019 S1 — the loaded consortium). The
     /// boundary (renderer/CLI) loads each baked `SpeciesSpec` JSON into a [`BuiltSpecies`] and registers it
     /// here so a journaled [`Action::RegionInoculate`] can resolve its key to a genome at `step`. Empty by
@@ -354,6 +362,7 @@ impl GeneSimEnv {
             last_edit: None,
             last_region_edit: None,
             species: None,
+            roster: Vec::new(),
             consortium: Vec::new(),
             containment: sim_core::ContainmentLevel::default(),
             consortium_config: sim_core::ConsortiumConfig::default(),
@@ -476,6 +485,28 @@ impl GeneSimEnv {
             self.entity_count = built.entity_count;
         }
         self.species = Some(built);
+    }
+
+    /// Set the MULTI-SPECIES ROSTER the **next** `reset` spawns (SP-2, ADR-020). The boundary (renderer/CLI)
+    /// loads each baked `SpeciesSpec` JSON into a [`BuiltSpecies`] and pairs it with the player's chosen
+    /// STARTING COUNT; this stores the ordered `(built, count)` pairs verbatim. A non-empty roster takes
+    /// PRECEDENCE over [`set_species`](Self::set_species) at `reset`, mapping each entry to a
+    /// [`sim_core::RosterEntry`] (with `entity_count` = the per-species count) and spawning via
+    /// [`Simulation::reset_with_roster`] — one `SimRng` seeded once over the full population (inv #3).
+    ///
+    /// CRITICAL (hash-neutrality guard): unlike `set_species`, this does **NOT** mutate `self.entity_count`.
+    /// The per-species count flows straight into each `RosterEntry`; `self.entity_count` stays the
+    /// legacy/snapshot-grid fallback for the non-roster paths, so calling `set_roster` then resetting WITHOUT
+    /// a roster (e.g. after `clear_roster`) is byte-identical to never having called it. Does not disturb a
+    /// run in progress.
+    pub fn set_roster(&mut self, entries: Vec<(BuiltSpecies, u32)>) {
+        self.roster = entries;
+    }
+
+    /// Clear the multi-species roster (SP-2) — the **next** `reset` falls back to the
+    /// [`set_species`](Self::set_species) / default-plant precedence. Leaves `self.entity_count` untouched.
+    pub fn clear_roster(&mut self) {
+        self.roster.clear();
     }
 
     /// The outcome of the most recent [`Action::ApplyEdit`], if any (for inspection / tests).
@@ -668,22 +699,44 @@ impl Env for GeneSimEnv {
         // (read by the read-only `observe_all` so the renderer can show the right glyph). The roster path is
         // byte-identical to `reset_with_genome_and_map` for a single entry (name/key/role are display metadata,
         // never folded into the determinism hash) — so determinism is preserved (inv #3).
-        let mut sim = match &self.species {
-            Some(b) => Simulation::reset_with_roster(
-                &cfg,
-                &self.env,
-                vec![sim_core::RosterEntry {
+        // SP-2 (ADR-020): the MULTI-SPECIES ROSTER takes PRECEDENCE (roster > species > default plant). When the
+        // player has composed a consortium, map each `(built, count)` to a `RosterEntry` — the EXACT per-entry
+        // construction the single-species path below inlines, GENERALIZED from 1 to N, with `entity_count: *n`
+        // (the per-species starting count, NOT `cfg.entity_count`) — and spawn the whole roster through ONE
+        // `reset_with_roster` (the single `SimRng` seeded once over the full population, inv #3). Empty by default
+        // → this arm is skipped → the pinned config falls through to the IDENTICAL `Some`/`None` arms (hash-neutral).
+        let mut sim = if !self.roster.is_empty() {
+            let roster: Vec<sim_core::RosterEntry> = self
+                .roster
+                .iter()
+                .map(|(b, n)| sim_core::RosterEntry {
                     name: b.name.clone(),
                     key: b.key.clone(),
                     genome: b.genome.clone(),
                     gp_map: OntologyMap::new(trait_map_for(&b.key)),
-                    entity_count: cfg.entity_count,
-                    // ADR-013 F4: honour the spec's `niche.trophic_role` override (E. coli → Decomposer),
-                    // falling back to `role_for(key)` when absent/unrecognized (the DATA-driven role seam).
+                    entity_count: *n,
                     role: sim_core::gp::role_from_override(b.trophic_role.as_deref(), &b.key),
-                }],
-            ),
-            None => Simulation::reset_with_env(&cfg, &self.env),
+                })
+                .collect();
+            Simulation::reset_with_roster(&cfg, &self.env, roster)
+        } else {
+            match &self.species {
+                Some(b) => Simulation::reset_with_roster(
+                    &cfg,
+                    &self.env,
+                    vec![sim_core::RosterEntry {
+                        name: b.name.clone(),
+                        key: b.key.clone(),
+                        genome: b.genome.clone(),
+                        gp_map: OntologyMap::new(trait_map_for(&b.key)),
+                        entity_count: cfg.entity_count,
+                        // ADR-013 F4: honour the spec's `niche.trophic_role` override (E. coli → Decomposer),
+                        // falling back to `role_for(key)` when absent/unrecognized (the DATA-driven role seam).
+                        role: sim_core::gp::role_from_override(b.trophic_role.as_deref(), &b.key),
+                    }],
+                ),
+                None => Simulation::reset_with_env(&cfg, &self.env),
+            }
         };
         let obs = sim.observe();
         self.sim = Some(sim);
@@ -951,6 +1004,159 @@ mod tests {
         let op = plant.reset(7);
         assert_eq!(op.population_size, 500);
         assert!((op.phenotype.get(Trait::GrowthRate).unwrap() - 0.6).abs() < 1e-9);
+    }
+
+    /// Load a baked species spec from `data/species/<stem>.json` (the byte-mover boundary used in tests).
+    fn load_stem(stem: &str) -> BuiltSpecies {
+        crate::species::load_species_file(format!(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species/{}.json"),
+            stem
+        ))
+        .unwrap_or_else(|e| panic!("{stem}.json loads: {e}"))
+    }
+
+    #[test]
+    fn one_entry_plant_roster_equals_single_species_path() {
+        // SP-2.1 hash-neutrality / degenerate-case identity (ADR-020): a 1-row Plant/N roster is byte-identical
+        // to the single-species plant path of the SAME N — name/key/role are display metadata, never hashed.
+        let plant = load_stem("default");
+
+        // Both envs carry the SAME fallback `entity_count` (500) so the metadata `config.entity_count` folded
+        // into `run_stats().hash` matches; the roster's per-species count (500) equals it, isolating the test
+        // to the SPAWN path (RosterEntry-from-N vs RosterEntry-from-1). 500 < default.json's niche (1000), so
+        // `set_species` would adopt 1000 — force it back to 500 to drive an identical population on both paths.
+        let mut roster_env = GeneSimEnv::new(500);
+        roster_env.set_roster(vec![(plant.clone(), 500)]);
+        roster_env.reset(7);
+        let roster_hash = roster_env.run_stats().hash;
+
+        let mut single_env = GeneSimEnv::new(500);
+        single_env.set_species(plant);
+        single_env.entity_count = 500; // override the adopted niche count back to 500 to match the roster entry
+        single_env.reset(7);
+        let single_hash = single_env.run_stats().hash;
+
+        assert_eq!(
+            roster_hash, single_hash,
+            "a 1-entry plant/500 roster must be byte-identical to the single-species plant/500 path"
+        );
+    }
+
+    #[test]
+    fn set_roster_does_not_mutate_entity_count() {
+        // SP-2.1 CRITICAL guard: unlike set_species, set_roster must NOT copy a per-species count into
+        // self.entity_count — so a subsequent NON-roster reset is unchanged. Clearing the roster restores the
+        // legacy fallback path exactly.
+        let ecoli = load_stem("ecoli"); // niche count = 800
+
+        let mut env = GeneSimEnv::new(300);
+        env.set_roster(vec![(ecoli, 800)]);
+        // The fallback count is untouched by set_roster.
+        assert_eq!(
+            env.entity_count, 300,
+            "set_roster must not mutate entity_count"
+        );
+
+        // After clear_roster a default reset spawns the legacy 300, not 800.
+        env.clear_roster();
+        let o = env.reset(7);
+        assert_eq!(
+            o.population_size, 300,
+            "clearing the roster restores the legacy entity_count fallback"
+        );
+    }
+
+    #[test]
+    fn three_species_roster_is_deterministic_same_seed() {
+        // SP-2.1 determinism (inv #3): a fixed multi-species roster reset TWICE from one seed → equal hash.
+        let roster = || {
+            vec![
+                (load_stem("default"), 500u32),
+                (load_stem("ecoli"), 300u32),
+                (load_stem("bdellovibrio"), 100u32),
+            ]
+        };
+        let run = || {
+            let mut env = GeneSimEnv::new(200);
+            env.set_roster(roster());
+            env.reset(2024);
+            env.step(Action::Advance(20));
+            env.run_stats().hash
+        };
+        assert_eq!(
+            run(),
+            run(),
+            "a composed multi-species run must be deterministic"
+        );
+    }
+
+    #[test]
+    fn roster_order_and_count_are_load_bearing() {
+        // SP-2.1: the roster is the load-bearing spawn key — a DIFFERENT order OR count yields a DIFFERENT hash,
+        // proving set_roster actually drives the RNG stream (not a metadata no-op).
+        let base = || {
+            let mut env = GeneSimEnv::new(200);
+            env.set_roster(vec![
+                (load_stem("default"), 500u32),
+                (load_stem("ecoli"), 300u32),
+                (load_stem("bdellovibrio"), 100u32),
+            ]);
+            env.reset(2024);
+            env.step(Action::Advance(20));
+            env.run_stats().hash
+        };
+        let reordered = || {
+            let mut env = GeneSimEnv::new(200);
+            env.set_roster(vec![
+                (load_stem("ecoli"), 300u32),
+                (load_stem("default"), 500u32),
+                (load_stem("bdellovibrio"), 100u32),
+            ]);
+            env.reset(2024);
+            env.step(Action::Advance(20));
+            env.run_stats().hash
+        };
+        let recounted = || {
+            let mut env = GeneSimEnv::new(200);
+            env.set_roster(vec![
+                (load_stem("default"), 400u32), // 500 -> 400
+                (load_stem("ecoli"), 300u32),
+                (load_stem("bdellovibrio"), 100u32),
+            ]);
+            env.reset(2024);
+            env.step(Action::Advance(20));
+            env.run_stats().hash
+        };
+        let h = base();
+        assert_ne!(
+            h,
+            reordered(),
+            "a reordered roster must yield a different hash"
+        );
+        assert_ne!(
+            h,
+            recounted(),
+            "a different per-species count must yield a different hash"
+        );
+    }
+
+    #[test]
+    fn empty_roster_reset_is_unchanged_default_plant() {
+        // SP-2.1 hash-neutrality: with an empty roster the env reset is byte-identical to a plain default reset
+        // (the pinned single-species-plant path is never perturbed by the additive roster field).
+        let mut env = GeneSimEnv::new(200);
+        env.reset(7);
+        let baseline = env.run_stats().hash;
+
+        let mut env2 = GeneSimEnv::new(200);
+        env2.set_roster(vec![(load_stem("ecoli"), 800)]);
+        env2.clear_roster(); // back to empty
+        env2.reset(7);
+        assert_eq!(
+            env2.run_stats().hash,
+            baseline,
+            "an empty roster must leave the default-plant reset byte-identical"
+        );
     }
 
     #[test]
