@@ -653,6 +653,9 @@ impl GeneSimEnv {
             built.genome,
             OntologyMap::new(trait_map_for(&built.key)),
             role,
+            // ADR-019 S5: carry the declared host_key through so an obligate symbiont resolves its host SpeciesId
+            // at register (the host must already be registered — the region_inoculate host-presence gate enforces it).
+            built.host_key.as_deref(),
         );
         sim.region_inoculate(sid, region.to_region(), count, endow_j);
         self.last_edit = None;
@@ -716,6 +719,7 @@ impl Env for GeneSimEnv {
                     gp_map: OntologyMap::new(trait_map_for(&b.key)),
                     entity_count: *n,
                     role: sim_core::gp::role_from_override(b.trophic_role.as_deref(), &b.key),
+                    host_key: b.host_key.clone(),
                 })
                 .collect();
             Simulation::reset_with_roster(&cfg, &self.env, roster)
@@ -733,6 +737,7 @@ impl Env for GeneSimEnv {
                         // ADR-013 F4: honour the spec's `niche.trophic_role` override (E. coli → Decomposer),
                         // falling back to `role_for(key)` when absent/unrecognized (the DATA-driven role seam).
                         role: sim_core::gp::role_from_override(b.trophic_role.as_deref(), &b.key),
+                        host_key: b.host_key.clone(),
                     }],
                 ),
                 None => Simulation::reset_with_env(&cfg, &self.env),

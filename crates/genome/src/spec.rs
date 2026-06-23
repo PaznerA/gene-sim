@@ -52,6 +52,12 @@ pub struct Niche {
     /// (serde default). E. coli sets `"decomposer"` to close the obligate plant→detritus→microbe loop.
     #[serde(default)]
     pub trophic_role: Option<String>,
+    /// The declared HOST species KEY for an obligate symbiont (ADR-019 S5). `None` ⇒ no host (every
+    /// non-symbiont; serde default → byte-neutral for every existing spec). An obligate symbiont
+    /// (`trophic_role == "symbiont"`) names the species key it draws its sole income from; the sim-core boundary
+    /// resolves it to a registry `SpeciesId` at register/reset (this crate has no dependency on sim-core, inv #2).
+    #[serde(default)]
+    pub host_key: Option<String>,
 }
 
 /// A genome as data: a model version + ordered loci.
@@ -107,6 +113,9 @@ pub struct BuiltSpecies {
     /// boundary uses `gp::role_for(key)`. Inert DATA in this crate — resolved to a `gp::TrophicRole` only at
     /// the sim-core boundary (this crate has no dependency on `sim-core`, inv #2).
     pub trophic_role: Option<String>,
+    /// The declared HOST species KEY for an obligate symbiont, carried verbatim from `niche.host_key` (ADR-019
+    /// S5). `None` for every non-symbiont. Resolved to a registry `SpeciesId` only at the sim-core boundary.
+    pub host_key: Option<String>,
     pub genome: Genome,
 }
 
@@ -217,6 +226,7 @@ impl SpeciesSpec {
             name: self.name.clone(),
             entity_count: self.niche.entity_count,
             trophic_role: self.niche.trophic_role.clone(),
+            host_key: self.niche.host_key.clone(),
             genome,
         })
     }
@@ -302,6 +312,28 @@ mod tests {
         let json = r#"{ "entity_count": 5, "description": "x" }"#;
         let parsed: Niche = serde_json::from_str(json).expect("niche parses without trophic_role");
         assert_eq!(parsed.trophic_role, None);
+    }
+
+    #[test]
+    fn niche_host_key_serde_default_is_none_and_round_trips_to_built_species() {
+        // ADR-019 S5: the new `host_key` field is serde-default `None`, so every existing spec (no such key)
+        // deserializes byte-neutrally; an obligate symbiont sets it and it reaches the BuiltSpecies verbatim.
+        let n = Niche::default();
+        assert_eq!(n.host_key, None);
+        // A niche JSON WITHOUT host_key still parses (default None) — proves existing specs are unaffected.
+        let json = r#"{ "entity_count": 5, "trophic_role": "decomposer" }"#;
+        let parsed: Niche = serde_json::from_str(json).expect("niche parses without host_key");
+        assert_eq!(parsed.host_key, None);
+        // A symbiont declaring a host_key carries it verbatim into the BuiltSpecies.
+        let mut spec =
+            SpeciesSpec::from_genome(&crate::sample_genome(), "carsonella", "Carsonella");
+        spec.niche.trophic_role = Some("symbiont".to_string());
+        spec.niche.host_key = Some("default".to_string());
+        let back: SpeciesSpec =
+            serde_json::from_str(&serde_json::to_string(&spec).expect("ser")).expect("de");
+        assert_eq!(back.niche.host_key.as_deref(), Some("default"));
+        let built = back.build().expect("build");
+        assert_eq!(built.host_key.as_deref(), Some("default"));
     }
 
     #[test]

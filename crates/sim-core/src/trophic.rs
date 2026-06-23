@@ -31,8 +31,9 @@ use bevy_ecs::prelude::*;
 use crate::fixed;
 use crate::gp::{self, BudgetChannel, TrophicRole};
 use crate::{
-    cell_index, credit_capped, ledger, Biomass, Energy, OrgId, Position, Species, SpeciesRegistry,
-    BODY_FACTOR_FLOOR, ENERGY_CAP, MAINTENANCE_FLOOR, POOL_CAP,
+    cell_index, credit_capped, deposit_carcass, ledger, Age, Biomass, DroughtTol, Energy, Genotype,
+    NextOrgId, OrgId, Position, Species, SpeciesId, SpeciesRegistry, ThermalTol, BODY_FACTOR_FLOOR,
+    ENERGY_CAP, MAINTENANCE_FLOOR, OFFSPRING_SEED_BIOMASS, POOL_CAP,
 };
 
 /// The MEASURED S×S net-integer J flow matrix for the current generation (ADR-013 F4). Row-major:
@@ -261,6 +262,277 @@ impl PoolProvenance {
             &mut self.scratch_s,
             &mut self.scratch_rem,
         );
+    }
+}
+
+// ── ADR-019 S4: the SPORE/DORMANCY reservoir + sporulation split + germination ──────────────────────────────
+//
+// A spore-former species (gene-anchored on `Trait::SporulationCapacity` → `Strategy.spore_former`) banks a
+// DETERMINISTIC INTEGER FRACTION of a dying/culled org's residual J into a per-cell, per-species reservoir
+// INSTEAD of (all of) carcass→detritus — a SECOND live-J bucket that PERSISTS across ticks and is INVISIBLE to
+// region_cull's live-org census (cull-immunity is STRUCTURAL: a resource plane is not an ECS org). When local
+// conditions return, `germinate` withdraws from the reservoir and spawns vegetative orgs RNG-FREE (the
+// region_inoculate precedent: neutral-0.5 traits as a CONSTANT, OrgIds from the monotonic `NextOrgId`, ZERO
+// next_u64 draws → the spawn stream is unchanged). Spore J is CONSERVED end-to-end — every move is a PAIRED
+// bucket transfer (org→spore+detritus on sporulate; spore→org on germinate), so `ledger_closes` holds via a
+// FIFTH `LiveTotal.spore` bucket with NO new tap. All `i64`, flat `[cell*s + species]` (never a HashMap, inv
+// #3), walked in canonical `(cell, SpeciesId)` order — the proven `PoolProvenance`/`KinProvenance` substrate.
+
+/// Survival fraction (permille) of a spore-former's residual J that is BANKED into the reservoir on a
+/// death/cull, the remainder routed through the existing carcass→detritus path (ADR-019 S4). A REAL mechanic,
+/// not balance-forcing: a high fraction means more seed survives a cull, but whether the species ULTIMATELY
+/// persists stays fully emergent (banked spores must still germinate against the conserved ADR-013 economy and
+/// can starve out if the niche stays occupied). A tuning lever (§0.6: NOT tuned to force persistence).
+pub(crate) const SPORE_SURVIVAL_PERMILLE: i64 = 700;
+
+/// The local pool-channel stock (role-appropriate: detritus for decomposers/molds, light for an autotroph) at
+/// or above which germination conditions are deemed FAVORABLE (ADR-019 S4). An integer comparison on the frozen
+/// i64 pool stock. A tuning lever.
+pub(crate) const GERMINATION_THRESHOLD: i64 = 1;
+
+/// The J a single germling is endowed from the reservoir (ADR-019 S4): one vegetative org is spawned per this
+/// much banked spore J (split into seed Biomass + residual Energy, the region_inoculate carve-out). A tuning
+/// lever; sized so a banked reservoir can seed a viable fresh org.
+pub(crate) const GERM_ENDOW_J: i64 = 200_000;
+
+/// Max germlings spawned per (cell, species) per `germinate` tick (ADR-019 S4) — a bounded batch (order-stable,
+/// MAX_POPULATION-safe) rather than a drain-the-whole-reservoir bloom when conditions return. A tuning lever.
+pub(crate) const GERM_BATCH_CAP: i64 = 4;
+
+/// The per-cell, per-species DORMANT spore reservoir (ADR-019 S4) — a structural twin of [`PoolProvenance`] /
+/// [`crate::chem::KinProvenance`] (the proven flat-`Vec` conserved-J seam). Flat `[cell * s + species]`,
+/// PERSISTS across ticks, integer, never a `HashMap` (inv #3). A SEPARATE live-J bucket folded into
+/// [`ledger::LiveTotal::spore`] (so the books close) but NOT into `hash_world` (it reaches the hash only through
+/// its coupling effect on already-hashed Energy/Biomass/OrgIds when a germling spawns — the deliberate divergence
+/// that keeps the all-zero pinned run hash-neutral). Sporulation [`deposit`](Self::deposit)s into it; germination
+/// [`withdraw`](Self::withdraw)s from it.
+#[derive(Resource, Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SporeReservoir {
+    s: usize,
+    /// Banked dormant spore J per cell, in species order: flat `[cell * s + species]`.
+    spore_j: Vec<i64>,
+}
+
+impl SporeReservoir {
+    /// A zeroed reservoir for `cells` cells and `s` species.
+    pub(crate) fn new(cells: usize, s: usize) -> Self {
+        Self {
+            s,
+            spore_j: vec![0i64; cells * s],
+        }
+    }
+
+    /// Bank `amount` (>0) of dormant spore J to (`cell`, `species`). A no-op for a non-positive amount or an
+    /// out-of-range species (defensive).
+    pub(crate) fn deposit(&mut self, cell: usize, species: usize, amount: i64) {
+        if amount > 0 && species < self.s {
+            self.spore_j[cell * self.s + species] += amount;
+        }
+    }
+
+    /// Withdraw up to `amount` of banked spore J from (`cell`, `species`), returning the J ACTUALLY withdrawn
+    /// (capped at the available stock — never goes negative). A non-positive request / out-of-range species
+    /// withdraws nothing.
+    pub(crate) fn withdraw(&mut self, cell: usize, species: usize, amount: i64) -> i64 {
+        if amount <= 0 || species >= self.s {
+            return 0;
+        }
+        let idx = cell * self.s + species;
+        let taken = amount.min(self.spore_j[idx].max(0));
+        self.spore_j[idx] -= taken;
+        taken
+    }
+
+    /// The banked spore J at (`cell`, `species`). `0` for an out-of-range species. Pure read.
+    pub(crate) fn stock(&self, cell: usize, species: usize) -> i64 {
+        if species < self.s {
+            self.spore_j[cell * self.s + species]
+        } else {
+            0
+        }
+    }
+
+    /// `Σ` over all cells/species of the banked dormant spore J — the [`ledger::LiveTotal::spore`] bucket.
+    /// Integer addition is commutative so the sum is order-independent (inv #3).
+    pub(crate) fn total(&self) -> i64 {
+        self.spore_j.iter().copied().sum()
+    }
+
+    /// Grow to `new_s ≥ s` species for `cells` cells (ADR-019: a `RegionInoculate` may register a new
+    /// spore-former mid-run), re-laying the flat `[cell*s + species]` plane so every existing cell's banked spore
+    /// block is preserved and the new species columns start zero. A no-op if `new_s <= s`. Only ever called on an
+    /// inoculated run (the pinned config never inoculates → the dimension is unchanged → hash-neutral).
+    pub(crate) fn grow_to(&mut self, cells: usize, new_s: usize) {
+        if new_s <= self.s {
+            return;
+        }
+        let mut spore_j = vec![0i64; cells * new_s];
+        for c in 0..cells {
+            for sp in 0..self.s {
+                spore_j[c * new_s + sp] = self.spore_j[c * self.s + sp];
+            }
+        }
+        self.s = new_s;
+        self.spore_j = spore_j;
+    }
+}
+
+/// **SPORULATION SPLIT** (ADR-019 S4) — the shared accounting for routing a spore-former's residual J at a
+/// death/cull. Splits `residual` (>0) via [`fixed::apportion`] into `[spore_share, carcass_remainder]` by the
+/// pinned [`SPORE_SURVIVAL_PERMILLE`] permille (the SAME largest-remainder idiom `region_cull` uses for its
+/// kill/spare COUNT split, applied here to J), banks `spore_share` into the reservoir, and RETURNS the
+/// `carcass_remainder` for the caller to route through the existing `deposit_carcass` path. A PAIRED bucket
+/// move (live org J → live spore J + live detritus J), never a mint. Conserves exactly: `spore_share +
+/// carcass_remainder == residual`. RNG-free, integer (inv #3). A non-positive `residual` banks nothing and
+/// returns `0`; a non-spore-former NEVER calls this (the caller gates on `Strategy.spore_former`), so it is a
+/// byte-identical no-op on every plant/ecoli/predator org.
+pub(crate) fn sporulation_split(
+    reservoir: &mut SporeReservoir,
+    cell: usize,
+    species: usize,
+    residual: i64,
+) -> i64 {
+    if residual <= 0 {
+        return 0;
+    }
+    let split = fixed::apportion(
+        residual,
+        &[
+            SPORE_SURVIVAL_PERMILLE as u64,
+            (fixed::PERMILLE as i64 - SPORE_SURVIVAL_PERMILLE) as u64,
+        ],
+    );
+    let spore_share = split[0];
+    reservoir.deposit(cell, species, spore_share);
+    residual - spore_share // the carcass remainder → the caller's deposit_carcass (conserves: Σ == residual)
+}
+
+/// The role-appropriate pool channel `germinate` reads to judge "conditions returned" (ADR-019 S4): an
+/// `Autotroph` germinates on local `light`, every other (decomposer mold / Bacillus-style) role on local
+/// `detritus` — the SAME role→channel intuition `metabolism`/`mineralize` use. Pure, ordered, no HashMap.
+fn germination_stock(role: TrophicRole, pools: &crate::PoolStock, cell: usize) -> i64 {
+    match role {
+        TrophicRole::Autotroph | TrophicRole::Mixotroph => pools.light[cell],
+        _ => pools.detritus[cell],
+    }
+}
+
+/// One pending germling spawn, collected during the canonical `(cell, SpeciesId)` reservoir walk and applied via
+/// `Commands` AFTER the walk (the reproduce_or_die never-mutate-during-query discipline).
+struct Germling {
+    species: u16,
+    energy: i64,
+    biomass: i64,
+    px: u32,
+    py: u32,
+}
+
+/// **GERMINATE** (ADR-019 S4) — the dormant-reservoir → vegetative-org reseed pass, modeled on [`mineralize`]
+/// (canonical-order, integer, no `HashMap`, `if … is_empty() { return }` no-op skeleton). Inserted into the tick
+/// `.chain()` AFTER [`mineralize`] (so it reads THIS tick's refilled pools to judge "conditions returned") and
+/// BEFORE `reproduce_or_die` (so a fresh germling immediately participates in the same tick's maintenance/birth
+/// and OrgId interleaving). RNG-free (ZERO `next_u64` draws → births stay the SOLE RNG consumer), all `i64`.
+///
+/// Walks the [`SporeReservoir`] in canonical `(cell, SpeciesId)` order over its flat indexed plane. For each
+/// (cell, species) with banked stock `> 0`: if the species' role-appropriate pool channel is ≥
+/// [`GERMINATION_THRESHOLD`] AND the stock affords at least one [`GERM_ENDOW_J`] germling, germinate `n =
+/// min(stock / GERM_ENDOW_J, GERM_BATCH_CAP)` orgs (MAX_POPULATION-bounded — over-cap leaves the J dormant, no
+/// leak): [`withdraw`](SporeReservoir::withdraw) `n*GERM_ENDOW_J`, spawn n orgs EXACTLY like `region_inoculate`
+/// (Energy/Biomass split from the withdrawn J, Age 0, neutral-0.5 heritable traits as a CONSTANT not a draw,
+/// OrgId from the monotonic [`NextOrgId`], Position = the spore's own cell). A spore-former-free run keeps the
+/// reservoir all-zero → the non-zero set is empty → early no-op → HASH-NEUTRAL on the pinned plant run.
+#[allow(clippy::type_complexity)]
+pub(crate) fn germinate(
+    registry: Res<SpeciesRegistry>,
+    mut commands: Commands,
+    mut next_id: ResMut<NextOrgId>,
+    mut reservoir: ResMut<SporeReservoir>,
+    pools: Res<crate::PoolStock>,
+    q: Query<&Species>,
+) {
+    let s = registry.entries.len();
+    if s == 0 {
+        return;
+    }
+    let cells = (pools.width as usize) * (pools.height as usize);
+    // Current live population (the MAX_POPULATION guard — germination, like a birth, must respect the cap).
+    let mut population = q.iter().count() as u32;
+
+    // Walk the reservoir in canonical (cell, SpeciesId) order over the flat indexed plane (inv #3 — never a
+    // HashMap). Collect germlings; apply spawns AFTER the walk (never mutate-during-query for the spawn set).
+    let mut germlings: Vec<Germling> = Vec::new();
+    let mut any = false;
+    for cell in 0..cells {
+        for species in 0..s {
+            let stock = reservoir.stock(cell, species);
+            if stock <= 0 {
+                continue;
+            }
+            any = true;
+            let strat = &registry.entries[species].strategy;
+            // Conditions returned? Role-appropriate local pool channel ≥ the threshold (integer compare on the
+            // frozen i64 stock — RNG-free). Unfavorable → the spore stays dormant, J stays in the reservoir.
+            if germination_stock(strat.role, &pools, cell) < GERMINATION_THRESHOLD {
+                continue;
+            }
+            // How many germlings the stock affords, bounded by the per-tick batch cap.
+            let affordable = stock / GERM_ENDOW_J;
+            if affordable <= 0 {
+                continue;
+            }
+            let mut n = affordable.min(GERM_BATCH_CAP);
+            // MAX_POPULATION guard (inv #6): never germinate past the cap; the un-germinated J stays dormant.
+            let headroom = (crate::MAX_POPULATION as i64 - population as i64).max(0);
+            n = n.min(headroom);
+            if n <= 0 {
+                continue;
+            }
+            // Withdraw exactly n*GERM_ENDOW_J (paired move: reservoir → new orgs); spawn n vegetative orgs.
+            let withdrawn = reservoir.withdraw(cell, species, n * GERM_ENDOW_J);
+            // Each germling gets GERM_ENDOW_J (the last carries any rounding remainder so Σ == withdrawn exactly).
+            let cellu_x = (cell % (pools.width as usize)) as u32;
+            let cellu_y = (cell / (pools.width as usize)) as u32;
+            for k in 0..n {
+                // Distribute the withdrawn J as floor(GERM_ENDOW_J) each, the last germling absorbing the
+                // remainder so the spawned Σ equals `withdrawn` EXACTLY (conserved — no minted/lost quantum).
+                let endow = if k == n - 1 {
+                    withdrawn - GERM_ENDOW_J * (n - 1)
+                } else {
+                    GERM_ENDOW_J
+                };
+                let seed_biomass = OFFSPRING_SEED_BIOMASS.min(endow);
+                let seed_energy = endow - seed_biomass;
+                germlings.push(Germling {
+                    species: species as u16,
+                    energy: seed_energy,
+                    biomass: seed_biomass,
+                    px: cellu_x,
+                    py: cellu_y,
+                });
+                population += 1;
+            }
+        }
+    }
+    if !any {
+        return; // reservoir all-zero (the spore-former-free / pinned run) → byte-identical no-op.
+    }
+    // Spawn the collected germlings (Commands defers application — never mutates-during-query, inv #3). OrgIds
+    // minted IN ORDER from the monotonic NextOrgId; heritable traits seed at a neutral 0.5 CONSTANT (NOT a draw,
+    // the region_inoculate precedent → ZERO next_u64 draws → the spawn stream is unchanged).
+    for g in germlings {
+        let org = next_id.0;
+        next_id.0 += 1;
+        commands.spawn((
+            OrgId(org),
+            Energy(g.energy),
+            Biomass(g.biomass),
+            Age(0),
+            Genotype(0.5),
+            DroughtTol(0.5),
+            ThermalTol(0.5),
+            Position { x: g.px, y: g.py },
+            Species(SpeciesId::new(g.species)),
+        ));
     }
 }
 
@@ -776,6 +1048,342 @@ pub(crate) fn predation(
     }
 }
 
+// ── ADR-019 S5: the obligate-symbiont HOST-COUPLING interaction kernel — the host→symbiont J draw ─────────────
+//
+// An `ObligateSymbiont` (Carsonella / Syn3.0) earns its joules ONLY here (its role taps no abiotic pool in
+// `metabolism`, exactly like a `Predator`). The kernel is modeled cell-for-cell on the proven `predation`
+// skeleton: a FROZEN start-of-tick HOST census (per cell, per declared host species), per-cell `apportion` of
+// symbiont demand, and a paired conserved transfer (host J → symbiont − efficiency-tax → respired). V1 ships the
+// HOST→SYMBIONT DRAW ARM ONLY (a single conserved transfer like predation); "provisioning" is modeled as a
+// benign-low net draw (low `host_draw_rate` + the 7/10 efficiency tax) so coexistence is reachable, not a pure
+// parasitic drain — the genuine bidirectional reverse credit-back is a documented S5b stretch (sign-off, not v1).
+// RNG-free (DrawCount untouched → births stay the sole RNG consumer), all `i64`, no `HashMap` iterated (BTreeMap
+// for the org-keyed host-debit set), walked in canonical `(cell, SpeciesId, OrgId)` order (inv #3). On a
+// symbiont-free roster the symbiont row vector is empty → early `return` (the mineralize/predation no-op
+// precedent) → it moves no value and draws nothing → HASH-NEUTRAL on the pinned plant run. PINNED schedule slot:
+// immediately BEFORE `predation`, both on independently-frozen start-of-tick snapshots, so "host dies → symbiont
+// starves next tick" is a clean one-tick-lag emergent cascade.
+
+/// A symbiont's `host_coupling` row, snapshotted in canonical `(cell, SpeciesId, OrgId)` order. `host` is the
+/// symbiont's declared host species (resolved at register-time, cached on the registry entry).
+struct SymbiontRow {
+    cell: u32,
+    species: u16,
+    host: u16,
+    org: u64,
+    body: i64,
+}
+
+/// A host org's frozen drawable-J row, snapshotted in canonical `(cell, SpeciesId, OrgId)` order BEFORE any
+/// symbiont draws (within-tick draws never re-feed this tick's demand — the `frozen_prey_j` discipline).
+struct HostRow {
+    cell: u32,
+    species: u16,
+    org: u64,
+    entity: Entity,
+    /// Frozen `Energy + Biomass` (its drawable J) at start-of-system.
+    frozen_j: i64,
+    energy: i64,
+    biomass: i64,
+}
+
+/// A pending debit applied to a host org after the canonical walk (never mutate-during-query). `drawn >= 0`;
+/// the host loses `drawn` J Energy-first-then-Biomass.
+struct HostDebit {
+    drawn: i64,
+}
+
+/// **HOST COUPLING** (ADR-019 S5 KEYSTONE) — obligate symbionts draw kept-J from their co-located declared HOST
+/// on a FROZEN start-of-tick census, apportioned across co-located symbionts sharing a host (largest-remainder,
+/// ties→lowest canonical index). Runs AFTER `metabolism`+`mineralize` (so it reads this tick's post-uptake host
+/// Energy) and immediately BEFORE `predation` (the pinned slot). RNG-free, all `i64`, no `HashMap` iterated.
+///
+/// FOUR PASSES (deterministic, canonical `(cell, SpeciesId, OrgId)` order):
+/// 1. BUILD the symbiont row vector (`role == ObligateSymbiont`, with a resolved host). Empty → early `return`.
+/// 2. FREEZE the start-of-tick co-located HOST census per cell, keyed by host species
+///    (`frozen_host_j[cell*s + host]` = Σ that host's `Energy+Biomass`) + the per-cell ordered host-org list.
+/// 3. DEMAND per symbiont: Monod on its `frozen_host_j[cell, host]` (a Holling-II saturating response), folding
+///    `host_draw_rate · body_factor · edit_factor` into ONE demand permille (EditModifier GATED on non-neutral).
+/// 4. CONSUME + ATTRIBUTE: per (cell, host species), apportion the host's available frozen J across co-located
+///    symbionts ([`fixed::apportion_into`]); debit host Energy-first-then-Biomass; the symbiont GAINS `kept =
+///    drawn · EFF_NUM/EFF_DEN` (the 7/10 trophic efficiency), the tax `drawn − kept` → respired; record
+///    `flow[symbiont][host] += kept` — a MEASURED host↔symbiont off-diagonal. A host drained sub-floor with no
+///    body left dies via the standard carcass path (its residual → detritus); the host normally survives the
+///    benign draw and integrates normally next tick.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn host_coupling(
+    registry: Res<SpeciesRegistry>,
+    edit_mod: Res<crate::EditModifierRes>,
+    mut commands: Commands,
+    mut pools: ResMut<crate::PoolStock>,
+    mut prov: ResMut<PoolProvenance>,
+    mut chem: ResMut<crate::chem::ChemField>,
+    mut flow: ResMut<FlowMatrix>,
+    mut ledger: ResMut<ledger::Ledger>,
+    mut q: Query<(
+        Entity,
+        &OrgId,
+        &Species,
+        &mut Energy,
+        &mut Biomass,
+        &Position,
+    )>,
+) {
+    let s = registry.entries.len();
+    let width = pools.width;
+    // ── Pass 1: build the canonical SYMBIONT row vector. A symbiont-free roster (or a symbiont with no resolved
+    //    host) → empty → early return (the mineralize/predation no-op precedent; the hash-neutrality anchor). ──
+    let mut symbionts: Vec<SymbiontRow> = q
+        .iter()
+        .filter_map(|(_e, id, sp, _en, biomass, p)| {
+            let entry = &registry.entries[sp.0 .0 as usize];
+            if entry.strategy.role != TrophicRole::ObligateSymbiont {
+                return None;
+            }
+            // The symbiont's declared host (resolved at register-time). Hostless → it draws nothing (it will
+            // starve via the conserved economy) — exclude it from the row vector so the pass stays a no-op for it.
+            let host = entry.host?;
+            Some(SymbiontRow {
+                cell: cell_index(p, width),
+                species: sp.0 .0,
+                host: host.ordinal(),
+                org: id.0,
+                body: biomass.0.max(crate::OFFSPRING_SEED_BIOMASS),
+            })
+        })
+        .collect();
+    if symbionts.is_empty() {
+        return;
+    }
+    symbionts.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
+
+    // ── Pass 2: FREEZE the start-of-tick HOST census in canonical order (BEFORE any symbiont draws). A host is a
+    //    live org whose species == some symbiont's declared host. Within-tick draws never re-feed this tick's
+    //    demand (the `frozen_prey_j` discipline). ──
+    let cells = (pools.width as usize) * (pools.height as usize);
+    let mut hosts: Vec<HostRow> = q
+        .iter()
+        .filter_map(|(e, id, sp, energy, biomass, p)| {
+            // Only census a species that is SOME symbiont's host (cheap ordered scan over the small registry).
+            let is_host = symbionts.iter().any(|r| r.host == sp.0 .0);
+            if !is_host {
+                return None;
+            }
+            let frozen_j = energy.0.max(0) + biomass.0.max(0);
+            if frozen_j <= 0 {
+                return None;
+            }
+            Some(HostRow {
+                cell: cell_index(p, width),
+                species: sp.0 .0,
+                org: id.0,
+                entity: e,
+                frozen_j,
+                energy: energy.0,
+                biomass: biomass.0,
+            })
+        })
+        .collect();
+    if hosts.is_empty() {
+        return; // symbionts present but no host co-located anywhere — no transfer, no-op (they starve emergently).
+    }
+    hosts.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
+
+    // Per-cell, per-host-species frozen drawable J (the Monod stock S), flat `[cell*s + host_species]` (never a
+    // HashMap — inv #3). A symbiont only draws from its OWN declared host species' frozen stock in its cell.
+    let mut frozen_host_j = vec![0i64; cells * s];
+    for r in &hosts {
+        frozen_host_j[r.cell as usize * s + r.species as usize] += r.frozen_j;
+    }
+
+    // ── Pass 3: per-symbiont DEMAND (Monod on the frozen host J of its declared host species → Holling-II). ──
+    let n = symbionts.len();
+    let mut demand = vec![0i64; n];
+    for (i, r) in symbionts.iter().enumerate() {
+        let strat = &registry.entries[r.species as usize].strategy;
+        let cell = r.cell as usize;
+        let stock = frozen_host_j[cell * s + r.host as usize];
+        // demand_permille = host_draw_rate · body, both on permille grids (the predation demand shape).
+        let rate_permille = (u64::from(strat.host_draw_rate) * u64::from(fixed::PERMILLE))
+            / u64::from(fixed::UNIT_SCALE);
+        let body_factor = (((r.body as u128 * u128::from(fixed::PERMILLE))
+            / (crate::BIOMASS_CAP as u128))
+            .min(1000) as u64)
+            .max(BODY_FACTOR_FLOOR);
+        let p = u64::from(fixed::PERMILLE);
+        let mut dp = rate_permille * body_factor / p;
+        // ADR-019 S5 OVERSIGHT: a committed edit on the SYMBIONT throttles its host-coupling draw (a provisioning-
+        // locus knockdown). The SAME per-species `[0.5,1.5]` factor scales the demand. GATED on non-neutral so a
+        // no-edit run is byte-identical (the symbiont-free pinned hash is unmoved).
+        let edit_factor_q = edit_mod.factor_q(r.species);
+        if edit_factor_q != crate::EDIT_FACTOR_NEUTRAL_Q {
+            dp = dp * u64::from(edit_factor_q) / u64::from(fixed::PERMILLE);
+        }
+        demand[i] = crate::monod_demand(stock, dp.min(p));
+    }
+
+    // ── Pass 4: CONSUME + ATTRIBUTE — a CONSERVING two-level per-(cell, host-species) apportion (the predation
+    //    skeleton). Per (cell, host species): apportion the host's TOTAL grant (Σ co-located symbionts' demand,
+    //    capped at the host's frozen J) across the host orgs by frozen_j (each host gives ≤ its frozen_j EXACTLY),
+    //    and back-split each host's `drawn` across the symbionts by their demand share, so the FlowMatrix edge +
+    //    symbiont credit are attributed per (symbiont, host species) with no over-draw. Conserves J exactly. ──
+    let mut host_debit: std::collections::BTreeMap<u64, HostDebit> =
+        std::collections::BTreeMap::new();
+    let mut symb_credit: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+
+    let mut host_w: Vec<u64> = Vec::new();
+    let mut host_drawn: Vec<i64> = Vec::new(); // per cell-host: total J this host org loses this tick
+    let mut symb_w: Vec<u64> = Vec::new();
+    let mut symb_share: Vec<i64> = Vec::new(); // per cell-symbiont: how much of THIS host it draws
+    let mut rem: Vec<(u128, usize)> = Vec::new();
+
+    // Walk the symbiont rows grouped by cell (canonical order → cells contiguous). Within a cell, sub-group by
+    // the declared host species so each (cell, host) pair shares its host stock independently.
+    let mut si = 0usize;
+    while si < n {
+        let cell = symbionts[si].cell;
+        let mut sj = si;
+        while sj < n && symbionts[sj].cell == cell {
+            sj += 1;
+        }
+        // The slice of host rows in this cell (hosts globally sorted by (cell, species, org)).
+        let host_lo = hosts.partition_point(|r| r.cell < cell);
+        let host_hi = hosts.partition_point(|r| r.cell <= cell);
+        let cell_hosts = &hosts[host_lo..host_hi];
+        // Sub-group the cell's symbionts by declared host species (they are NOT sorted by host within the cell,
+        // but the canonical (cell, species, org) order is a TOTAL order; we scan all distinct host ids present).
+        // Collect the distinct host species in this cell's symbiont group, in ascending order (deterministic).
+        let mut host_ids: Vec<u16> = (si..sj).map(|k| symbionts[k].host).collect();
+        host_ids.sort_unstable();
+        host_ids.dedup();
+        for hid in host_ids {
+            // The host orgs of this declared species in this cell.
+            let group_hosts: Vec<&HostRow> =
+                cell_hosts.iter().filter(|r| r.species == hid).collect();
+            if group_hosts.is_empty() {
+                continue; // this host species is not present in the cell → its symbionts draw nothing (starve)
+            }
+            // The symbionts in this cell that draw from THIS host species, in canonical order.
+            let group_symb: Vec<usize> = (si..sj).filter(|&k| symbionts[k].host == hid).collect();
+            // Total grant = Σ this host species' co-located symbionts' demand, capped at the host's frozen J.
+            let stock = frozen_host_j[cell as usize * s + hid as usize];
+            let total_demand: i64 = group_symb.iter().map(|&k| demand[k].max(0)).sum();
+            if total_demand <= 0 || stock <= 0 {
+                continue;
+            }
+            let cell_grant = stock.min(total_demand);
+            // (1) Apportion the cell's total grant across the host orgs by frozen_j (each gives ≤ its frozen_j).
+            host_w.clear();
+            host_w.extend(group_hosts.iter().map(|r| r.frozen_j.max(0) as u64));
+            host_drawn.clear();
+            host_drawn.resize(group_hosts.len(), 0);
+            fixed::apportion_into(cell_grant, &host_w, &mut host_drawn, &mut rem);
+            // Symbiont demand weights for the per-host back-split (canonical symbiont order within the group).
+            symb_w.clear();
+            symb_w.extend(group_symb.iter().map(|&k| demand[k].max(0) as u64));
+            for (hidx, hr) in group_hosts.iter().enumerate() {
+                let drawn = host_drawn[hidx];
+                if drawn <= 0 {
+                    continue;
+                }
+                // Record the host debit (it loses exactly `drawn`, Energy-first-then-Biomass, applied below).
+                host_debit
+                    .entry(hr.org)
+                    .or_insert(HostDebit { drawn: 0 })
+                    .drawn += drawn;
+                // (2) Back-split this host's `drawn` across the group's symbionts by their demand share, so the
+                // symbiont credit + FlowMatrix edge are attributed per (symbiont, host species). Σ symb_share == drawn.
+                symb_share.resize(group_symb.len(), 0);
+                fixed::apportion_into(drawn, &symb_w, &mut symb_share, &mut rem);
+                for (kk, &k) in group_symb.iter().enumerate() {
+                    let take = symb_share[kk];
+                    if take <= 0 {
+                        continue;
+                    }
+                    let symb_species = symbionts[k].species as usize;
+                    let symb_org = symbionts[k].org;
+                    // Belt-and-suspenders: a symbiont never draws from itself (its host species differs by
+                    // construction — an ObligateSymbiont is never another symbiont's host in this slice).
+                    debug_assert!(
+                        hr.org != symb_org && hr.species != symbionts[k].species,
+                        "host_coupling self-draw guard: host org/species must differ from the symbiont"
+                    );
+                    // The symbiont GAINS kept = take · EFF_NUM/EFF_DEN; the tax (take − kept) → respired (a
+                    // residual, never an independent divide that double-floors — the predation precedent).
+                    let kept = take * crate::EFF_NUM / crate::EFF_DEN;
+                    let tax = take - kept;
+                    ledger.respired += tax;
+                    *symb_credit.entry(symb_org).or_insert(0) += kept;
+                    // FlowMatrix: net assimilated J flowed FROM the host species INTO the symbiont species (the
+                    // host↔symbiont off-diagonal; the diagonal pairing keeps the symbiont row summing to 0).
+                    flow.record(symb_species, hr.species as usize, kept);
+                }
+            }
+        }
+        si = sj;
+    }
+
+    // Apply host debits: Energy-first-then-Biomass; a host drained to a sub-floor residual with no body left dies
+    // (its residual → carcass→detritus, the standard conserved death path). The benign draw normally leaves the
+    // host alive to integrate next tick.
+    let mut to_despawn: Vec<Entity> = Vec::new();
+    for r in &hosts {
+        let Some(d) = host_debit.get(&r.org) else {
+            continue;
+        };
+        if d.drawn <= 0 {
+            continue;
+        }
+        let drawn = d.drawn.min(r.frozen_j); // never draw more than the frozen drawable J (apportion guarantees)
+        let new_energy = r.energy - drawn.min(r.energy.max(0));
+        let energy_drawn = r.energy - new_energy;
+        let biomass_drawn = drawn - energy_drawn;
+        let new_biomass = r.biomass - biomass_drawn;
+        let residual = new_energy.max(0) + new_biomass.max(0);
+        let dead = residual <= 0 || (new_energy < MAINTENANCE_FLOOR && new_biomass <= 0);
+        if dead {
+            if residual > 0 {
+                let cellu = r.cell as usize;
+                deposit_carcass(
+                    &mut pools,
+                    &mut chem,
+                    &mut prov,
+                    &mut ledger,
+                    cellu,
+                    r.species as usize,
+                    residual,
+                );
+            }
+            to_despawn.push(r.entity);
+        }
+    }
+
+    // Apply the surviving-host debits + symbiont credits via the live query (AFTER the walk; never mutate-during-
+    // query for the despawned set). Despawns are deferred through Commands.
+    let despawn_set: std::collections::BTreeSet<Entity> = to_despawn.iter().copied().collect();
+    for (entity, id, _sp, mut energy, mut biomass, _p) in q.iter_mut() {
+        if despawn_set.contains(&entity) {
+            continue; // about to despawn; its J already deposited as carcass
+        }
+        if let Some(d) = host_debit.get(&id.0) {
+            // Surviving host: debit Energy-first-then-Biomass by the drawn amount.
+            let drawn = d.drawn.min(energy.0.max(0) + biomass.0.max(0));
+            let from_energy = drawn.min(energy.0.max(0));
+            energy.0 -= from_energy;
+            biomass.0 -= drawn - from_energy;
+        }
+        if let Some(&kept) = symb_credit.get(&id.0) {
+            // Symbiont gains the kept J into Energy; past the cap → overflow (never a silent clamp).
+            let (new_e, over) = credit_capped(energy.0, kept, ENERGY_CAP);
+            energy.0 = new_e;
+            ledger.overflow += over;
+        }
+    }
+    for e in &to_despawn {
+        commands.entity(*e).despawn();
+    }
+}
+
 /// **ASSERT FLOW CLOSES** (ADR-013 F4) — runs near the END of the tick (after every transfer recorded into the
 /// matrix), asserting the per-row zero-sum identity holds. Mirrors `measure_and_assert_ledger`.
 pub(crate) fn assert_flow_closes(flow: Res<FlowMatrix>) {
@@ -877,5 +1485,73 @@ mod tests {
         // Guard: the detritus slot the decomposer taps is the last RESOURCE_CHANNEL (a compile-time sanity that
         // affinity[2] is the detritus channel the F4 design names).
         assert_eq!(crate::resource::RESOURCE_CHANNELS, 3);
+    }
+
+    #[test]
+    fn spore_reservoir_deposit_withdraw_caps_at_stock_and_totals() {
+        // ADR-019 S4: deposit/withdraw are paired integer bucket moves; withdraw never goes negative (caps at
+        // the available stock); total() sums the flat plane in an order-independent way.
+        let mut r = SporeReservoir::new(2, 3); // 2 cells, 3 species
+        r.deposit(0, 1, 500);
+        r.deposit(1, 2, 200);
+        assert_eq!(r.stock(0, 1), 500);
+        assert_eq!(r.stock(1, 2), 200);
+        assert_eq!(r.total(), 700);
+        // Withdraw less than stock → exact.
+        assert_eq!(r.withdraw(0, 1, 300), 300);
+        assert_eq!(r.stock(0, 1), 200);
+        // Withdraw MORE than stock → capped at the remaining stock, never negative.
+        assert_eq!(r.withdraw(0, 1, 9999), 200);
+        assert_eq!(r.stock(0, 1), 0);
+        assert_eq!(r.total(), 200); // only cell1/sp2 remains
+                                    // Defensive no-ops: non-positive amount, out-of-range species.
+        assert_eq!(r.withdraw(1, 2, 0), 0);
+        assert_eq!(r.withdraw(1, 9, 100), 0);
+        r.deposit(1, 9, 100); // out-of-range species → no-op
+        assert_eq!(r.total(), 200);
+    }
+
+    #[test]
+    fn sporulation_split_banks_the_survival_fraction_and_conserves() {
+        // ADR-019 S4: the split routes SPORE_SURVIVAL_PERMILLE of the residual into the reservoir and returns the
+        // carcass remainder; spore_share + remainder == residual EXACTLY (a paired move, no minted/lost quantum).
+        let mut r = SporeReservoir::new(1, 1);
+        let residual = 1000;
+        let carcass = sporulation_split(&mut r, 0, 0, residual);
+        let banked = r.stock(0, 0);
+        assert_eq!(
+            banked + carcass,
+            residual,
+            "conserved: spore + carcass == residual"
+        );
+        // With permille 700 the largest-remainder split is exactly [700, 300].
+        assert_eq!(banked, residual * SPORE_SURVIVAL_PERMILLE / 1000);
+        assert_eq!(carcass, residual - banked);
+        // A non-positive residual banks nothing and returns 0.
+        let mut r2 = SporeReservoir::new(1, 1);
+        assert_eq!(sporulation_split(&mut r2, 0, 0, 0), 0);
+        assert_eq!(r2.total(), 0);
+    }
+
+    #[test]
+    fn spore_reservoir_grow_to_preserves_existing_blocks() {
+        // ADR-019 S4: grow_to re-lays the flat [cell*s + species] plane, preserving every existing cell block and
+        // zeroing the new species columns (the PoolProvenance/KinProvenance grow precedent).
+        let mut r = SporeReservoir::new(2, 2);
+        r.deposit(0, 1, 11);
+        r.deposit(1, 0, 22);
+        r.grow_to(2, 4); // 2 → 4 species
+        assert_eq!(
+            r.stock(0, 1),
+            11,
+            "existing block preserved across the re-lay"
+        );
+        assert_eq!(r.stock(1, 0), 22);
+        assert_eq!(r.stock(0, 3), 0, "new species column starts zero");
+        assert_eq!(r.total(), 33, "no J minted or lost in the re-lay");
+        // A no-op shrink (new_s <= s) leaves it unchanged.
+        let before = r.clone();
+        r.grow_to(2, 4);
+        assert_eq!(r, before);
     }
 }
