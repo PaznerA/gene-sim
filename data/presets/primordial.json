@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "name": "Primordial Soil",
+  "description": "The first starter preset — a trophic-realistic microbial load on the 32x32 world. A producer-heavy biomass pyramid (autotroph base >> decomposers > predator), the way a real soil/biofilm community is structured. Designed to be ALIVE + LEGIBLE + show emergent trophic dynamics (producer growth, decomposition, predation, spore counterplay) without being chaotic. Containment starts Sealed so the player sees the designed community's closed dynamics first; raise Containment to let airborne contaminants trickle in (the open-system reality).",
+  "roster": [
+    { "key": "default",      "label": "Abstract plant (autotroph)",  "count": 800, "role": "Autotroph",   "note": "the energy base — producers dominate the biomass pyramid; grows on solar influx" },
+    { "key": "ecoli",        "label": "E. coli K-12 (decomposer)",   "count": 250, "role": "Decomposer",  "note": "primary consumer of detritus from dead producers" },
+    { "key": "bacillus",     "label": "Bacillus (spore-former)",     "count": 150, "role": "Decomposer",  "note": "a second decomposer — adds spore/dormancy dynamics + cull counterplay (a cull leaves a regerminating spore bank)" },
+    { "key": "bdellovibrio", "label": "Bdellovibrio (predator)",     "count": 50,  "role": "Predator",    "note": "apex predator of E. coli — sparse (predators are rare in a healthy pyramid)" }
+  ],
+  "env": {
+    "seed": 7,
+    "lat": 0.0,
+    "lon": 0.0,
+    "temp": 0.50,
+    "season": "Spring"
+  },
+  "containment": {
+    "level": 0,
+    "level_name": "Sealed (OFF)",
+    "consortium": ["bacillus", "pseudomonas", "aspergillus-niger"],
+    "note": "Sealed for a clean first impression of the closed community; the consortium is pre-armed so raising Containment to Lab/Open immediately starts deterministic airborne immigration."
+  },
+  "_design_notes": "Counts are a producer-heavy pyramid ~ 16:5:3:1 (800:250:150:50), ~1250 orgs on 1024 cells (~1.2/cell). Total stays light so the tick is fast + the map legible. These counts are a STARTING POINT — the autonomous emergent-run discovery harness (docs/llm/proposals/emergent-discovery-harness-draft.md) is the long-term way to tune presets + find dramatic runs. Symbionts (carsonella/syn3) are intentionally excluded from the airborne consortium (they can't free-live / airborne-arrive) — a host-coupled symbiont preset is a separate Mode-B starter."
+}

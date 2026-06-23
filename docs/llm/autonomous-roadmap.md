@@ -245,3 +245,27 @@ NOTE: the contamination-epic adversarial-verify skeptics repeatedly hit a conten
 3. **UE5 / web renderer** (from `rendering-platform-architecture-draft.md`): the C-ABI/IPC boundary, the web/wasm path (+ a wasm leg on the multi-ISA gate), the perf roadmap.
 4. **OVERSIGHT in-game UI** (earn/spend/trigger E. coli edits) + a richer KO table.
 5. **Contamination polish**: a symbiont S5b bidirectional provisioning edge; loaded-session immigration markers (the `journal_actions` export).
+
+### §9. PRESENTATION + DISCOVERY (2026-06-23 — current direction)
+
+**Ecosystem-map species visualization (ACTIVE — the map is unusable with all orgs the same size).** The
+snapshot carries only per-cell aggregates (density/allele/fitness), no species → the renderer sizes every
+org from one density-derived radius. FIX (hash-neutral — the snapshot is off the hash path): add a per-cell
+`dominant_species_id` channel to GridSnapshot (GSS4→GSS5; the literal 0x47a0 stays — snapshot draws no RNG),
++ a per-species visual table (size/color by key/role, real cell-size scale: plant ≫ rod ≫ predator ≫
+symbiont) the org layer uses, + per-zoom-scope differentiation (Field aggregate / Patch / Cells).
+
+**Starter preset — `data/presets/primordial.json`** (DONE, this slice). A trophic-realistic producer-heavy
+load (plant 800 / E. coli 250 / Bacillus 150 / Bdellovibrio 50 ≈ 16:5:3:1, ~1250 orgs on 1024 cells, Sealed
++ a pre-armed consortium). FOLLOW-UP: wire a "Load Starter" into the SP-2 composer (the menu reads the
+preset JSON → pre-fills the roster + env + containment). The counts are a starting point — the discovery
+harness is the real way to tune.
+
+**Emergent-run discovery harness (EPIC — the big vision).** Autonomously SEARCH the (init-config +
+mid-run-edit) space, SCORE runs for interestingness (emergent events), SAVE the gems as replayable
+showcases; gradient-free first, then a surrogate ML model ("brute force gradient beats manual testing").
+Rides the deterministic headless core + the R2 journal/replay. Full plan + slices D0–D4 + the workflow defs
+(emergent-scorer-design / discovery-harness-impl / discovery-batch / surrogate-model-impl) in
+**`docs/llm/proposals/emergent-discovery-harness-draft.md`**. FIRST STEP: D0 the interestingness scorer +
+D1 the per-gen trace (a new std-only `crates/discovery`), anchored on the Primordial starter preset. See
+the memory note [[autonomous-emergent-run-discovery-ml]].
