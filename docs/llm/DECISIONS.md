@@ -841,6 +841,25 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
   / `par::pool` / `PAR_THRESHOLD` / `force_serial` are `#[allow(dead_code)]` / `pub` until S1 wires the first call
   site (a built-but-unused pool must not warn — satisfied via `#[allow(dead_code)]` on `run` + exercised by the
   `par::tests`). Worker count is pinned for bench stability only; correctness never depends on it.
+- **⚠️ MEASURED OUTCOME (2026-06-23) — parallelism does NOT pay; S2–S4 NOT pursued. The ~2–2.5× projection was
+  WRONG.** S1 (diffusion scatter→gather) landed and is kept — it is a byte-identical determinism-clarity win, and
+  the parallel gather is proven (`parallel_gather_equals_serial`) but stays serial behind `DIFFUSE_PAR_THRESHOLD =
+  65536` (fork/join is ~22× slower than the ≤5-add-per-cell work at the 1024-cell grid). **S2+S3 (metabolism
+  compute/apply split → parallelize) were implemented, proven byte-identical AND inv-#3-correct (`parallel ==
+  serial` across 1/2/8/16 threads), but BENCHED A NET SLOWDOWN (1k +8%, 5k +2%, 10k +1%, clean A/B) → REVERTED.**
+  A separate surgical parallelization of ONLY the big per-item Pass-1 demand loop (the ADR's lowest-overhead
+  candidate) was also byte-identical + correct but **FLAT (±1%, noise) → reverted.** A bigger-grid experiment
+  (256×256 = 65536 cells, both `SOIL_DIMS` + `resource::RESOURCE_DIMS` bumped, alive population) confirmed
+  parallelism STILL flat (20k orgs 110.8 vs 110.4 ms/tick; 80k 198.3 vs 197.8) **and** a bigger grid is 5–9× SLOWER
+  (it hurts FPS, does not help). **Root cause:** the per-tick cost is dominated by the per-ORGANISM `metabolism`
+  loop, whose per-org work (a few integer ops) is too fine-grained to beat fork/join overhead at any grid/population
+  we tested; the parallelizable grid passes (diffusion) early-exit on the sparse default chem field. **The sim is
+  at its single-thread FPS ceiling (~0.85 M org-updates/s); 32×32 is the FPS sweet spot (~1000+ ticks/s at typical
+  loads — ample for the decoupled render loop).** The rayon scaffold (S0) + the gather (S1) STAY on main (the gather
+  is a clean win; the scaffold is dormant and would only ever pay on a hypothetical huge DENSE-chem grid). Do NOT
+  re-attempt S2–S4 without a fundamentally different cost profile (e.g. a much heavier per-org model, or a dense
+  chem field). The pinned literal `0x47a0_3c8f_6701_f240` is unchanged throughout (S2/S3/demand/grid were all
+  reverted; only the byte-identical S0+S1 remain merged).
 
 ---
 
