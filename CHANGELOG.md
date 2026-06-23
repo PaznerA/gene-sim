@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Ecosystem map — per-cell MORPHOTYPE glyphs at the Cells scope (feat, renderer) — HASH-NEUTRAL
+Completes the ADR-021 follow-up (per-zoom-scope refinement). The map sized + coloured each cell by its dominant
+species but drew them all as the SAME rod (the primary species' template) → microbe cells read as uniform coloured
+dots. Now each non-plant cell draws its dominant species' MORPHOTYPE glyph — the field-scale echo of the specimen
+view. **ZERO Rust touched → pinned literal `0x47a0_3c8f_6701_f240` byte-identical** (full `tools/gate.sh` GREEN).
+Adversarially verified 3/3 clean (zero issues) on every dimension.
+- `godot/species_visual_map.gd` `build_table` now carries `morph` (the `morph_for` lookup) per species id.
+- `godot/organisms.gd` `_draw_morph` dispatches a non-plant cell to one of 5 new field-scale glyphs — **cocci**
+  (staph grape-cluster), **vibrioid** (Bdellovibrio comma), **pleomorph** (Mycoplasma blob), **symbiont**
+  (Carsonella/Syn3 speck), **mold** (Aspergillus/Penicillium filament tuft) — plus the existing **rod** for
+  E. coli/Bacillus. All trait-free `draw_circle`/`draw_line`/`draw_polyline` primitives (no triangulation trap),
+  jittered only by `_hash01` (inv #3 byte-identical), modulated by the already-expressed fitness/density.
+- **Per-zoom refinement:** the glyphs draw ONLY in the Cells-scope branch (`_sprites_on and not lod_dots_only`);
+  the Field scope still falls to the sized colored `_draw_dot` (Field = density dots, Cells = morphotype community).
+  Pure presentation (inv #2): morphotype is a per-species lookup, never computed in GDScript.
+- Visually verified by a multi-species `--zoom` shot: large tan mold tufts, green plant canopies, magenta
+  vibrioid/cocci microbe clusters, a blue E. coli rod — distinct shapes + the plant/mold ≫ microbe size hierarchy.
+
 ### Relations node-link GRAPH (default) + `--roster` / `--steps` shot flags (feat, renderer/tooling) — HASH-NEUTRAL
 ADR-022. The Relations view shipped only the S×S FlowMatrix heatmap; users expected a node-link GRAPH of the
 trophic web. **ZERO Rust touched → pinned literal `0x47a0_3c8f_6701_f240` byte-identical** (full `tools/gate.sh`
