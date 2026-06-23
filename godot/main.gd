@@ -185,6 +185,7 @@ var _intervention_panel: Control  # live-mode CRISPR injection UI
 var _cas_picker: OptionButton
 var _locus_picker: OptionButton
 var _guide_edit: LineEdit
+var _inject_button: Button  # Item 1: explicit whole-species inject (CRISPR sub-panel); mirrors the Guide-Enter hook
 var _inject_status: Label
 var _cas_ids: Array = []  # cas variant id per _cas_picker item
 var _locus_ids: Array = []  # locus id per _locus_picker item
@@ -315,6 +316,13 @@ var _allele_history: Array = []  # rolling allele-freq [0,1] for the sparkline
 # population (keyed by species_id) so we can detect a crash-to-0 (extinction) or a >~10× jump (boom) vs the
 # prior frame. _alert_label is a transient HUD flash; _alert_until is the engine time it auto-hides at.
 var _prev_pop: Dictionary = {}  # species_id:int → population:int from the previous render frame
+# Item 2(b): persistent EXTINCTION tracking for the specimen view. _ever_alive marks any species seen with pop>0
+# (so we never false-flag a not-yet-spawned species); _extinct[sid]=true once a previously-alive species hits pop 0
+# (or drops out of observe_species). It UN-marks on regermination (a spore bank coming back, pop 0→N) so the
+# struck-through glyph reflects the live state. _render_specimens greys + strikes the extinct species (kept for
+# investigation, never removed). Pure renderer state derived from the core's population export (inv #2).
+var _ever_alive: Dictionary = {}  # species_id:int → true once observed with population > 0
+var _extinct: Dictionary = {}     # species_id:int → true while currently extinct (struck-through in the specimen view)
 var _alert_label: Label  # transient HUD notification ("✗ plant extinct" / "📈 bdellovibrio boom")
 var _alert_until: float = 0.0  # Time.get_ticks_msec()/1000 deadline after which the flash hides
 const ALERT_BOOM_FACTOR := 10  # a population jump of ≥ this multiple vs the prior frame counts as a "boom"
@@ -1054,6 +1062,16 @@ func _build_crispr_params() -> VBoxContainer:
 	_guide_edit.text_submitted.connect(_on_guide_submitted)
 	r3.add_child(_guide_edit)
 	col.add_child(r3)
+	# Item 1 (UX): an EXPLICIT whole-species inject button. The whole-species CRISPR edit — the only edit that
+	# appends a NEW specimen variant — used to fire ONLY on Enter in the Guide field (undiscoverable). This button
+	# makes it visible; it calls the same _on_inject_pressed the Enter hook does. It lives in the CRISPR sub-panel so
+	# it's contextual (shown only while the CRISPR tool is active), distinct from the shared region BRUSH below.
+	# Renderer-only (inv #2): it only asks the core to apply the edit it already exposes; biology stays in the core.
+	_inject_button = Button.new()
+	_inject_button.text = "💉 Inject (whole species)"
+	_inject_button.tooltip_text = "Apply this Cas / Locus / Guide to the ENTIRE active species (not a region).\nThis is the edit that appends a new variant to the specimen view.\n(Same as pressing Enter in the Guide field.)"
+	_inject_button.pressed.connect(_on_inject_pressed)
+	col.add_child(_inject_button)
 	return col
 
 
@@ -1370,10 +1388,40 @@ func _apply_brush() -> void:
 		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
-	_record_tool_outcome(TOOL_CRISPR, _live.apply_edit_region(
-		cas_id, locus_id, _guide_edit.text, _brush_cell.x, _brush_cell.y, _brush_radius))
+	var outcome: Dictionary = _live.apply_edit_region(
+		cas_id, locus_id, _guide_edit.text, _brush_cell.x, _brush_cell.y, _brush_radius)
+	_record_tool_outcome(TOOL_CRISPR, outcome)
+	# Item 2(a): a brush CRISPR stroke ALSO surfaces a "region edit" variant in the specimen view, attributed to the
+	# DOMINANT species at the painted cell (the species the player visually painted on, read from the GSS5
+	# dominant_species_id plane). This lets a region edit be inspected as a glyph for investigation — even though it
+	# changes per-individual alleles, not the species' whole genome. Renderer-only (inv #2): a projection of the
+	# core's already-exported phenotype + per-cell dominant id, no biology in GDScript.
+	if bool(outcome.get("applied", false)):
+		var sid := _dominant_species_at(_brush_cell)
+		_append_edit_variant_for(sid if sid >= 0 else _active_species_id(), "region edit", int(outcome.get("generation", 0)))
+		if _view_mode == VIEW_SPECIMEN:
+			_render_specimens()
+			_update_trait_readout()
+			_emphasise_focus()
 	if _mission_on:
 		_edits_used += 1
+
+
+## The dominant SpeciesId at a world cell, read from the latest snapshot's GSS5 dominant_species_id plane (the
+## per-cell most-populous species the core exports). -1 when there's no snapshot, the cell is out of range, or the
+## build predates GSS5 (forward-compat). Pure read (inv #2): an index into an already-exported plane, no biology.
+func _dominant_species_at(cell: Vector2i) -> int:
+	if _snaps.is_empty() or cell.x < 0 or cell.y < 0:
+		return -1
+	var snap = _snaps[_snaps.size() - 1]
+	if not ("dominant_species_id" in snap) or cell.x >= snap.width or cell.y >= snap.height:
+		return -1
+	var plane: PackedFloat32Array = snap.dominant_species_id
+	var w := int(snap.width)  # snap is an untyped Array element → annotate so the index type is inferred (not Variant)
+	var i: int = cell.y * w + cell.x
+	if i < 0 or i >= plane.size():
+		return -1
+	return int(round(plane[i]))
 
 
 ## Dispatch the ACTIVE tool at the current brush cell (SP-3.6). POSITION MATTERS end-to-end: brush cell →
@@ -1665,6 +1713,8 @@ func _poll_population_alerts() -> void:
 		var pop := int(d.get("population_size", 0))
 		var nm := str(d.get("name", "species"))
 		seen[sid] = pop
+		if pop > 0:
+			_ever_alive[sid] = true  # Item 2(b): remember it was alive (so extinction = ever-alive then gone)
 		if not _prev_pop.has(sid):
 			continue  # first sighting of this species — establish a baseline, don't flash
 		var prev := int(_prev_pop[sid])
@@ -1673,6 +1723,17 @@ func _poll_population_alerts() -> void:
 		elif prev >= ALERT_BOOM_FLOOR and pop >= prev * ALERT_BOOM_FACTOR:
 			events.append("📈 %s boom" % nm)
 	_prev_pop = seen
+	# Item 2(b): recompute the persistent extinct set across EVERY species that owns a specimen glyph. A species is
+	# extinct when it was ever alive but is now absent from observe_species() (it can be dropped when empty) OR shows
+	# population 0; it un-marks the moment it's alive again (a spore bank regerminating — pop 0→N). The specimen view
+	# keeps the glyph either way and strikes it while extinct. No biology here (inv #2) — a prev/now compare only.
+	for sid in _live_species_logs:
+		var key_sid := int(sid)
+		var alive: bool = seen.has(key_sid) and int(seen[key_sid]) > 0
+		if alive:
+			_extinct.erase(key_sid)
+		elif _ever_alive.has(key_sid):
+			_extinct[key_sid] = true
 	if events.size() > 0:
 		# Newest event wins the single line (multiple at once are joined). Colour by kind: red = extinction.
 		var any_ext := false
@@ -2630,6 +2691,34 @@ func _log_live_genome(label: String) -> void:
 ## species_key(); falls back to the primary (first SpeciesId). Read-only (inv #2): pure projection of the core's
 ## already-edited phenotype + species key into the renderer's history list.
 func _append_active_edit_variant(generation: int) -> void:
+	# The active species = the one whose key matches the core's species_key() (the whole-species inject targets it).
+	_append_edit_variant_for(_active_species_id(), "edit", generation)
+
+
+## The SpeciesId of the active species (its key == the core's species_key()); the primary (first id) when there's
+## no match or no species_key() export. Pure read (inv #2): a string compare over the already-logged species.
+func _active_species_id() -> int:
+	if _live_species_order.is_empty():
+		return -1
+	var active_key := ""
+	if _live != null and _live.has_method("species_key"):
+		active_key = String(_live.species_key())
+	if active_key != "":
+		for sid in _live_species_order:
+			var le: Dictionary = _live_species_logs[sid]
+			if str(le.get("key", "")) == active_key:
+				return int(sid)
+	return int(_live_species_order[0])
+
+
+## Item 2(a)/Issue 4: FORCE-append a new variant glyph to ONE species' history (`target_sid`), captioned
+## "<kind> N — gen G" (kind = "edit" for a whole-species inject, "region edit" for a brush stroke). A deliberate
+## user intervention must ALWAYS surface a fresh specimen glyph for investigation — even when the species'
+## 5-trait projection is visually unchanged this frame (a whole-species edit may re-express only next generation;
+## a region edit changes per-individual alleles, not the species genome at all). The trait-dedup paths
+## (_log_live_genome) would suppress that, so this bypasses dedup. Read-only (inv #2): pure projection of the
+## core's already-expressed phenotype + species key into the renderer's history list — no biology in GDScript.
+func _append_edit_variant_for(target_sid: int, kind: String, generation: int) -> void:
 	if _live == null:
 		return
 	# Ensure baselines exist for every species (no-op once seeded; dedups internally).
@@ -2637,19 +2726,12 @@ func _append_active_edit_variant(generation: int) -> void:
 		_log_live_genome("baseline — gen %d" % generation)
 	if _live_species_order.is_empty():
 		return  # observe_species() returned nothing AND _log_primary_genome could not seed — give up gracefully
-	# Resolve the active species' log: prefer the one whose key == species_key(); else the primary (first id).
-	var active_key := ""
-	if _live.has_method("species_key"):
-		active_key = String(_live.species_key())
-	var target_sid: int = int(_live_species_order[0])
-	for sid in _live_species_order:
-		var le: Dictionary = _live_species_logs[sid]
-		if str(le.get("key", "")) == active_key and active_key != "":
-			target_sid = int(sid)
-			break
+	# Resolve the target log; an unknown/absent id falls back to the primary species so a stroke always lands.
+	if not _live_species_logs.has(target_sid):
+		target_sid = int(_live_species_order[0])
 	var log_entry: Dictionary = _live_species_logs[target_sid]
 	var entries: Array = log_entry["entries"]
-	# Capture the active species' CURRENT (post-edit, re-expressed) traits from its observe_species row if present,
+	# Capture the target species' CURRENT (post-edit, re-expressed) traits from its observe_species row if present,
 	# else from the active observe() phenotype — either is the core's authoritative projection (inv #2).
 	var traits := _capture_live_traits()
 	if _live.has_method("observe_species"):
@@ -2658,8 +2740,8 @@ func _append_active_edit_variant(generation: int) -> void:
 			if int(spd.get("species_id", -1)) == target_sid:
 				traits = _capture_traits_from(spd.get("phenotype", {}))
 				break
-	var n := entries.size()  # the first edit after the baseline is "edit 1"
-	entries.append({"label": "edit %d — gen %d" % [maxi(1, n), generation], "traits": traits})
+	var n := entries.size()  # the first edit after the baseline is "<kind> 1"
+	entries.append({"label": "%s %d — gen %d" % [kind, maxi(1, n), generation], "traits": traits})
 	# Keep the legacy flat mirror in sync (primary species).
 	if _live_species_order.size() > 0:
 		_live_specimen_log = (_live_species_logs[_live_species_order[0]] as Dictionary)["entries"]
@@ -2760,6 +2842,35 @@ func _with_key(spec: Variant) -> Dictionary:
 	return d
 
 
+## The under-glyph caption node. Alive → the crisp outlined Label (the existing look). Extinct (Item 2(b)) → a
+## greyed, STRUCK-THROUGH RichTextLabel ("✟ … — extinct") so the dead species reads as dead while staying in the
+## grid for investigation. Both are `label_w` wide + centered; the caller sets `.position`. Presentation only (inv #2).
+func _specimen_caption(text: String, extinct: bool, label_w: float) -> Control:
+	if not extinct:
+		var label := Label.new()
+		label.text = text
+		label.add_theme_font_size_override("font_size", 15)
+		label.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
+		label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
+		label.add_theme_constant_override("outline_size", 6)
+		label.size = Vector2(label_w, 0)
+		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		return label
+	var rt := RichTextLabel.new()
+	rt.bbcode_enabled = true
+	# Pin the width to label_w (fit_content OFF so a long "✟ <name> — extinct" can't grow the control past label_w
+	# and offset the [center]ed caption); a fixed one-line height matches the alive Label's single row.
+	rt.fit_content = false
+	rt.scroll_active = false
+	rt.autowrap_mode = TextServer.AUTOWRAP_OFF
+	rt.custom_minimum_size = Vector2(label_w, 26)
+	rt.size = Vector2(label_w, 26)
+	rt.add_theme_font_size_override("normal_font_size", 15)
+	# [s] strikethrough + a tombstone glyph + a muted grey; centered to match the Label layout.
+	rt.text = "[center][color=#9aa0a0][s]✟ %s — extinct[/s][/color][/center]" % text
+	return rt
+
+
 ## Build one glyph per specimen (via the key-led GlyphFactory), laid out as a 2D GRID with a caption under each:
 ## species stack VERTICALLY (one row each), their variations run HORIZONTALLY to the right (issue 5). The glyph
 ## geometry comes from the core-exported trait vector + role + key (presentation mapping — no biology, inv #2).
@@ -2838,16 +2949,17 @@ func _render_specimens() -> void:
 		_specimen_root.add_child(holder)
 		holder.add_child(glyph)
 
-		var label := Label.new()
-		label.text = str(spec.get("label", "specimen"))
-		label.add_theme_font_size_override("font_size", 15)
-		label.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
-		label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
-		label.add_theme_constant_override("outline_size", 6)
-		label.size = Vector2(LABEL_W, 0)
+		# Item 2(b): a species whose population has crashed to 0 stays in the grid (for investigation) but reads as
+		# DEAD — its caption is struck-through + greyed and its glyph is desaturated/dimmed. The extinct set is keyed
+		# by SpeciesId (the row `group`), maintained by _poll_population_alerts. Presentation only (inv #2).
+		var is_extinct: bool = _extinct.has(int(spec.get("group", 0)))
+		var label := _specimen_caption(str(spec.get("label", "specimen")), is_extinct, LABEL_W)
 		label.position = Vector2(-LABEL_W * 0.5, maxf(24.0, pb.position.y + pb.size.y + 12.0))
-		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		holder.add_child(label)
+		if is_extinct:
+			# Bake the dimming onto the GLYPH node (not the holder) so it survives _emphasise_focus's holder modulate
+			# — an extinct species is desaturated/dim whether or not it's the focused specimen.
+			glyph.modulate = Color(0.62, 0.62, 0.62, 0.72)
 
 		# Track this row's vertical extent (glyph top + caption bottom) so the next row drops below it.
 		row_top = minf(row_top, holder.position.y + pb.position.y)
