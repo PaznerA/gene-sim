@@ -19,28 +19,36 @@
 //! ## Binary format ([`GridSnapshot::write_snapshot_bytes`])
 //! Little-endian, `std`-only (no `bincode`/`serde`):
 //! ```text
-//!   bytes 0..4 : ASCII magic "GSS4"
+//!   bytes 0..4 : ASCII magic "GSS5"
 //!   u32 LE     : width
 //!   u32 LE     : height
-//!   u32 LE     : channel_count (= 12)
+//!   u32 LE     : channel_count (= 13)
 //!   u64 LE     : generation
 //!   u32 LE     : population
 //!   then channel-major, each channel's width*height f32 LE values in row-major order,
 //!   channels in order: density, allele_freq, fitness, soil_moisture, soil_nutrients, soil_ph,
-//!   light, free_nutrient, detritus, toxin, kin, alarm.
+//!   light, free_nutrient, detritus, toxin, kin, alarm, dominant_species_id.
 //! ```
+//! The last channel `dominant_species_id` (GSS5) carries the MOST-POPULOUS [`crate::SpeciesId`] ordinal in
+//! each cell as an exact integer encoded in an `f32` (`u16` 0..=65535 round-trips through `f32` losslessly).
+//! It is `0.0` for empty cells; the renderer maps the id → a per-species size/colour (the species-map view).
+//! Like the chem/pool planes it is a READ-ONLY projection off the LIVING `Species` tags — no `SimRng` draw,
+//! no mutation — so producing it never perturbs the determinism hash (inv #2/#3); the pinned literal is
+//! byte-identical for a single-species run (whose dominant id is uniformly `0`).
 
 use std::io;
 use std::path::Path;
 
-/// ASCII magic header identifying the snapshot binary format (`"GSS4"` = Gene-Sim Snapshot v4; v2 added the
-/// 3 soil channels, v3 appended the 3 live-pool channels, v4 (ADR-013 F5) appends the 3 chem channels
-/// (toxin/kin/alarm) — a bumped magic turns a stale 9-channel reader into a loud bad-magic error, not silence).
-pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS4";
+/// ASCII magic header identifying the snapshot binary format (`"GSS5"` = Gene-Sim Snapshot v5; v2 added the
+/// 3 soil channels, v3 appended the 3 live-pool channels, v4 (ADR-013 F5) appended the 3 chem channels
+/// (toxin/kin/alarm), v5 appends the per-cell `dominant_species_id` plane (the species-map view) — a bumped
+/// magic turns a stale 12-channel reader into a loud bad-magic error, not a silent mis-parse at the wrong offset).
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS5";
 
 /// The number of per-cell channels a [`GridSnapshot`] carries: `density`, `allele_freq`, `fitness`,
-/// `soil_moisture`, `soil_nutrients`, `soil_ph`, `light`, `free_nutrient`, `detritus`, `toxin`, `kin`, `alarm`.
-pub const CHANNEL_COUNT: u32 = 12;
+/// `soil_moisture`, `soil_nutrients`, `soil_ph`, `light`, `free_nutrient`, `detritus`, `toxin`, `kin`, `alarm`,
+/// `dominant_species_id`.
+pub const CHANNEL_COUNT: u32 = 13;
 
 /// A read-only, derived per-cell grid view of the simulation for the renderer (SPEC §W10).
 ///
@@ -86,18 +94,22 @@ pub struct GridSnapshot {
     pub kin: Vec<f32>,
     /// Per-cell live `alarm` signal in `[0, 1]`, row-major (ADR-013 F5; resampled from `ChemField` / `CHEM_CAP`).
     pub alarm: Vec<f32>,
+    /// Per-cell MOST-POPULOUS [`crate::SpeciesId`] ordinal as an exact `u16`-in-`f32`, row-major (GSS5); `0` for
+    /// empty cells. Ties resolve to the LOWEST `SpeciesId` (deterministic). A read-only display projection off
+    /// the living `Species` tags (no RNG, no mutation) — the renderer maps it to a per-species size/colour.
+    pub dominant_species_id: Vec<f32>,
 }
 
 impl GridSnapshot {
     /// Serialize to the exact little-endian binary format documented on this module (`std`-only).
     ///
-    /// Header (`magic`, dims, `channel_count`, `generation`, `population`) followed by the three channels
-    /// channel-major — `density`, then `allele_freq`, then `fitness` — each `width * height` `f32` LE in
-    /// row-major order. Deterministic for a given snapshot.
+    /// Header (`magic`, dims, `channel_count`, `generation`, `population`) followed by every channel
+    /// channel-major — `density`, `allele_freq`, `fitness`, the soil/pool/chem planes, then
+    /// `dominant_species_id` — each `width * height` `f32` LE in row-major order. Deterministic for a snapshot.
     #[must_use]
     pub fn write_snapshot_bytes(&self) -> Vec<u8> {
         let cells = (self.width as usize) * (self.height as usize);
-        // 4 (magic) + 4+4+4 (dims+channels) + 8 (gen) + 4 (pop) + 3 channels * cells * 4 bytes.
+        // 4 (magic) + 4+4+4 (dims+channels) + 8 (gen) + 4 (pop) + CHANNEL_COUNT channels * cells * 4 bytes.
         let mut buf = Vec::with_capacity(28 + CHANNEL_COUNT as usize * cells * 4);
 
         buf.extend_from_slice(&SNAPSHOT_MAGIC);
@@ -120,6 +132,7 @@ impl GridSnapshot {
             &self.toxin,
             &self.kin,
             &self.alarm,
+            &self.dominant_species_id,
         ] {
             for &v in channel {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -175,6 +188,7 @@ mod tests {
         let toxin = read_channel();
         let kin = read_channel();
         let alarm = read_channel();
+        let dominant_species_id = read_channel();
         assert_eq!(off, bytes.len(), "trailing bytes");
 
         GridSnapshot {
@@ -194,6 +208,7 @@ mod tests {
             toxin,
             kin,
             alarm,
+            dominant_species_id,
         }
     }
 
@@ -216,6 +231,7 @@ mod tests {
             toxin: vec![0.03, 0.06, 0.09, 0.12, 0.15, 0.18],
             kin: vec![0.07, 0.14, 0.21, 0.28, 0.35, 0.42],
             alarm: vec![0.5, 0.4, 0.3, 0.2, 0.1, 0.05],
+            dominant_species_id: vec![0.0, 1.0, 2.0, 0.0, 3.0, 1.0],
         };
         let back = parse(&snap.write_snapshot_bytes());
 
@@ -237,6 +253,7 @@ mod tests {
         assert_eq!(back.toxin, snap.toxin);
         assert_eq!(back.kin, snap.kin);
         assert_eq!(back.alarm, snap.alarm);
+        assert_eq!(back.dominant_species_id, snap.dominant_species_id);
         // Full struct equality.
         assert_eq!(back, snap);
     }
@@ -260,10 +277,11 @@ mod tests {
             toxin: vec![0.0; 16],
             kin: vec![0.0; 16],
             alarm: vec![0.0; 16],
+            dominant_species_id: vec![0.0; 16],
         };
         let bytes = snap.write_snapshot_bytes();
-        // 28-byte header + 12 channels * 16 cells * 4 bytes.
-        assert_eq!(bytes.len(), 28 + 12 * 16 * 4);
-        assert_eq!(&bytes[0..4], b"GSS4");
+        // 28-byte header + 13 channels * 16 cells * 4 bytes.
+        assert_eq!(bytes.len(), 28 + 13 * 16 * 4);
+        assert_eq!(&bytes[0..4], b"GSS5");
     }
 }

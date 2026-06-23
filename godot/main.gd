@@ -52,6 +52,7 @@ const PanelChrome := preload("res://panel.gd")
 const PillRail := preload("res://pill_rail.gd")
 const MainMenu := preload("res://main_menu.gd")
 const DataLayerShader := preload("res://data_layer.gdshader")
+const SpeciesVisualMap := preload("res://species_visual_map.gd")
 
 const OVERLAY_NAMES := ["off", "density", "allele_freq", "fitness", "soil_moisture", "soil_nutrients", "soil_ph",
 	"light", "free_nutrient", "detritus",  # GSS3 live-pool joule-economy planes appended after soil_ph
@@ -2543,12 +2544,32 @@ func _capture_live_traits() -> Dictionary:
 	return _capture_traits_from(_live.observe().get("phenotype", {}))
 
 
-## The species template the ECOSYSTEM field renders with: {traits, key}. The GSS2 snapshot is species-BLIND
-## (no per-cell species id; R3-B's observe path is single-active-species per run), so the field is parameterized
-## by the run-level species phenotype applied uniformly + the existing per-cell channels for intra-field variation
-## (per the renderer-only mapping — a per-cell species channel would be a core snapshot-format change, out of
-## scope here). Live → the active observe() species (with its core key); file-replay → the specimens.json
-## baseline (plant). Pure reads (inv #2).
+## The {species_id:int -> {key, role}} map the GSS5 species-map visual table is built from. Authoritative source
+## is the live observe_species() (current roster, in SpeciesId order); falls back to the per-species log
+## (_live_species_logs) which carries the same {key, role}. Empty on file-replay / older cdylib → the field draws
+## the default plant visual (graceful). Pure reads (inv #2): no biology, just id → display metadata.
+func _species_id_meta() -> Dictionary:
+	var meta: Dictionary = {}
+	if _live != null and _live.has_method("observe_species"):
+		for sp in _live.observe_species():
+			var d: Dictionary = sp
+			meta[int(d.get("species_id", 0))] = {
+				"key": str(d.get("key", "default")),
+				"role": str(d.get("role", "")),
+			}
+	# Backfill from the per-species log for any id not in the live observation (e.g. just-extinct species).
+	for sid in _live_species_logs:
+		if not meta.has(int(sid)):
+			var le: Dictionary = _live_species_logs[sid]
+			meta[int(sid)] = {"key": str(le.get("key", "default")), "role": str(le.get("role", ""))}
+	return meta
+
+
+## The species template the ECOSYSTEM field renders with: {traits, key}. This sets the run-level glyph TEMPLATE
+## (the active species' phenotype → sprite morph). The per-cell SPECIES IDENTITY now rides on the GSS5
+## dominant_species_id plane (sized/coloured via SpeciesVisualMap in _show), so a multi-species field draws each
+## cell's dominant species at its real-cell scale on top of this template. Live → the active observe() species
+## (with its core key); file-replay → the specimens.json baseline (plant). Pure reads (inv #2).
 func _ecosystem_species_traits() -> Dictionary:
 	if _live != null:
 		var key := "default"
@@ -4018,6 +4039,14 @@ func _show(i: int) -> void:
 	if _organisms.has_method("set_species_traits"):
 		var st := _ecosystem_species_traits()
 		_organisms.set_species_traits(st.get("traits", {}), str(st.get("key", "default")))
+	# GSS5 species-map: hand the organism layer the per-cell dominant SpeciesId plane + the species-id → visual
+	# table (size/colour by key/role), so each cell's organisms render at their dominant species' real-cell scale
+	# (plant LARGE … symbiont tiny) instead of one shared density radius. Pure presentation (inv #2): the core
+	# decided which species dominates each cell; this only maps id → pixels. Empty table (file-replay / older
+	# cdylib) → the default plant visual (graceful).
+	if _organisms.has_method("set_dominant_species_ids"):
+		var dom: PackedFloat32Array = snap.dominant_species_id if "dominant_species_id" in snap else PackedFloat32Array()
+		_organisms.set_dominant_species_ids(dom, SpeciesVisualMap.build_table(_species_id_meta()))
 	_organisms.set_snapshot(snap, _cell)
 	if _iso_ground != null:
 		_iso_ground.set_snapshot(snap, _overlay_mode)  # iso draws ground + data overlay as diamonds

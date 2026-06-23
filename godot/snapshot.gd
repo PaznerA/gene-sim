@@ -1,16 +1,19 @@
 extends RefCounted
-## Reads a gene-sim binary snapshot (.bin, format "GSS4") written by the Rust core
+## Reads a gene-sim binary snapshot (.bin, format "GSS5") written by the Rust core
 ## (sim-core `GridSnapshot::write_snapshot_bytes`). Little-endian layout:
-##   "GSS4" | u32 width | u32 height | u32 channel_count(=12) | u64 generation | u32 population
+##   "GSS5" | u32 width | u32 height | u32 channel_count(=13) | u64 generation | u32 population
 ##   | f32[w*h] density | f32[w*h] allele_freq | f32[w*h] fitness
 ##   | f32[w*h] soil_moisture | f32[w*h] soil_nutrients | f32[w*h] soil_ph
 ##   | f32[w*h] light | f32[w*h] free_nutrient | f32[w*h] detritus
-##   | f32[w*h] toxin | f32[w*h] kin | f32[w*h] alarm   (each channel row-major)
+##   | f32[w*h] toxin | f32[w*h] kin | f32[w*h] alarm
+##   | f32[w*h] dominant_species_id   (each channel row-major)
 ## The soil_* channels (roadmap R1.0), the live-pool light/free_nutrient/detritus planes (GSS3, the joule
 ## economy made visible), and the chem toxin/kin/alarm planes (GSS4, ADR-013 F5 — allelopathy/kin/chemotaxis)
 ## are PARSED here and packed into RGBF textures (to_soil_image / to_pool_image / to_chem_image) for the
-## data-layer shader's full-field overlays. GSS4 bumped the magic from GSS3 so a stale 9-channel reader fails
-## LOUD on bad magic rather than silently mis-parsing the wider body at the wrong offsets (inv #2).
+## data-layer shader's full-field overlays. GSS5 appends the per-cell `dominant_species_id` plane (the most-
+## populous SpeciesId ordinal per cell, as an exact u16-in-f32; the species-sized/coloured map view reads it).
+## A bumped magic (GSS4→GSS5) turns a stale 12-channel reader into a LOUD bad-magic error rather than a silent
+## mis-parse of the wider body at the wrong offsets (inv #2).
 ##
 ## INVARIANT #2 (STOP THE LINE if violated): this ONLY parses snapshot bytes and exposes them for rendering.
 ## It computes NO biology / genotype→phenotype — all of that lives in the Rust core. The renderer is read-only.
@@ -20,7 +23,7 @@ extends RefCounted
 ## Consumers `preload("res://snapshot.gd")`; the static factory self-references via `SnapshotData` below.
 ## Both are resolved at parse time and need no `.godot/` cache.
 
-const MAGIC := "GSS4"
+const MAGIC := "GSS5"
 const SnapshotData := preload("res://snapshot.gd")
 
 var width: int = 0
@@ -42,6 +45,9 @@ var detritus: PackedFloat32Array
 var toxin: PackedFloat32Array
 var kin: PackedFloat32Array
 var alarm: PackedFloat32Array
+# GSS5 species-map plane: the per-cell MOST-POPULOUS SpeciesId ordinal (exact u16-in-f32; 0 for empty cells),
+# appended AFTER alarm — offsets 0..11 never reorder. The renderer maps each id → a per-species size/colour.
+var dominant_species_id: PackedFloat32Array
 
 
 static func load_from(path: String) -> SnapshotData:
@@ -73,6 +79,7 @@ static func load_from(path: String) -> SnapshotData:
 	s.toxin = f.get_buffer(n * 4).to_float32_array()
 	s.kin = f.get_buffer(n * 4).to_float32_array()
 	s.alarm = f.get_buffer(n * 4).to_float32_array()
+	s.dominant_species_id = f.get_buffer(n * 4).to_float32_array()
 	if not _channels_complete(s):
 		push_error("snapshot: %s has truncated/short channels (expected %d floats each)" % [path, n])
 		return null
@@ -106,7 +113,8 @@ static func parse_bytes(buf: PackedByteArray) -> SnapshotData:
 	s.detritus = read.call(off); off += n * 4
 	s.toxin = read.call(off); off += n * 4
 	s.kin = read.call(off); off += n * 4
-	s.alarm = read.call(off)
+	s.alarm = read.call(off); off += n * 4
+	s.dominant_species_id = read.call(off)
 	if not _channels_complete(s):
 		push_error("snapshot: byte buffer has truncated/short channels (expected %d floats each)" % n)
 		return null
@@ -120,7 +128,7 @@ static func _channels_complete(s: SnapshotData) -> bool:
 	if s.width < 0 or s.height < 0:
 		return false
 	for arr in [s.density, s.allele_freq, s.fitness, s.soil_moisture, s.soil_nutrients, s.soil_ph,
-			s.light, s.free_nutrient, s.detritus, s.toxin, s.kin, s.alarm]:
+			s.light, s.free_nutrient, s.detritus, s.toxin, s.kin, s.alarm, s.dominant_species_id]:
 		if arr.size() != n:
 			return false
 	return true

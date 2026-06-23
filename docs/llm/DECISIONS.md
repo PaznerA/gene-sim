@@ -863,6 +863,39 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-021 — GSS5 snapshot: per-cell `dominant_species_id` channel (ecosystem-map species visualization)
+
+- **Date:** 2026-06-23
+- **Status:** Accepted.
+- **Context:** the ecosystem map sized every organism from one per-cell density-derived radius → on a
+  multi-species roster every species looked identical (the map was unusable). The render snapshot
+  (`GridSnapshot`) carried only per-cell AGGREGATES (density/allele/fitness + the soil/resource/chem planes),
+  no per-cell SPECIES — so the renderer could not tell a plant cell from an E. coli cell from a Bdellovibrio
+  cell.
+- **Decision:** add a per-cell `dominant_species_id` channel to the snapshot. `Simulation::snapshot()` tallies
+  the resident organisms per cell (a sorted `Vec<(u16,u32)>`, no HashMap — inv #3) and emits the most-populous
+  `SpeciesId` (deterministic lowest-id tiebreak), `u16→f32`. `SNAPSHOT_MAGIC` **GSS4→GSS5**, `CHANNEL_COUNT`
+  **12→13** (a bumped magic makes a stale 12-channel reader fail loudly — the same discipline as GSS1→GSS2
+  (ADR near DECISIONS.md:295) and GSS2→GSS3 (:588)). EVERY GSS reader updated: `godot/snapshot.gd`,
+  `crates/godot-sim/godot/livesim_smoke.gd` (the magic + `channels==13` assert — the classic stale-reader
+  break), `tools/check_godot_snapshot.sh` (`channels=13`), the godot-sim doc comments. The renderer side
+  (`godot/species_visual_map.gd` — a per-species size/color table on a real cell-size scale: plant ≫ rod ≫
+  predator ≫ symbiont; `godot/organisms.gd` sizes/colors each cell by its dominant species; `main.gd` wires it)
+  is pure presentation.
+- **Determinism / hash (inv #3):** **HASH-NEUTRAL — the pinned literal `0x47a0_3c8f_6701_f240` is unchanged.**
+  The snapshot is read-only, off `hash_world`, draws ZERO `SimRng` (exactly like the soil/resource/chem display
+  channels). The per-cell tally is a sorted-Vec argmax (no HashMap iterated in sim logic); single-species runs
+  emit a uniformly-0 plane. Proven by `determinism_hash_is_pinned` + the new
+  `snapshot_single_species_dominant_id_is_uniformly_zero` / `..._picks_most_populous_with_lowest_id_tiebreak`
+  tests (178 sim-core tests green).
+- **Invariants:** **#2** biology stays in the core (the renderer only maps the exported id → a visual);
+  **#1/#5/#6** untouched; **#7** this format break is recorded here (the GSS lineage discipline).
+- **Consequences:** the map is now legible (species sized by real cell-scale). FOLLOW-UP: per-zoom-scope
+  refinement (Field aggregate vs Cells per-organism glyphs) + wiring the `data/presets/primordial.json` starter
+  into the SP-2 composer.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

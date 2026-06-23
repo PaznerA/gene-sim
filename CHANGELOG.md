@@ -4,6 +4,15 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### GSS5 — ecosystem-map species visualization: per-cell `dominant_species_id` snapshot channel + per-species sizing (feat, sim-core/godot) — HASH-NEUTRAL
+ADR-021. The map sized every organism the same → unusable on a multi-species roster. Added a per-cell
+`dominant_species_id` channel to `GridSnapshot` (most-populous species per cell, sorted-Vec argmax, no HashMap),
+`SNAPSHOT_MAGIC` GSS4→GSS5 / `CHANNEL_COUNT` 12→13, every GSS reader updated (snapshot.gd, livesim_smoke.gd,
+check_godot_snapshot.sh). Renderer: `species_visual_map.gd` (size/color per species on a real cell-scale —
+plant ≫ rod ≫ predator ≫ symbiont) + organisms.gd sizes/colors each cell by its dominant species. **HASH-NEUTRAL**
+— the snapshot is off `hash_world` + draws no `SimRng`; pinned literal `0x47a0_3c8f_6701_f240` byte-identical
+(178 sim-core tests green incl. the single-species-uniform-zero + multi-species-argmax asserts).
+
 ### PAR-S0 — Deterministic parallelization scaffold: rayon pinned dep + persistent pool + threshold + escape hatch (feat, sim-core/build) — HASH-NEUTRAL
 The S0 slice of the parallelization epic (`docs/llm/proposals/parallel-sim-draft.md`, now COMMITTED; ADR-020).
 **ZERO call sites yet → pinned literal `0x47a0_3c8f_6701_f240` BYTE-IDENTICAL** (the parallel region does not yet
