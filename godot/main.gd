@@ -385,6 +385,9 @@ func _ready() -> void:
 	if _live != null and _has_flag("--inject"):  # optional: fire one demo injection for --shot verification
 		_live.step(20)
 		_publish_frame()
+		# Issue 4: seed every species' BASELINE specimen from the PRE-edit genome so the demo --shot shows the
+		# baseline alongside the appended "edit 1" variant (the inject below force-appends the edited variant).
+		_log_live_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
 		_on_inject_pressed()
 	if _live != null and _has_flag("--brush"):  # optional: show + fire one demo brush stroke for --shot
 		_live.step(20)
@@ -1262,11 +1265,30 @@ func _on_inject_pressed() -> void:
 		return
 	var cas_id := int(_cas_ids[_cas_picker.selected])
 	var locus_id := int(_locus_ids[_locus_picker.selected])
+	# Issue 4: capture the PRE-edit genome as the baseline specimen BEFORE mutating it. Otherwise an inject that
+	# fires before the specimen view was ever opened (e.g. the --inject --view specimen smoke, or a click straight
+	# after launch) logs only the post-edit genome — the baseline variant is then lost and only the "edit" glyph
+	# shows. Seeding it here guarantees baseline + edit N both appear in the row. (_log_live_genome dedups, so this
+	# is a no-op once a baseline already exists.)
+	_log_live_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
 	var outcome: Dictionary = _live.apply_edit(cas_id, locus_id, _guide_edit.text)
 	_record_edit_outcome(outcome)
 	if bool(outcome.get("applied", false)):
-		# A whole-species edit changed the genome → log the new genome state as a specimen (incremental history).
-		_log_live_genome("edit %d — gen %d" % [_live_specimen_log.size(), int(outcome.get("generation", 0))])
+		# Issue 4 (regression): a whole-species edit is a deliberate user action → it must ALWAYS append a NEW
+		# specimen variant to the EDITED species' history, even when its 5-trait projection is visually unchanged
+		# this frame (the core may re-express the phenotype only on the next generation, OR the edited param maps
+		# to a trait already saturated / outside the projection). The old path logged via _log_live_genome, whose
+		# dedup-on-traits then SUPPRESSED the variant ("Před tím přibývaly" → stopped). _append_active_edit_variant
+		# force-appends to the active species, so baseline + edit 1 + … always grow to the right. The passive
+		# refresh path (_log_live_genome on view re-entry) keeps its trait dedup so it never double-logs.
+		_append_active_edit_variant(int(outcome.get("generation", 0)))
+		# Re-render the specimen view NOW so the new variant glyph appears immediately (it used to only show on a
+		# view re-entry). Cheap + idempotent when not in the specimen view (the root is hidden); keeps the picker +
+		# framing in sync with the freshly-appended variant.
+		if _view_mode == VIEW_SPECIMEN:
+			_render_specimens()
+			_update_trait_readout()
+			_emphasise_focus()
 	if _mission_on:
 		_edits_used += 1
 
@@ -2468,7 +2490,10 @@ func _set_view_mode(m: int) -> void:
 		_render_specimens()  # also repopulates the picker
 		_update_trait_readout()
 		_emphasise_focus()
-		_frame_focused_specimen()
+		# Issue 2: frame the WHOLE grid ONCE on view-entry only. Switching the active specimen afterwards
+		# (_on_specimen_selected) no longer re-zooms the camera — it just moves the highlight + the readout, so
+		# the user's chosen zoom/pan is preserved while they browse species/variants.
+		_frame_specimens()
 	elif m == VIEW_RELATIONS:
 		_refresh_relations()  # pull species names + the flat FlowMatrix, feed the heatmap (degrades gracefully)
 		_frame_world()  # the heatmap is a fixed Control panel, not world-space — keep the camera neutral
@@ -2576,6 +2601,49 @@ func _log_live_genome(label: String) -> void:
 		_live_specimen_log = (_live_species_logs[_live_species_order[0]] as Dictionary)["entries"]
 
 
+## Issue 4: FORCE-append a new "edit N" variant to the ACTIVE (just-edited) species' history — regardless of the
+## trait dedup — because a whole-species inject is a deliberate user action whose new genome must always show as a
+## new glyph, even when its 5-trait projection is unchanged this frame. First make sure every species' baseline is
+## logged (so the edited species has a "baseline" entry to grow from), then append the freshly re-expressed traits
+## of the active species under an "edit N" caption. The active species is the one whose `key` matches the core's
+## species_key(); falls back to the primary (first SpeciesId). Read-only (inv #2): pure projection of the core's
+## already-edited phenotype + species key into the renderer's history list.
+func _append_active_edit_variant(generation: int) -> void:
+	if _live == null:
+		return
+	# Ensure baselines exist for every species (no-op once seeded; dedups internally).
+	if _live_species_order.is_empty():
+		_log_live_genome("baseline — gen %d" % generation)
+	if _live_species_order.is_empty():
+		return  # observe_species() returned nothing AND _log_primary_genome could not seed — give up gracefully
+	# Resolve the active species' log: prefer the one whose key == species_key(); else the primary (first id).
+	var active_key := ""
+	if _live.has_method("species_key"):
+		active_key = String(_live.species_key())
+	var target_sid: int = int(_live_species_order[0])
+	for sid in _live_species_order:
+		var le: Dictionary = _live_species_logs[sid]
+		if str(le.get("key", "")) == active_key and active_key != "":
+			target_sid = int(sid)
+			break
+	var log_entry: Dictionary = _live_species_logs[target_sid]
+	var entries: Array = log_entry["entries"]
+	# Capture the active species' CURRENT (post-edit, re-expressed) traits from its observe_species row if present,
+	# else from the active observe() phenotype — either is the core's authoritative projection (inv #2).
+	var traits := _capture_live_traits()
+	if _live.has_method("observe_species"):
+		for sp in _live.observe_species():
+			var spd: Dictionary = sp
+			if int(spd.get("species_id", -1)) == target_sid:
+				traits = _capture_traits_from(spd.get("phenotype", {}))
+				break
+	var n := entries.size()  # the first edit after the baseline is "edit 1"
+	entries.append({"label": "edit %d — gen %d" % [maxi(1, n), generation], "traits": traits})
+	# Keep the legacy flat mirror in sync (primary species).
+	if _live_species_order.size() > 0:
+		_live_specimen_log = (_live_species_logs[_live_species_order[0]] as Dictionary)["entries"]
+
+
 ## Single-active-species fallback (older cdylib without observe_species): mirrors the pre-fan-out behaviour, but
 ## ALSO seeds the per-species structures (_live_species_logs / _live_species_order) so _specimen_list() takes the
 ## per-species path and renders the ACTUAL species' baseline glyph at gen 0 — never falling through to the empty
@@ -2648,6 +2716,8 @@ func _specimen_list() -> Array:
 					"traits": ed.get("traits", {}),
 					"key": key,
 					"role": role,  # SP-4: the per-row trophic role (glyph fallback + codex role join)
+					"group": sid,  # issue 5: the SpeciesId — entries sharing it form one grid ROW (species)
+					"species_name": sname,  # the bare species name (for the per-row caption)
 				})
 		return out
 	# File-replay / single-species fallback: the specimens.json baseline+edits, all plant ("default").
@@ -2664,14 +2734,17 @@ func _with_key(spec: Variant) -> Dictionary:
 	var d: Dictionary = (spec as Dictionary).duplicate()
 	if not d.has("key"):
 		d["key"] = "default"
+	if not d.has("group"):
+		d["group"] = 0  # issue 5: file-replay is single-species → all variants share one grid row
 	return d
 
 
-## Build one glyph per specimen (via the key-led GlyphFactory), laid out in a row with a caption. The glyph
+## Build one glyph per specimen (via the key-led GlyphFactory), laid out as a 2D GRID with a caption under each:
+## species stack VERTICALLY (one row each), their variations run HORIZONTALLY to the right (issue 5). The glyph
 ## geometry comes from the core-exported trait vector + role + key (presentation mapping — no biology, inv #2).
 func _render_specimens() -> void:
 	# Synchronous teardown: queue_free() is DEFERRED, so the stale holders would linger in get_children()
-	# this same frame and _emphasise_focus/_frame_focused_specimen (run right after on a view re-entry) would
+	# this same frame and _emphasise_focus / _frame_specimens (run right after on a view re-entry) would
 	# index the wrong (old) holder and dim the real focused plant. remove_child + free drops them at once.
 	for c in _specimen_root.get_children():
 		_specimen_root.remove_child(c)
@@ -2694,25 +2767,53 @@ func _render_specimens() -> void:
 		var role := str(spec.get("role", ""))
 		glyphs.append(GlyphFactory.make(key, role, spec.get("traits", {}), spec, i + 1))
 
-	const GAP := 120.0  # breathing room between adjacent glyph bounding boxes
+	# Issue 5: a 2D GRID — each SPECIES is its own ROW (stacked vertically, one under another); within a species
+	# its VARIATIONS (baseline + edit 1 + edit 2 …) advance HORIZONTALLY to the right. Entries arrive grouped by
+	# species (_specimen_list walks per-species in SpeciesId order), so a change in the `group` field marks a new
+	# row. Holders are still added in flat list order, so child index == focus index (the picker + _emphasise_focus
+	# map unchanged). X uses the same ADAPTIVE half-width spacing as before (glyph sizes vary wildly); each new row
+	# steps Y down by the PREVIOUS row's measured height so a tall mold row never collides with the next.
+	const GAP := 120.0  # breathing room between adjacent glyph bounding boxes within a row
 	const LABEL_W := 220.0
-	var cursor := 0.0  # x of the current cell's ORIGIN
-	var prev_half_right := 0.0  # how far the previous glyph extended to the right of its origin
+	const ROW_GAP := 90.0  # vertical breathing room between species rows
 	var union := Rect2()
 	var has_union := false
+	var cursor := 0.0  # x of the current cell's ORIGIN within the active row
+	var prev_half_right := 0.0  # how far the previous glyph extended to the right of its origin (this row)
+	var row_y := 0.0  # y of the current row's glyph origins
+	var row_top := 0.0  # topmost extent of the current row (most-negative y), measured as we place
+	var row_bottom := 0.0  # bottommost extent of the current row (caption baseline included)
+	var row_started := false
+	var cur_group: Variant = null  # the SpeciesId of the active row (null until the first entry)
 	for i in list.size():
 		var spec: Dictionary = list[i]
 		var glyph: Node2D = glyphs[i]
 		var pb: Rect2 = glyph.bounds()
+		var grp: Variant = spec.get("group", 0)
 		# A glyph extends pb.position.x .. pb.position.x+pb.size.x around its origin. The label box spans ±LABEL_W/2.
 		var half_left := maxf(LABEL_W * 0.5, -pb.position.x)
 		var half_right := maxf(LABEL_W * 0.5, pb.position.x + pb.size.x)
-		if i > 0:
+
+		var new_row: bool = row_started and grp != cur_group
+		if new_row:
+			# Drop to the next row: advance Y below the previous row's lowest extent + the row gap, reset the X cursor.
+			row_y = row_bottom + ROW_GAP - pb.position.y  # align the new glyph's TOP just under the prior row
+			cursor = 0.0
+			prev_half_right = 0.0
+			row_top = row_y + pb.position.y
+			row_bottom = row_y + pb.position.y
+		elif not row_started:
+			row_y = -pb.position.y if pb.position.y < 0.0 else 0.0  # seed the first row at the top
+			row_top = row_y + pb.position.y
+			row_bottom = row_y + pb.position.y
+		if row_started and not new_row:
 			cursor += prev_half_right + GAP + half_left
 		prev_half_right = half_right
+		cur_group = grp
+		row_started = true
 
 		var holder := Node2D.new()
-		holder.position = Vector2(cursor, 0.0)
+		holder.position = Vector2(cursor, row_y)
 		_specimen_root.add_child(holder)
 		holder.add_child(glyph)
 
@@ -2727,6 +2828,10 @@ func _render_specimens() -> void:
 		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		holder.add_child(label)
 
+		# Track this row's vertical extent (glyph top + caption bottom) so the next row drops below it.
+		row_top = minf(row_top, holder.position.y + pb.position.y)
+		row_bottom = maxf(row_bottom, holder.position.y + label.position.y + 44.0)
+
 		var wb := Rect2(holder.position + pb.position, pb.size).merge(
 			Rect2(holder.position + label.position, Vector2(LABEL_W, 44)))
 		if has_union:
@@ -2735,7 +2840,7 @@ func _render_specimens() -> void:
 			union = wb
 			has_union = true
 	_specimen_bounds = union
-	_populate_specimen_picker()  # keep the A1 selector in sync with the rebuilt plant row
+	_populate_specimen_picker()  # keep the A1 selector in sync with the rebuilt grid
 
 
 ## On-screen size of the ecosystem field — the iso diamond bbox under --iso, else the ortho rectangle.
@@ -3257,10 +3362,12 @@ func _populate_specimen_picker() -> void:
 
 
 func _on_specimen_selected(idx: int) -> void:
+	# Issue 2: focus-CHANGE updates only the highlight + the detail/inspect readout — it does NOT re-frame the
+	# camera (the old _frame_focused_specimen() zoom-on-focus is gone), so the current zoom/pan is preserved while
+	# the user switches the active species for labels/details.
 	_focus = idx
 	_update_trait_readout()
 	_emphasise_focus()
-	_frame_focused_specimen()
 
 
 ## Whether the ACTIVE species is the microbe (E. coli) rather than the abstract plant. Routes on the menu stem
@@ -3432,11 +3539,11 @@ func _update_trait_readout() -> void:
 			delta.add_theme_color_override("font_color", Color(0.95, 0.5, 0.45))
 
 
-## Brighten the focused plant; dim the others. Holders are added in _specimen_list() order by _render_specimens.
-## Item 2d (hide the watermark): only the FOCUSED specimen keeps its world-space NAME LABEL (holder child 1)
-## visible. The non-focused glyphs stay dimmed (alpha 0.3) so the row is still legible, but their large
-## low-alpha name text no longer spreads across the viewport and bleeds BEHIND the docked panels — that faint
-## species-name watermark was the artifact in the screenshots. Presentation only (inv #2).
+## Brighten the focused specimen; dim the others. Holders are added in _specimen_list() order by _render_specimens.
+## Issue 3: the per-specimen world-space NAME LABEL (holder child 1) stays VISIBLE under every glyph now. The old
+## "watermark" it produced was an artifact of the auto-zoom-on-focus (issue 2) scaling the world-space text into a
+## giant faded banner; with that zoom removed, the label reads cleanly at the default frame directly under the
+## model. Presentation only (inv #2).
 func _emphasise_focus() -> void:
 	if _specimen_root == null:
 		return
@@ -3444,34 +3551,6 @@ func _emphasise_focus() -> void:
 	for i in kids.size():
 		var holder := kids[i] as Node2D
 		holder.modulate = Color.WHITE if i == _focus else Color(1, 1, 1, 0.3)
-		# Holder layout (see _render_specimens): child 0 = glyph, child 1 = the world-space name label. The label
-		# is WORLD-space so the focus camera zoom scales it into a giant faded watermark bleeding behind the docked
-		# panels. The species name is already shown prominently in the SPECIMEN panel header + the picker dropdown,
-		# so the world-space label is redundant — hide it on EVERY specimen to kill the watermark entirely.
-		if holder.get_child_count() > 1:
-			(holder.get_child(1) as CanvasItem).visible = false
-
-
-## Centre the camera on the focused specimen's plant (falls back to framing the whole row).
-func _frame_focused_specimen() -> void:
-	var kids := _specimen_root.get_children()
-	if _focus < 0 or _focus >= kids.size():
-		_frame_specimens()
-		return
-	var holder := kids[_focus] as Node2D
-	var glyph := holder.get_child(0) as Node2D  # the species glyph (Lsystem | Microbe) is child 0 (label is 2nd)
-	if glyph == null or not glyph.has_method("bounds"):
-		_frame_specimens()
-		return
-	var pb: Rect2 = glyph.bounds()
-	if pb.size == Vector2.ZERO:
-		_frame_specimens()
-		return
-	var wb := Rect2(holder.position + pb.position, pb.size).grow(60.0)
-	var vp := get_viewport_rect().size
-	var z := minf(vp.x / wb.size.x, vp.y / wb.size.y) * 0.9
-	_cam.zoom = Vector2(z, z)
-	_cam.position = wb.position + wb.size * 0.5
 
 
 # ──────────────────────────── mouse interaction: hover tooltip + click detail ────────────────────────────

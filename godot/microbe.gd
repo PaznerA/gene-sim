@@ -187,35 +187,57 @@ func bounds() -> Rect2:
 
 # ──────────────────────────── geometry builders (called from build) ────────────────────────────
 
-## A stadium (capsule) outline, optionally bent into a comma by `curvature` (vibrioid). Top edge L→R, right cap,
-## bottom edge R→L, left cap. The bend rotates each point about the centre proportionally to its x (a sheared arc).
+## A stadium (capsule) outline, optionally bent into a comma by `curvature` (vibrioid). Built as a CENTERLINE-
+## OFFSET ribbon: sample the (straight or arc-bent) spine, offset each sample by ±r along its perpendicular for
+## the top/bottom edges, and close with a semicircular cap at each pole. This produces a SIMPLE (non-self-
+## intersecting) polygon as long as the spine's radius of curvature exceeds r — which holds for our parameter
+## ranges (rad ≈ length/bend ≫ r). The earlier "rotate a pre-built stadium" method pinched the inner edge
+## through the outer edge at strong curvature, yielding a degenerate/non-simple polygon that failed the engine's
+## triangulation (microbe.gd:328). Offsetting a monotone arc centerline cannot self-intersect, so it cannot fail.
 func _capsule(half: float, r: float, curvature: float) -> PackedVector2Array:
-	var straight := maxf(0.0, half - r)
-	var seg := 10
-	var raw := PackedVector2Array()
-	raw.append(Vector2(-straight, -r))
-	raw.append(Vector2(straight, -r))
-	for k in range(1, seg):
-		var a := -PI / 2.0 + PI * float(k) / float(seg)
-		raw.append(Vector2(straight, 0.0) + Vector2(cos(a), sin(a)) * r)
-	raw.append(Vector2(straight, r))
-	raw.append(Vector2(-straight, r))
-	for k in range(1, seg):
-		var a := PI / 2.0 + PI * float(k) / float(seg)
-		raw.append(Vector2(-straight, 0.0) + Vector2(cos(a), sin(a)) * r)
-	if curvature <= 0.01:
-		return raw
-	# Bend: map x∈[-half,half] to an arc of total angle `curvature*~110°`, so the rod becomes a comma/banana.
-	var bend := curvature * deg_to_rad(110.0)
+	var straight := maxf(0.0, half - r)  # half-length of the straight spine between the two semicircular caps
+	var spine_seg := 12  # samples along the centerline (cap → cap)
+	# Sample the centerline spine[i] + its outward unit normal[i], i in [0, spine_seg]. x runs from the LEFT
+	# pole's straight start (-straight) to the RIGHT (+straight). A clamped bend keeps the radius of curvature
+	# comfortably above r (rad = spine_len / bend), so the offset ribbon stays simple even at curvature 1.0.
+	var bend := clampf(curvature, 0.0, 1.0) * deg_to_rad(110.0)
+	var spine_pts: Array = []  # [Vector2]
+	var normals: Array = []  # [Vector2] unit, pointing "up" (towards the top edge)
+	for i in spine_seg + 1:
+		var u := float(i) / float(spine_seg)  # 0..1 along the straight span
+		var x := -straight + u * (2.0 * straight)
+		if bend <= 0.01 or straight <= 0.001:
+			spine_pts.append(Vector2(x, 0.0))
+			normals.append(Vector2(0.0, -1.0))  # straight rod: normal points up
+		else:
+			var t := x / maxf(0.001, straight)  # -1..1 along the spine
+			var ang := t * bend * 0.5
+			var rad := (2.0 * straight) / bend  # arc radius so the spine arc-length ≈ the straight span
+			# Arc position (curving downward as |t| grows) + the tangent's perpendicular as the outward normal.
+			var pos := Vector2(sin(ang) * rad, (1.0 - cos(ang)) * rad)
+			var tangent := Vector2(cos(ang), sin(ang))  # d(pos)/d(ang), unit
+			spine_pts.append(pos)
+			normals.append(Vector2(tangent.y, -tangent.x))  # rotate tangent -90° → consistent "up" normal
 	var out := PackedVector2Array()
-	var rad := (half * 2.0) / maxf(0.001, bend)  # arc radius so the spine arc-length ≈ the rod length
-	for v in raw:
-		var t := v.x / maxf(0.001, half)  # -1..1 along the spine
-		var ang := t * bend * 0.5
-		# Position along the arc + offset by the cross-section y, rotated to the local tangent.
-		var spine := Vector2(sin(ang) * rad, (1.0 - cos(ang)) * rad)
-		var normal := Vector2(cos(ang), sin(ang))  # outward (towards +y of the spine)
-		out.append(spine + normal * v.y)
+	# Top edge: left pole → right pole, offset +r along the up-normal.
+	for i in spine_pts.size():
+		out.append((spine_pts[i] as Vector2) + (normals[i] as Vector2) * r)
+	# Right semicircular cap: sweep from +normal to -normal around the right pole.
+	var rc: Vector2 = spine_pts.back()
+	var rn: Vector2 = normals.back()
+	var cap_seg := 8
+	for k in range(1, cap_seg):
+		var a := PI * float(k) / float(cap_seg)  # 0..π
+		out.append(rc + rn.rotated(a) * r)  # sweep the up-normal OUTWARD (through +tangent) to the down-normal — +a bulges the cap away from the spine; -a would pinch it inward through the body (bowtie)
+	# Bottom edge: right pole → left pole, offset -r along the up-normal.
+	for i in range(spine_pts.size() - 1, -1, -1):
+		out.append((spine_pts[i] as Vector2) - (normals[i] as Vector2) * r)
+	# Left semicircular cap: sweep from -normal back to +normal around the left pole.
+	var lc: Vector2 = spine_pts[0]
+	var ln: Vector2 = normals[0]
+	for k in range(1, cap_seg):
+		var a := PI * float(k) / float(cap_seg)  # 0..π
+		out.append(lc + (-ln).rotated(a) * r)  # from the down-normal OUTWARD back to the up-normal (+a bulges the left cap away from the spine; -a would pinch inward → bowtie)
 	return out
 
 
@@ -323,8 +345,8 @@ func _draw() -> void:
 		draw_circle(h["pos"], h["r"], h["color"])
 	# Body fill + membrane outline, per cell (cocci cluster = several).
 	for poly in _body_polys:
-		if poly.size() < 3:
-			continue
+		if not _polygon_is_drawable(poly):
+			continue  # < 3 pts, non-finite coords, or zero-area (collinear/collapsed) → triangulation would fail
 		draw_colored_polygon(poly, _body_color)
 		if _outline_width > 0.0:
 			var ring := PackedVector2Array(poly)
@@ -356,6 +378,25 @@ func _draw() -> void:
 	# Septum (graded dividing-cell pinch).
 	for s in _septum:
 		draw_line(s["a"], s["b"], _outline_color, float(s.get("w", maxf(1.5, _bounds.size.y * 0.05))), true)
+
+
+## Defensive draw-guard: is this body polygon a valid, non-degenerate simple-area polygon the renderer can
+## triangulate? Rejects < 3 points, any non-finite coordinate, and a zero-area (collinear / collapsed /
+## duplicate-point) ring — exactly the cases that make Godot's canvas_item_add_polygon log "triangulation
+## failed" (the inv-#4 headless gate never runs _draw, so this is a runtime belt-and-braces on top of the
+## generation fix in _capsule). Presentation only (inv #2): no biology, just geometry validity.
+func _polygon_is_drawable(poly: PackedVector2Array) -> bool:
+	if poly.size() < 3:
+		return false
+	# Twice the signed area (shoelace). |area| below epsilon → degenerate (a line / a point) → skip.
+	var area2 := 0.0
+	for i in poly.size():
+		var p: Vector2 = poly[i]
+		if not (is_finite(p.x) and is_finite(p.y)):
+			return false
+		var q: Vector2 = poly[(i + 1) % poly.size()]
+		area2 += p.x * q.y - q.x * p.y
+	return absf(area2) > 0.5  # > 0.25 px² of actual area — anything tinier is visually nothing anyway
 
 
 ## Deterministic [0,1) hash for per-glyph jitter (no global RNG — inv #3 hygiene). Mirrors lsystem.gd::_hash01.
