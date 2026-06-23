@@ -66,9 +66,9 @@ if ! printf '%s' "$OUT" | grep -q "snapshot OK"; then
   exit 1
 fi
 echo "GODOT READER OK — $(printf '%s' "$OUT" | grep 'snapshot OK')"
-# GSS4 channel-count contract: a silent channel-count regression (e.g. a stale 9-channel reader, or a
-# producer that drops the 3 chem planes) goes RED here. main.gd prints `channels=%d` from the file header.
-printf '%s' "$OUT" | grep -q "channels=12" || { echo "FAIL — expected channels=12 (GSS4 chem planes), got:"; printf '%s\n' "$OUT"; exit 1; }
+# GSS5 channel-count contract: a silent channel-count regression (e.g. a stale 12-channel reader, or a
+# producer that drops the dominant_species_id plane) goes RED here. main.gd prints `channels=%d` from the header.
+printf '%s' "$OUT" | grep -q "channels=13" || { echo "FAIL — expected channels=13 (GSS5 + dominant_species_id plane), got:"; printf '%s\n' "$OUT"; exit 1; }
 
 # 2. S4.3 render scene (headless build smoke) — ISOMETRIC (default, P3) AND orthographic (--ortho opt-out).
 # SP-4: --check now ALSO builds every baked species' glyph via the key-led factory (prints glyphs=N) and

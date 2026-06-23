@@ -2082,12 +2082,14 @@ impl Simulation {
         let generation = self.world.resource::<Tick>().0;
 
         // Collect organisms in STABLE OrgId order (decouples from ECS archetype iteration — inv. #3),
-        // carrying each one's REAL world Position (ADR-011 S-C — no longer the OrgId-hash layout).
-        let mut rows: Vec<(u64, f64, i64, u32, u32)> = self
+        // carrying each one's REAL world Position (ADR-011 S-C — no longer the OrgId-hash layout) AND its
+        // Species tag (GSS5: the per-cell dominant-species projection). Reading the already-spawned Species
+        // ordinal draws ZERO SimRng and mutates nothing — a read-only display projection (inv #2/#3).
+        let mut rows: Vec<(u64, f64, i64, u32, u32, u16)> = self
             .world
-            .query::<(&OrgId, &Genotype, &Energy, &Position)>()
+            .query::<(&OrgId, &Genotype, &Energy, &Position, &Species)>()
             .iter(&self.world)
-            .map(|(id, g, e, p)| (id.0, g.0, e.0, p.x, p.y))
+            .map(|(id, g, e, p, s)| (id.0, g.0, e.0, p.x, p.y, s.0.ordinal()))
             .collect();
         rows.sort_unstable_by_key(|r| r.0);
         let population = rows.len() as u32;
@@ -2096,8 +2098,12 @@ impl Simulation {
         let mut count = vec![0u32; cells];
         let mut genotype_sum = vec![0.0f64; cells];
         let mut energy_sum = vec![0.0f64; cells];
+        // Per-cell species tally (GSS5). A small `Vec<(SpeciesId ordinal, count)>` per cell kept SORTED by
+        // ordinal — no `HashMap` (inv #3) — so the most-populous id with a LOWEST-ordinal tiebreak is a
+        // single deterministic linear scan. Rosters are tiny (≤ a handful), so the per-cell Vec stays short.
+        let mut species_tally: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cells];
 
-        for (_id, g, e, px, py) in &rows {
+        for (_id, g, e, px, py, sid) in &rows {
             // Resample the organism's REAL world cell (px,py on WORLD_DIMS) onto the render grid — no RNG,
             // no OrgId hash. Clamp guards the top edge when render dims exceed the world grid.
             let x = ((u64::from(*px) * u64::from(width)) / u64::from(WORLD_DIMS.0))
@@ -2108,12 +2114,19 @@ impl Simulation {
             count[cell] += 1;
             genotype_sum[cell] += *g;
             energy_sum[cell] += *e as f64; // i64 energy → f64 for the (display-only) fitness channel mean
+                                           // Tally this organism's species into the cell's ordinal-sorted bucket (insertion keeps it sorted).
+            let tally = &mut species_tally[cell];
+            match tally.binary_search_by_key(sid, |&(s, _)| s) {
+                Ok(idx) => tally[idx].1 += 1,
+                Err(idx) => tally.insert(idx, (*sid, 1)),
+            }
         }
 
         let max_count = count.iter().copied().max().unwrap_or(0);
         let mut density = vec![0.0f32; cells];
         let mut allele_freq = vec![0.0f32; cells];
         let mut fitness = vec![0.0f32; cells];
+        let mut dominant_species_id = vec![0.0f32; cells];
         for c in 0..cells {
             let n = count[c];
             if n == 0 {
@@ -2125,6 +2138,18 @@ impl Simulation {
             allele_freq[c] = (genotype_sum[c] / f64::from(n)) as f32;
             // Mean energy normalized to [0,1] by ENERGY_FULL for the f32 fitness channel (display-only).
             fitness[c] = (energy_sum[c] / f64::from(n) / (ENERGY_FULL as f64)) as f32;
+            // GSS5: the MOST-POPULOUS SpeciesId in the cell; the ordinal-sorted Vec means the FIRST max found
+            // is automatically the lowest-ordinal one (deterministic tiebreak → lowest SpeciesId). A u16
+            // ordinal round-trips through f32 exactly (the renderer reads it back as an integer id).
+            let mut best_id = 0u16;
+            let mut best_n = 0u32;
+            for &(sid, sn) in &species_tally[c] {
+                if sn > best_n {
+                    best_n = sn;
+                    best_id = sid;
+                }
+            }
+            dominant_species_id[c] = f32::from(best_id);
         }
 
         // Resample the static soil field onto the snapshot grid (read-only, no RNG → off the hash path).
@@ -2234,6 +2259,7 @@ impl Simulation {
             toxin,
             kin,
             alarm,
+            dominant_species_id,
         }
     }
 
@@ -4300,6 +4326,118 @@ mod tests {
         let snap = sim.snapshot(8, 8);
         let max = snap.density.iter().copied().fold(0.0f32, f32::max);
         assert_eq!(max, 1.0, "busiest cell should have density 1.0");
+    }
+
+    #[test]
+    fn snapshot_single_species_dominant_id_is_uniformly_zero() {
+        // GSS5: a single-species (default plant) run tags every organism Species(SpeciesId(0)), so EVERY
+        // populated cell's dominant id is 0 and every empty cell stays 0 — the plane is uniformly 0.0. This is
+        // the byte-identical-for-single-species guarantee at the channel level (the hash test below pins it).
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 12,
+            entity_count: 400,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let snap = sim.snapshot(16, 16);
+        assert_eq!(snap.dominant_species_id.len(), 16 * 16);
+        assert!(
+            snap.dominant_species_id.iter().all(|&v| v == 0.0),
+            "a single-species run's dominant_species_id plane must be uniformly 0"
+        );
+    }
+
+    #[test]
+    fn snapshot_dominant_species_id_picks_most_populous_with_lowest_id_tiebreak() {
+        // GSS5: in a multi-species world each populated cell reports the MOST-POPULOUS SpeciesId, ties broken
+        // to the LOWEST id. Cross-check the channel against an independent per-cell tally rebuilt from the live
+        // (Position, Species) components — they must agree exactly. Also assert the channel actually carries
+        // more than one distinct id (so the projection is exercised, not trivially all-zero).
+        let roster = vec![
+            RosterEntry {
+                name: "a".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 300,
+                role: gp::TrophicRole::default(),
+                host_key: None,
+            },
+            RosterEntry {
+                name: "b".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 300,
+                role: gp::TrophicRole::default(),
+                host_key: None,
+            },
+            RosterEntry {
+                name: "c".to_string(),
+                key: "default".to_string(),
+                genome: genome::sample_genome(),
+                gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                entity_count: 300,
+                role: gp::TrophicRole::default(),
+                host_key: None,
+            },
+        ];
+        let cfg = SimConfig {
+            seed: 9,
+            generations: 8,
+            entity_count: 100,
+        };
+        let (w, h) = (24u32, 24u32);
+        let mut sim = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster);
+        sim.step(cfg.generations);
+
+        // Independent reference: per-cell per-species counts straight from the live components, resampled with
+        // the SAME world→render integer map snapshot() uses, then argmax with a lowest-id tiebreak.
+        let cells = (w as usize) * (h as usize);
+        let mut tally: Vec<std::collections::BTreeMap<u16, u32>> = vec![Default::default(); cells];
+        let mut rows: Vec<(u64, u32, u32, u16)> = sim
+            .world
+            .query::<(&OrgId, &Position, &Species)>()
+            .iter(&sim.world)
+            .map(|(id, p, s)| (id.0, p.x, p.y, s.0.ordinal()))
+            .collect();
+        rows.sort_unstable_by_key(|r| r.0);
+        for (_id, px, py, sid) in &rows {
+            let x = ((u64::from(*px) * u64::from(w)) / u64::from(WORLD_DIMS.0))
+                .min(u64::from(w) - 1) as usize;
+            let y = ((u64::from(*py) * u64::from(h)) / u64::from(WORLD_DIMS.1))
+                .min(u64::from(h) - 1) as usize;
+            *tally[y * (w as usize) + x].entry(*sid).or_insert(0) += 1;
+        }
+
+        let snap = sim.snapshot(w, h);
+        let mut distinct = std::collections::BTreeSet::new();
+        for (c, cell_tally) in tally.iter().enumerate() {
+            // Reference argmax: BTreeMap iterates ascending by id, so the first strictly-greater count wins →
+            // lowest-id tiebreak (matches snapshot()).
+            let mut best_id = 0u16;
+            let mut best_n = 0u32;
+            for (&sid, &n) in cell_tally {
+                if n > best_n {
+                    best_n = n;
+                    best_id = sid;
+                }
+            }
+            let want = f32::from(best_id);
+            assert_eq!(
+                snap.dominant_species_id[c], want,
+                "cell {c}: dominant_species_id must be the most-populous (lowest-id tiebreak) species"
+            );
+            if snap.density[c] > 0.0 {
+                distinct.insert(snap.dominant_species_id[c].to_bits());
+            }
+        }
+        assert!(
+            distinct.len() >= 2,
+            "a 3-species run should leave at least two distinct dominant ids across the field, got {}",
+            distinct.len()
+        );
     }
 
     #[test]

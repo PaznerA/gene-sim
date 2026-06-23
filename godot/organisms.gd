@@ -22,6 +22,7 @@ const MAX_DOTS_PER_CELL := 5
 const DOT_RADIUS_SCALE := 0.55  # demoted "activity pip" dots under each plant render at this × the old radius
 const LOD_MIN_CELL := 5.0  # below this on-screen cell size, draw dots only (sprites would be sub-pixel clutter)
 const ALLELE_HUE_SHIFT := 0.12  # allele_freq shifts the hue ±this AROUND the species base hue (within-species cline)
+const SpeciesVisualMap := preload("res://species_visual_map.gd")
 
 var _w: int = 0
 var _h: int = 0
@@ -31,6 +32,13 @@ var _allele: PackedFloat32Array
 var _fitness: PackedFloat32Array
 var _moisture: PackedFloat32Array
 var _nutrients: PackedFloat32Array
+# GSS5: per-cell dominant SpeciesId ordinal (row-major, w*h) the core exported. Drives the per-cell SIZE + base
+# COLOR via _species_table so each cell's organisms render at their dominant species' real-cell scale (plant
+# LARGE, microbes small, symbionts tiny) instead of one shared density-derived radius. Empty → all-default.
+var _dominant: PackedFloat32Array
+# species_id:int -> {size:float, color:Color, is_plant:bool}; built in main.gd via SpeciesVisualMap.build_table
+# from observe_species(). Empty (file-replay / pre-feed) → every cell uses the default plant visual (graceful).
+var _species_table: Dictionary = {}
 var _iso = null  # iso.gd instance; when set, markers are placed in isometric screen space + depth-sorted
 var _sprites_on: bool = true  # renderer-only: plants vs plain dots (no biology — pure presentation state)
 
@@ -124,6 +132,30 @@ func _compute_glyph_params(t: Dictionary, key: String) -> Dictionary:
 	}
 
 
+## Set the per-cell dominant SpeciesId plane (GSS5, from snap.dominant_species_id) + the species-id → visual
+## lookup (built in main.gd from observe_species() via SpeciesVisualMap.build_table). Together they let the
+## per-cell draw size + colour each cell's organisms by its DOMINANT species' real-cell scale, instead of one
+## shared density radius. Pure presentation (inv #2): the core decided which species dominates each cell; this
+## maps that id → pixels. Either argument may be empty (file-replay / older cdylib) → the draw falls back to the
+## default plant visual gracefully. queue_redraw so a changed map repaints.
+func set_dominant_species_ids(dominant: PackedFloat32Array, species_table: Dictionary) -> void:
+	_dominant = dominant
+	_species_table = species_table
+	queue_redraw()
+
+
+## The {size, color, is_plant} visual for the dominant species at cell index `i`. Reads _dominant (the GSS5
+## plane) → species_table. Graceful: a missing plane / unknown id → the default plant visual (never a crash).
+func _cell_visual(i: int) -> Dictionary:
+	if i < 0 or i >= _dominant.size():
+		return {"size": 1.0, "color": Color(0.36, 0.62, 0.24), "is_plant": true}
+	var sid := int(round(_dominant[i]))
+	if _species_table.has(sid):
+		return _species_table[sid]
+	# Unknown id (empty table on file-replay, or a species absent from observe_species) → a neutral default.
+	return {"size": SpeciesVisualMap.SIZE_DEFAULT, "color": SpeciesVisualMap.COLOR_DEFAULT, "is_plant": true}
+
+
 ## Point the layer at a parsed snapshot (snapshot.gd instance) and a cell size in pixels, then redraw.
 func set_snapshot(snap, cell: float) -> void:
 	_w = snap.width
@@ -134,6 +166,10 @@ func set_snapshot(snap, cell: float) -> void:
 	_fitness = snap.fitness
 	_moisture = snap.soil_moisture  # soil channels drive ground tint / canopy fullness (presentation only)
 	_nutrients = snap.soil_nutrients
+	# GSS5: pull the per-cell dominant-species plane straight off the snapshot so a freshly-fed snapshot is always
+	# size-aware even if set_dominant_species_ids wasn't called separately (the table may still be empty → default).
+	if "dominant_species_id" in snap:
+		_dominant = snap.dominant_species_id
 	if _glyph_params.is_empty():
 		# File-replay or pre-feed: neutral 0.5s so the field still renders as a plausible green population.
 		_glyph_params = _compute_glyph_params({}, _species_key)
@@ -168,9 +204,17 @@ func _draw() -> void:
 		var fit := clampf(_fitness[i], 0.0, 1.0)
 		var allele := clampf(_allele[i], 0.0, 1.0)
 		var markers := clampi(int(ceil(dens * float(MAX_DOTS_PER_CELL))), 1, MAX_DOTS_PER_CELL)
-		# Per-cell colour: the species base hue, shifted ±0.12 by allele_freq (the selection cline stays legible
-		# WITHIN the species palette), brightened by fitness. Same for the LOD dot so no scope shows a flat marker.
-		var col := _organism_color(allele, fit, base_hue)
+		# GSS5 per-cell species sizing/colouring: the DOMINANT species of THIS cell (core-exported id → visual)
+		# sets the radius (plant LARGE … symbiont tiny) and the base colour, so adjacent species read at their
+		# real relative scale instead of one shared density radius. Empty plane/table → the default plant visual.
+		var vis := _cell_visual(i)
+		var cell_r := base_r * float(vis.get("size", 1.0))
+		var cell_is_plant: bool = bool(vis.get("is_plant", not is_microbe))
+		# Per-cell colour: blend the SPECIES base colour (from the visual table) toward the fitness-brightened
+		# allele cline so selection stays legible WITHIN the species palette. Same for the LOD dot so no scope
+		# shows a flat marker. _cell_base_hue derives a hue from the table colour, falling back to the run hue.
+		var cell_hue := _hue_of(vis.get("color", null), base_hue)
+		var col := _organism_color(allele, fit, cell_hue)
 
 		# Anchor: iso lifts onto the tile's terrain relief; ortho roots near the cell's lower edge. Both grow
 		# toward screen-up (Vector2(0,-1)) as billboards, so the SAME sprite math works in either mode.
@@ -190,27 +234,32 @@ func _draw() -> void:
 			else:
 				p = base + Vector2(jx * _cell * 0.7, jy * _cell * 0.5)
 			if _sprites_on and not lod_dots_only:
-				# Route the per-cell draw on the SPECIES key: a microbe rod-blob for E. coli, the plant otherwise.
-				if is_microbe:
-					_draw_microbe_sprite(p, col, fit, dens, x, y, k)
+				# Route the per-cell draw on the cell's DOMINANT species (GSS5): a plant L-sprite for autotrophs,
+				# else a microbe rod-blob — sized by the species' real-cell SIZE multiplier (vis.size). Falls back
+				# to the run-level is_microbe flag when no dominant plane/table is present (file-replay).
+				var size_scale := float(vis.get("size", 1.0))
+				if cell_is_plant:
+					_draw_plant(p, col, fit, dens, x, y, k, size_scale)
 				else:
-					_draw_plant(p, col, fit, dens, x, y, k)
-				_draw_dot(p, col, rim, base_r * DOT_RADIUS_SCALE)  # demoted activity pip at the foot
+					_draw_microbe_sprite(p, col, fit, dens, x, y, k, size_scale)
+				_draw_dot(p, col, rim, cell_r * DOT_RADIUS_SCALE)  # demoted activity pip at the foot, species-sized
 			else:
-				# LOD / sprites-off: a TRAIT-TINTED dot (species hue + allele shift + fitness brightness) so even
-				# the zoomed-out field scope is varied and species-distinct by palette — no generic uniform marker.
-				_draw_dot(p, col, rim, base_r)
+				# LOD / sprites-off: a TRAIT-TINTED dot at the species' real-cell radius (cell_r) — even the
+				# zoomed-out field scope is species-distinct by SIZE + palette, not one generic uniform marker.
+				_draw_dot(p, col, rim, cell_r)
 
 
 ## One procedural plant standing at foot `p`. The SPECIES template (`_glyph_params`: stature→height, branchiness→
 ## morph bias + extra strokes + clumps, leaf_size→canopy, growth→thickness, leaf_hue+reflectance→palette via
 ## `col`, drought→leaf aspect, fecundity→flower, ksl→sway) sets the shape; the per-CELL fitness/density/soil
 ## modulate vigor on top. Presentation only — no biology; all randomness is _hash01(x,y,k).
-func _draw_plant(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int, k: int) -> void:
+func _draw_plant(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int, k: int, size_scale: float = 1.0) -> void:
 	var hh := _hash01(x, y, k * 7)
 	var up := Vector2(0.0, -1.0)
 	var nutrient := _soil_at(_nutrients, x, y)
 	var moist := _soil_at(_moisture, x, y)
+	# GSS5: the per-cell effective cell metric scales the whole sprite by the dominant species' real-cell size.
+	var ec := _cell * maxf(0.2, size_scale)
 	var stem_h_mul: float = float(_glyph_params.get("stem_h_mul", 1.0))
 	var stem_w_mul: float = float(_glyph_params.get("stem_w_mul", 1.0))
 	var leaf_mul: float = float(_glyph_params.get("leaf_mul", 1.0))
@@ -221,10 +270,10 @@ func _draw_plant(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int
 	var clumps: int = int(_glyph_params.get("clumps", 1))
 	var fec: float = float(_glyph_params.get("fecundity", 0.0))
 	# Height = species template (stature/growth) × per-cell fitness vigor, capped so depth order holds.
-	var stem_h := minf(_cell * (0.35 + 0.85 * fit) * stem_h_mul * (0.85 + 0.3 * hh), _cell * 1.4)
-	var stem_w := maxf(1.0, _cell * 0.05 * stem_w_mul)
-	var sway := (hh - 0.5) * _cell * 0.18 * (0.4 + (1.0 - fit)) * sway_gain  # ksl + low fitness lean more
-	var leaf := _cell * (0.10 + 0.18 * fit) * leaf_mul * (1.0 + 0.25 * nutrient)  # rich soil → fuller canopy
+	var stem_h := minf(ec * (0.35 + 0.85 * fit) * stem_h_mul * (0.85 + 0.3 * hh), ec * 1.4)
+	var stem_w := maxf(1.0, ec * 0.05 * stem_w_mul)
+	var sway := (hh - 0.5) * ec * 0.18 * (0.4 + (1.0 - fit)) * sway_gain  # ksl + low fitness lean more
+	var leaf := ec * (0.10 + 0.18 * fit) * leaf_mul * (1.0 + 0.25 * nutrient)  # rich soil → fuller canopy
 
 	# Ground-contact shadow, tinted darker/bluer where the soil is wet (lush) vs pale where dry.
 	var shadow := Color(0.0, 0.0, 0.0, 0.18).lerp(Color(0.02, 0.05, 0.12, 0.26), moist)
@@ -261,7 +310,7 @@ func _draw_plant(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int
 			for j in blades:
 				var f := (float(j) / float(maxi(1, blades - 1))) - 0.5
 				var bh := stem_h * (0.7 + 0.3 * _hash01(x, y, k * 5 + j))
-				draw_line(p, p + Vector2(f * _cell * 0.5, -bh), col, maxf(1.0, stem_w * 0.7))
+				draw_line(p, p + Vector2(f * ec * 0.5, -bh), col, maxf(1.0, stem_w * 0.7))
 		_:  # shrub — a round canopy body (clump lobes) + a lighter highlight
 			for c in clumps:
 				var off := Vector2((_hash01(x, y, c * 11) - 0.5) * leaf, -(_hash01(x, y, c * 13)) * leaf * 0.6)
@@ -277,8 +326,10 @@ func _draw_plant(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int
 ## rod/capsule: length ← growth, width ← glucose, tint ← respiration (via `col`), 0–2 flagella ← glucose,
 ## granule speck ← fermentation, acetate halo speck ← acetate overflow. Per-cell fitness/density modulate vigor.
 ## Presentation only (inv #2) — the 5 microbe traits were expressed by the Rust core; this is trait→pixels.
-func _draw_microbe_sprite(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int, k: int) -> void:
+func _draw_microbe_sprite(p: Vector2, col: Color, fit: float, dens: float, x: int, y: int, k: int, size_scale: float = 1.0) -> void:
 	var hh := _hash01(x, y, k * 7)
+	# GSS5: scale the rod by the dominant species' real-cell size (a Bdellovibrio speck is far smaller than a rod).
+	var ec := _cell * maxf(0.2, size_scale)
 	var rod_len: float = float(_glyph_params.get("rod_len", 1.0))
 	var rod_width: float = float(_glyph_params.get("rod_width", 0.4))
 	var flagella: int = int(_glyph_params.get("flagella", 0))
@@ -287,8 +338,8 @@ func _draw_microbe_sprite(p: Vector2, col: Color, fit: float, dens: float, x: in
 	var acetate: float = float(_glyph_params.get("acetate", 0.0))
 	var moist := _soil_at(_moisture, x, y)
 	# Rod dimensions: species template × per-cell fitness vigor. Lies horizontal (substrate lawn), slight tilt.
-	var half_len := _cell * 0.5 * rod_len * (0.55 + 0.45 * fit)
-	var width := maxf(1.5, _cell * 0.5 * rod_width * (0.7 + 0.3 * fit))
+	var half_len := ec * 0.5 * rod_len * (0.55 + 0.45 * fit)
+	var width := maxf(1.5, ec * 0.5 * rod_width * (0.7 + 0.3 * fit))
 	var tilt := (hh - 0.5) * 0.5  # small per-cell tilt so the lawn isn't a grid of identical rods
 	var axis := Vector2(cos(tilt), sin(tilt))
 	var a := p - axis * half_len
@@ -339,6 +390,15 @@ func _soil_at(arr: PackedFloat32Array, x: int, y: int) -> float:
 	if i < 0 or i >= arr.size():
 		return 0.0
 	return clampf(arr[i], 0.0, 1.0)
+
+
+## The HUE of a species visual-table colour (GSS5), so the per-cell allele/fitness cline shifts WITHIN that
+## species' palette. `fallback` (the run-level base hue) is used when no table colour is present (file-replay /
+## unknown id) — graceful. Pure presentation: a Color→hue read, no biology.
+func _hue_of(color, fallback: float) -> float:
+	if color is Color:
+		return (color as Color).h
+	return fallback
 
 
 ## (allele_freq, fitness, species base_hue) → Color. allele_freq SHIFTS the hue ±0.12 AROUND the species base
