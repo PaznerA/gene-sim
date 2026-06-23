@@ -183,6 +183,30 @@ and (b) be a subclass (`is_a`) of an existing SO/GO term in the graph, **before*
 
 ---
 
+## 6. Codex (player-facing annotation layer) 🔭 (Stage 4/SP-4 — renderer-only)
+
+The **codex** is a static display-content layer (`data/codex/codex.json`, mirrored to `res://data/codex/`)
+that annotates — never derives — biology the core computed. It is keyed entirely on ids the core already
+exports, so it carries **no logic** and lives outside the sim path (inv #2: renderer-only):
+
+| Codex table | Joins on | Core source of truth |
+|-------------|----------|----------------------|
+| `species[]` | `key` | `data/species/*.json` `key` |
+| `genes[]`   | `go` (+ `so`) | a locus's `tags.go_refs` / `tags.so_term` (exported by the widened `LiveSim::loci()`) |
+| `roles[]`   | `id` | `gp::TrophicRole` (`role_from_str`: autotroph/heterotroph/mixotroph/decomposer/predator/symbiont) |
+| `flows[]`   | `from_role`/`to_role` | the FlowMatrix edges |
+
+Each entry carries the three annotation axes — **taxonomy** (classification), **ontology** (the SO/GO
+molecular-function meaning), **phenology** (life-cycle/timing) — plus a `famous_fact` and `sources[]`.
+A missing entry degrades to the bare exported ids (never an error), so a species can ship before its codex
+copy exists. Iteration is over the ordered arrays, never a Dictionary's keys (inv #3 UI hygiene). Loaded by
+`godot/codex.gd` (a `preload`-then-`.new()` singleton, NOT `class_name`); surfaced in the INSPECT card (the
+6-section per-specimen card), hover tooltips, and the per-morphotype glyph chrome. The codex is staged into the
+`res://` PCK by `run.sh`, `tools/check_godot_snapshot.sh` (byte-equality `CODEX MIRROR OK` guard), and
+`release.yml` (both exports), exactly mirroring the `data/species` convention.
+
+---
+
 ## 5. Determinism notes (cross-cutting, inv. #3)
 - Genome/Locus/Parameter/Ontology iteration is over `Vec`s in stable order. `HashMap`/`HashSet` may be used
   for lookup caches but are **never iterated** to produce state or hashes (use sorted keys / `IndexMap`).

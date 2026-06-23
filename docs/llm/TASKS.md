@@ -68,8 +68,17 @@ on this principle; the predator's overshoot-crash is real and is recovered by re
   Mode-A contaminants Mycoplasma/Bacillus/Pseudomonas/Staph/Cutibacterium/Aspergillus/Penicillium → RegionInoculate
   → containment schedule → renderer panel+markers); **S4 (spore/dormancy reservoir) + S5 (Mode B obligate symbionts:
   Carsonella/Syn3.0/Hodgkinia — `ObligateSymbiont` role + host edge) are 🔁 RE-PINS** (separate sign-off).
-- [~] **SP-4 codex** — phenology/ontology/taxonomy descriptions (`docs/llm/proposals/sp4-codex-content-draft.md` drafted:
-  E.coli K-12 + 5 anchor genes around the pyruvate node, Bdellovibrio biphasic life cycle, trophic roles/flows).
+- [~] **SP-4 codex + specimen-view upgrade** — phenology/ontology/taxonomy descriptions + evidence-driven
+  morphology + rich inspect (`docs/llm/proposals/sp4-codex-content-draft.md`). **DELIVERED (HASH-NEUTRAL, pin
+  `0x47a0` unchanged):** `data/codex/codex.json` (12 species + 12 genes + 6 roles + 4 flows) + `godot/codex.gd`
+  loader; the key-led `godot/glyph_factory.gd` + generalized `godot/microbe.gd` (rod/coccus/vibrioid/wall-less +
+  endospore/biofilm/host-ring) + new `godot/mold.gd` (hyphae + conidiophore); the 6-section `_fill_specimen_detail`
+  inspect card (FIXES the live-mode wrong-loci bug + the title-only pin) + codex tooltips; `TRAIT_KEY_MAP` +
+  `_active_trait_keys` carry the dropped predation/sporulation/symbiosis rows; `LiveSim::loci()` widened with
+  `so_term`+`go_refs` (additive, off-hash); the res:// STAGING FIX (run.sh + `check_godot_snapshot.sh`
+  `CODEX MIRROR OK` + `--check` glyphs=13/codex=OK + release.yml both exports stage species+codex into the PCK).
+  All 5 GDScripts parse clean headless; gate green. *(Follow-up: the browsable CODEX panel §2.3 — out of the
+  load-bearing scope; a clean follow-up.)*
 - [ ] **Rendering & platform** (`docs/llm/proposals/rendering-platform-architecture-draft.md` drafted) — ONE
   deterministic core → MANY read-only renderers: UE5 realistic (C-ABI cdylib + thin UE plugin / shm IPC; Niagara +
   Grid2D) · web (sim-core→wasm32 + multi-ISA-wasm leg, or godot web export) · the perf roadmap.

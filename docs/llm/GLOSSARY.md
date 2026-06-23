@@ -27,6 +27,22 @@
 - **NCBI Taxonomy** — clade/lineage nodes; extended as in-game lineages emerge.
 - **Ontology extension boundary** — the schema-validated gate where the LLM may add new SO/GO subclasses
   (Stage 5). The only place new "genes" enter the sim.
+- **Codex** — the player-facing encyclopedia layer: a static `data/codex/codex.json` of authored
+  **taxonomy / ontology / phenology** copy for each species, anchor gene, trophic role, and trophic flow.
+  Renderer-only (inv #2): it *annotates* core-exported ids (species `key`, locus `go`/`so`, `TrophicRole`,
+  FlowMatrix edges), never computes biology. Surfaces: the INSPECT card, hover tooltips, the per-morphotype
+  glyph chrome. Missing entry → graceful degrade to bare ids. Loaded by `godot/codex.gd`.
+- **Anchor gene** — a GO-tagged locus the genotype→phenotype map binds a `Trait` to (E. coli: `gltA`/GO:0004108
+  →GrowthRate, `ptsG`/GO:0008982→GlucoseUptake, `pflB`/GO:0008861→RespirationMode, `pta`/GO:0008959→
+  AcetateOverflow, `ldhA`/GO:0008720→FermentationCapacity; Bdellovibrio `amiB_like`/GO:0008745→PredationCapacity;
+  Bacillus `spo0A`/`sigF`→SporulationCapacity; the molds `brlA`/`abaA`→SporulationCapacity; Carsonella
+  `tuf`/GO:0006414→GrowthRate + `leuB_provision`/GO:0008652→SymbiosisCapacity). The CRISPR levers; each is a
+  codex `genes[]` entry.
+- **Morphotype** — the renderer's per-species body family chosen by the key-led `glyph_factory.gd`
+  (`MORPH_BY_KEY`, role-fallback for an un-tabled key): PLANT (L-system) · ROD (E. coli/cutibacterium/
+  pseudomonas/Bacillus) · VIBRIOID (Bdellovibrio comma) · COCCI (staph grape-cluster) · MOLD (Aspergillus
+  vesicle / Penicillium brush) · PLEOMORPH (wall-less mycoplasma) · SYMBIONT (Carsonella/Syn3 speck). Pure
+  presentation (inv #2): trait scalars + role + key → pixels, no biology.
 
 ## Engineering / sim
 - **Headless** — runs with no renderer/window (SPEC inv. #4). The core is headless-first.

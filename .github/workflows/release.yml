@@ -124,6 +124,17 @@ jobs:
           linux.x86_64.release = "res://libgodot_sim.so"
           EOF
 
+      - name: Stage data into res:// before export
+        run: |
+          set -euo pipefail
+          # Embed species + codex JSON into the PCK: the renderer reads res://data/{species,codex}/*.json via
+          # FileAccess, which in an EXPORTED build resolves ONLY against the PCK. godot/data/ is the gitignored
+          # generated mirror; without this step neither species (a pre-existing PCK gap) nor the SP-4 codex are
+          # embedded. data/{species,codex}/ at repo-root are the committed sources of truth.
+          mkdir -p godot/data/species godot/data/codex
+          cp data/species/*.json godot/data/species/
+          cp data/codex/*.json godot/data/codex/
+
       - name: Export the Linux game executable
         run: |
           set -euo pipefail
@@ -152,8 +163,10 @@ jobs:
           cp build/libgodot_sim.so "$root/opt/gene-sim/libgodot_sim.so"
           # Species data must sit BESIDE the binary so LiveSim::set_species resolves it in the shipped build
           # (the cwd is not the repo root there) — the "RUN E. coli" feature needs data/species/*.json (ADR-017).
-          mkdir -p "$root/opt/gene-sim/data/species"
+          # The codex rides along (belt-and-suspenders beside-binary copy; the PCK embed above is the primary path).
+          mkdir -p "$root/opt/gene-sim/data/species" "$root/opt/gene-sim/data/codex"
           cp data/species/*.json "$root/opt/gene-sim/data/species/"
+          cp data/codex/*.json "$root/opt/gene-sim/data/codex/"
           chmod 755 "$root/opt/gene-sim/gene-sim.x86_64"
           cat > "$root/usr/bin/gene-sim" <<'EOF'
           #!/bin/sh
@@ -236,6 +249,16 @@ jobs:
           windows.x86_64.release = "res://godot_sim.dll"
           EOF
 
+      - name: Stage data into res:// before export
+        run: |
+          set -euo pipefail
+          # Embed species + codex JSON into the PCK (the renderer reads res://data/{species,codex}/*.json via
+          # FileAccess, which in an exported build resolves ONLY against the PCK). Closes the pre-existing species
+          # PCK gap + embeds the SP-4 codex. godot/data/ is the gitignored generated mirror.
+          mkdir -p godot/data/species godot/data/codex
+          cp data/species/*.json godot/data/species/
+          cp data/codex/*.json godot/data/codex/
+
       - name: Export the Windows game executable
         run: |
           set -euo pipefail
@@ -243,9 +266,10 @@ jobs:
           /tmp/godot/godot.exe --headless --path godot --import 2>/dev/null || true
           /tmp/godot/godot.exe --headless --path godot --export-release "Windows Desktop" "$(pwd)/build/gene-sim.exe"
           [ -f build/godot_sim.dll ] || cp crates/godot-sim/target/release/godot_sim.dll build/godot_sim.dll
-          # Species data beside the .exe so LiveSim::set_species resolves it in the shipped build ("RUN E. coli").
-          mkdir -p build/data/species
+          # Species + codex data beside the .exe (belt-and-suspenders; the PCK embed above is the primary path).
+          mkdir -p build/data/species build/data/codex
           cp data/species/*.json build/data/species/
+          cp data/codex/*.json build/data/codex/
           ls -la build
           test -f build/gene-sim.exe
 

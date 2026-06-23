@@ -87,5 +87,30 @@ func _init() -> void:
 		_fail("same seed+steps+grid produced different snapshot bytes (determinism!)")
 		return
 
+	# SP-4: the loci() export is widened (PURELY ADDITIVE) with so_term + go_refs for the codex inspect join.
+	# Assert the {id,name} fields are still present AND at least one locus carries so_term + a non-empty go_refs
+	# (the default plant genome's loci are SO:704 with a GO ref). RED if the widening dropped/reordered the
+	# original fields or the ontology projection is missing.
+	var loci: Array = sim.loci()
+	if loci.is_empty():
+		_fail("loci() returned empty")
+		return
+	var l0: Dictionary = loci[0]
+	if not (l0.has("id") and l0.has("name")):
+		_fail("loci() row lost its {id,name} fields: %s" % l0)
+		return
+	if not (l0.has("so_term") and l0.has("go_refs")):
+		_fail("loci() row missing SP-4 ontology fields {so_term,go_refs}: %s" % l0)
+		return
+	var any_go := false
+	for l in loci:
+		if int((l as Dictionary).get("so_term", 0)) > 0 and not ((l as Dictionary).get("go_refs", []) as Array).is_empty():
+			any_go = true
+			break
+	if not any_go:
+		_fail("loci() carried no so_term+go_refs on any locus (ontology projection broken)")
+		return
+	print("LIVESIM_LOCI_ONTOLOGY_OK=", loci.size(), " first=", l0)
+
 	print("LIVESIM_SMOKE_OK")
 	quit(0)
