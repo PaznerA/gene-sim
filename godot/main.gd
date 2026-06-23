@@ -151,6 +151,7 @@ var _relations_root: Node2D  # holds the relations heatmap (parallels _specimen_
 var _relations_panel: Control  # PanelChrome wrapper (🔗 RELATIONS)
 var _relations_heatmap: Control  # the RelationsHeatmap _draw() node
 var _relations_banner: Label  # degrade-state banner (State 1/2/4 text; hidden in State 3)
+var _relations_flowsum: Label  # plain-language "who's eating whom" top-N flow summary (parsed from the FlowMatrix)
 var _relations_nearest: Label  # ADR-014 nearest-species strip (view-only/advisory; hidden when no overlay)
 # Per-species panel vitals (Rel-UI.1): 3-up Population / Allele / Fitness, value + ▲▼ trend per row.
 var _species_vital_rows: Array = []  # [{key:String, fmt:String, value:Label}] one per vitals row
@@ -244,6 +245,18 @@ const NON_AIRBORNE_STEMS := ["default", "ecoli", "bdellovibrio", "carsonella", "
 # Fallback when a res:// directory scan is unavailable (e.g. an odd export): the 7 known baked airborne keys.
 const CONTAMINANT_KEYS_FALLBACK := [
 	"bacillus", "pseudomonas", "staph", "cutibacterium", "aspergillus-niger", "penicillium", "mycoplasma"]
+# Static per-contaminant blurbs for the consortium checkbox tooltips when the codex is not loaded (Item 2b). Short
+# role/trait one-liners only — descriptive UI text, NOT biology (the core owns every genome; inv #2). Keyed by the
+# airborne file stem; an unknown key falls back to a generic line in _consortium_blurb.
+const CONSORTIUM_FALLBACK_BLURBS := {
+	"bacillus": "Bacillus subtilis — hardy soil generalist; forms cull-surviving endospores.",
+	"pseudomonas": "Pseudomonas aeruginosa — biofilm generalist; metabolically versatile opportunist.",
+	"staph": "Staphylococcus epidermidis — skin flora; tolerant surface coloniser.",
+	"cutibacterium": "Cutibacterium acnes — slow-growing anaerobe; skin/sebaceous niche.",
+	"aspergillus-niger": "Aspergillus niger — mold; airborne conidia, hyphal decomposer.",
+	"penicillium": "Penicillium — mold; airborne spores, fast saprophytic colony.",
+	"mycoplasma": "Mycoplasma genitalium — wall-less minimal-genome microbe; classic cell-culture contaminant.",
+}
 # The core's ConsortiumConfig::default_mode_a kebab keys — the non-empty consortium the MENU seeds when the
 # player picks a containment level > Sealed, so "Open" actually contaminates (mirrors immigration.rs).
 const DEFAULT_MODE_A_KEYS := ["bacillus", "pseudomonas", "aspergillus-niger"]
@@ -288,7 +301,7 @@ var _newrun_button: Button
 var _seed_edit: LineEdit
 var _titlebar: Control
 var _title_badge: Label  # ● LIVE / REPLAY
-var _title_status: Label  # seed · gen · pop · fit · allele chip strip
+var _title_status: RichTextLabel  # seed · gen · pop · fit · allele chip strip (BBCode → color-coded ▲▼ trend glyphs)
 var _vitals_panel: Control
 var _vitals_pop: Label
 var _vitals_fit: Label
@@ -297,6 +310,15 @@ var _sparkline: Control
 var _prev_obs: Dictionary = {}  # previous vitals, for the ▲▼ trend glyphs (deterministic last-vs-now)
 var _fit_history: Array = []  # rolling mean-fitness [0,1] for the sparkline (live: per tick; replay: per snap)
 var _allele_history: Array = []  # rolling allele-freq [0,1] for the sparkline
+# Item (c): per-species extinction/boom alerts (--live). _prev_pop caches last render-tick's per-species
+# population (keyed by species_id) so we can detect a crash-to-0 (extinction) or a >~10× jump (boom) vs the
+# prior frame. _alert_label is a transient HUD flash; _alert_until is the engine time it auto-hides at.
+var _prev_pop: Dictionary = {}  # species_id:int → population:int from the previous render frame
+var _alert_label: Label  # transient HUD notification ("✗ plant extinct" / "📈 bdellovibrio boom")
+var _alert_until: float = 0.0  # Time.get_ticks_msec()/1000 deadline after which the flash hides
+const ALERT_BOOM_FACTOR := 10  # a population jump of ≥ this multiple vs the prior frame counts as a "boom"
+const ALERT_BOOM_FLOOR := 5    # ignore booms from a tiny prior pop (noise); require prev ≥ this to flag
+const ALERT_HOLD_SEC := 3.5    # how long an alert flash stays visible
 
 
 func _ready() -> void:
@@ -713,6 +735,7 @@ func _setup_live() -> bool:
 ## RENDER_HZ. FILE replay uses the Timer, not this. (History granularity is the render rate, not per-generation;
 ## lower the speed slider for finer detail.)
 func _process(delta: float) -> void:
+	_tick_alert_flash()  # Item (c): expire a finished extinction/boom flash even while paused (wall-clock UI only)
 	# The live sim keeps stepping in the Ecosystem AND Relations views (the FlowMatrix is per-generation, so the
 	# heatmap wants live frames); only the Specimen view pauses stepping (it inspects a static genome). Determinism
 	# is unaffected — _process advances by whole LIVE_STEP generations, never wall-clock.
@@ -763,6 +786,7 @@ func _publish_frame() -> void:
 		_timeline.setup(gens)
 		_timeline.set_markers(_injections)
 	_show(_snaps.size() - 1)
+	_poll_population_alerts()  # Item (c): per-species extinction/boom flash vs the prior render frame (--live)
 	if _view_mode == VIEW_RELATIONS:
 		_refresh_relations()  # the FlowMatrix is per-generation — repaint the heatmap each render tick in Relations
 
@@ -821,20 +845,30 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 	palette.add_theme_constant_override("separation", 3)
 	col.add_child(palette)
 	var grp := ButtonGroup.new()
+	# Richer 2-3 line tooltips (Item 2a): say WHAT each tool acts on. The two SUBSTRATE tools (Nutrient/Toxin)
+	# paint a POOL/CHEM channel — no organism is targeted; the three ORGANISM tools (CRISPR/PCR/Antibiotic) act on
+	# resident orgs in the disc; Inoculate seeds a NEW contaminant. POSITION MATTERS for every tool (the brush disc
+	# → RegionSpec → the core picks cells/orgs). Tooltip text only — biology stays in the core (inv #2).
 	var tool_specs := [
-		{"glyph": "🧬", "name": "CRISPR", "tip": "Region CRISPR edit"},
-		{"glyph": "🧫", "name": "PCR", "tip": "Amplify a resident species (faithful clones)"},
-		{"glyph": "💊", "name": "Antibiotic", "tip": "Cull a species in the region"},
-		{"glyph": "🌱", "name": "Nutrient", "tip": "Feed a pool plane (light/nutrient/detritus)"},
-		{"glyph": "☣", "name": "Toxin", "tip": "Spike the chem field (toxin/kin/alarm)"},
-		{"glyph": "🦠", "name": "Inoculate", "tip": "Seed a contaminant at the region (ADR-019 — POSITION MATTERS)"},
+		{"glyph": "🧬", "name": "CRISPR", "tip":
+			"Apply a CRISPR edit to the RESIDENT species in the painted disc.\nThe core resolves PAM / on- & off-target score / gate (inv #2).\nPOSITION MATTERS — only orgs inside the brush cell are edited."},
+		{"glyph": "🧫", "name": "PCR", "tip":
+			"Amplify a RESIDENT species — adds faithful clones at the disc.\nPick the target species + clone count + per-clone J endowment.\nActs on organisms; POSITION MATTERS (clones spawn in the disc)."},
+		{"glyph": "💊", "name": "Antibiotic", "tip":
+			"Kill a FRACTION of a resident species in the disc (a cull).\nPick the target species + cull strength; survivors persist.\nActs on organisms; POSITION MATTERS (only the disc is dosed)."},
+		{"glyph": "🌱", "name": "Nutrient", "tip":
+			"Feed a POOL / CHEM channel (light / free-nutrient / detritus).\nTargets the ENVIRONMENT plane, NOT an organism — orgs benefit\nindirectly via uptake. POSITION MATTERS (only the disc is fed)."},
+		{"glyph": "☣", "name": "Toxin", "tip":
+			"Spike a CHEM channel (toxin / kin / alarm) in the disc.\nTargets the ENVIRONMENT plane, NOT an organism — it suppresses\nuptake / signals. POSITION MATTERS (only the disc is spiked)."},
+		{"glyph": "🦠", "name": "Inoculate", "tip":
+			"Seed a NEW contaminant SpeciesSpec at the disc (ADR-019).\nManual seeds work at ANY containment (even Sealed); SCHEDULED\nimmigrants need Containment > Sealed. POSITION MATTERS (the disc)."},
 	]
 	_tool_buttons.clear()
 	for i in tool_specs.size():
 		var spec: Dictionary = tool_specs[i]
 		var b := Button.new()
 		b.text = str(spec["glyph"])
-		b.tooltip_text = str(spec["name"]) + " — " + str(spec["tip"])
+		b.tooltip_text = str(spec["name"]) + "\n" + str(spec["tip"])
 		b.toggle_mode = true
 		b.button_group = grp
 		b.custom_minimum_size = Vector2(34, 0)
@@ -913,15 +947,26 @@ func _build_contamination_ui(ui: CanvasLayer) -> void:
 	col.add_child(lvl_row)
 
 	# Consortium menu: one CheckBox per baked contaminant key. Checked keys ride the schedule (registered with the
-	# core at reset). These are just file stems — no biology in GDScript (inv #2).
-	col.add_child(_dim_label("Consortium (schedule):"))
+	# core at reset). These are just file stems — no biology in GDScript (inv #2). Item 2b: a header that explains
+	# WHEN these arrive (scheduled airborne immigration only fires at Containment > Sealed) + a per-species role
+	# blurb tooltip pulled from the codex (read-only projection; falls back to a static one-liner when the codex is
+	# absent), and a note that the Inoculate brush still works manually even at Sealed.
+	var consortium_hdr := _dim_label("Airborne immigrants (arrive on schedule when Containment > Sealed):")
+	consortium_hdr.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	consortium_hdr.custom_minimum_size = Vector2(248, 0)
+	col.add_child(consortium_hdr)
 	_consortium_checks.clear()
 	for key in _discover_contaminant_keys():
 		var cb := CheckBox.new()
 		cb.text = key
-		cb.tooltip_text = "Include %s in the deterministic immigration schedule" % key
+		cb.tooltip_text = _consortium_blurb(key)
 		col.add_child(cb)
 		_consortium_checks[key] = cb
+	var inoc_note := _dim_label("Manual Inoculate (🦠 brush) seeds at ANY containment, even Sealed; only the scheduled immigrants above need Containment > Sealed.")
+	inoc_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	inoc_note.custom_minimum_size = Vector2(248, 0)
+	inoc_note.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
+	col.add_child(inoc_note)
 
 	# Schedule pressure: per-immigrant J endowment (radius + horizon are fixed defaults; the level scales frequency
 	# in the core). The disc/horizon stay constant so the level is the single legible knob.
@@ -1162,6 +1207,25 @@ func _picker_species_id(ob: OptionButton) -> int:
 	return int(ob.get_item_metadata(ob.selected))
 
 
+## Whether a species picker has an EXPLICIT, valid target selected (Item 2c). Without this guard PCR/Antibiotic
+## silently default to species 0 (implicit) and a no-selection click reads as a successful hit on the wrong
+## species — a silent mistarget. Returns false for a null/empty/unselected picker so the caller can surface
+## feedback instead of dispatching. Pure read of UI state (inv #2).
+func _has_target_species(ob: OptionButton) -> bool:
+	return ob != null and ob.item_count > 0 and ob.selected >= 0
+
+
+## Surface a clear "no target species selected" verdict for a target-picker tool (Item 2c): flashes the status
+## line + drops a NOT-applied timeline marker (via _record_tool_outcome) so the player gets the same feedback
+## channel a real outcome uses, instead of a silent no-op. Renderer-only (inv #2).
+func _record_no_target(tool: int) -> void:
+	_record_tool_outcome(tool, {
+		"applied": false,
+		"detail": "no target species selected — pick one in the %s panel" % TOOL_KEYS[tool],
+		"generation": int(_live.observe().get("generation", 0)) if (_live != null and _live.has_method("observe")) else 0,
+	})
+
+
 ## A human-readable label for the species a picker resolves to (R2-minor: surface the RESOLVED target so a
 ## reordered roster / an implicit default-to-0 is legible in the status line, not a silent mistarget). Maps the
 ## picker's selected SpeciesId metadata back to its name+key via _panel_species_list (SpeciesId-ordered). When the
@@ -1307,6 +1371,9 @@ func _apply_active_tool() -> void:
 			if not _live.has_method("pcr_amplify"):
 				_flash_status("✗ PCR unsupported by this build", false)
 				return
+			if not _has_target_species(_pcr_species):
+				_record_no_target(TOOL_PCR)
+				return
 			var sid := _picker_species_id(_pcr_species)
 			var cnt := int(_pcr_count.value) if _pcr_count != null else 1
 			var endow := int(_pcr_endow.value) if _pcr_endow != null else 0
@@ -1316,6 +1383,9 @@ func _apply_active_tool() -> void:
 		TOOL_ANTIBIOTIC:
 			if not _live.has_method("cull"):
 				_flash_status("✗ Antibiotic unsupported by this build", false)
+				return
+			if not _has_target_species(_cull_species):
+				_record_no_target(TOOL_ANTIBIOTIC)
 				return
 			var sid2 := _picker_species_id(_cull_species)
 			var strength := int(_cull_strength.value) if _cull_strength != null else 0
@@ -1418,6 +1488,18 @@ func _discover_contaminant_keys() -> Array:
 		found = CONTAMINANT_KEYS_FALLBACK.duplicate()  # scan unavailable → the known baked airborne set
 	_contaminant_keys = found
 	return _contaminant_keys
+
+
+## A short role/trait one-liner for a consortium contaminant `key`, for its checkbox tooltip (Item 2b). Reads the
+## codex (display_name + headline — a read-only off-hash projection, inv #2) when loaded; else falls back to a
+## static blurb keyed by the file stem, then to the bare key. Presentation only — the core owns every genome.
+func _consortium_blurb(key: String) -> String:
+	var cx := _codex.species_for(key)
+	if not cx.is_empty():
+		var nm := str(cx.get("display_name", key))
+		var head := str(cx.get("headline", cx.get("sim_role", "")))
+		return "%s\n%s" % [nm, head] if head != "" else nm
+	return CONSORTIUM_FALLBACK_BLURBS.get(key, "Airborne contaminant '%s' — rides the immigration schedule." % key)
 
 
 ## Update the hovered brush cell from the mouse (world → cell, clamped to the world/live grid) + refresh preview.
@@ -1529,6 +1611,65 @@ func _show_mission_banner(text: String, color: Color) -> void:
 	_mission_banner.visible = true
 
 
+## Item (c): a transient top-centre HUD flash for per-species extinction/boom events (--live). A single Label
+## pinned below the title bar; _poll_population_alerts fills it + sets the auto-hide deadline. Presentation only.
+func _build_alert_ui(ui: CanvasLayer) -> void:
+	_alert_label = Label.new()
+	_alert_label.position = Vector2(_field_screen_size().x * 0.5 - 150.0, 116.0)
+	_alert_label.add_theme_font_size_override("font_size", 22)
+	_alert_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_alert_label.add_theme_color_override("font_color", Color(0.98, 0.86, 0.4))
+	# A subtle dark outline so the flash reads over any data layer underneath.
+	_alert_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.85))
+	_alert_label.add_theme_constant_override("outline_size", 6)
+	_alert_label.visible = false
+	ui.add_child(_alert_label)
+
+
+## Item (c): poll the per-species population (observe_species().population_size) against the PRIOR render frame's
+## cache and flash an extinction ("✗ <name> extinct") or boom ("📈 <name> boom") notification on a 0-crossing or a
+## ≥10× jump. This surfaces the emergent "the predator ate them all" / "the prey bloomed" moment. Read-only (inv
+## #2): the population integers are a pure core export (no biology here — only a prev-vs-now compare on already-
+## measured counts); deterministic w.r.t. the snapshot (inv #3), the flash itself is wall-clock UI only.
+func _poll_population_alerts() -> void:
+	if _live == null or not _live.has_method("observe_species"):
+		return
+	var events: PackedStringArray = PackedStringArray()
+	var seen: Dictionary = {}  # species_id → population this frame (becomes the next _prev_pop)
+	for sp in _live.observe_species():
+		var d: Dictionary = sp
+		var sid := int(d.get("species_id", 0))
+		var pop := int(d.get("population_size", 0))
+		var nm := str(d.get("name", "species"))
+		seen[sid] = pop
+		if not _prev_pop.has(sid):
+			continue  # first sighting of this species — establish a baseline, don't flash
+		var prev := int(_prev_pop[sid])
+		if prev > 0 and pop == 0:
+			events.append("✗ %s extinct" % nm)
+		elif prev >= ALERT_BOOM_FLOOR and pop >= prev * ALERT_BOOM_FACTOR:
+			events.append("📈 %s boom" % nm)
+	_prev_pop = seen
+	if events.size() > 0:
+		# Newest event wins the single line (multiple at once are joined). Colour by kind: red = extinction.
+		var any_ext := false
+		for e in events:
+			if e.begins_with("✗"):
+				any_ext = true
+		_alert_label.text = "   ·   ".join(events)
+		_alert_label.add_theme_color_override(
+			"font_color", Color(0.96, 0.45, 0.42) if any_ext else Color(0.45, 0.92, 0.55))
+		_alert_label.visible = true
+		_alert_until = float(Time.get_ticks_msec()) / 1000.0 + ALERT_HOLD_SEC
+
+
+## Hide an expired alert flash (called per render frame). Wall-clock only — never touches the sim or its hash.
+func _tick_alert_flash() -> void:
+	if _alert_label != null and _alert_label.visible:
+		if float(Time.get_ticks_msec()) / 1000.0 >= _alert_until:
+			_alert_label.visible = false
+
+
 # ──────────────────────────── scene construction (read-only presentation) ────────────────────────────
 
 func _build_scene() -> void:
@@ -1626,6 +1767,7 @@ func _build_scene() -> void:
 	_build_intervention_ui(ui)
 	_build_contamination_ui(ui)
 	_build_mission_ui(ui)
+	_build_alert_ui(ui)
 	# --live was requested but the LiveSim cdylib failed to load → show why (we fell back to file replay).
 	if _has_flag("--live") and _live == null:
 		var np := _dark_panel(0.82)
@@ -1752,9 +1894,17 @@ func _build_titlebar(ui: CanvasLayer) -> void:
 	_title_badge = Label.new()
 	_title_badge.add_theme_font_size_override("font_size", 15)
 	row.add_child(_title_badge)
-	_title_status = Label.new()
-	_title_status.add_theme_font_size_override("font_size", 15)
-	_title_status.add_theme_color_override("font_color", Color(0.88, 0.92, 0.88))
+	# RichTextLabel (not a plain Label) so the per-chip ▲/▼/→ trend glyphs can be color-coded inline via BBCode
+	# (green up / red down / neutral flat). Sized to its content + single-line so it sits in the title row like a
+	# Label. The `.text` setter still accepts plain captions (specimen/relations views) — BBCode only kicks in on tags.
+	_title_status = RichTextLabel.new()
+	_title_status.bbcode_enabled = true
+	_title_status.fit_content = true
+	_title_status.scroll_active = false
+	_title_status.autowrap_mode = TextServer.AUTOWRAP_OFF
+	_title_status.custom_minimum_size = Vector2(360, 0)
+	_title_status.add_theme_font_size_override("normal_font_size", 15)
+	_title_status.add_theme_color_override("default_color", Color(0.88, 0.92, 0.88))
 	row.add_child(_title_status)
 
 
@@ -1839,6 +1989,20 @@ func _trend(now: float, key: String) -> String:
 	return "▲" if now > prev else "▼"
 
 
+## Item (b): a COLOR-CODED ▲/▼/→ trend glyph (green up / red down / neutral flat) as a BBCode span for the
+## RichTextLabel title bar — the same deterministic last-vs-now comparison as _trend(), so the glyph agrees with
+## the Vitals panel. Returns "→" (grey) before the first prior reading exists. Pure presentation (inv #2/#3).
+func _trend_bbcode(now: float, key: String) -> String:
+	if not _prev_obs.has(key):
+		return "[color=#8a9690]→[/color]"
+	var prev := float(_prev_obs[key])
+	if absf(now - prev) <= maxf(0.0005, absf(prev) * 0.001):
+		return "[color=#8a9690]→[/color]"
+	if now > prev:
+		return "[color=#54e35a]▲[/color]"
+	return "[color=#e86464]▼[/color]"
+
+
 ## Refresh the title-bar chips + Vitals scoreboard + sparkline from the current vitals source.
 func _refresh_vitals() -> void:
 	var v := _vitals_source()
@@ -1849,8 +2013,15 @@ func _refresh_vitals() -> void:
 		_title_badge.add_theme_color_override(
 			"font_color", Color(0.45, 0.92, 0.5) if _live != null else Color(0.7, 0.72, 0.74))
 	if _title_status != null and _view_mode == 0:
-		_title_status.text = "seed %d     gen %d     pop %d     fit %.2f     allele %.2f" % [
-			_seed, int(v.generation), int(v.population), float(v.fitness), float(v.allele)]
+		# Item (b): a color-coded ▲/▼/→ trend glyph next to each live vital chip (pop/fit/allele) so direction
+		# reads at a glance — "population crashing" / "fitness diverging" — without opening the Vitals panel. The
+		# glyphs use the SAME prev-vs-now comparison as the Vitals scoreboard, so they always agree. gen/seed get
+		# no glyph (gen only ever climbs; seed is constant). BBCode → the RichTextLabel colorizes the spans.
+		_title_status.text = "seed %d     gen %d     pop %d %s    fit %.2f %s    allele %.2f %s" % [
+			_seed, int(v.generation),
+			int(v.population), _trend_bbcode(float(v.population), "population"),
+			float(v.fitness), _trend_bbcode(float(v.fitness), "fitness"),
+			float(v.allele), _trend_bbcode(float(v.allele), "allele")]
 	if _vitals_pop != null:
 		_vitals_pop.text = "%s  Population    %d" % [_trend(float(v.population), "population"), int(v.population)]
 		_vitals_fit.text = "%s  Mean fitness  %.2f" % [_trend(float(v.fitness), "fitness"), float(v.fitness)]
@@ -2111,6 +2282,9 @@ func _resync_to_live() -> void:
 	_live_species_order = []
 	_log_live_genome("baseline — gen 0")
 	_prev_obs = {}
+	_prev_pop = {}  # Item (c): fresh run → drop the per-species pop baseline so we don't falsely flash on reset
+	if _alert_label != null:
+		_alert_label.visible = false
 	_paused = false
 	_step_carry = 0.0  # fresh run → no owed steps / render backlog (the decoupled live loop, _process)
 	_render_carry = 0.0
@@ -2402,12 +2576,41 @@ func _log_live_genome(label: String) -> void:
 		_live_specimen_log = (_live_species_logs[_live_species_order[0]] as Dictionary)["entries"]
 
 
-## Single-active-species fallback (older cdylib without observe_species): mirrors the pre-fan-out behaviour.
+## Single-active-species fallback (older cdylib without observe_species): mirrors the pre-fan-out behaviour, but
+## ALSO seeds the per-species structures (_live_species_logs / _live_species_order) so _specimen_list() takes the
+## per-species path and renders the ACTUAL species' baseline glyph at gen 0 — never falling through to the empty
+## file-replay branch (which is {} in --live) and showing a blank/default-plant specimen view. The single synthetic
+## species row is tagged with the CORE species_key() (the authoritative glyph tiebreak — "bacillus"/"ecoli-core"/
+## "default") so GlyphFactory draws the right morphotype with zero steps. Read-only (inv #2): species_key()/observe()
+## are pure core projections; the renderer only maps the already-expressed phenotype to a glyph.
 func _log_primary_genome(label: String) -> void:
 	var traits := _capture_live_traits()
-	if not _live_specimen_log.is_empty() and (_live_specimen_log.back() as Dictionary).get("traits", {}) == traits:
-		return
-	_live_specimen_log.append({"label": label, "traits": traits})
+	# Resolve the active species' core key (glyph tiebreak) + a display name, with graceful fallbacks for an older
+	# cdylib that lacks species_key() (then key "" → the plant L-system, the historical single-species look).
+	var key := ""
+	if _live != null and _live.has_method("species_key"):
+		key = String(_live.species_key())
+	var sname := _species_display_name(key)
+	if _live_species_order.is_empty():
+		_live_species_logs[0] = {"key": key, "name": sname, "role": "", "entries": []}
+		_live_species_order = [0]
+	var entry: Dictionary = _live_species_logs[0]
+	var entries: Array = entry["entries"]
+	if not entries.is_empty() and (entries.back() as Dictionary).get("traits", {}) == traits:
+		return  # unchanged genome — don't log a duplicate
+	var per_label := label
+	if not entries.is_empty():
+		per_label = "edit %d — gen %d" % [entries.size(), int(_live.observe().get("generation", 0))]
+	entries.append({"label": per_label, "traits": traits})
+	# Keep the legacy flat log mirroring this primary species for any back-compat reader.
+	_live_specimen_log = entries
+
+## A human-readable display name for the primary species from its core key (presentation only, inv #2). Falls back
+## to a Titled key, or "Plant" for the abstract "" / "default" species (the historical single-species caption).
+func _species_display_name(key: String) -> String:
+	if key == "" or key == "default":
+		return "Plant"
+	return key.capitalize()
 
 
 func _refresh_live_specimens() -> void:
@@ -2415,6 +2618,13 @@ func _refresh_live_specimens() -> void:
 		return
 	if _live_specimen_log.is_empty() and _live_species_logs.is_empty():
 		_log_live_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
+	# Guarantee a non-empty specimen list at gen 0 (with ZERO steps): _log_live_genome should have populated the
+	# per-species log from observe_species(), but if that export is absent OR returned an empty roster, the
+	# per-species path would be empty and _specimen_list() would fall through to the file-replay branch — which is
+	# {} in --live → a BLANK specimen view. Seed the active species' baseline directly from its observe row so the
+	# registered species' baseline morphology always renders immediately. Read-only (inv #2).
+	if _live_species_order.is_empty():
+		_log_primary_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
 	# _specimen_list() now flattens the per-species logs directly; clamp focus into the new flat range.
 	_focus = clampi(_focus, 0, maxi(0, _specimen_list().size() - 1))
 
@@ -2717,6 +2927,18 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	_relations_banner.visible = false
 	col.add_child(_relations_banner)
 
+	# Plain-language "who's eating whom" summary (Item a): the top few NONZERO inter-species flows parsed from the
+	# MEASURED FlowMatrix, e.g. "Primary flows: plant → ecoli (+450 J/gen), ecoli → bdellovibrio (−200 J/gen)". This
+	# is the SAME data the heatmap below paints — just narrated. GDScript only sorts already-finished integers by
+	# magnitude + names them (no biology / inv #2). Hidden when all flows are zero (State 1/2).
+	_relations_flowsum = Label.new()
+	_relations_flowsum.add_theme_font_size_override("font_size", 11)
+	_relations_flowsum.add_theme_color_override("font_color", Color(0.82, 0.93, 0.84))
+	_relations_flowsum.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_relations_flowsum.custom_minimum_size = Vector2(340, 0)
+	_relations_flowsum.visible = false
+	col.add_child(_relations_flowsum)
+
 	_relations_heatmap = RelationsHeatmap.new()
 	_relations_heatmap.custom_minimum_size = Vector2(340, 300)
 	col.add_child(_relations_heatmap)
@@ -2745,7 +2967,7 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	col.add_child(caption)
 
 	var badge := Label.new()
-	badge.text = "◆ ADVISORY · off-hash signature similarity — NOT the MEASURED FlowMatrix · view-only"
+	badge.text = "◆ ADVISORY · metabolic similarity, not measured flows · off-hash signature, view-only"
 	badge.add_theme_font_size_override("font_size", 9)
 	badge.add_theme_color_override("font_color", Color(0.62, 0.7, 0.86))
 	badge.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -2822,6 +3044,15 @@ func _refresh_relations() -> void:
 		flat = PackedInt64Array()
 		flat.resize(s * s)  # zero-filled
 	_relations_heatmap.set_matrix(flat, s)
+	# Item (a): narrate the top NONZERO inter-species flows in plain language above the heatmap. Same MEASURED
+	# integers the heatmap paints — just sorted by magnitude + named. Hidden when the matrix is all-zero (State 1/2).
+	if _relations_flowsum != null:
+		var summary := _format_flow_summary(names, flat, s)
+		if summary != "":
+			_relations_flowsum.text = summary
+			_relations_flowsum.visible = true
+		else:
+			_relations_flowsum.visible = false
 	# Banner: distinguish "no export" (State 1) from "export wired, physics off" (State 2) from "live" (State 3).
 	if _relations_banner != null:
 		if not method_present:
@@ -2875,6 +3106,42 @@ func _format_nearest(names: PackedStringArray, nearest: Dictionary) -> String:
 		if parts.size() > 0:
 			lines.append("%s → %s" % [fname, ", ".join(parts)])
 	return "\n".join(lines)
+
+
+## Item (a): narrate the top NONZERO inter-species flows from the MEASURED FlowMatrix as a plain-language line,
+## e.g. "Primary flows: plant → ecoli (+450 J/gen), ecoli → bdellovibrio (−200 J/gen)". The matrix contract:
+## flat[i*s+j] = NET joules that flowed FROM source j INTO sink i. Each physical edge appears twice (the +v at
+## (i,j) and its −v mirror at (j,i)); we keep ONE per unordered {i,j} pair (the entry with the larger species
+## index as sink, deterministically) so the same flow isn't listed both ways. We render it SOURCE → SINK with the
+## net magnitude, signed by whether the higher-indexed member gains (+) or loses (−) — a stable orientation a
+## viewer can read. Returns "" when there are no nonzero off-diagonal flows (State 1/2). Pure DISPLAY arithmetic
+## (sort finished integers by |magnitude|, name them) — no biology, no index remap (inv #2/#3).
+func _format_flow_summary(names: PackedStringArray, flat: PackedInt64Array, s: int) -> String:
+	if s <= 1 or flat.size() != s * s:
+		return ""
+	# Collect one entry per unordered pair {a,b} with a<b: read the OFF-diagonal cell at (b,a) — i.e. net into the
+	# higher-indexed species b from the lower-indexed a. v>0 ⇒ a feeds b (source a → sink b); v<0 ⇒ b feeds a.
+	var edges: Array = []  # [{src:int, dst:int, v:int}] — v already oriented as net into dst
+	for a in s:
+		for b in range(a + 1, s):
+			var v: int = int(flat[b * s + a])  # net J from a into b (the canonical pair entry)
+			if v == 0:
+				continue
+			if v > 0:
+				edges.append({"src": a, "dst": b, "v": v})  # a → b, a gives
+			else:
+				edges.append({"src": b, "dst": a, "v": -v})  # b → a, b gives (flip so the arrow points to the gainer)
+	if edges.is_empty():
+		return ""
+	edges.sort_custom(func(x, y): return int(x["v"]) > int(y["v"]))  # largest magnitude first (stable display order)
+	var parts: PackedStringArray = PackedStringArray()
+	var k: int = mini(5, edges.size())  # top 3–5; cap at 5
+	for i in k:
+		var e: Dictionary = edges[i]
+		var sn := names[int(e["src"])] if int(e["src"]) < names.size() else "sp%d" % int(e["src"])
+		var dn := names[int(e["dst"])] if int(e["dst"]) < names.size() else "sp%d" % int(e["dst"])
+		parts.append("%s → %s (+%d J/gen)" % [sn, dn, int(e["v"])])
+	return "Primary flows: " + ", ".join(parts)
 
 
 ## True if every entry of `flat` is zero (or it is empty). Pure display-state check, not biology.
@@ -3166,12 +3433,23 @@ func _update_trait_readout() -> void:
 
 
 ## Brighten the focused plant; dim the others. Holders are added in _specimen_list() order by _render_specimens.
+## Item 2d (hide the watermark): only the FOCUSED specimen keeps its world-space NAME LABEL (holder child 1)
+## visible. The non-focused glyphs stay dimmed (alpha 0.3) so the row is still legible, but their large
+## low-alpha name text no longer spreads across the viewport and bleeds BEHIND the docked panels — that faint
+## species-name watermark was the artifact in the screenshots. Presentation only (inv #2).
 func _emphasise_focus() -> void:
 	if _specimen_root == null:
 		return
 	var kids := _specimen_root.get_children()
 	for i in kids.size():
-		(kids[i] as Node2D).modulate = Color.WHITE if i == _focus else Color(1, 1, 1, 0.3)
+		var holder := kids[i] as Node2D
+		holder.modulate = Color.WHITE if i == _focus else Color(1, 1, 1, 0.3)
+		# Holder layout (see _render_specimens): child 0 = glyph, child 1 = the world-space name label. The label
+		# is WORLD-space so the focus camera zoom scales it into a giant faded watermark bleeding behind the docked
+		# panels. The species name is already shown prominently in the SPECIMEN panel header + the picker dropdown,
+		# so the world-space label is redundant — hide it on EVERY specimen to kill the watermark entirely.
+		if holder.get_child_count() > 1:
+			(holder.get_child(1) as CanvasItem).visible = false
 
 
 ## Centre the camera on the focused specimen's plant (falls back to framing the whole row).
@@ -3697,9 +3975,10 @@ func _refresh_hud() -> void:
 	if _view_mode == VIEW_SPECIMEN:
 		# Specimen view: caption in the title status; hide the data legend.
 		if _title_status != null:
+			# `[lb]V back]` escapes the literal "[" for the BBCode title-bar RichTextLabel (Item b made it bbcode).
 			var edits := _specimen_list().size() - 1
-			_title_status.text = ("specimen view — baseline + %d edited genome(s)   [V back]" % maxi(0, edits)
-				if edits >= 0 else "specimen view — no specimens.json   [V back]")
+			_title_status.text = ("specimen view — baseline + %d edited genome(s)   [lb]V back]" % maxi(0, edits)
+				if edits >= 0 else "specimen view — no specimens.json   [lb]V back]")
 		if _legend != null:
 			_legend.set_active(false)
 		return
@@ -3707,7 +3986,7 @@ func _refresh_hud() -> void:
 		# Relations view: caption in the title status; the inferno data legend is irrelevant (the heatmap carries
 		# its own diverging sign/magnitude legend strip).
 		if _title_status != null:
-			_title_status.text = "relations view — S×S inter-species joule flows   [V back]"
+			_title_status.text = "relations view — S×S inter-species joule flows   [lb]V back]"
 		if _legend != null:
 			_legend.set_active(false)
 		return
