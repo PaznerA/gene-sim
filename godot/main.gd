@@ -473,11 +473,25 @@ func _on_menu_start(cfg: Dictionary) -> void:
 		float(cfg.get("temp", 0.5)),
 		int(cfg.get("season", 0)),
 	)
-	# ADR-017: run the selected species (e.g. "ecoli") before reset; "" keeps the abstract plant. The species
-	# JSON is read from the res:// VFS here (cwd-independent in dev AND in the exported PCK) and handed to the
-	# core as inert bytes — GDScript moves only the string + reads a bool, all biology stays in Rust (inv #2).
+	# SP-2: compose the run from the menu ROSTER when non-trivial; else the legacy single-species path. The roster
+	# is moved as inert JSON bytes + int counts (FileAccess reads the res:// JSON; set_roster hands it to the core's
+	# serde + SpeciesSpec::build) — GDScript moves only strings + ints, all biology stays in Rust (inv #2). Pushing
+	# the roster + containment BEFORE _do_reset is load-bearing: the core seeds the single RNG ONCE over the full
+	# composed population at reset (inv #3), and the containment schedule expands deterministically at reset.
+	var roster: Array = cfg.get("roster", [])
 	var species_stem: String = String(cfg.get("species", ""))
-	_species_stem = _apply_species(species_stem)
+	if _apply_roster(roster):
+		# A composed roster (≥2 species OR a non-default stem) was armed via set_roster. The first roster stem is
+		# tracked as the "active" species for the specimen view / readout (the rest light up via per-species panels).
+		_species_stem = _roster_active_stem(roster)
+	else:
+		# Trivial roster (single default plant) or set_roster unavailable/failed → the proven single-species path.
+		# ADR-017: run the selected species (e.g. "ecoli") before reset; "" keeps the abstract plant.
+		_species_stem = _apply_species(_roster_active_stem(roster) if not roster.is_empty() else species_stem)
+	# Containment (ADR-019 S3): push the up-front level BEFORE reset so its immigration schedule expands
+	# deterministically. Sealed (0) → empty schedule → hash-neutral. Reuse the _on_apply_containment_pressed shape:
+	# empty/default consortium keys by default (the menu only chooses the LEVEL; the consortium menu lives in-run).
+	_apply_menu_containment(int(cfg.get("containment", 0)))
 	_do_reset(_seed)
 	_populate_locus_picker()  # refresh the edit-target picker for the new species' genome (ADR-017)
 	_populate_species_pickers()  # refresh the PCR/Antibiotic target-species pickers for the new roster (SP-3.6)
@@ -521,6 +535,68 @@ func _apply_species(stem: String) -> String:
 		_live.set_species_json("")  # ensure cleared state on a failed build
 		return ""
 	return stem
+
+
+## SP-2: arm the multi-species ROSTER on the live core from a cfg.roster ([{stem,count}], in load-bearing order).
+## Returns true when a COMPOSED roster was armed via LiveSim.set_roster (so the caller skips the single-species
+## path); false when the roster is trivial (a single default plant — reproduces today's run byte-for-byte), the
+## binding is unavailable (forward-compat probe, mirroring observe_species/fire_due_inoculations), or every build
+## failed (graceful fallback to the default plant). The renderer only moves inert JSON bytes + int counts; the core
+## builds every RosterEntry / genome→phenotype (inv #2). The single ChaCha8Rng seeds ONCE over the full population
+## at reset (inv #3) — so set_roster MUST be applied BEFORE _do_reset (the caller's order).
+func _apply_roster(roster: Array) -> bool:
+	if _live == null or roster.is_empty():
+		return false
+	# Trivial roster = exactly one row, the default plant → keep the proven single-species path (hash-neutral).
+	if roster.size() == 1 and String((roster[0] as Dictionary).get("stem", "default")) == "default":
+		return false
+	if not _live.has_method("set_roster"):
+		push_warning("LiveSim.set_roster unavailable in this build; falling back to the single-species path")
+		return false
+	# Collect the JSON texts + counts positionally (PackedStringArray/PackedInt32Array zip by index in the core).
+	var texts := PackedStringArray()
+	var counts := PackedInt32Array()
+	for e in roster:
+		var d: Dictionary = e
+		var stem: String = String(d.get("stem", "default"))
+		var path := "res://data/species/%s.json" % stem
+		var f := FileAccess.open(path, FileAccess.READ)
+		if f == null:
+			push_warning("roster species '%s' not found at %s; falling back to the default plant" % [stem, path])
+			_apply_species("")
+			return false
+		texts.append(f.get_as_text())  # whole JSON; FileAccess (RefCounted) closes on free
+		counts.append(maxi(0, int(d.get("count", 0))))
+	if not _live.set_roster(texts, counts):
+		# A build failed in the core (graceful, mirroring set_species_json) → byte-clean default-plant run.
+		push_warning("roster failed to build; falling back to the default plant")
+		_apply_species("")
+		return false
+	return true
+
+
+## The roster's first/active species stem (the one the specimen view + readout track; the rest light up via the
+## per-species panels). "default" maps to the abstract plant (its core key is ""), so return "" for _species_stem.
+func _roster_active_stem(roster: Array) -> String:
+	if roster.is_empty():
+		return ""
+	var stem: String = String((roster[0] as Dictionary).get("stem", "default"))
+	return "" if stem == "default" else stem
+
+
+## SP-2: push the menu's up-front ContainmentLevel to the core BEFORE reset (ADR-019 S3). Reuses the
+## _on_apply_containment_pressed call shape with an EMPTY/default consortium (the menu chooses only the LEVEL;
+## the in-run CONTAMINATION panel composes the consortium). Sealed (0) → empty schedule → hash-neutral. The
+## schedule expands deterministically at reset off the off-stream IMMG family (zero SimRng draws, inv #3).
+func _apply_menu_containment(level: int) -> void:
+	if _live == null or not _live.has_method("set_containment"):
+		return
+	_containment_level = clampi(level, 0, CONTAINMENT_LABELS.size() - 1)
+	if _containment_selector != null:
+		_containment_selector.select(_containment_level)
+	var keys := PackedStringArray()  # empty consortium by default (the menu sets only the level)
+	var endow := int(_containment_endow.value) if _containment_endow != null else 120000
+	_live.set_containment(_containment_level, keys, _containment_radius, endow, _containment_horizon)
 
 
 # ──────────────────────────── live mode (P5): drive the sim via the LiveSim gdext node ────────────────────
