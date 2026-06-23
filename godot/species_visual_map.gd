@@ -118,5 +118,6 @@ static func build_table(id_to_meta: Dictionary) -> Dictionary:
 			"size": size_for(key, role),
 			"color": color_for(key, role),
 			"is_plant": is_plant(key, role),
+			"morph": morph_for(key, role),  # per-cell MORPHOTYPE glyph routing at the Cells scope (Item #5)
 		}
 	return table

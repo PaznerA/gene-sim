@@ -148,12 +148,12 @@ func set_dominant_species_ids(dominant: PackedFloat32Array, species_table: Dicti
 ## plane) → species_table. Graceful: a missing plane / unknown id → the default plant visual (never a crash).
 func _cell_visual(i: int) -> Dictionary:
 	if i < 0 or i >= _dominant.size():
-		return {"size": 1.0, "color": Color(0.36, 0.62, 0.24), "is_plant": true}
+		return {"size": 1.0, "color": Color(0.36, 0.62, 0.24), "is_plant": true, "morph": "plant"}
 	var sid := int(round(_dominant[i]))
 	if _species_table.has(sid):
 		return _species_table[sid]
 	# Unknown id (empty table on file-replay, or a species absent from observe_species) → a neutral default.
-	return {"size": SpeciesVisualMap.SIZE_DEFAULT, "color": SpeciesVisualMap.COLOR_DEFAULT, "is_plant": true}
+	return {"size": SpeciesVisualMap.SIZE_DEFAULT, "color": SpeciesVisualMap.COLOR_DEFAULT, "is_plant": true, "morph": "plant"}
 
 
 ## Point the layer at a parsed snapshot (snapshot.gd instance) and a cell size in pixels, then redraw.
@@ -241,7 +241,10 @@ func _draw() -> void:
 				if cell_is_plant:
 					_draw_plant(p, col, fit, dens, x, y, k, size_scale)
 				else:
-					_draw_microbe_sprite(p, col, fit, dens, x, y, k, size_scale)
+					# Item #5: route the cell to its DOMINANT species' MORPHOTYPE glyph (rod / cocci / vibrioid /
+					# pleomorph / symbiont / mold), the field-scale echo of the specimen view — so the Cells scope
+					# reads as a real microbial community, not one rod sized+coloured per species.
+					_draw_morph(str(vis.get("morph", "rod")), p, col, fit, dens, x, y, k, size_scale)
 				_draw_dot(p, col, rim, cell_r * DOT_RADIUS_SCALE)  # demoted activity pip at the foot, species-sized
 			else:
 				# LOD / sprites-off: a TRAIT-TINTED dot at the species' real-cell radius (cell_r) — even the
@@ -373,6 +376,99 @@ func _draw_microbe_sprite(p: Vector2, col: Color, fit: float, dens: float, x: in
 	# Acetate overflow → an excreted halo speck beside the cell.
 	if acetate > 0.5 and dens > 0.4:
 		draw_circle(b + perp * width * 0.6, width * 0.18, Color(0.93, 0.58, 0.30, 0.6))
+
+
+## Item #5: route a non-plant cell to its DOMINANT species' MORPHOTYPE glyph — the field-scale echo of the
+## specimen view's morphotypes (glyph_factory / microbe.gd), so the Cells scope reads as a real microbial
+## community (rods, cocci clusters, vibrioid commas, mold filaments, pleomorph blobs, symbiont specks) rather
+## than one shared rod sized+coloured per species. `morph` is a per-species LOOKUP (SpeciesVisualMap.morph_for,
+## carried in _species_table); the shapes are deterministic hash-jittered primitives. Presentation only (inv #2).
+func _draw_morph(morph: String, p: Vector2, col: Color, fit: float, dens: float, x: int, y: int, k: int, size_scale: float) -> void:
+	match morph:
+		"cocci":
+			_draw_cocci(p, col, fit, x, y, k, size_scale)
+		"vibrioid":
+			_draw_vibrioid(p, col, fit, x, y, k, size_scale)
+		"pleomorph":
+			_draw_pleomorph(p, col, fit, x, y, k, size_scale)
+		"symbiont":
+			_draw_symbiont(p, col, fit, x, y, k, size_scale)
+		"mold":
+			_draw_mold(p, col, fit, x, y, k, size_scale)
+		_:  # "rod" (E. coli / Bacillus / Pseudomonas / Cutibacterium) → the existing capsule echo
+			_draw_microbe_sprite(p, col, fit, dens, x, y, k, size_scale)
+
+
+## Cocci (staph): a tight grape-cluster of small rimmed spheres + a central highlight.
+func _draw_cocci(p: Vector2, col: Color, fit: float, x: int, y: int, k: int, size_scale: float) -> void:
+	var ec := _cell * maxf(0.2, size_scale)
+	var r := maxf(1.5, ec * 0.2 * (0.8 + 0.3 * fit))
+	var rim := Color(0.03, 0.05, 0.04, 0.92)
+	for c in 4:
+		var ang := float(c) / 4.0 * TAU + _hash01(x, y, k * 9 + c) * 0.6
+		var off := Vector2(cos(ang), sin(ang)) * r * 0.85
+		draw_circle(p + off, r + 1.0, rim)
+		draw_circle(p + off, r, col)
+	draw_circle(p, r * 0.55, col.lightened(0.18))
+
+
+## Vibrioid (Bdellovibrio): a small CURVED comma rod — a bowed capsule with rounded caps.
+func _draw_vibrioid(p: Vector2, col: Color, fit: float, x: int, y: int, k: int, size_scale: float) -> void:
+	var ec := _cell * maxf(0.2, size_scale)
+	var length := ec * 0.5 * (0.7 + 0.3 * fit)
+	var w := maxf(1.5, ec * 0.16)
+	var rim := Color(0.03, 0.05, 0.04, 0.92)
+	var tilt := (_hash01(x, y, k * 7) - 0.5) * 0.8
+	var axis := Vector2(cos(tilt), sin(tilt))
+	var perp := axis.orthogonal()
+	var pts := PackedVector2Array([
+		p - axis * length * 0.5,
+		p + perp * length * 0.34,  # bow the midpoint out → a comma curve
+		p + axis * length * 0.5,
+	])
+	draw_polyline(pts, rim, w + 2.0, true)
+	draw_polyline(pts, col, w, true)
+	draw_circle(pts[0], w * 0.5, col)
+	draw_circle(pts[2], w * 0.5, col)
+
+
+## Pleomorph (Mycoplasma, wall-less): a soft irregular blob — overlapping spheres of varying radius + a halo.
+func _draw_pleomorph(p: Vector2, col: Color, fit: float, x: int, y: int, k: int, size_scale: float) -> void:
+	var ec := _cell * maxf(0.2, size_scale)
+	var r := maxf(1.5, ec * 0.26 * (0.8 + 0.3 * fit))
+	var rim := Color(0.03, 0.05, 0.04, 0.85)
+	draw_circle(p, r * 1.5, Color(col.r, col.g, col.b, 0.18))  # soft membraneless halo
+	for c in 3:
+		var off := Vector2(_hash01(x, y, k * 11 + c) - 0.5, _hash01(x, y, k * 13 + c) - 0.5) * r * 0.8
+		var rr := r * (0.6 + 0.4 * _hash01(x, y, k * 17 + c))
+		draw_circle(p + off, rr + 0.5, rim)
+		draw_circle(p + off, rr, col)
+
+
+## Symbiont (Carsonella / Syn3, reduced genome): the tiniest speck — one small rimmed sphere + a faint halo so it
+## still reads at field scale.
+func _draw_symbiont(p: Vector2, col: Color, fit: float, x: int, y: int, k: int, size_scale: float) -> void:
+	var ec := _cell * maxf(0.2, size_scale)
+	var r := maxf(1.0, ec * 0.16 * (0.85 + 0.3 * fit))
+	var rim := Color(0.03, 0.05, 0.04, 0.9)
+	draw_circle(p, r * 1.9, Color(col.r, col.g, col.b, 0.16))
+	draw_circle(p, r + 0.5, rim)
+	draw_circle(p, r, col)
+
+
+## Mold (Aspergillus / Penicillium): a filament tuft — a basal node + a fan of radiating hyphae topped with
+## conidiophore-head specks. The largest microbe morphotype (a colony, not a single cell).
+func _draw_mold(p: Vector2, col: Color, fit: float, x: int, y: int, k: int, size_scale: float) -> void:
+	var ec := _cell * maxf(0.2, size_scale)
+	var reach := ec * 0.6 * (0.7 + 0.3 * fit)
+	var w := maxf(1.0, ec * 0.06)
+	draw_circle(p, w * 1.8, col.darkened(0.1))  # basal node
+	for h in 4:
+		var ang := -PI * 0.5 + (float(h) / 3.0 - 0.5) * 1.7 + (_hash01(x, y, k * 7 + h) - 0.5) * 0.3
+		var dir := Vector2(cos(ang), sin(ang))
+		var tip := p + dir * reach * (0.7 + 0.3 * _hash01(x, y, k * 9 + h))
+		draw_line(p, tip, col, w)
+		draw_circle(tip, w * 1.6, col.lightened(0.12))  # conidiophore head
 
 
 ## The old dot marker (rim + body + specular), reused at full size when sprites are off / at LOD, or shrunk to
