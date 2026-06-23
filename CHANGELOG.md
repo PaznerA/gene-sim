@@ -4,6 +4,32 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Specimen testing-unblock — inject button + brush→variant + extinct-struck-through + Load Starter (feat, renderer/tooling) — HASH-NEUTRAL
+Three presentation/gameplay quick-wins that unblock manual testing of the specimen view. **ZERO Rust touched →
+pinned literal `0x47a0_3c8f_6701_f240` byte-identical** (`determinism_hash_is_pinned` + reproducible-at-pinned-config
+green; full `tools/gate.sh` GREEN; godot UI gate `channels=13` / `glyphs=13` / `codex=OK`). All on the read-only
+side of inv #2 — pure projections of core exports (observe_species phenotype, GSS5 `dominant_species_id`,
+`species_key`, `population_size`) into pixels.
+- **Item 1 — explicit `💉 Inject (whole species)` button** (`godot/main.gd` `_build_crispr_params`): the
+  whole-species CRISPR inject (the only edit that appends a new specimen variant) used to fire ONLY on Enter in the
+  Guide field — undiscoverable. Now a labelled button in the CRISPR sub-panel calls the same `_on_inject_pressed`.
+- **Item 2 — brush stroke surfaces a variant + extinct = struck-through-but-kept**: a region CRISPR brush now
+  force-appends a `region edit N` variant to the dominant species at the painted cell (`_dominant_species_at` reads
+  the GSS5 plane; `_append_edit_variant_for` generalizes the old whole-species path). A species whose population
+  crashes to 0 is tracked (`_ever_alive`/`_extinct` in `_poll_population_alerts`, un-struck on spore regermination)
+  and rendered struck-through + greyed (`✟ … — extinct` via a `[s]` RichTextLabel + dimmed glyph) — KEPT in the
+  grid for investigation, never removed.
+- **Item 3 — `📂 Load Starter — "Primordial Soil"`** (`godot/main_menu.gd`): reads `res://data/presets/primordial.json`
+  → prefills the roster rows + env (seed/lat/lon/temp/season) + containment level, so a legible multi-species map is
+  one click away. Preset staged into the res:// mirror (`run.sh`, `tools/check_godot_snapshot.sh` byte-equality gate,
+  `release.yml` PCK + .deb).
+- **Tooling — macOS-robust godot gate**: `tools/check_godot_snapshot.sh` captured godot via `OUT="$(godot …)"`, which
+  hangs forever on macOS (a headless-godot child keeps the stdout pipe open after exit). Switched to a `timeout` +
+  file-capture `run_godot` helper — Linux CI unaffected, local gating no longer hangs.
+- Adversarially verified by a 3-skeptic workflow (3/3 on no-biology-in-GDScript, zero-Rust/hash-neutral, graceful
+  degrade, UX-faithful); one skeptic independently caught the same GDScript Variant-inference parse error the godot
+  load did (fixed: `var i: int`), proving the verify pass.
+
 ### GSS5 — ecosystem-map species visualization: per-cell `dominant_species_id` snapshot channel + per-species sizing (feat, sim-core/godot) — HASH-NEUTRAL
 ADR-021. The map sized every organism the same → unusable on a multi-species roster. Added a per-cell
 `dominant_species_id` channel to `GridSnapshot` (most-populous species per cell, sorted-Vec argmax, no HashMap),

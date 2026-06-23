@@ -44,6 +44,17 @@ if ! diff -rq data/codex godot/data/codex >/dev/null 2>&1; then
 fi
 echo "CODEX MIRROR OK — godot/data/codex == data/codex ($(ls data/codex | wc -l | tr -d ' ') files)"
 
+# Item 3 res:// presets mirror — the SAME discipline as the species/codex mirrors. data/presets/ is the committed
+# source of truth (the "Load Starter" presets main_menu.gd reads via FileAccess); godot/data/presets/ is the
+# generated, gitignored mirror. Stage it + assert byte-equality (RED on drift) so a preset can never silently rot.
+mkdir -p godot/data/presets && cp data/presets/*.json godot/data/presets/
+if ! diff -rq data/presets godot/data/presets >/dev/null 2>&1; then
+  echo "FAIL — godot/data/presets is not byte-equal to data/presets (Item 3 mirror drift):"
+  diff -rq data/presets godot/data/presets || true
+  exit 1
+fi
+echo "PRESETS MIRROR OK — godot/data/presets == data/presets ($(ls data/presets | wc -l | tr -d ' ') files)"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -58,8 +69,20 @@ fi
 SNAP="$(ls "$TMP"/snap_*.bin 2>/dev/null | sort | tail -1)"
 [ -n "$SNAP" ] && [ -f "$SNAP" ] || { echo "FAIL — harness wrote no snap_*.bin into $TMP"; exit 1; }
 
+# macOS headless Godot can leave a child process holding the stdout PIPE so a `$(godot …)` command substitution
+# never returns even after Godot has finished its work and exited — the gate appears to hang forever. Capture to a
+# FILE under a `timeout` instead (a file has no pipe to wait on; a genuine hang is bounded by GODOT_TIMEOUT and
+# reported as a missing success marker). Linux CI is unaffected — Godot finishes in seconds and the timeout is just
+# a safety net. The callers below grep the captured file exactly as they greped the old `$OUT`/`$ROUT` strings.
+GODOT_TIMEOUT="${GODOT_TIMEOUT:-180}"
+run_godot() {  # run_godot <out-file> <args-after-`--path godot`...>; never aborts the script (callers grep the file)
+  local out="$1"; shift
+  timeout "$GODOT_TIMEOUT" godot --headless --path godot "$@" > "$out" 2>&1 || true
+}
+
 # 1. S4.2 reader.
-OUT="$(godot --headless --path godot -- --snap "$SNAP" 2>&1)"
+run_godot "$TMP/reader_out.log" -- --snap "$SNAP"
+OUT="$(cat "$TMP/reader_out.log")"
 if ! printf '%s' "$OUT" | grep -q "snapshot OK"; then
   echo "FAIL — Godot reader did not report 'snapshot OK'. Full output:"
   printf '%s\n' "$OUT"
@@ -76,7 +99,8 @@ printf '%s' "$OUT" | grep -q "channels=13" || { echo "FAIL — expected channels
 # morphotype body OR a garbled codex.json / broken join goes RED here — the inv-#4 guarantee the deferred
 # SP-4 lacked. Expect glyphs=13 (the 12 baked species + 1 unknown-key fallback) and codex=OK.
 for mode in "" "--ortho"; do
-  ROUT="$(godot --headless --path godot -- --run "$TMP" --check $mode 2>&1)"
+  run_godot "$TMP/check_out.log" -- --run "$TMP" --check $mode
+  ROUT="$(cat "$TMP/check_out.log")"
   if ! printf '%s' "$ROUT" | grep -q "render scene OK"; then
     echo "FAIL — Godot render scene (${mode:-iso-default}) did not report 'render scene OK'. Full output:"
     printf '%s\n' "$ROUT"

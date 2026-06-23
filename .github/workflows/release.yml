@@ -131,9 +131,10 @@ jobs:
           # FileAccess, which in an EXPORTED build resolves ONLY against the PCK. godot/data/ is the gitignored
           # generated mirror; without this step neither species (a pre-existing PCK gap) nor the SP-4 codex are
           # embedded. data/{species,codex}/ at repo-root are the committed sources of truth.
-          mkdir -p godot/data/species godot/data/codex
+          mkdir -p godot/data/species godot/data/codex godot/data/presets
           cp data/species/*.json godot/data/species/
           cp data/codex/*.json godot/data/codex/
+          cp data/presets/*.json godot/data/presets/
 
       - name: Export the Linux game executable
         run: |
@@ -164,9 +165,10 @@ jobs:
           # Species data must sit BESIDE the binary so LiveSim::set_species resolves it in the shipped build
           # (the cwd is not the repo root there) — the "RUN E. coli" feature needs data/species/*.json (ADR-017).
           # The codex rides along (belt-and-suspenders beside-binary copy; the PCK embed above is the primary path).
-          mkdir -p "$root/opt/gene-sim/data/species" "$root/opt/gene-sim/data/codex"
+          mkdir -p "$root/opt/gene-sim/data/species" "$root/opt/gene-sim/data/codex" "$root/opt/gene-sim/data/presets"
           cp data/species/*.json "$root/opt/gene-sim/data/species/"
           cp data/codex/*.json "$root/opt/gene-sim/data/codex/"
+          cp data/presets/*.json "$root/opt/gene-sim/data/presets/"
           chmod 755 "$root/opt/gene-sim/gene-sim.x86_64"
           cat > "$root/usr/bin/gene-sim" <<'EOF'
           #!/bin/sh
@@ -255,9 +257,10 @@ jobs:
           # Embed species + codex JSON into the PCK (the renderer reads res://data/{species,codex}/*.json via
           # FileAccess, which in an exported build resolves ONLY against the PCK). Closes the pre-existing species
           # PCK gap + embeds the SP-4 codex. godot/data/ is the gitignored generated mirror.
-          mkdir -p godot/data/species godot/data/codex
+          mkdir -p godot/data/species godot/data/codex godot/data/presets
           cp data/species/*.json godot/data/species/
           cp data/codex/*.json godot/data/codex/
+          cp data/presets/*.json godot/data/presets/
 
       - name: Export the Windows game executable
         run: |

@@ -44,6 +44,10 @@ mkdir -p godot/data/species && cp data/species/*.json godot/data/species/
 # generated, gitignored mirror.
 echo "» staging codex JSON → godot/data/codex/"
 mkdir -p godot/data/codex && cp data/codex/*.json godot/data/codex/
+# Item 3: stage the run PRESETS too — main_menu.gd's "Load Starter" reads res://data/presets/*.json via FileAccess
+# (same inert-bytes path). data/presets/ is the committed source of truth; godot/data/ is the gitignored mirror.
+echo "» staging preset JSON → godot/data/presets/"
+mkdir -p godot/data/presets && cp data/presets/*.json godot/data/presets/
 
 # Engine args before `--`; game args (FLAGS from config + CLI args) after it. --live is always on for run.sh.
 echo "» launching: $GODOT --path godot -- --live ${FLAGS[*]:-} $*"

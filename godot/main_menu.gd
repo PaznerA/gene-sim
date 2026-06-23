@@ -119,6 +119,17 @@ func _build() -> void:
 	sub.add_theme_color_override("font_color", Color(0.6, 0.72, 0.62))
 	col.add_child(sub)
 
+	# Item 3: one-click QUICK START — load the bundled "Primordial Soil" starter preset (a trophic-realistic
+	# multi-species roster + env + containment) into the composer below, so a legible multi-species map is one click
+	# away (the way to actually SEE the per-species size contrast on the field). Renderer-only (inv #2): it reads
+	# inert preset JSON via FileAccess + fills the existing widgets; the CORE still builds every species from the
+	# roster at reset. Degrades gracefully (a push_warning, form untouched) if the preset is absent / malformed.
+	var starter := Button.new()
+	starter.text = "📂  Load Starter — “Primordial Soil”"
+	starter.tooltip_text = "Fill the form below with the bundled starter preset:\na producer-heavy 4-species soil community (plant · E. coli · Bacillus · Bdellovibrio)."
+	starter.pressed.connect(_on_load_starter)
+	col.add_child(starter)
+
 	col.add_child(_sep())
 
 	# --- SEED row: a random toggle + a fixed-value field.
@@ -269,6 +280,97 @@ func _on_remove_species(entry: Dictionary) -> void:
 	var row: Node = entry["row"]
 	if row != null:
 		row.queue_free()
+
+
+# ──────────────────────────── Item 3: "Load Starter" preset ─────────────────────────────────────────────────
+
+const STARTER_PRESET_PATH := "res://data/presets/primordial.json"
+
+
+## "📂 Load Starter": read the bundled Primordial preset (inert JSON via FileAccess — same res:// path the species
+## data rides, inv #2) and PREFILL the composer: rebuild the roster rows from preset.roster (key + count, in the
+## load-bearing row order), set the env sliders (seed/lat/lon/temp/season), the Population total, and the
+## containment level. The CORE still builds every species at reset — GDScript only moves stems/ints into widgets.
+## Degrades gracefully (a warning, the form left as-is) on a missing/malformed preset.
+func _on_load_starter() -> void:
+	if not FileAccess.file_exists(STARTER_PRESET_PATH):
+		push_warning("Load Starter: preset not found at %s (was data/presets staged into res://?)" % STARTER_PRESET_PATH)
+		return
+	var f := FileAccess.open(STARTER_PRESET_PATH, FileAccess.READ)
+	if f == null:
+		push_warning("Load Starter: could not open %s" % STARTER_PRESET_PATH)
+		return
+	var text := f.get_as_text()
+	f.close()
+	var parsed: Variant = JSON.parse_string(text)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		push_warning("Load Starter: malformed preset JSON in %s" % STARTER_PRESET_PATH)
+		return
+	var preset: Dictionary = parsed
+
+	# --- ROSTER: rebuild rows from preset.roster (key → ALL_SPECIES index, + count), in order (row order is the
+	# load-bearing SpeciesId key, inv #3). Detach the old rows synchronously so the form never shows old+new at once.
+	var roster: Array = preset.get("roster", [])
+	if not roster.is_empty():
+		for e in _roster_rows:
+			var old_row: Node = e.get("row")
+			if old_row != null and is_instance_valid(old_row):
+				_roster_box.remove_child(old_row)
+				old_row.queue_free()
+		_roster_rows.clear()
+		var total := 0
+		for entry in roster:
+			var d: Dictionary = entry
+			var stem := str(d.get("key", "default"))
+			var count := int(d.get("count", ROSTER_DEFAULT_COUNT))
+			_add_roster_row(_species_index_for_stem(stem), count)
+			total += maxi(0, count)
+		# Reflect the composed total on the Population slider so its readout matches the roster (the per-row counts
+		# are authoritative for a composed run; this keeps the displayed number honest).
+		if total > 0 and _entities != null:
+			_entities.value = clampf(float(total), _entities.min_value, _entities.max_value)
+
+	# --- ENV: seed / lat / lon / temp / season (each guarded so a partial preset only sets what it carries).
+	var env: Dictionary = preset.get("env", {})
+	if env.has("seed") and _seed_edit != null:
+		if _random_chk != null:
+			_random_chk.button_pressed = false  # a fixed starter seed → turn random off
+		_seed_edit.editable = true
+		_seed_edit.text = str(int(env.get("seed", _seed)))
+	if env.has("lat") and _lat != null:
+		_lat.value = float(env.get("lat", _lat.value))
+	if env.has("lon") and _lon != null:
+		_lon.value = float(env.get("lon", _lon.value))
+	if env.has("temp") and _temp != null:
+		_temp.value = float(env.get("temp", _temp.value))
+	if env.has("season"):
+		_season = _season_index(str(env.get("season", "Spring")))
+
+	# --- CONTAINMENT level (ordinal into CONTAINMENT_LABELS / sim_core::ContainmentLevel).
+	var cont: Dictionary = preset.get("containment", {})
+	if _containment_btn != null and cont.has("level"):
+		_containment_btn.selected = clampi(int(cont.get("level", 0)), 0, CONTAINMENT_LABELS.size() - 1)
+
+	_refresh_values()
+	_update_preview()
+
+
+## ALL_SPECIES index for a file stem (preset roster key → composer row selection). Unknown stem → 0 (the abstract
+## plant) so a preset that names an unbundled species still loads SOMETHING rather than failing.
+func _species_index_for_stem(stem: String) -> int:
+	for i in ALL_SPECIES.size():
+		if String(ALL_SPECIES[i][1]) == stem:
+			return i
+	push_warning("Load Starter: unknown species stem '%s' → defaulting to plant" % stem)
+	return 0
+
+
+## SEASONS index for a season name string (the preset stores "Spring"…"Winter"); unknown → 0 (Spring).
+func _season_index(season_name: String) -> int:
+	for i in SEASONS.size():
+		if SEASONS[i] == season_name:
+			return i
+	return 0
 
 
 var _last_value_label: Label = null  # set by _add_slider so the caller can keep the readout label
