@@ -2283,6 +2283,10 @@ func _set_view_mode(m: int) -> void:
 		_specimen_panel.set_active(m == VIEW_SPECIMEN)
 	if _relations_panel != null:
 		_relations_panel.set_active(m == VIEW_RELATIONS)
+	if _containment_panel != null:
+		# CONTAMINATION is an ecosystem-mode control (consortium schedule); gate it to the field view like the
+		# intervention panel, so its (tall) body never overlaps the SPECIMEN / RELATIONS panels (both top-right).
+		_containment_panel.set_active(_live != null and m == VIEW_ECOSYSTEM)
 	if m == VIEW_SPECIMEN:
 		# The specimen view now renders a GENUINE per-species body: a Microbe rod glyph for E. coli, the L-system
 		# plant for the abstract species (branched in _render_specimens). No placeholder.
@@ -2582,6 +2586,7 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 
 	_specimen_picker = OptionButton.new()
 	_specimen_picker.item_selected.connect(_on_specimen_selected)
+	_specimen_picker.clip_text = true  # long strain titles ("Escherichia coli K-12 core — baseline — gen 0") ellipsize inside the panel instead of overflowing its right edge
 	col.add_child(_specimen_picker)
 
 	# Per-species VITALS row (Rel-UI.1): a compact 3-up Population / Allele / Fitness block, each a value + ▲▼
