@@ -47,6 +47,7 @@ const Iso := preload("res://iso.gd")
 const IsoGround := preload("res://iso_ground.gd")
 const Sparkline := preload("res://sparkline.gd")
 const RelationsHeatmap := preload("res://relations_heatmap.gd")
+const RelationsGraph := preload("res://relations_graph.gd")  # Item 4: node-link trophic-web graph (companion view)
 const Brush := preload("res://brush.gd")
 const PanelChrome := preload("res://panel.gd")
 const PillRail := preload("res://pill_rail.gd")
@@ -151,6 +152,10 @@ var _specimen_picker: OptionButton
 var _relations_root: Node2D  # holds the relations heatmap (parallels _specimen_root)
 var _relations_panel: Control  # PanelChrome wrapper (🔗 RELATIONS)
 var _relations_heatmap: Control  # the RelationsHeatmap _draw() node
+var _relations_graph: Control  # Item 4: the RelationsGraph node-link _draw() node (companion to the heatmap)
+var _relations_show_graph: bool = true  # Item 4: which relations representation is visible (Graph default vs Matrix)
+var _relations_graph_btn: Button  # the Graph/Matrix segmented toggle (kept for set_pressed_no_signal sync)
+var _relations_matrix_btn: Button
 var _relations_banner: Label  # degrade-state banner (State 1/2/4 text; hidden in State 3)
 var _relations_flowsum: Label  # plain-language "who's eating whom" top-N flow summary (parsed from the FlowMatrix)
 var _relations_nearest: Label  # ADR-014 nearest-species strip (view-only/advisory; hidden when no overlay)
@@ -391,6 +396,13 @@ func _ready() -> void:
 	var reseed := _arg_value("--reset-seed")  # optional: exercise the lifecycle reset for --shot verification
 	if _live != null and reseed != "":
 		_do_reset(int(reseed))
+	# --steps N (live shot): advance the sim N generations before the view/capture so the ecosystem DEVELOPS —
+	# populations establish (varied node sizes on the map + relations graph) and the FlowMatrix accumulates the
+	# measured trophic flows the relations graph draws as edges. Pure stepping of the deterministic core (inv #3).
+	var steps_arg := _arg_value("--steps")
+	if _live != null and steps_arg != "" and steps_arg.is_valid_int():
+		_live.step(maxi(0, int(steps_arg)))
+		_publish_frame()
 	if _live != null and _has_flag("--inject"):  # optional: fire one demo injection for --shot verification
 		_live.step(20)
 		_publish_frame()
@@ -498,6 +510,15 @@ func _apply_cli_environment() -> void:
 	# --species <stem> (ADR-017): the scripted/headless equivalent of the menu's Species picker. Routes through
 	# the SAME res:// byte-mover the menu uses, so the specimen view + readout pick up E. coli identically.
 	_species_stem = _apply_species(_arg_value("--species"))
+	# --roster "stem:count,stem:count,…" (shot/headless parity for a MULTI-species run — the scripted equivalent of
+	# the menu's roster composer / the Load Starter preset). Lets --shot exercise a real multi-species map + the
+	# relations GRAPH with measured predator/prey flows. When present + non-trivial it OVERRIDES --species. Renderer
+	# only moves stems+counts (inv #2); the core builds every species; armed here, BEFORE _do_reset (inv #3).
+	var roster_arg := _arg_value("--roster")
+	if roster_arg != "":
+		var roster := _parse_roster_arg(roster_arg)
+		if _apply_roster(roster):
+			_species_stem = _roster_active_stem(roster)
 
 
 ## Show the menu only for a plain interactive launch — never for the headless/gate paths (--shot/--check) or an
@@ -653,6 +674,22 @@ func _roster_active_stem(roster: Array) -> String:
 		return ""
 	var stem: String = String((roster[0] as Dictionary).get("stem", "default"))
 	return "" if stem == "default" else stem
+
+
+## Parse a "--roster" CLI string ("default:800,ecoli:250,bdellovibrio:50") into a [{stem,count}] array in the given
+## (load-bearing) order. A bare "stem" with no ":count" defaults to 100. Pure renderer string parsing (inv #2).
+func _parse_roster_arg(arg: String) -> Array:
+	var roster: Array = []
+	for part in arg.split(",", false):
+		var kv := String(part).strip_edges().split(":")
+		var stem := String(kv[0]).strip_edges()
+		if stem == "":
+			continue
+		var count := 100
+		if kv.size() >= 2 and String(kv[1]).strip_edges().is_valid_int():
+			count = int(String(kv[1]).strip_edges())
+		roster.append({"stem": stem, "count": count})
+	return roster
 
 
 ## SP-2: push the menu's up-front ContainmentLevel to the core BEFORE reset (ADR-019 S3). The menu chooses only
@@ -3177,9 +3214,41 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	_relations_flowsum.visible = false
 	col.add_child(_relations_flowsum)
 
+	# Item 4: Graph / Matrix segmented toggle. The user expected a node-link GRAPH of the trophic web but only had
+	# the S×S heatmap; the GRAPH is now the DEFAULT representation, with the matrix one click away. Both read the same
+	# core-MEASURED FlowMatrix (+ populations) — only the drawing differs (inv #2). A ButtonGroup keeps one selected.
+	var rep_row := HBoxContainer.new()
+	rep_row.add_theme_constant_override("separation", 4)
+	var rep_grp := ButtonGroup.new()
+	_relations_graph_btn = Button.new()
+	_relations_graph_btn.text = "🕸 Graph"
+	_relations_graph_btn.tooltip_text = "Node-link web: species as nodes (sized by population, coloured by morphotype),\nedges = measured net joule flows (arrow = source→sink, thickness = magnitude)."
+	_relations_graph_btn.toggle_mode = true
+	_relations_graph_btn.button_group = rep_grp
+	_relations_graph_btn.pressed.connect(_on_relations_rep_selected.bind(true))
+	rep_row.add_child(_relations_graph_btn)
+	_relations_matrix_btn = Button.new()
+	_relations_matrix_btn.text = "▦ Matrix"
+	_relations_matrix_btn.tooltip_text = "S×S FlowMatrix heatmap (rows = sink/gains, cols = source/gives)."
+	_relations_matrix_btn.toggle_mode = true
+	_relations_matrix_btn.button_group = rep_grp
+	_relations_matrix_btn.pressed.connect(_on_relations_rep_selected.bind(false))
+	rep_row.add_child(_relations_matrix_btn)
+	col.add_child(rep_row)
+
+	# Item 4: the node-link GRAPH (default-visible). Built before the heatmap; _on_relations_rep_selected swaps which
+	# of the two is shown. Reads names/keys/roles/populations + the flat FlowMatrix in _refresh_relations (inv #2).
+	_relations_graph = RelationsGraph.new()
+	_relations_graph.custom_minimum_size = Vector2(340, 320)
+	col.add_child(_relations_graph)
+
 	_relations_heatmap = RelationsHeatmap.new()
 	_relations_heatmap.custom_minimum_size = Vector2(340, 300)
 	col.add_child(_relations_heatmap)
+
+	# Default representation: GRAPH (the user's expectation). The toggle reflects + swaps it.
+	_relations_graph_btn.set_pressed_no_signal(true)
+	_apply_relations_rep()
 
 	# Diverging sign/magnitude legend strip (reuses the _legend_label colored-text pattern, diverging variant).
 	var legend := HBoxContainer.new()
@@ -3223,6 +3292,47 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	_relations_panel = PanelChrome.new()
 	_relations_panel.setup("🔗 RELATIONS", body, ui, Vector2(maxf(220.0, field_px.x - 376.0), 70.0), _pill_rail)
 	_relations_panel.set_active(false)
+
+
+## Item 4: select the relations representation (Graph vs Matrix) + swap which node is visible. The legend / flow
+## summary / nearest strips stay shown for BOTH (they annotate the same MEASURED data). Pure renderer state (inv #2).
+func _on_relations_rep_selected(show_graph: bool) -> void:
+	_relations_show_graph = show_graph
+	_apply_relations_rep()
+
+
+func _apply_relations_rep() -> void:
+	if _relations_graph != null:
+		_relations_graph.visible = _relations_show_graph
+	if _relations_heatmap != null:
+		_relations_heatmap.visible = not _relations_show_graph
+
+
+## Item 4: per-species display arrays in SpeciesId order (= observe_species() order = FlowMatrix index order, by
+## construction): {names, keys, roles, pops}. Feeds the relations GRAPH nodes. Pure reads of core exports (inv #2);
+## empty (→ a node-less graph) on file-replay / an older cdylib without observe_species().
+func _relations_species_arrays() -> Dictionary:
+	var names := PackedStringArray()
+	var keys := PackedStringArray()
+	var roles := PackedStringArray()
+	var pops := PackedInt64Array()
+	if _live != null and _live.has_method("observe_species"):
+		for sp in _live.observe_species():
+			var d: Dictionary = sp
+			names.append(str(d.get("name", "species")))
+			keys.append(str(d.get("key", "default")))
+			roles.append(str(d.get("role", "")))
+			pops.append(int(d.get("population_size", 0)))
+	# File-replay / older cdylib (no observe_species): mirror the heatmap's _species_names() placeholder so the two
+	# views agree — the graph then draws a neutral node captioned like the matrix row, not a bare "sp0". Cosmetic
+	# parity only (inv #2 — still a pure projection; populations are unknown in replay → 0).
+	if names.is_empty():
+		for nm in _species_names():
+			names.append(nm)
+			keys.append("default")
+			roles.append("")
+			pops.append(0)
+	return {"names": names, "keys": keys, "roles": roles, "pops": pops}
 
 
 ## A small color swatch + label for the diverging legend strip (presentation only).
@@ -3282,6 +3392,12 @@ func _refresh_relations() -> void:
 		flat = PackedInt64Array()
 		flat.resize(s * s)  # zero-filled
 	_relations_heatmap.set_matrix(flat, s)
+	# Item 4: feed the node-link GRAPH the SAME MEASURED FlowMatrix + per-species metadata (names/keys/roles/pops in
+	# SpeciesId order = the matrix index order). The graph degrades to nodes-only on a degenerate matrix, exactly like
+	# the heatmap. Pure projection of core exports (inv #2) — no biology, no RNG.
+	if _relations_graph != null and _relations_graph.has_method("set_data"):
+		var meta := _relations_species_arrays()
+		_relations_graph.set_data(meta["names"], meta["keys"], meta["roles"], meta["pops"], flat, s)
 	# Item (a): narrate the top NONZERO inter-species flows in plain language above the heatmap. Same MEASURED
 	# integers the heatmap paints — just sorted by magnitude + named. Hidden when the matrix is all-zero (State 1/2).
 	if _relations_flowsum != null:
