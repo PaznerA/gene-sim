@@ -39,6 +39,9 @@ const SnapshotReader := preload("res://snapshot.gd")
 const Organisms := preload("res://organisms.gd")
 const Lsystem := preload("res://lsystem.gd")
 const Microbe := preload("res://microbe.gd")
+const Mold := preload("res://mold.gd")
+const GlyphFactory := preload("res://glyph_factory.gd")
+const Codex := preload("res://codex.gd")
 const Timeline := preload("res://timeline.gd")
 const Iso := preload("res://iso.gd")
 const IsoGround := preload("res://iso_ground.gd")
@@ -81,6 +84,12 @@ const TRAIT_KEYS := [
 const MICROBE_TRAIT_KEYS := [
 	"growth_rate", "glucose_uptake", "respiration_mode", "acetate_overflow", "fermentation_capacity"
 ]
+# The PREDATOR (Bdellovibrio) phenotype: growth + the attack-rate lever. The spore-former (Bacillus / molds) and
+# obligate-symbiont (Carsonella / Syn3) sets surface the previously-DROPPED diagnostic traits — they were silently
+# omitted from the readout because TRAIT_KEY_MAP didn't carry them. _active_trait_keys() picks the set by morphotype.
+const PREDATOR_TRAIT_KEYS := ["growth_rate", "predation_capacity"]
+const SPORE_TRAIT_KEYS := ["growth_rate", "sporulation_capacity"]
+const SYMBIONT_TRAIT_KEYS := ["growth_rate", "symbiosis_capacity"]
 const FRAME_SECONDS := 0.45  # seconds per snapshot when playing a FILE run (the Timer cadence)
 # Decoupled-single-thread live loop (keeps the brush/clicks responsive while the sim runs fast — see _process):
 const STEPS_PER_SECOND_BASE := 1.0 / FRAME_SECONDS  # live generations/sec at speed 1.0 (the speed slider scales it)
@@ -163,6 +172,9 @@ var _tooltip: PanelContainer
 var _tooltip_label: Label
 var _detail_panel: PanelContainer
 var _detail_box: VBoxContainer
+# SP-4 codex: the renderer-only encyclopedia (static res://data/codex/codex.json). Built once; joined on the
+# core-exported ids (key/go/role) by the inspect card + tooltips. Graceful {} when an entry is missing.
+var _codex = Codex.new()
 var _dragging: bool = false  # left-button drag-pan in progress
 var _drag_moved: float = 0.0  # accumulated drag distance (to tell a click from a drag)
 var _live = null  # LiveSim gdext node when --live is active (drives an open-ended run); null = file replay
@@ -395,8 +407,15 @@ func _ready() -> void:
 		_update_trait_readout()  # exercise the per-species vitals + trait readout build path (Rel-UI.1)
 		_refresh_relations()  # exercise the relations heatmap refresh + degrade path (Rel-UI.0, State 1 in replay)
 		_fill_detail("(check)", ["density 0.0"])  # exercise the detail/ontology rendering path
-		print("render scene OK — %d snapshots, %d specimens, cell=%d, grid %dx%d" % [
-			_snaps.size(), _specimen_list().size(), int(_cell), _snaps[0].width, _snaps[0].height])
+		# SP-4 headless guards (inv #4 — every path built before any GPU): (a) BUILD every baked species' glyph via
+		# the key-led factory so a parse error / malformed polygon in ANY morphotype body goes RED; (b) load the
+		# codex + exercise the codex-enriched inspect join with a real species so a garbled codex.json or a broken
+		# join goes RED. The deferred SP-4 died because its GDScript path was never built headlessly — this fixes it.
+		var built := _check_build_all_glyphs()
+		var codex_ok := _check_codex_inspect()
+		print("render scene OK — %d snapshots, %d specimens, cell=%d, grid %dx%d, glyphs=%d, codex=%s" % [
+			_snaps.size(), _specimen_list().size(), int(_cell), _snaps[0].width, _snaps[0].height,
+			built, "OK" if codex_ok else "MISSING"])
 		get_tree().quit()
 		return
 
@@ -2297,6 +2316,11 @@ const TRAIT_KEY_MAP := {
 	# microbe (5) — E. coli phenotype (ecoli_trait_map); GrowthRate is shared with the plant set above.
 	"GlucoseUptake": "glucose_uptake", "RespirationMode": "respiration_mode",
 	"AcetateOverflow": "acetate_overflow", "FermentationCapacity": "fermentation_capacity",
+	# predator / spore-former / obligate-symbiont diagnostic traits (SP-4 — previously DROPPED from the readout
+	# because they were absent here, so a predator/spore-former/symbiont row showed no attack/sporulation/symbiosis
+	# bar). These cross the boundary via observe_species()'s Debug-cased phenotype; add them so they render.
+	"PredationCapacity": "predation_capacity", "SporulationCapacity": "sporulation_capacity",
+	"SymbiosisCapacity": "symbiosis_capacity",
 }
 
 
@@ -2354,9 +2378,10 @@ func _log_live_genome(label: String) -> void:
 		var sid := int(spd.get("species_id", 0))
 		var key := str(spd.get("key", "default"))
 		var sname := str(spd.get("name", "species"))
+		var role := str(spd.get("role", ""))  # SP-4: the Debug-cased TrophicRole, for the glyph + codex join
 		var traits := _capture_traits_from(spd.get("phenotype", {}))
 		if not _live_species_logs.has(sid):
-			_live_species_logs[sid] = {"key": key, "name": sname, "entries": []}
+			_live_species_logs[sid] = {"key": key, "name": sname, "role": role, "entries": []}
 			_live_species_order.append(sid)
 		var log_entry: Dictionary = _live_species_logs[sid]
 		var entries: Array = log_entry["entries"]
@@ -2401,12 +2426,14 @@ func _specimen_list() -> Array:
 			var log_entry: Dictionary = _live_species_logs[sid]
 			var key := str(log_entry.get("key", "default"))
 			var sname := str(log_entry.get("name", "species"))
+			var role := str(log_entry.get("role", ""))
 			for e in (log_entry["entries"] as Array):
 				var ed: Dictionary = e
 				out.append({
 					"label": "%s — %s" % [sname, str(ed.get("label", ""))],
 					"traits": ed.get("traits", {}),
 					"key": key,
+					"role": role,  # SP-4: the per-row trophic role (glyph fallback + codex role join)
 				})
 		return out
 	# File-replay / single-species fallback: the specimens.json baseline+edits, all plant ("default").
@@ -2426,8 +2453,8 @@ func _with_key(spec: Variant) -> Dictionary:
 	return d
 
 
-## Build one L-system plant per specimen, laid out in a row with a caption. The plant geometry comes from
-## the core-exported trait vector via _plant_params_from_traits (presentation mapping — no biology, inv #2).
+## Build one glyph per specimen (via the key-led GlyphFactory), laid out in a row with a caption. The glyph
+## geometry comes from the core-exported trait vector + role + key (presentation mapping — no biology, inv #2).
 func _render_specimens() -> void:
 	# Synchronous teardown: queue_free() is DEFERRED, so the stale holders would linger in get_children()
 	# this same frame and _emphasise_focus/_frame_focused_specimen (run right after on a view re-entry) would
@@ -2439,30 +2466,41 @@ func _render_specimens() -> void:
 	_specimen_bounds = Rect2()
 	if list.is_empty():
 		return
-	var spacing := 300.0
+	# Build every glyph FIRST so we can lay them out with ADAPTIVE spacing: glyph sizes now vary wildly (a tiny
+	# symbiont speck vs a tall mold conidiophore vs a plant), so a flat 300 either loses the specks or overlaps
+	# the molds. We place each cell using the running cursor + the previous/next half-widths from bounds().
+	var glyphs: Array = []  # [Node2D] one built glyph per specimen, in list order
+	for i in list.size():
+		var spec: Dictionary = list[i]
+		# Per-ROW dispatch on the specimen's OWN species key + role (not the global active species) via the
+		# key-led GlyphFactory: a mixed roster draws a rod for E. coli, a comma for Bdellovibrio, a mold for
+		# Aspergillus, a speck for the symbiont, an L-system tree for the plant — ALL in the same view. Each
+		# glyph honours the Node2D + build(Dictionary) + bounds()->Rect2 contract. Presentation only (inv #2).
+		var key := str(spec.get("key", "default"))
+		var role := str(spec.get("role", ""))
+		glyphs.append(GlyphFactory.make(key, role, spec.get("traits", {}), spec, i + 1))
+
+	const GAP := 120.0  # breathing room between adjacent glyph bounding boxes
+	const LABEL_W := 220.0
+	var cursor := 0.0  # x of the current cell's ORIGIN
+	var prev_half_right := 0.0  # how far the previous glyph extended to the right of its origin
 	var union := Rect2()
 	var has_union := false
 	for i in list.size():
 		var spec: Dictionary = list[i]
-		var holder := Node2D.new()
-		holder.position = Vector2(float(i) * spacing, 0.0)
-		_specimen_root.add_child(holder)
+		var glyph: Node2D = glyphs[i]
+		var pb: Rect2 = glyph.bounds()
+		# A glyph extends pb.position.x .. pb.position.x+pb.size.x around its origin. The label box spans ±LABEL_W/2.
+		var half_left := maxf(LABEL_W * 0.5, -pb.position.x)
+		var half_right := maxf(LABEL_W * 0.5, pb.position.x + pb.size.x)
+		if i > 0:
+			cursor += prev_half_right + GAP + half_left
+		prev_half_right = half_right
 
-		# Per-species body: a Microbe rod for E. coli, the L-system plant otherwise. Both expose the SAME
-		# Node2D + build(Dictionary) + bounds()->Rect2 contract, so the row/label/focus/framing machinery below
-		# (and _frame_focused_specimen / _emphasise_focus) is reused verbatim. Presentation only (inv #2):
-		# trait scalars → visual params, the biology already ran in the core.
-		# Dispatch per-ROW on the specimen's OWN species key (not the global active species) so a mixed roster
-		# draws a Microbe rod for the E. coli row AND an L-system tree for the plant row IN THE SAME view.
-		var glyph: Node2D
-		if _is_microbe_key(str(spec.get("key", "default"))):
-			glyph = Microbe.new()
-			holder.add_child(glyph)
-			glyph.build(_microbe_params_from_traits(spec.get("traits", {}), i + 1))
-		else:
-			glyph = Lsystem.new()
-			holder.add_child(glyph)
-			glyph.build(_plant_params_from_traits(spec.get("traits", {}), i + 1))
+		var holder := Node2D.new()
+		holder.position = Vector2(cursor, 0.0)
+		_specimen_root.add_child(holder)
+		holder.add_child(glyph)
 
 		var label := Label.new()
 		label.text = str(spec.get("label", "specimen"))
@@ -2470,14 +2508,13 @@ func _render_specimens() -> void:
 		label.add_theme_color_override("font_color", Color(0.94, 0.98, 0.94))
 		label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
 		label.add_theme_constant_override("outline_size", 6)
-		label.size = Vector2(220, 0)
-		label.position = Vector2(-110, 18)
+		label.size = Vector2(LABEL_W, 0)
+		label.position = Vector2(-LABEL_W * 0.5, maxf(24.0, pb.position.y + pb.size.y + 12.0))
 		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		holder.add_child(label)
 
-		var pb: Rect2 = glyph.bounds()
 		var wb := Rect2(holder.position + pb.position, pb.size).merge(
-			Rect2(holder.position + Vector2(-110, 18), Vector2(220, 44)))
+			Rect2(holder.position + label.position, Vector2(LABEL_W, 44)))
 		if has_union:
 			union = union.merge(wb)
 		else:
@@ -2485,80 +2522,6 @@ func _render_specimens() -> void:
 			has_union = true
 	_specimen_bounds = union
 	_populate_specimen_picker()  # keep the A1 selector in sync with the rebuilt plant row
-
-
-## Map a core-exported trait vector (each in [0,1]) to L-system visual params. PRESENTATION ONLY (the
-## genome→trait biology already ran in the Rust core; this is trait→appearance, the renderer's job).
-func _plant_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
-	# 9 independent traits → distinct visual axes, so each edit changes the plant in a legible, different way.
-	var growth := clampf(float(t.get("growth_rate", 0.5)), 0.0, 1.0)
-	var stature := clampf(float(t.get("stature", 0.5)), 0.0, 1.0)
-	var branchy := clampf(float(t.get("branchiness", 0.5)), 0.0, 1.0)
-	var leaf := clampf(float(t.get("leaf_size", 0.5)), 0.0, 1.0)
-	var hue := clampf(float(t.get("leaf_hue", 0.5)), 0.0, 1.0)
-	var refl := clampf(float(t.get("reflectance", 0.5)), 0.0, 1.0)
-	var fec := clampf(float(t.get("fecundity", 0.5)), 0.0, 1.0)
-	var drought := clampf(float(t.get("drought_tolerance", 0.5)), 0.0, 1.0)
-	var ksl := clampf(float(t.get("kill_switch_linkage", 0.0)), 0.0, 1.0)
-	# Leaf hue sweeps yellow-green → deep green → blue-green; reflectance brightens it.
-	var leaf_hsv := Color.from_hsv(0.18 + hue * 0.30, 0.55 + drought * 0.25, 0.55 + refl * 0.35)
-	return {
-		"iterations": 3 + int(round(branchy * 3.0)),  # branchiness → recursion depth / density (3..6)
-		"angle_deg": 14.0 + branchy * 34.0,  # branchiness → branch spread
-		"segment_len": 5.0 + stature * 10.0,  # stature → reach/height
-		"len_falloff": 0.78 + drought * 0.16,  # drought → sturdier (slower) taper
-		"thickness": 2.5 + growth * 4.0,  # growth → trunk vigour
-		"leaf_size": 1.5 + leaf * 7.0,  # leaf_size → leaf area
-		"leaf_aspect": 0.42 + drought * 0.30,  # drought → narrower, sturdier leaves
-		"jitter_deg": 2.0 + ksl * 11.0,  # kill-switch linkage → unruliness
-		"seed": seed_val,
-		"flower_count": int(round(fec * 5.0)),  # fecundity → flowers (0..5)
-		"petal_count": 4 + int(round(fec * 4.0)),  # fecundity → fuller blooms (4..8)
-		"branch_base": Color(0.34, 0.23, 0.12).lerp(Color(0.45, 0.34, 0.18), growth),
-		"branch_tip": Color(0.30, 0.50, 0.20).lerp(Color(0.64, 0.60, 0.22), drought),
-		"leaf_color": leaf_hsv,
-		"flower_color": Color(0.95, 0.45, 0.55).lerp(Color(0.98, 0.85, 0.35), hue),
-		# Two previously-weak traits get DEDICATED channels (distinct from leaf_color / jitter):
-		"leaf_sheen": refl,  # reflectance → a specular glint on each leaf poly (independent of leaf_color value)
-		"kill_marker": ksl,  # kill_switch_linkage → a red base "genetic-instability" ring (on top of its jitter)
-	}
-
-
-## Map a core-exported E. coli trait vector (each in [0,1]) to microbe.gd visual params. PRESENTATION ONLY: the
-## genome→phenotype biology already ran in the Rust core (ecoli_trait_map); this is trait→pixels, the renderer's
-## job — the microbe analogue of _plant_params_from_traits. The 5 phenotypes drive 5 distinct, legible axes so
-## each whole-species edit (e.g. gltA knockout → growth_rate 1.0→0) visibly reshapes/recolors the cell.
-func _microbe_params_from_traits(t: Dictionary, seed_val: int) -> Dictionary:
-	var growth := clampf(float(t.get("growth_rate", 0.5)), 0.0, 1.0)
-	var glucose := clampf(float(t.get("glucose_uptake", 0.5)), 0.0, 1.0)
-	var respiration := clampf(float(t.get("respiration_mode", 0.5)), 0.0, 1.0)  # 0 aerobic … 1 fermentative
-	var acetate := clampf(float(t.get("acetate_overflow", 0.0)), 0.0, 1.0)
-	var ferment := clampf(float(t.get("fermentation_capacity", 0.0)), 0.0, 1.0)
-	# Membrane/cytoplasm tint: respiration lerps aerobic(cool blue-green) → fermentative(warm amber); acetate
-	# overflow pushes further toward a reddish/amber overflow tint (legible overflow-metabolism cue).
-	var aerobic := Color(0.42, 0.78, 0.80)
-	var ferment_tint := Color(0.86, 0.66, 0.34)
-	var body := aerobic.lerp(ferment_tint, respiration).lerp(Color(0.90, 0.42, 0.30), acetate * 0.6)
-	return {
-		"length": 56.0 + growth * 86.0,  # growth → longer cell (fast growth = elongated, dividing)
-		"width": 24.0 + glucose * 26.0,  # glucose uptake → fatter cell
-		# Graded fission-septum PINCH: reads across the whole growth range (waist pinch ~ (growth-0.7)/0.3,
-		# clamped 0..1), not just a binary >0.7 toggle — high growth = a deeper, more divided waist.
-		"septum_pinch": clampf((growth - 0.7) / 0.3, 0.0, 1.0),
-		# Respiration as its OWN channel (independent of acetate's reddish push): aerobic crisp membrane + O2 dots
-		# vs fermentative striped cytoplasm. The microbe.gd cytoplasm texture reads this, so respiration is legible
-		# separately from the acetate tint.
-		"respiration": respiration,
-		"flagella_count": 2 + int(round(glucose * 4.0)),  # motility leans on uptake/chemotaxis (2..6)
-		"flagella_len": 44.0 + glucose * 46.0,  # uptake → longer flagella reach
-		"granule_count": int(round(ferment * 12.0)),  # fermentation capacity → internal granule density (0..12)
-		"halo_count": int(round(acetate * 14.0)),  # acetate overflow → excreted dots/halo around the cell (0..14)
-		"seed": seed_val,
-		"body_color": body,
-		"outline_color": Color(0.92, 0.97, 0.99, 0.9),
-		"granule_color": Color(0.97, 0.88, 0.46, 0.9),
-		"halo_color": Color(0.93, 0.58, 0.30, 0.6),
-	}
 
 
 ## On-screen size of the ecosystem field — the iso diamond bbox under --iso, else the ortho rectangle.
@@ -3056,10 +3019,43 @@ func _focused_key() -> String:
 	return "ecoli-core" if _is_microbe() else "default"
 
 
-## The trait-key list for the FOCUSED specimen's species: the 5 microbe phenotypes for E. coli, else the 9 plant
-## traits. Iterated everywhere the readout walks traits, so the panel shows exactly that species' phenotype set.
+## The trophic role (Debug-cased) of the focused specimen row, for the morphotype + codex join. "" if unknown.
+func _focused_role() -> String:
+	var list := _specimen_list()
+	if not list.is_empty():
+		var spec: Dictionary = list[clampi(_focus, 0, list.size() - 1)]
+		return str(spec.get("role", ""))
+	return ""
+
+
+## The trait-key list for the FOCUSED specimen's species, picked by MORPHOTYPE so the readout shows exactly that
+## species' diagnostic phenotype set (and the previously-DROPPED predation/sporulation/symbiosis rows now render).
 func _active_trait_keys() -> Array:
-	return MICROBE_TRAIT_KEYS if _is_microbe_key(_focused_key()) else TRAIT_KEYS
+	match GlyphFactory.morph_for(_focused_key(), _focused_role()):
+		GlyphFactory.ROD:
+			# Spore-forming rod (Bacillus) → the sporulation row; other rods (E. coli/cutibacterium/pseudomonas) →
+			# the 5 microbe phenotypes. Detect a spore-former by the focused row carrying a sporulation_capacity > 0.
+			return SPORE_TRAIT_KEYS if _focused_has_trait("sporulation_capacity") else MICROBE_TRAIT_KEYS
+		GlyphFactory.VIBRIOID:
+			return PREDATOR_TRAIT_KEYS
+		GlyphFactory.MOLD:
+			return SPORE_TRAIT_KEYS
+		GlyphFactory.SYMBIONT:
+			return SYMBIONT_TRAIT_KEYS
+		GlyphFactory.COCCI, GlyphFactory.PLEOMORPH:
+			return MICROBE_TRAIT_KEYS
+		_:
+			return TRAIT_KEYS
+
+
+## Whether the focused specimen row carries a non-zero value for `trait_key` (used to tell a spore-forming rod
+## like Bacillus from a plain rod like E. coli without hard-coding keys).
+func _focused_has_trait(trait_key: String) -> bool:
+	var list := _specimen_list()
+	if list.is_empty():
+		return false
+	var t: Dictionary = (list[clampi(_focus, 0, list.size() - 1)] as Dictionary).get("traits", {})
+	return float(t.get(trait_key, 0.0)) > 0.0
 
 
 ## Rewrite the trait bars/values/deltas for the focused specimen (vs baseline = list index 0). The row COUNT is
@@ -3129,9 +3125,10 @@ func _update_trait_readout() -> void:
 	var list := _specimen_list()
 	if list.is_empty():
 		return
-	# Chrome glyph follows the FOCUSED specimen's species (🦠 for E. coli, 🌱 for the plant).
+	# Chrome glyph follows the FOCUSED specimen's MORPHOTYPE (🦠 rod/cocci/vibrioid · 🍄 mold · 🫧 mycoplasma ·
+	# 🔬 symbiont · 🌱 plant) for instant identity — via the same key-led table the glyph factory uses.
 	if _specimen_panel != null and _specimen_panel.has_method("set_title"):
-		_specimen_panel.set_title("🦠 SPECIMEN" if _is_microbe_key(_focused_key()) else "🌱 SPECIMEN")
+		_specimen_panel.set_title("%s SPECIMEN" % GlyphFactory.emoji_for(_focused_key(), _focused_role()))
 	_update_species_vitals()  # the 3-up Population/Allele/Fitness block for the focused species (Rel-UI.1)
 	var keys := _active_trait_keys()
 	var focused: Dictionary = (list[clampi(_focus, 0, list.size() - 1)] as Dictionary).get("traits", {})
@@ -3271,13 +3268,35 @@ func _update_tooltip() -> void:
 	elif _view_mode == 1:
 		var hit := _specimen_at(world)
 		if hit >= 0:
-			text = str((_specimen_list()[hit] as Dictionary).get("label", ""))
+			text = _specimen_tooltip(hit)
 	if text == "":
 		_tooltip.visible = false
 		return
 	_tooltip_label.text = text
 	_tooltip.visible = true
 	_tooltip.position = get_viewport().get_mouse_position() + Vector2(16, 14)
+
+
+## The lazy codex tooltip one-liner for a hovered specimen (SP-4): the label + emoji + headline + role one-line,
+## a pure string lookup keyed on the row's key/role (inv #2 — no biology). Degrades to the bare label when the
+## codex has no entry for the species (a species can ship before its codex copy).
+func _specimen_tooltip(hit: int) -> String:
+	var spec: Dictionary = _specimen_list()[hit]
+	var key := str(spec.get("key", "default"))
+	var role_dbg := str(spec.get("role", ""))
+	var label := str(spec.get("label", ""))
+	var cx := _codex.species_for(key)
+	if cx.is_empty():
+		return label
+	var emoji := str(cx.get("emoji", GlyphFactory.emoji_for(key, role_dbg)))
+	var role_id := _role_id_from_debug(role_dbg, key)
+	var role := _codex.role_for(role_id)
+	var line := "%s  %s" % [emoji, label]
+	if cx.has("headline"):
+		line += "\n%s" % str(cx["headline"])
+	if not role.is_empty():
+		line += "\n%s — %s" % [_role_badge(role_id), str(role.get("one_line", ""))]
+	return line
 
 
 ## Index of the specimen whose body (plant | microbe) bounds contain `world`, else -1.
@@ -3318,7 +3337,7 @@ func _on_click() -> void:
 			if _specimen_picker != null:
 				_specimen_picker.select(_focus)
 			_on_specimen_selected(_focus)
-			_fill_detail(str((_specimen_list()[hit] as Dictionary).get("label", "specimen")), [])
+			_fill_specimen_detail(hit)  # SP-4: the rich 6-section codex card for the FOCUSED species
 
 
 ## The per-cell stat lines (population channels + R1.0 soil channels + GSS3 pool channels) for the detail panel.
@@ -3363,7 +3382,266 @@ func _detail_label(text: String, size: int, color: Color) -> Label:
 	l.text = text
 	l.add_theme_font_size_override("font_size", size)
 	l.add_theme_color_override("font_color", color)
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.custom_minimum_size = Vector2(236, 0)
 	return l
+
+
+# ──────────────────────────── SP-4 rich per-specimen INSPECT card ────────────────────────────
+
+## The rich 6-section inspect card for the FOCUSED specimen (replaces the title-only specimen pin + the
+## file-replay-only genome block of _fill_detail). Reads ONLY core-exported ids joined to the static codex
+## (inv #2 — annotation, never derivation): the specimen row {key,label,traits,role}, the per-species
+## observe_species() row, the widened _live.loci() ontology, and codex.gd lookups. Every section degrades
+## gracefully — a missing codex entry falls back to bare ids; file-replay keeps the specimens.json genome path.
+## FIXES the confirmed live-mode bug: the old block read loci ONLY from _specimens.genome.loci (the file-replay
+## plant), so in --live it showed zero/wrong loci regardless of the focused species.
+func _fill_specimen_detail(focus: int) -> void:
+	for c in _detail_box.get_children():
+		c.queue_free()
+	var list := _specimen_list()
+	if list.is_empty() or focus < 0 or focus >= list.size():
+		_fill_detail("specimen", [])
+		return
+	var spec: Dictionary = list[focus]
+	var key := str(spec.get("key", "default"))
+	var role_dbg := str(spec.get("role", ""))  # Debug-cased TrophicRole ("Decomposer"); "" in file-replay
+	var role_id := _role_id_from_debug(role_dbg, key)  # the codex/gp role id ("decomposer")
+	var traits: Dictionary = spec.get("traits", {})
+	var cx := species_for_or_empty(key)
+
+	# 1. HEADER — emoji + display name + trophic-role badge.
+	var emoji := str(cx.get("emoji", GlyphFactory.emoji_for(key, role_dbg)))
+	var disp := str(cx.get("display_name", str(spec.get("label", key)).split(" — ")[0]))
+	var role_title := _role_badge(role_id)
+	_detail_box.add_child(_detail_label("%s  %s — %s" % [emoji, disp, role_title], 15, Color(0.97, 0.99, 0.96)))
+
+	# 2. CODEX BLURB — headline + a short taxonomy/phenology line (with a "Codex ▸" affordance).
+	if cx.has("headline"):
+		_detail_box.add_child(_detail_label(str(cx["headline"]), 11, Color(0.86, 0.92, 0.88)))
+	if cx.has("taxonomy"):
+		_detail_box.add_child(_detail_label("Codex ▸  %s" % str(cx["taxonomy"]), 10, Color(0.66, 0.74, 0.70)))
+
+	# 3. GENOME (loci/genes) — the FOCUSED species' loci with anchors FIRST/highlighted, then the rest.
+	_fill_genome_section(key, cx)
+
+	# 4. TRAITS WITH VALUES + GLOSS — value + delta-vs-baseline + a per-trait codex gene gloss.
+	_fill_traits_section(key, traits, (list[0] as Dictionary).get("traits", {}))
+
+	# 5. TROPHIC ROLE — the badge + the codex role one-liner.
+	var role_entry := _codex.role_for(role_id)
+	_detail_box.add_child(_detail_label("Trophic role", 12, Color(0.7, 0.78, 0.7)))
+	var role_line := str(role_entry.get("one_line", "")) if not role_entry.is_empty() else "—"
+	_detail_box.add_child(_detail_label("• %s — %s" % [role_title, role_line], 11, Color(0.86, 0.9, 0.86)))
+
+	# 6. GENE ANCHORS + EDIT LINEAGE — anchor-gene chips + the per-species edit trail.
+	_fill_anchors_and_lineage(key, cx, spec)
+
+	_detail_panel.visible = true
+
+
+## Genome section: the FOCUSED species' loci, anchors (codex anchor_genes order) first/highlighted, then a
+## scrollable-style tail (capped). Live → _live.loci() when the focused species is the active one (widened with
+## so_term+go_refs); else fall back to the codex anchor list; file-replay → _specimens.genome.loci. Each enriched
+## row joins gene_for_go(go_refs[0]) → + go_label + one_line gloss.
+func _fill_genome_section(key: String, cx: Dictionary) -> void:
+	var loci := _loci_for_focus(key)
+	_detail_box.add_child(_detail_label("Genome · ontology (%d loci)" % loci.size(), 12, Color(0.7, 0.78, 0.7)))
+	if loci.is_empty():
+		# No loci available (a non-active species in a multi-species run) → surface the codex anchor genes instead.
+		var anchors: Array = cx.get("anchor_genes", [])
+		for sym in anchors:
+			var g := _codex.gene_for_symbol(str(sym))
+			var gloss := (" — %s" % str(g.get("one_line", ""))) if not g.is_empty() else ""
+			_detail_box.add_child(_detail_label("• %s%s" % [str(sym), gloss], 11, Color(0.9, 0.86, 0.62)))
+		return
+	# Order: anchor loci (by the codex anchor_genes order) first/highlighted, then the rest, capped for sanity.
+	var anchors: Array = cx.get("anchor_genes", [])
+	var anchor_set := {}
+	for a in anchors:
+		anchor_set[str(a)] = true
+	var head: Array = []  # anchor loci
+	var tail: Array = []  # the rest
+	for l in loci:
+		if anchor_set.has(str((l as Dictionary).get("name", ""))):
+			head.append(l)
+		else:
+			tail.append(l)
+	for l in head:
+		_detail_box.add_child(_locus_row(l, true))
+	const TAIL_CAP := 24  # keep the panel sane for E. coli's 136 genes; the anchors (the levers) always show
+	var shown := 0
+	for l in tail:
+		if shown >= TAIL_CAP:
+			_detail_box.add_child(_detail_label("  … +%d more loci" % (tail.size() - shown), 10, Color(0.6, 0.66, 0.62)))
+			break
+		_detail_box.add_child(_locus_row(l, false))
+		shown += 1
+
+
+## One enriched locus row: "• <name>  SO:<so>  GO:<go>" + codex gloss (go_label + one_line) when present.
+func _locus_row(l: Variant, anchor: bool) -> Label:
+	var ld: Dictionary = l
+	var name := str(ld.get("name", ""))
+	var so := int(ld.get("so_term", 0))
+	var go_refs: Array = ld.get("go_refs", [])
+	var go0 := int(go_refs[0]) if not go_refs.is_empty() else 0
+	var text := "• %s  SO:%d" % [name, so]
+	if go0 > 0:
+		text += "  GO:%d" % go0
+		var g := _codex.gene_for_go(go0)
+		if not g.is_empty():
+			text += "  %s — %s" % [str(g.get("go_label", "")), str(g.get("one_line", ""))]
+	var col := Color(0.95, 0.88, 0.55) if anchor else Color(0.84, 0.88, 0.84)
+	return _detail_label(text, 11 if anchor else 10, col)
+
+
+## Traits section: the focused species' traits with value + delta-vs-baseline + a codex gloss via the trait←gene
+## join ("RespirationMode ← pflB (pyruvate formate-lyase)"). Uses _active_trait_keys() so the right set shows.
+func _fill_traits_section(key: String, focused: Dictionary, base: Dictionary) -> void:
+	_detail_box.add_child(_detail_label("Traits", 12, Color(0.7, 0.78, 0.7)))
+	for snake in _active_trait_keys():
+		var v := clampf(float(focused.get(snake, 0.0)), 0.0, 1.0)
+		var b := clampf(float(base.get(snake, 0.0)), 0.0, 1.0)
+		var d := v - b
+		var dtxt := "" if absf(d) < 0.0005 else ("  (%+.2f)" % d)
+		var line := "• %s  %.3f%s" % [snake, v, dtxt]
+		var g := _codex.gene_for_trait(snake, key)
+		if not g.is_empty():
+			line += "   ← %s (%s)" % [str(g.get("symbol", "")), str(g.get("go_label", g.get("one_line", "")))]
+		_detail_box.add_child(_detail_label(line, 10, Color(0.86, 0.9, 0.86)))
+
+
+## Anchors + lineage section: the codex anchor_genes as chips, then the per-species edit trail from
+## _live_species_logs[sid].entries (baseline → edit 1 → edit 2 …, each label carrying the gen).
+func _fill_anchors_and_lineage(key: String, cx: Dictionary, spec: Dictionary) -> void:
+	var anchors: Array = cx.get("anchor_genes", [])
+	if not anchors.is_empty():
+		_detail_box.add_child(_detail_label("Gene anchors", 12, Color(0.7, 0.78, 0.7)))
+		_detail_box.add_child(_detail_label("  " + "  ·  ".join(PackedStringArray(anchors)), 11, Color(0.9, 0.86, 0.62)))
+	# Edit lineage — the focused species' per-species log entries (baseline → edits), labels carry the gen.
+	var sname := str(spec.get("label", "")).split(" — ")[0]
+	var entries := _lineage_entries_for(key, sname)
+	if entries.size() >= 1:
+		_detail_box.add_child(_detail_label("Lineage / edit history", 12, Color(0.7, 0.78, 0.7)))
+		for e in entries:
+			_detail_box.add_child(_detail_label("  → %s" % str((e as Dictionary).get("label", "")), 10, Color(0.82, 0.86, 0.88)))
+
+
+## The per-species log entries (baseline + edits) for a focused species (live only); [] in file-replay.
+func _lineage_entries_for(key: String, sname: String) -> Array:
+	for sid in _live_species_order:
+		var log_entry: Dictionary = _live_species_logs[sid]
+		if str(log_entry.get("key", "")) == key:
+			return log_entry.get("entries", [])
+	return []
+
+
+## The loci to show for the focused species. Live: _live.loci() when the focused species is the active selected
+## one (the only genome the boundary exposes); file-replay: _specimens.genome.loci. [] when neither applies (a
+## non-active species in a multi-species live run — the genome section then falls back to codex anchors).
+func _loci_for_focus(key: String) -> Array:
+	if _live != null and _live.has_method("loci"):
+		var active := "default"
+		if _live.has_method("species_key"):
+			var k := String(_live.species_key())
+			if k != "":
+				active = k
+		if key == active:
+			return _live.loci()
+		# Active species' loci only — if the focused row IS the default/active, still show; else fall back below.
+		if key == "default" and active == "default":
+			return _live.loci()
+		return []
+	return (_specimens.get("genome", {}) as Dictionary).get("loci", [])
+
+
+## The species codex entry, or {} (graceful). Thin wrapper so the section helpers read clean.
+func species_for_or_empty(key: String) -> Dictionary:
+	return _codex.species_for(key)
+
+
+## A human role badge for a codex role id (title-cased), falling back to the raw id.
+func _role_badge(role_id: String) -> String:
+	var r := _codex.role_for(role_id)
+	if not r.is_empty():
+		return str(r.get("title", role_id)).split(" (")[0]
+	return role_id.capitalize() if role_id != "" else "—"
+
+
+## Normalize a Debug-cased TrophicRole ("Decomposer"/"ObligateSymbiont") to the gp/codex role id
+## ("decomposer"/"symbiont"). Falls back to the species key→role for file-replay (no role string).
+func _role_id_from_debug(role_dbg: String, key: String) -> String:
+	match role_dbg:
+		"Autotroph": return "autotroph"
+		"Heterotroph": return "heterotroph"
+		"Mixotroph": return "mixotroph"
+		"Decomposer": return "decomposer"
+		"Predator": return "predator"
+		"ObligateSymbiont": return "symbiont"
+		_:
+			# File-replay / unknown: a small key→role map mirroring the species JSONs (graceful, no biology).
+			match key:
+				"ecoli-core", "bacillus", "cutibacterium", "aspergillus-niger", "penicillium": return "decomposer"
+				"bdellovibrio": return "predator"
+				"mycoplasma", "staph": return "heterotroph"
+				"pseudomonas": return "mixotroph"
+				"carsonella", "syn3": return "symbiont"
+				_: return "autotroph"
+
+
+# ──────────────────────────── SP-4 headless --check guards ────────────────────────────
+
+## Build EVERY baked species' glyph via the key-led factory with a representative trait vector, so a parse error
+## or a malformed polygon in ANY morphotype body (rod/cocci/vibrioid/spore-former/wall-less/symbiont/mold/plant)
+## goes RED at build time — never only under a GPU (inv #4). Returns the count of glyphs built. The factory's
+## build() precomputes all geometry, so this exercises the full geometry path without _draw().
+func _check_build_all_glyphs() -> int:
+	# (key, role) for each baked species — mirrors the species JSONs (key-led table; role for the fallback path).
+	var roster := [
+		["default", "Autotroph"], ["ecoli-core", "Decomposer"], ["bdellovibrio", "Predator"],
+		["staph", "Heterotroph"], ["cutibacterium", "Decomposer"], ["pseudomonas", "Mixotroph"],
+		["bacillus", "Decomposer"], ["aspergillus-niger", "Decomposer"], ["penicillium", "Decomposer"],
+		["mycoplasma", "Heterotroph"], ["carsonella", "ObligateSymbiont"], ["syn3", "ObligateSymbiont"],
+		# An UNKNOWN key → role fallback must still draw SOMETHING (graceful degrade).
+		["future-unknown-species", "Heterotroph"],
+	]
+	# A representative trait vector touching every lever a morphotype reads (so the spore/predation/symbiosis
+	# branches all run): all set to mid so endospore/biofilm/conidia/tether/curvature are exercised.
+	var t := {
+		"growth_rate": 0.7, "stature": 0.6, "branchiness": 0.6, "leaf_size": 0.6, "leaf_hue": 0.5,
+		"reflectance": 0.5, "fecundity": 0.5, "drought_tolerance": 0.5, "kill_switch_linkage": 0.3,
+		"glucose_uptake": 0.6, "respiration_mode": 0.5, "acetate_overflow": 0.5, "fermentation_capacity": 0.5,
+		"predation_capacity": 0.7, "sporulation_capacity": 0.6, "symbiosis_capacity": 0.6,
+	}
+	var built := 0
+	for r in roster:
+		var spec := {"key": r[0], "role": r[1], "traits": t, "loci_count": 16}
+		var g := GlyphFactory.make(str(r[0]), str(r[1]), t, spec, built + 1)
+		# Touch bounds() so a glyph that built no geometry surfaces (a Rect2() is fine; a crash here is RED).
+		var _b: Rect2 = g.bounds()
+		g.free()
+		built += 1
+	return built
+
+
+## Exercise the codex-enriched inspect join headlessly with a real species (E. coli), so a garbled codex.json or
+## a broken join (species_for / gene_for_go / role_for / gene_for_trait) goes RED. Returns true if the codex
+## loaded AND the E. coli join resolved (the species entry + the gltA gene by GO + the decomposer role).
+func _check_codex_inspect() -> bool:
+	if not _codex.is_loaded():
+		push_warning("--check: codex.gd did not load res://data/codex/codex.json")
+		return false
+	# The joins the inspect card relies on — each must resolve for the shipped content.
+	var sp := _codex.species_for("ecoli-core")
+	var gltA := _codex.gene_for_go(4108)  # gltA's GO ref (a locus go_refs[0] in ecoli.json)
+	var role := _codex.role_for("decomposer")
+	var by_trait := _codex.gene_for_trait("growth_rate", "ecoli-core")
+	var ok := not sp.is_empty() and not gltA.is_empty() and not role.is_empty() and not by_trait.is_empty()
+	if not ok:
+		push_warning("--check: codex inspect join failed (species=%s gene=%s role=%s trait=%s)" % [
+			not sp.is_empty(), not gltA.is_empty(), not role.is_empty(), not by_trait.is_empty()])
+	return ok
 
 
 # ──────────────────────────── per-snapshot update ────────────────────────────

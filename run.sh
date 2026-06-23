@@ -39,6 +39,11 @@ fi
 # mirror (copy, NOT symlink — ecoli.json is 226 KB of real CDS and a symlink does not survive a PCK export).
 echo "» staging species JSON → godot/data/species/"
 mkdir -p godot/data/species && cp data/species/*.json godot/data/species/
+# SP-4: stage the codex too — codex.gd reads res://data/codex/codex.json via FileAccess (same inert-bytes path
+# _apply_species uses for res://data/species). data/codex/ is the committed source of truth; godot/data/ is the
+# generated, gitignored mirror.
+echo "» staging codex JSON → godot/data/codex/"
+mkdir -p godot/data/codex && cp data/codex/*.json godot/data/codex/
 
 # Engine args before `--`; game args (FLAGS from config + CLI args) after it. --live is always on for run.sh.
 echo "» launching: $GODOT --path godot -- --live ${FLAGS[*]:-} $*"

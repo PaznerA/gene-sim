@@ -936,10 +936,17 @@ impl LiveSim {
         arr
     }
 
-    /// The ACTIVE species-genome loci as `[{id, name}, ...]` for the intervention UI's target picker (ids +
-    /// names only) — the SELECTED species when one is set (e.g. E. coli's 136 real genes), else the default
-    /// plant baseline. The picker must be repopulated from this after `set_species`/`reset` so an edit targets
-    /// the genome `apply_edit` actually resolves against (ADR-017).
+    /// The ACTIVE species-genome loci as `[{id, name, so_term, go_refs}, ...]` for the intervention UI's target
+    /// picker AND the SP-4 codex inspect ontology join (ids + names only — no biology in GDScript) — the SELECTED
+    /// species when one is set (e.g. E. coli's 136 real genes), else the default plant baseline. The picker must
+    /// be repopulated from this after `set_species`/`reset` so an edit targets the genome `apply_edit` actually
+    /// resolves against (ADR-017).
+    ///
+    /// SP-4 (hash-neutral, PURELY ADDITIVE): `so_term` (the SO feature-type id) + `go_refs` (the ontology GO ids,
+    /// in their stable genome order) are marshalled from the already-loaded `Genome` so the codex inspect can
+    /// join each locus → `gene_for_go(go_refs[0])`. This is a READ-ONLY off-hash export exactly like
+    /// `observe_species` / `flow_matrix`: the `{id, name}` fields and their order are UNCHANGED; it touches no
+    /// selection / metabolism / RNG stream / `hash_world`.
     #[func]
     fn loci(&self) -> VarArray {
         let default = genome::sample_genome();
@@ -952,6 +959,13 @@ impl LiveSim {
             let mut d = VarDictionary::new();
             d.set("id", i64::from(l.id.0));
             d.set("name", l.name.as_str());
+            // SP-4 ontology projection (additive): SO feature-type + GO refs in stable order.
+            d.set("so_term", i64::from(l.tags.so_term.0));
+            let mut go = VarArray::new();
+            for g in &l.tags.go_refs {
+                go.push(&i64::from(g.0).to_variant());
+            }
+            d.set("go_refs", &go.to_variant());
             arr.push(&d.to_variant());
         }
         arr

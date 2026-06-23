@@ -31,6 +31,19 @@ if ! diff -rq data/species godot/data/species >/dev/null 2>&1; then
 fi
 echo "SPECIES MIRROR OK — godot/data/species == data/species ($(ls data/species | wc -l | tr -d ' ') files)"
 
+# SP-4 res:// codex mirror — the SAME discipline as the species mirror above. data/codex/ is the committed
+# source of truth; godot/data/codex/ is the generated, gitignored mirror codex.gd reads via FileAccess in dev
+# AND the exported PCK. Stage it + assert byte-equality (RED on drift), so the codex can never silently rot.
+# This is the staging fix that BLOCKED SP-4 (the codex JSON was never staged into the mirror → codex.gd found
+# nothing → deferral). The headless --check below now exercises the REAL content path.
+mkdir -p godot/data/codex && cp data/codex/*.json godot/data/codex/
+if ! diff -rq data/codex godot/data/codex >/dev/null 2>&1; then
+  echo "FAIL — godot/data/codex is not byte-equal to data/codex (SP-4 mirror drift):"
+  diff -rq data/codex godot/data/codex || true
+  exit 1
+fi
+echo "CODEX MIRROR OK — godot/data/codex == data/codex ($(ls data/codex | wc -l | tr -d ' ') files)"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -58,6 +71,10 @@ echo "GODOT READER OK — $(printf '%s' "$OUT" | grep 'snapshot OK')"
 printf '%s' "$OUT" | grep -q "channels=12" || { echo "FAIL — expected channels=12 (GSS4 chem planes), got:"; printf '%s\n' "$OUT"; exit 1; }
 
 # 2. S4.3 render scene (headless build smoke) — ISOMETRIC (default, P3) AND orthographic (--ortho opt-out).
+# SP-4: --check now ALSO builds every baked species' glyph via the key-led factory (prints glyphs=N) and
+# exercises the codex-enriched inspect join (prints codex=OK), so a parse error / malformed polygon in ANY
+# morphotype body OR a garbled codex.json / broken join goes RED here — the inv-#4 guarantee the deferred
+# SP-4 lacked. Expect glyphs=13 (the 12 baked species + 1 unknown-key fallback) and codex=OK.
 for mode in "" "--ortho"; do
   ROUT="$(godot --headless --path godot -- --run "$TMP" --check $mode 2>&1)"
   if ! printf '%s' "$ROUT" | grep -q "render scene OK"; then
@@ -65,6 +82,9 @@ for mode in "" "--ortho"; do
     printf '%s\n' "$ROUT"
     exit 1
   fi
+  printf '%s' "$ROUT" | grep -q "glyphs=13" || { echo "FAIL — expected glyphs=13 (12 baked species + unknown-key fallback), got:"; printf '%s\n' "$ROUT"; exit 1; }
+  printf '%s' "$ROUT" | grep -q "codex=OK" || { echo "FAIL — codex inspect join did not resolve (codex=OK expected). Output:"; printf '%s\n' "$ROUT"; exit 1; }
   echo "GODOT RENDER OK (${mode:-iso-default}) — $(printf '%s' "$ROUT" | grep 'render scene OK')"
 done
+echo "CODEX INSPECT OK — every species glyph built headlessly + the codex inspect join resolved"
 exit 0

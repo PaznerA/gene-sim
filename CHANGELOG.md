@@ -4,6 +4,37 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### SP-4 — Specimen view upgrade: evidence-driven morphology + rich inspect + codex (feat, renderer/content) — HASH-NEUTRAL
+The specimen view becomes a real per-species encyclopedia. **Pinned literal `0x47a0_3c8f_6701_f240` unchanged**
+(all-RENDERER + CONTENT on the read-only side of inv #2/#3; the one core touch is a purely-additive off-hash export).
+- **Evidence-based morphology** — `godot/glyph_factory.gd`: a key-led `MORPH_BY_KEY` table (role-fallback for an
+  un-tabled key) dispatches each of the 12 baked species to a morphotype. `godot/microbe.gd` GENERALIZED from the
+  E. coli rod into rod / coccus / vibrioid / wall-less with `shape`/`curvature`/`flagella_layout`/`biofilm`/
+  `endospore` params (E. coli peritrichous rod · Bdellovibrio comma w/ sheathed polar flagellum · staph
+  grape-cluster cocci · Bacillus rod + refractile endospore · Cutibacterium short non-motile rod · Pseudomonas
+  rod + polar flagella + biofilm halo · Mycoplasma wall-less pleomorph · Carsonella/Syn3 symbiont speck w/
+  host-containment ring + SymbiosisCapacity tether). NEW `godot/mold.gd` — hyphal mycelium + conidiophore
+  (Aspergillus globose vesicle / Penicillium brush), conidia density driven by SporulationCapacity. The plant
+  L-system is unchanged; `_render_specimens` rewired to `GlyphFactory.make()` with adaptive per-glyph-bounds
+  spacing + per-morphotype chrome emoji (🦠/🍄/🫧/🔬/🌱). All geometry precomputed in build() (inv #4 / #3).
+- **Rich INSPECT card** — `_fill_specimen_detail`: a 6-section card (header + codex blurb + genome loci with
+  anchors-first + traits-with-gloss + trophic role + gene-anchors/edit-lineage) reading the FOCUSED species.
+  **FIXES the confirmed live-mode bug** (the old genome block read loci only from `_specimens.genome.loci` = the
+  file-replay plant, so --live showed zero/wrong loci) **and** the title-only specimen pin (`_fill_detail(label,[])`).
+  Lazy codex tooltip one-liners on hovered specimens.
+- **Trait-set bug fix** — `PredationCapacity`/`SporulationCapacity`/`SymbiosisCapacity` added to `TRAIT_KEY_MAP`
+  (silently dropped before) + per-morphotype `_active_trait_keys()`, so predator/spore-former/symbiont rows render.
+- **SP-4 codex** — `data/codex/codex.json` (committed source of truth; format_version 1, 12 species + 12 genes +
+  6 roles + 4 flows, keyed on the real ids: species `key`, gene `go`/`so`, role `role_from_str` ids, flow
+  from/to roles). `godot/codex.gd` ordered-array loader (graceful `{}`). Joined in the inspect card + tooltips.
+- **Core export widening (hash-neutral, additive)** — `LiveSim::loci()` now also marshals `so_term` + `go_refs`
+  from the already-loaded Genome (the `{id,name}` fields + order UNCHANGED), unblocking the live-mode ontology join.
+- **res:// STAGING FIX (the SP-4 blocker)** — `run.sh`, `tools/check_godot_snapshot.sh` (byte-equality
+  `CODEX MIRROR OK` guard + a headless `--check` that BUILDS every species' glyph + exercises the codex inspect
+  join → `glyphs=13`, `codex=OK`), and `release.yml` (BOTH exports now stage species **and** codex into the PCK
+  before `--export-release`, closing the pre-existing species-PCK hole, + beside-binary copies). The original
+  SP-4 RED (parse error + unstaged JSON) cannot recur — verified: all 5 GDScripts parse clean headless.
+
 ### ADR-019 S5 — obligate-symbiont mode (feat, Mode B, 🔁 RE-PIN pending; sim-core/genome) — likely HASH-NEUTRAL
 The first Mode-B obligate symbiont: a host-dependent endosymbiont that **cannot free-live** and earns its joules
 ONLY by drawing kept-J from a co-located host. Emergent host-dependence, NOT a forced equilibrium (§0.6).
