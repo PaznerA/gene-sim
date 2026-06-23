@@ -30,6 +30,12 @@ serde = { version = "1", features = ["derive"] }  # MIT/Apache-2.0 — data (de)
 serde_json = "1"  # MIT/Apache-2.0 — JSON for replay logs (seed.json + actions.ndjson; SPEC §5)
 ron = "0.12"  # MIT/Apache-2.0 — Rusty Object Notation; git-friendly config/data format (SPEC §5)
 bio = "4.0"  # MIT — rust-bio: sequence ops / PAM finding (SPEC §2.2 chosen lib); pinned to current minor
+# MIT/Apache-2.0 — inv #1's process-boundary rule is GPL-ONLY, so linking rayon into the sim binary is fine.
+# Pinned per inv #7 (ADR-020): deterministic data-parallelism INSIDE the heavy sim systems (compute-parallel /
+# apply-canonical). Work-stealing order is nondeterministic by design — the parallel region is RNG-free +
+# disjoint-cell + order-independent-reduction, so the result is independent of it (the pinned hash + multi-ISA
+# gate are the oracles). A minor bump is a cross-version reproducibility event to re-gate.
+rayon = "1.12"
 
 [profile.release]
 # Determinism is build-scoped (SPEC §6); keep the release profile fixed for the reference build.

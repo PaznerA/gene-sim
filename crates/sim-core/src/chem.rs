@@ -305,10 +305,133 @@ pub(crate) fn reset_chem_scratch(mut chem: ResMut<ChemField>) {
     }
 }
 
+/// Below this many cells the diffusion gather runs its SERIAL loop (parallel-sim §4/§6/§10.10). The S1 micro-bench
+/// (serial vs the rayon row-band path, `RAYON_NUM_THREADS=10`, M-series) measured the crossover precisely:
+///
+/// | grid | cells | serial | parallel | verdict |
+/// |---|---|---|---|---|
+/// | 32×32 (PINNED) | 1 024 | 1.39 µs | 31.3 µs | serial ~22× faster |
+/// | 64×64 | 4 096 | 5.64 µs | 29.7 µs | serial ~5× faster |
+/// | 128×128 | 16 384 | 23.0 µs | 40.0 µs | serial ~1.7× faster |
+/// | 256×256 | 65 536 | 91.5 µs | 63.3 µs | **parallel 1.44× faster** |
+/// | 512×512 | 262 144 | 361 µs | 105 µs | parallel 3.42× faster |
+///
+/// rayon's fork/join + per-band setup dwarfs the ≤5-add-per-cell arithmetic until ~65 k cells, so the pinned
+/// 32×32 world stays SERIAL (this slice's S1 decision; the parallel path is wired + byte-identity-proven but
+/// dormant). The threshold is set at the measured crossover so a larger grid (S5) opts in automatically with no
+/// further code. Correctness is path-INDEPENDENT (both paths call the identical [`gather_cell`] kernel), so this
+/// only governs *which* path runs, never the bytes — `0x47a0_3c8f_6701_f240` is unmoved either way.
+const DIFFUSE_PAR_THRESHOLD: usize = 65_536;
+
+/// The GATHER kernel for ONE output cell `d` at `(dx, dy)` — pure: reads only the frozen `src`, returns
+/// `new[d]`. The §4 byte-identity proof in one place — `new[d]` is the kept remainder, plus Σ over in-grid
+/// von-Neumann neighbour shares, plus (count of `d`'s OWN off-grid edges) × `(src[d]>>shift)`. Used by both the
+/// serial and parallel gather so the two paths are bit-identical by construction. `dx/dy/w/h` are `i64` (the
+/// existing row-major convention).
+#[inline]
+fn gather_cell(src: &[i32], dx: i64, dy: i64, w: i64, h: i64, shift: u32) -> i32 {
+    let d = (dy * w + dx) as usize;
+    let dd = src[d];
+    // d's own self-share (its kept remainder + each of its off-grid reflects ride this single floor).
+    let self_share = dd >> shift;
+    // Kept remainder (floor-routing, no quantum lost): dd − 4*(dd>>shift) stays in-cell.
+    let mut acc = dd - 4 * self_share;
+    // The 4 von-Neumann neighbours of `d` in the SAME pinned order [N, E, S, W] as the old scatter. In-grid →
+    // `d` RECEIVES `src[nb]>>shift` (exactly the share the scatter pushed nb→d, adjacency being symmetric).
+    // Off-grid → d's OWN edge reflected d's share back to d (one per off-grid direction OF d — §4/§10.9: NOT
+    // the neighbours' reflects, the easy-to-get-wrong spot).
+    let neighbours: [(i64, i64); 4] = [(dx, dy - 1), (dx + 1, dy), (dx, dy + 1), (dx - 1, dy)];
+    for (nx, ny) in neighbours {
+        if nx >= 0 && nx < w && ny >= 0 && ny < h {
+            acc += src[(ny * w + nx) as usize] >> shift;
+        } else {
+            acc += self_share;
+        }
+    }
+    acc
+}
+
+/// Run the gather over the whole output plane, writing each `scratch[d]` from the frozen `src`. Picks the SERIAL
+/// loop below [`DIFFUSE_PAR_THRESHOLD`] (or under the `--no-parallel` escape hatch) and the rayon
+/// `par_chunks_mut`-over-row-bands path above it. Both paths invoke the identical [`gather_cell`] kernel on
+/// disjoint output cells → byte-identical regardless of thread count / work-stealing order (inv #3).
+fn gather_diffuse(src: &[i32], scratch: &mut [i32], w: i64, h: i64, shift: u32) {
+    let cells = (w * h) as usize;
+    if cells < DIFFUSE_PAR_THRESHOLD || crate::par::force_serial() {
+        // SERIAL: row-major over every output cell (the proven path — the pinned grid takes this).
+        for dy in 0..h {
+            for dx in 0..w {
+                scratch[(dy * w + dx) as usize] = gather_cell(src, dx, dy, w, h, shift);
+            }
+        }
+    } else {
+        // PARALLEL: disjoint ROW BANDS. `par_chunks_mut(w)` hands each task whole rows (write-disjoint by
+        // construction); each cell reads only the read-only `src` → no cross-task dependence. The output value
+        // is the same `gather_cell` floor-arithmetic on the same frozen `src`, so the result is independent of
+        // which thread computed which band (inv #3). Decay's reduction stays in the caller (per-cell, separate).
+        use rayon::prelude::*;
+        let wu = w as usize;
+        crate::par::pool().install(|| {
+            scratch
+                .par_chunks_mut(wu)
+                .enumerate()
+                .for_each(|(row, band)| {
+                    let dy = row as i64;
+                    for dx in 0..w {
+                        band[dx as usize] = gather_cell(src, dx, dy, w, h, shift);
+                    }
+                });
+        });
+    }
+}
+
+/// Force-the-path GATHER for the diffusion micro-bench + the serial==parallel byte-identity test (parallel-sim
+/// §4/§9 S1). `parallel == true` runs the rayon row-band path, `false` the serial loop — both call the IDENTICAL
+/// [`gather_cell`] kernel, so this proves the two paths agree integer-for-integer at any grid size INDEPENDENT
+/// of the [`DIFFUSE_PAR_THRESHOLD`] guard. Bench-/test-only; never on the tick hot path.
+#[doc(hidden)]
+pub fn bench_gather_diffuse(
+    src: &[i32],
+    scratch: &mut [i32],
+    width: u32,
+    height: u32,
+    parallel: bool,
+) {
+    let w = width as i64;
+    let h = height as i64;
+    let shift = DIFFUSE_SHIFT[0];
+    if parallel {
+        use rayon::prelude::*;
+        let wu = width as usize;
+        crate::par::pool().install(|| {
+            scratch
+                .par_chunks_mut(wu)
+                .enumerate()
+                .for_each(|(row, band)| {
+                    let dy = row as i64;
+                    for dx in 0..w {
+                        band[dx as usize] = gather_cell(src, dx, dy, w, h, shift);
+                    }
+                });
+        });
+    } else {
+        for dy in 0..h {
+            for dx in 0..w {
+                scratch[(dy * w + dx) as usize] = gather_cell(src, dx, dy, w, h, shift);
+            }
+        }
+    }
+}
+
 /// **DIFFUSE AND DECAY** (ADR-013 F5 KEYSTONE) — the organism-free, row-major, all-`>>`-shift field math. One
 /// named pass: a mass-EXACT reflecting-boundary diffusion (Σ-before == Σ-after, asserted per channel) followed
 /// by the only chem sink, decay (the named [`ledger::Ledger::chem_decay`] tap). RNG-free, no transcendental,
 /// no `HashMap`, iterates CELLS only (touches no organisms → no `(cell, SpeciesId, OrgId)` sort needed).
+///
+/// Diffusion is a SCATTER→GATHER fold (parallel-sim §4): each output cell is computed purely from the frozen
+/// `src` snapshot, so it is embarrassingly parallel by output cell. It runs serially at the pinned 1024-cell
+/// grid ([`DIFFUSE_PAR_THRESHOLD`]) — the gather is the determinism-clarity keystone landed regardless; the
+/// rayon row-band path is wired but guarded off until a larger grid (S5) justifies the fork/join.
 ///
 /// Runs on the PREVIOUS tick's emitted chem BEFORE this tick's organisms sense it (a one-tick propagation lag,
 /// mirroring the F4 detritus→mineralize lag), and the conservation assert brackets a clean diffusion step.
@@ -324,43 +447,24 @@ pub(crate) fn diffuse_and_decay(mut chem: ResMut<ChemField>, mut ledger: ResMut<
         let shift = DIFFUSE_SHIFT[ch];
         let before = chem.channel_total(ch);
 
-        // Zero the scratch (reused buffer). reset_chem_scratch zeroed it at tick start, but a second channel in
-        // the same pass needs it zeroed again after the previous channel swapped it out — do it here so the pass
-        // is self-contained.
+        // Zero the scratch (reused buffer). The GATHER writes EVERY scratch cell unconditionally
+        // (`chem.scratch[d] = acc`), so a pre-zero is not strictly required for correctness — but keep it so the
+        // buffer is never read in a partially-written state and the pass stays self-contained (hash-neutral).
         for v in &mut chem.scratch {
             *v = 0;
         }
-        // Snapshot the live plane so the read is frozen while we scatter into scratch. Reuse the persistent
+        // Snapshot the live plane so the read is frozen while we GATHER into scratch. Reuse the persistent
         // `src_buf` (taken out to avoid a simultaneous borrow with `scratch`) instead of a per-channel `to_vec`
         // — byte-identical bytes, no per-tick allocation (the `scratch` swap precedent).
         let mut src = std::mem::take(&mut chem.src_buf);
         src.clear();
         src.extend_from_slice(chem.plane(ch));
-        for cy in 0..h {
-            for cx in 0..w {
-                let c = (cy * w + cx) as usize;
-                let cc = src[c];
-                if cc == 0 {
-                    continue;
-                }
-                // The AMOUNT sent to EACH of the up-to-4 von-Neumann neighbours (a pinned right-shift).
-                let share = cc >> shift;
-                // Walk the 4 neighbours in PINNED order [N, E, S, W]. In-grid → neighbour gets `share`;
-                // off-grid (reflecting boundary) → the share is RETURNED TO SELF (no quantum crosses the edge).
-                let neighbours: [(i64, i64); 4] =
-                    [(cx, cy - 1), (cx + 1, cy), (cx, cy + 1), (cx - 1, cy)];
-                for (nx, ny) in neighbours {
-                    if nx >= 0 && nx < w && ny >= 0 && ny < h {
-                        let n = (ny * w + nx) as usize;
-                        chem.scratch[n] += share;
-                    } else {
-                        chem.scratch[c] += share; // reflect
-                    }
-                }
-                // The kept remainder (floor-routing, no quantum lost): cc − 4*share stays in-cell.
-                chem.scratch[c] += cc - 4 * share;
-            }
-        }
+        // ── GATHER (was SCATTER; byte-identical by the §4 symmetry proof). Each OUTPUT cell `d` writes ONLY
+        // `scratch[d]`, read purely from the frozen `src` → embarrassingly parallel by output cell. Serial below
+        // the small-grid guard (1024 cells is tiny — the fork/join + a per-band closure exceed the arithmetic
+        // win, §6/§10.10), the rayon par_chunks_mut over disjoint row bands above it. BOTH paths call the same
+        // `gather_cell` kernel → bit-identical regardless of which path / how many threads run (the inv #3 proof).
+        gather_diffuse(&src, &mut chem.scratch, w, h, shift);
         // Swap scratch into the live plane (every share sent was received → exact conservation by construction).
         // Take the scratch buffer OUT (leaving an empty placeholder) so we can write it into the plane without a
         // simultaneous borrow; restore it after so the buffer is reused (no per-tick alloc).
@@ -882,7 +986,7 @@ mod tests {
         assert_eq!(alarm_bias_step(5, 3), alarm_bias_step(5, 3));
     }
 
-    // ── test helper: run ONE diffusion step on a single channel, no decay (mirrors diffuse_and_decay's fold). ──
+    // ── test helper: run ONE diffusion step on a single channel, no decay (mirrors diffuse_and_decay's GATHER). ──
     fn diffuse_channel_only(f: &mut ChemField, ch: usize) {
         let w = f.width as i64;
         let h = f.height as i64;
@@ -892,28 +996,111 @@ mod tests {
         }
         let src: Vec<i32> = f.plane(ch).to_vec();
         let shift = DIFFUSE_SHIFT[ch];
-        for cy in 0..h {
-            for cx in 0..w {
-                let c = (cy * w + cx) as usize;
-                let cc = src[c];
-                if cc == 0 {
-                    continue;
-                }
-                let share = cc >> shift;
+        for dy in 0..h {
+            for dx in 0..w {
+                let d = (dy * w + dx) as usize;
+                let dd = src[d];
+                let self_share = dd >> shift;
                 let neighbours: [(i64, i64); 4] =
-                    [(cx, cy - 1), (cx + 1, cy), (cx, cy + 1), (cx - 1, cy)];
+                    [(dx, dy - 1), (dx + 1, dy), (dx, dy + 1), (dx - 1, dy)];
+                let mut acc = dd - 4 * self_share;
                 for (nx, ny) in neighbours {
                     if nx >= 0 && nx < w && ny >= 0 && ny < h {
-                        f.scratch[(ny * w + nx) as usize] += share;
+                        acc += src[(ny * w + nx) as usize] >> shift;
                     } else {
-                        f.scratch[c] += share;
+                        acc += self_share;
                     }
                 }
-                f.scratch[c] += cc - 4 * share;
+                f.scratch[d] = acc;
             }
         }
         let buf = std::mem::take(&mut f.scratch);
         f.plane_mut(ch).copy_from_slice(&buf[..cells]);
         f.scratch = buf;
+    }
+
+    /// PARALLEL gather == SERIAL gather, integer-for-integer (the S1-parallel byte-identity proof). The row-band
+    /// rayon path and the serial loop call the same `gather_cell` kernel; assert they agree at multiple grid
+    /// sizes (incl. ones large enough to actually use multiple threads) over deterministic fills.
+    #[test]
+    fn parallel_gather_equals_serial_gather() {
+        for &(w, h) in &[(32u32, 32u32), (64, 64), (7, 5), (1, 9), (9, 1), (128, 96)] {
+            let cells = (w as usize) * (h as usize);
+            let src: Vec<i32> = (0..cells)
+                // i64 multiply then mask to 24 bits before the i32 cast — the index*prime overflows i32 for
+                // c >= ~810 (the mask is applied AFTER the multiply), which would panic under test-profile
+                // overflow checks before any ser==par assertion runs.
+                .map(|c| ((((c as i64) * 2_654_435 + 7) & 0x00FF_FFFF) as i32) + (c as i32 % 5))
+                .collect();
+            let mut ser = vec![-1i32; cells];
+            let mut par = vec![-2i32; cells];
+            super::bench_gather_diffuse(&src, &mut ser, w, h, false);
+            super::bench_gather_diffuse(&src, &mut par, w, h, true);
+            assert_eq!(ser, par, "parallel gather != serial gather at {w}x{h}");
+        }
+    }
+
+    /// GATHER == SCATTER, integer-for-integer (the §4 byte-identity proof, in a unit test). Runs both folds
+    /// over the SAME pseudo-random-ish frozen field on every channel + a reflecting edge/corner and asserts the
+    /// resulting planes are bit-identical. This is the cell-level twin of the pinned-hash gate.
+    #[test]
+    fn gather_equals_scatter_integer_for_integer() {
+        // The OLD scatter fold (verbatim from the pre-S1 implementation) as the oracle.
+        fn scatter(f: &mut ChemField, ch: usize) {
+            let w = f.width as i64;
+            let h = f.height as i64;
+            let cells = (f.width as usize) * (f.height as usize);
+            for v in &mut f.scratch {
+                *v = 0;
+            }
+            let src: Vec<i32> = f.plane(ch).to_vec();
+            let shift = DIFFUSE_SHIFT[ch];
+            for cy in 0..h {
+                for cx in 0..w {
+                    let c = (cy * w + cx) as usize;
+                    let cc = src[c];
+                    if cc == 0 {
+                        continue;
+                    }
+                    let share = cc >> shift;
+                    let neighbours: [(i64, i64); 4] =
+                        [(cx, cy - 1), (cx + 1, cy), (cx, cy + 1), (cx - 1, cy)];
+                    for (nx, ny) in neighbours {
+                        if nx >= 0 && nx < w && ny >= 0 && ny < h {
+                            f.scratch[(ny * w + nx) as usize] += share;
+                        } else {
+                            f.scratch[c] += share;
+                        }
+                    }
+                    f.scratch[c] += cc - 4 * share;
+                }
+            }
+            let buf = std::mem::take(&mut f.scratch);
+            f.plane_mut(ch).copy_from_slice(&buf[..cells]);
+            f.scratch = buf;
+        }
+
+        // A deterministic pseudo-random-ish fill (no RNG) that stresses every cell, including all edges/corners.
+        let (w, h) = (7u32, 5u32);
+        for ch in 0..CHEM_CHANNELS {
+            let mut g = ChemField::zeroed(w, h); // GATHER (production) side
+            let mut s = ChemField::zeroed(w, h); // SCATTER (oracle) side
+            for c in 0..(w as usize * h as usize) {
+                // a spread of magnitudes incl. small (< 1<<shift → share 0) and large values
+                let v = (((c as i32) * 2_654_435 + 1) & 0x00FF_FFFF) + (c as i32 % 3);
+                g.plane_mut(ch)[c] = v;
+                s.plane_mut(ch)[c] = v;
+            }
+            // Several steps so reflects/remainders compound; assert bit-identity every step.
+            for step in 0..12 {
+                diffuse_channel_only(&mut g, ch);
+                scatter(&mut s, ch);
+                assert_eq!(
+                    g.plane(ch),
+                    s.plane(ch),
+                    "gather != scatter on channel {ch} at step {step} (the reflect term is the usual culprit)"
+                );
+            }
+        }
     }
 }

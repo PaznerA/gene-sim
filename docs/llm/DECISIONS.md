@@ -781,6 +781,69 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-020 — Deterministic data-parallelism: rayon (compute-parallel / apply-canonical), S0 scaffold
+
+- **Date:** 2026-06-23
+- **Status:** Accepted (S0 SCAFFOLD; HASH-NEUTRAL — NO call sites yet). The full design + the byte-identity proof
+  live in `docs/llm/proposals/parallel-sim-draft.md` (now COMMITTED). S1 (diffusion scatter→gather, serial) /
+  S2 (metabolism compute/apply split, serial) / S3 (parallelize metabolism — the big win) / S4 (mineralize) /
+  S5 (optional permanent parallel diffusion) / S6 (deferred, multi-species predation/host-coupling) are separate,
+  later, independently-revertable slices each re-proven against the hash oracle.
+- **Context:** the post-F5 hot path is at its single-thread floor (~0.85 M organism-updates/s, flat across N;
+  the allocation-elimination sweep bought single-digit %, micro-opts are in the ~0–1% noise band). The only lever
+  that moves the bar by a *multiple* is data parallelism INSIDE the heavy systems — exactly the "deterministic
+  reduction" the ADR-002/ADR-013 consequence note anticipated ("*revisit if the perf gate forces it — parallelism
+  would then need a deterministic reduction*"). Three passes are RNG-free + cell-independent: `metabolism` (~45%),
+  `diffuse_and_decay` (~13%), `mineralize` (~5%). `reproduce_or_die` (the SOLE `SimRng` consumer) stays 100%
+  sequential — the immovable Amdahl ceiling. Honest projected payoff: ~2–2.5× at 5k–10k orgs, NOT 4×.
+- **Decision (S0, this slice):** add `rayon` as a **pinned workspace dependency** and the three knobs every later
+  slice depends on, with **ZERO call sites** — so this slice is trivially hash-neutral. (1) `rayon = "1.12"` in
+  `[workspace.dependencies]` (resolved to `1.12.0`, `Cargo.lock` pinned; pulls `rayon-core 1.13.0` +
+  `crossbeam-{deque,epoch,utils}` + `either`), wired into `crates/sim-core/Cargo.toml`. (2) `crates/sim-core/src/par.rs`:
+  a persistent global `OnceLock<rayon::ThreadPool>` built EXACTLY ONCE (`par::pool()`; NEVER spawn/teardown per
+  tick) with a pinned worker count (`RAYON_NUM_THREADS` if a valid positive int, else `DEFAULT_NUM_THREADS = 10`,
+  pinned for stable benches — correctness is schedule-independent). (3) `PAR_THRESHOLD = 2000` (bench-tuned
+  sequential cutoff — below it a heavy system runs its proven serial loop verbatim; the pinned ~1k config stays
+  serial = an extra byte-identity guarantee). (4) a `--no-parallel` escape hatch via env var `GENESIM_NO_PARALLEL`
+  (`par::force_serial()`, cached) forcing the serial path for differential debugging. (5) `par::run(op)` —
+  `pool().install(op)` unless `force_serial()` — the helper every future call site invokes. The Bevy `.chain()`
+  schedule stays strictly single-threaded; rayon will live INSIDE the three heavy systems, never in the scheduler
+  (no Bevy multi-threaded executor / query `par_iter`, which would scramble the canonical `(cell, species, org)`
+  order the hash depends on).
+- **Determinism / hash (inv #3 — the load-bearing one):** the discipline is **COMPUTE-PARALLEL / APPLY-CANONICAL**
+  — the parallel region (later slices) is RNG-FREE (no parallelized pass holds a `&mut SimRng`, so the ChaCha8
+  stream is physically untouchable — the only advancer, sequential `reproduce_or_die`, draws exactly D+1=4 words
+  per threshold-passing birth in canonical order), DISJOINT-CELL (each task computes a contiguous whole-cell range
+  from the pre-sorted vector, a pure function of frozen read-only snapshots), and every order-sensitive mutation
+  (PoolStock decrement per `(channel,cell)`, PoolProvenance/FlowMatrix, litterfall/toxin cap-overflow routing,
+  org Energy/Biomass via the OrgId map) is applied SEQUENTIALLY in the EXACT current order. The only cross-task
+  reductions are associative-AND-commutative `i64` adds (the one f64 on the path is quantized via `to_unit_u16`
+  BEFORE any thread, so no float reduction ever crosses a thread). rayon's work-stealing is nondeterministic in
+  TIMING but the RESULT depends only on the disjoint-cell decomposition — never on which thread ran which chunk.
+  No `HashMap` is iterated in sim logic (inv #3); rayon iterates Vec index ranges only; the BTreeMaps stay
+  sequential. **At S0 none of that machinery exists yet — there are no call sites, the parallel region is empty,
+  so the pinned literal `0x47a0_3c8f_6701_f240` is BYTE-IDENTICAL** (`determinism_hash_is_pinned` +
+  `species_signatures_export_is_hash_neutral` green at lib.rs:3228 / :3392; `tools/check_determinism.sh` double-run
+  OK). The two oracles — the local double-run + the **multi-ISA CI gate** (x86_64 hash == aarch64 hash, `--features
+  determinism` HARD asserts) — are the safety net for any latent platform-dependent reduction a single-arch run
+  would miss, and MUST run on every push for these slices. **If any later slice moves `0x47a0`, that slice is a
+  bug and is reverted — this is NOT a re-pin.**
+- **Invariants:** **#1 (GPL at the process boundary):** `rayon` (and all its transitive deps — `rayon-core`,
+  `crossbeam-deque/epoch/utils`, `either`) is **MIT OR Apache-2.0** — inv #1's boundary rule is about GPL ONLY,
+  so rayon linked into the sim binary is fine. No GPL crate is added; `oracle-slim` is untouched. The boundary
+  discipline is preserved as hygiene. **#7 (Versions pinned):** rayon IS a new pinned dependency → recorded here
+  (`1.12` → `1.12.0`) alongside the bevy/rand_chacha pins, `Cargo.lock` locked. A rayon minor bump is a
+  cross-version reproducibility event to re-gate (low-risk given schedule-result-independence, but pinned like
+  `bevy_ecs`/`rand_chacha`). **#3** as argued above. **#4 (headless-first):** the pool + threshold + escape hatch
+  are pure sim-core; no renderer touch. **#2/#5/#6** untouched.
+- **Consequences:** the persistent pool + the two knobs are the stable surface S1–S4 build on; the per-slice
+  "land serial first, prove `0x47a0` unmoved, THEN add threads" discipline is the whole safety story. `par::run`
+  / `par::pool` / `PAR_THRESHOLD` / `force_serial` are `#[allow(dead_code)]` / `pub` until S1 wires the first call
+  site (a built-but-unused pool must not warn — satisfied via `#[allow(dead_code)]` on `run` + exercised by the
+  `par::tests`). Worker count is pinned for bench stability only; correctness never depends on it.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

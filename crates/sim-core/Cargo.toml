@@ -19,6 +19,7 @@ determinism = []
 genome = { workspace = true }
 bevy_ecs = { workspace = true }
 rand_chacha = { workspace = true }
+rayon = { workspace = true }  # ADR-020: deterministic data-parallelism inside the heavy systems (no call sites yet at S0)
 
 [dev-dependencies]
 criterion = { workspace = true }

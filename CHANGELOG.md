@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### PAR-S0 — Deterministic parallelization scaffold: rayon pinned dep + persistent pool + threshold + escape hatch (feat, sim-core/build) — HASH-NEUTRAL
+The S0 slice of the parallelization epic (`docs/llm/proposals/parallel-sim-draft.md`, now COMMITTED; ADR-020).
+**ZERO call sites yet → pinned literal `0x47a0_3c8f_6701_f240` BYTE-IDENTICAL** (the parallel region does not yet
+exist; `determinism_hash_is_pinned` + `species_signatures_export_is_hash_neutral` green; `check_determinism.sh` OK).
+- **rayon pinned (inv #7)** — `rayon = "1.12"` (→ `1.12.0`, `Cargo.lock` locked; transitive `rayon-core 1.13.0` +
+  `crossbeam-{deque,epoch,utils}` + `either`) in `[workspace.dependencies]`, wired into `crates/sim-core/Cargo.toml`.
+  All MIT/Apache-2.0 — inv #1's process boundary is GPL-ONLY, so linking rayon into the sim binary is fine;
+  `oracle-slim` untouched.
+- **Persistent global pool (NEVER per-tick)** — `crates/sim-core/src/par.rs`: an `OnceLock<rayon::ThreadPool>`
+  built EXACTLY ONCE (`par::pool()`), pinned worker count (`RAYON_NUM_THREADS` else `DEFAULT_NUM_THREADS = 10`,
+  for stable benches; correctness is schedule-independent). `par::run(op)` = `pool().install(op)` is the helper
+  every future call site invokes.
+- **`PAR_THRESHOLD = 2000`** — bench-tuned sequential cutoff; below it a heavy system runs its proven serial loop
+  verbatim (the pinned ~1k config stays serial = an extra byte-identity guarantee).
+- **`--no-parallel` escape hatch** — env var `GENESIM_NO_PARALLEL` (`par::force_serial()`, cached) forces the
+  serial path for differential debugging; the result is byte-identical either way.
+- **Determinism contract documented in-module** (compute-parallel / apply-canonical, RNG-free + disjoint-cell +
+  associative-commutative i64 reductions). 5 new `par::tests` (174 sim-core tests green). The built-but-unused
+  scaffold is warning-free (`#[allow(dead_code)]` on `run` + exercised by tests); fmt + clippy clean.
+
 ### SP-4 — Specimen view upgrade: evidence-driven morphology + rich inspect + codex (feat, renderer/content) — HASH-NEUTRAL
 The specimen view becomes a real per-species encyclopedia. **Pinned literal `0x47a0_3c8f_6701_f240` unchanged**
 (all-RENDERER + CONTENT on the read-only side of inv #2/#3; the one core touch is a purely-additive off-hash export).
