@@ -30,8 +30,8 @@ pub mod search;
 pub mod trace;
 
 pub use search::{
-    caption, crossover, mutate, propose, propose_evolved, Gem, GemLibrary, SearchConfig,
-    SearchSpace, SpeciesAxis,
+    caption, crossover, mutate, propose, propose_evolved, EvalRecord, Gem, GemLibrary,
+    SearchConfig, SearchSpace, SpeciesAxis,
 };
 pub use trace::{GenRow, InocRec, PerGenTrace, SpeciesMeta};
 

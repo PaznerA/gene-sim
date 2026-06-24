@@ -578,6 +578,27 @@ pub struct Gem {
     pub gens: u32,
 }
 
+/// One `(config → ScoreVec)` evaluation record — the raw training row the D3 surrogate trains on. Mirrors
+/// [`Gem`] MINUS the novelty/score/caption/build_id/gens fields (those are save-time/keep-time concerns, not
+/// part of the raw evaluation). OFF-HASH: built purely from fields [`score_config`] already computes — it
+/// draws NO `SimRng`, mutates no sim state, and the pinned literal `0x47a0_3c8f_6701_f240` is untouched (the
+/// export is read-only, modelled on `observe_species`/`species_signatures`). Serialized one-per-line as JSONL
+/// to `data/runs/evals/<search_seed>.jsonl` (see the harness `--save-evals` flag), in EVALUATION ORDER so the
+/// surrogate trains on the sequence of evaluations as they happened.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalRecord {
+    /// The reproducible run description (master_seed + roster + env).
+    pub config: SearchConfig,
+    /// Gated combined quality `Q ∈ [0, SCORE_SCALE]` (pre-novelty).
+    pub quality: u64,
+    /// The six metric values `[m1, m2, m3, m4, m5, m6]` (explainability).
+    pub breakdown: [u16; 6],
+    /// The 12-dim novelty fingerprint (PINNED order).
+    pub fingerprint: [u16; FP_DIMS],
+    /// The `hash_world` the run produced — the byte-identical-replay contract anchor (inv #3).
+    pub recorded_hash: u64,
+}
+
 /// An auto one-liner describing a run, derived PURELY from the integer score signals + the roster size — no
 /// biology, no float. Form: `"<shape> · <N> spp · <events>"`, e.g. `"limit-cycle · 3 spp · 2 takeovers"`. The
 /// shape is read off M3 (dynamism) vs M1/M2 (coexistence/evenness); the event tail off the fingerprint's
@@ -1306,5 +1327,50 @@ mod tests {
         lib.consider(gem_with(50, fp_const(5000), 2, 2));
         // Clone + Eq is the determinism harness for the kept set (no I/O dependency in this crate's tests).
         assert_eq!(lib, lib.clone());
+    }
+
+    // ---- D3-A: EvalRecord serde ----
+
+    fn eval_record(quality: u64, hash: u64, seed: u64) -> EvalRecord {
+        EvalRecord {
+            config: SearchConfig {
+                master_seed: seed,
+                roster: vec![("default".to_string(), 100)],
+                containment_level: 0,
+                temp_q: 500,
+                season: 0,
+            },
+            quality,
+            breakdown: [1, 2, 3, 4, 5, 6],
+            fingerprint: fp_const(7),
+            recorded_hash: hash,
+        }
+    }
+
+    #[test]
+    fn eval_record_round_trips_serde() {
+        // JSON round-trip preserves the record exactly (field order is stable in declaration order, so the
+        // serialized bytes are byte-stable across runs — the surrogate's training-data contract).
+        let rec = eval_record(123_456, 0xDEAD_BEEF, 0x00C0_FFEE);
+        let json = serde_json::to_string(&rec).expect("serialize");
+        let back: EvalRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(rec, back, "round-trip must preserve all fields");
+
+        // Same record → byte-identical JSON (deterministic field order — inv #3).
+        let json2 = serde_json::to_string(&rec).expect("serialize");
+        assert_eq!(json, json2, "JSON bytes must be stable across runs");
+    }
+
+    #[test]
+    fn eval_record_serializes_field_in_declaration_order() {
+        // Pin the JSON shape the surrogate trains on (changing the field order invalidates stored logs).
+        let rec = eval_record(1, 2, 3);
+        let json = serde_json::to_string(&rec).expect("serialize");
+        // declaration order: config, quality, breakdown, fingerprint, recorded_hash.
+        let expected_prefix = r#"{"config":{"master_seed":3,"roster":[["default",100]],"#;
+        assert!(
+            json.starts_with(expected_prefix),
+            "unexpected JSON shape: {json}"
+        );
     }
 }

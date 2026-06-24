@@ -14,7 +14,7 @@ Learn `config-features → predicted DRAMA` from the accumulated `(config, score
 candidate proposals** before paying for the expensive real headless run — biasing the D2b evolutionary search toward
 **dramatic** runs (limit-cycles/cascades = high M3 dynamism + M5 events), not just the stable coexistence Q rewards.
 
-## D3-A — the eval log (PREREQUISITE slice, ships first, hash-neutral)
+## D3-A — the eval log (PREREQUISITE slice, ships first, hash-neutral) — ✅ DONE
 The discover loop currently saves only the top-K gems; the surrogate needs ALL evaluations. Add `EvalRecord {config,
 quality, breakdown:[u16;6], fingerprint, recorded_hash}` (std+serde, in `discovery::search`) and a `--save-evals`
 option that writes every evaluated `(config → ScoreVec)` to `data/runs/evals/<search_seed>.jsonl` (off-hash;

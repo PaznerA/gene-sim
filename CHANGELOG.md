@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Emergent-discovery D3-A — the eval log prerequisite (feat, discovery) — HASH-NEUTRAL
+D3-A (the prerequisite for the D3 surrogate model — `docs/llm/proposals/surrogate-model-spec.md` §D3-A). The discover
+loop previously saved only the top-K *kept* gems; the surrogate needs ALL evaluations. This adds the
+`(config → ScoreVec)` evaluation record + a `--save-evals` CLI flag that writes every evaluated config to a
+byte-reproducible JSONL log. **The pinned literal `0x47a0_3c8f_6701_f240` is byte-identical** (the eval log is
+OFF-HASH: read-only over already-computed gem fields; no `SimRng`/`hash_world` touched). Full `tools/gate.sh` GREEN;
+reviewer APPROVE on every invariant.
+- **`crates/discovery::search`** (still std+serde): `EvalRecord { config, quality, breakdown, fingerprint,
+  recorded_hash }` — mirrors `Gem` minus the novelty/score/caption/build_id/gens fields (the raw training row the
+  surrogate trains on). Re-exported from the crate root. 2 tests pin the serde round-trip + the declaration-order
+  JSON shape the surrogate trains on.
+- **`crates/harness::discover`**: `capture_and_consider` now pushes an `EvalRecord` onto a caller-provided `Vec`
+  BEFORE `lib.consider` (in EVALUATION ORDER — trial order for `discover`, gen×individual order for
+  `discover_evolved`). `write_eval_log` emits one JSON per line (serde declaration-order → byte-stable). 4 tests
+  including byte-reproducibility per `search_seed` (the spec contract) + the `None`-path writes no log.
+- **CLI:** `--save-evals` → `data/runs/evals/<search_seed:016x>.jsonl` (gitignored; deterministic per seed).
+- **Next (D3-B):** the `RidgeInt` surrogate + the `discover_evolved_steered` loop (oversample→predict→pre-filter).
+
 ### Variant Lab A — per-species CRISPR edit (whole-species inject targets ANY roster species) (feat, core/renderer) — HASH-NEUTRAL
 The whole-species CRISPR inject (and the journaled `Action::ApplyEdit`) now target a CHOSEN species, not just the
 resident primary — the foundation for the edit→save-variant→reseed loop (Variant Lab) + the auto-research's mid-run
