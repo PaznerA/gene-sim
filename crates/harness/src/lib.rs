@@ -36,6 +36,7 @@ use sim_core::{EnvParams, Observation, SimConfig, Simulation};
 
 pub mod campaign;
 pub mod capture;
+pub mod discover;
 pub mod firewall;
 pub mod oversight;
 pub mod replay;

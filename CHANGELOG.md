@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Emergent-discovery D2a — the random-search GEM loop (propose → run → score → save replayable gems) (feat, discovery) — HASH-NEUTRAL
+ADR-024. Makes the D0 scorer + D1 trace actually PRODUCE gems: the autonomous "find the dramatic runs" loop. **The
+pinned literal `0x47a0_3c8f_6701_f240` is UNTOUCHED** (the search adds no sim-path change; the proposal RNG is a
+meta-level splitmix, distinct from the sim `ChaCha8Rng`; a dedicated test asserts the literal is unmoved). Gate GREEN;
+adversarially verified 5/5 (std+serde, sim-hash-untouched, gems-round-trip, search-deterministic, novelty-dedup-real).
+- **`crates/discovery::search`** (still std+serde ONLY): `SearchConfig` + a `SearchSpace` pinning the Primordial
+  proposal ranges + a std-only DETERMINISTIC `propose()` sampler (splitmix64 + Lemire range — no `rand` crate) + a
+  `Gem` record (config + score + fingerprint + `recorded_hash` + `build_id` + an integer-derived caption) + a
+  `GemLibrary` keeping top-K by score and rejecting near-duplicates via integer `novelty_l1`.
+- **`crates/harness::discover`** (`discover(...)` + a `--discover --trials N --keep K --search-seed S` CLI): builds each
+  config, runs `capture_trace`, scores via `DefaultScorer`, keeps the top-K novel, and writes each gem to
+  `data/runs/gems/<score>-<seed>.json` **only after** a `record_episode → replay == recorded_hash` round-trip (a failed
+  round-trip is dropped). `data/runs/*` is gitignored. `BUILD_ID` anchors every gem to the pinned sim hash (a re-pin
+  self-invalidates stored scores). 6 discovery search tests + 6 harness discover tests (determinism, round-trip,
+  novelty-dedup, the pinned-literal-unmoved guard).
+- **Next (D2b):** widen the search space (broader count ranges / species mixes / scheduled mid-run edits) + the
+  evolutionary proposer (the Primordial space currently clusters → ~1 distinct gem). Then D3 surrogate, D4 showcase.
+
 ### Emergent-discovery D0 scorer + D1 trace — `crates/discovery` + harness capture seam (feat, discovery) — HASH-NEUTRAL
 ADR-023. The first phase of the autonomous emergent-run discovery epic: a reproducible INTERESTINGNESS SCORER + the
 per-generation trace it reads. **ZERO sim hash impact → pinned literal `0x47a0_3c8f_6701_f240` byte-identical**
