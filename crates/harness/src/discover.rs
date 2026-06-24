@@ -1,5 +1,6 @@
-//! D2a STAGE 2 — the SEARCH RUNNER: the engine that turns the Stage-1 [`discovery::search`] data model into
-//! saved, replay-verified [`Gem`](discovery::search::Gem)s (the emergent-run discovery harness, ADR-023).
+//! D2a/D2b — the SEARCH RUNNER: the engine that turns the [`discovery::search`] data model into saved,
+//! replay-verified [`Gem`](discovery::search::Gem)s (the emergent-run discovery harness: D2a random = ADR-024,
+//! D2b evolutionary = ADR-025; the D0 scorer + D1 trace it builds on = ADR-023).
 //!
 //! ## What it does (the search loop)
 //! [`discover`] is the meta-loop. For each `trial`:
@@ -27,7 +28,9 @@
 use std::io;
 use std::path::Path;
 
-use discovery::search::{caption, propose, Gem, GemLibrary, SearchConfig, SearchSpace};
+use discovery::search::{
+    caption, propose, propose_evolved, Gem, GemLibrary, SearchConfig, SearchSpace,
+};
 use discovery::{final_score, DefaultScorer};
 use genome::spec::BuiltSpecies;
 use sim_core::{ConsortiumConfig, ContainmentLevel, EnvParams};
@@ -172,7 +175,7 @@ pub fn gem_file_name(gem: &Gem) -> String {
     format!("{:020}-{:016x}.json", gem.score, gem.config.master_seed)
 }
 
-/// Run the emergent-run SEARCH and write the verified top-`keep` gems to `out_dir` (ADR-023 D2a STAGE 2).
+/// Run the emergent-run RANDOM SEARCH and write the verified top-`keep` gems to `out_dir` (ADR-024 D2a).
 ///
 /// For `trial` in `0..trials`: PROPOSE a [`SearchConfig`] from the [`SearchSpace::default`] Primordial anchor
 /// via the meta-RNG, BUILD a [`GeneSimEnv`] from it (roster via the `data/species/<key>.json` boundary, climate,
@@ -207,22 +210,48 @@ pub fn discover(
     // --- SEARCH: propose → build → capture → score → consider, in trial order (deterministic) ---
     for trial in 0..trials {
         let cfg = propose(search_seed, trial, &space);
-        let (env_config, skipped) = env_config_for(&cfg, species_dir);
-        for (key, err) in &skipped {
-            eprintln!("discover: trial {trial}: skipped species {key:?} ({err})");
-        }
-        let Some(env_config) = env_config else {
-            eprintln!("discover: trial {trial}: empty resolved roster — skipped");
-            continue;
-        };
-        // Score against the CURRENTLY-kept fingerprints (the save-time novelty multiplier). The library is the
-        // running set; novelty protects diversity among already-good runs (it never manufactures score).
-        let gem = score_config(&cfg, &env_config, gens, &lib.fingerprints());
-        lib.consider(gem);
+        capture_and_consider(&cfg, species_dir, gens, &mut lib, "trial", trial);
     }
 
-    // --- VERIFY + WRITE: each kept gem must round-trip (record_episode → replay == recorded_hash) before it is
-    // written; a gem that fails is DROPPED so the on-disk library only ever holds reproducible gems. ---
+    verify_and_write_library(&lib, keep, species_dir, out_dir)
+}
+
+/// Build, capture, score, and CONSIDER one [`SearchConfig`] into `lib` — the shared per-config step both the
+/// random ([`discover`]) and evolutionary ([`discover_evolved`]) loops use. Resolves the roster through the
+/// `data/species` boundary (a skip/empty roster is LOGGED + dropped, never a panic), scores against `lib`'s
+/// CURRENTLY-kept fingerprints (the save-time novelty multiplier), and folds the gem in. `phase`/`step` only
+/// flavour the log line. Returns `true` iff a gem was produced (the config resolved to a non-empty roster).
+fn capture_and_consider(
+    cfg: &SearchConfig,
+    species_dir: &Path,
+    gens: u32,
+    lib: &mut GemLibrary,
+    phase: &str,
+    step: u64,
+) -> bool {
+    let (env_config, skipped) = env_config_for(cfg, species_dir);
+    for (key, err) in &skipped {
+        eprintln!("discover: {phase} {step}: skipped species {key:?} ({err})");
+    }
+    let Some(env_config) = env_config else {
+        eprintln!("discover: {phase} {step}: empty resolved roster — skipped");
+        return false;
+    };
+    let gem = score_config(cfg, &env_config, gens, &lib.fingerprints());
+    lib.consider(gem);
+    true
+}
+
+/// VERIFY + WRITE the kept gems: each must round-trip (`record_episode → replay == recorded_hash`) before it is
+/// written, so the on-disk library only ever holds reproducible gems; a gem that fails is DROPPED (logged),
+/// never written. Returns the [`GemLibrary`] of the gems that PASSED and were written. Shared by [`discover`]
+/// and [`discover_evolved`] so the round-trip contract has ONE implementation.
+fn verify_and_write_library(
+    lib: &GemLibrary,
+    keep: usize,
+    species_dir: &Path,
+    out_dir: &Path,
+) -> io::Result<GemLibrary> {
     std::fs::create_dir_all(out_dir)?;
     let mut verified = GemLibrary::new(keep);
     for gem in &lib.gems {
@@ -284,6 +313,82 @@ pub fn discover(
     }
 
     Ok(verified)
+}
+
+/// The fraction of each generation's population that is FRESH RANDOM exploration (vs evolved from the kept
+/// parents), in basis points — `2_500` ≈ 1/4 random, 3/4 evolved. Keeps the search from collapsing onto the
+/// current pool (a deterministic, seeded explore/exploit split — NOT an RNG coin; the index threshold below).
+const EVOLVE_EXPLORE_BP: u64 = 2_500;
+/// The basis-point denominator for [`EVOLVE_EXPLORE_BP`] (== `discovery::fixed::SCALE`, kept local so this
+/// crate stays free of a fixed-point import for one constant). `10_000` bp = 100%.
+const BP_SCALE: u64 = 10_000;
+
+/// Run the EVOLUTIONARY emergent-run SEARCH (D2b STAGE 2) and write the verified top-`keep` gems to `out_dir`.
+///
+/// GENERATION 0 proposes `pop_size` RANDOM configs (the D2a [`propose`]), builds/captures/scores each, and
+/// folds them into a running [`GemLibrary`] (the kept gems are the PARENTS). For each subsequent generation
+/// (`1..generations`) it proposes `pop_size` NEW configs: a leading EXPLORE fraction ([`EVOLVE_EXPLORE_BP`])
+/// is fresh [`propose`] (so the search never collapses onto the pool), the rest are
+/// [`propose_evolved`](discovery::search::propose_evolved) of the CURRENT kept gems' configs (mutate/crossover
+/// of the parents). Every individual is built/captured/scored and folded in; the library carries the elites
+/// forward (elitist — a strong parent survives until beaten). After all generations the kept gems are
+/// round-trip-verified and written (the UNCHANGED [`verify_and_write_library`] contract — a gem that fails the
+/// `record_episode → replay == recorded_hash` check is DROPPED, never written).
+///
+/// `generations == 0` reduces to a single random generation of `pop_size` trials — i.e. exactly the D2a
+/// [`discover`] behaviour with `trials == pop_size` (the non-evolutionary base case).
+///
+/// ## Determinism (inv #3)
+/// Every proposal/operator draw is the META-RNG (splitmix over `(search_seed, step, field)` — see
+/// [`discovery::search`]); the per-generation `step` is a fixed function of `(generation, individual)`
+/// (`generation * pop_size + i`), so a fixed `(search_seed, pop_size, generations, keep, gens, species_dir)`
+/// produces a byte-identical set of saved gems. The sim runs are pure functions of their configs — the search
+/// adds NO sim-path change, so the pinned literal `0x47a0_3c8f_6701_f240` is untouched.
+///
+/// # Errors
+/// Returns an [`io::Error`] only for a failure to create `out_dir` or write a gem file (mirrors [`discover`]).
+pub fn discover_evolved(
+    search_seed: u64,
+    pop_size: u64,
+    generations: u64,
+    keep: usize,
+    gens: u32,
+    species_dir: &Path,
+    out_dir: &Path,
+) -> io::Result<GemLibrary> {
+    let space = SearchSpace::default();
+    let mut lib = GemLibrary::new(keep);
+
+    // The explore cut: the leading `explore` individuals of every post-0 generation are fresh random proposals,
+    // the rest are evolved from the parents. At least 1 explorer per generation (a degenerate pop_size still
+    // injects fresh blood); never more than the whole population.
+    let explore = ((pop_size * EVOLVE_EXPLORE_BP / BP_SCALE).max(1)).min(pop_size);
+
+    // The total number of individuals (== meta-RNG steps) is `pop_size * (generations + 1)`: one random
+    // generation 0 plus `generations` evolved generations. `step` is monotonic across the whole run so no two
+    // individuals share a proposal stream coordinate.
+    let total_generations = generations + 1;
+    for generation in 0..total_generations {
+        // The PARENTS for this generation are the CURRENTLY-kept gems' configs (the elites). Snapshotted before
+        // proposing this generation's children so the pool is stable within the generation (deterministic).
+        let parents: Vec<SearchConfig> = lib.gems.iter().map(|g| g.config.clone()).collect();
+
+        for i in 0..pop_size {
+            // A globally-monotonic meta-RNG step so every individual draws an independent proposal stream.
+            let step = generation * pop_size + i;
+            let cfg = if generation == 0 || i < explore {
+                // GENERATION 0 (cold start) + the per-generation EXPLORE fraction → fresh random proposal.
+                propose(search_seed, step, &space)
+            } else {
+                // The EXPLOIT fraction → mutate/crossover of the current elite pool (empty pool → cold propose,
+                // handled inside propose_evolved). Drawn off the evolve stream salt (disjoint from propose).
+                propose_evolved(&parents, search_seed, step, &space)
+            };
+            capture_and_consider(&cfg, species_dir, gens, &mut lib, "gen", generation);
+        }
+    }
+
+    verify_and_write_library(&lib, keep, species_dir, out_dir)
 }
 
 #[cfg(test)]

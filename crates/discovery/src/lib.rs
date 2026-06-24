@@ -29,7 +29,10 @@ pub mod fixed;
 pub mod search;
 pub mod trace;
 
-pub use search::{caption, propose, Gem, GemLibrary, SearchConfig, SearchSpace, SpeciesAxis};
+pub use search::{
+    caption, crossover, mutate, propose, propose_evolved, Gem, GemLibrary, SearchConfig,
+    SearchSpace, SpeciesAxis,
+};
 pub use trace::{GenRow, InocRec, PerGenTrace, SpeciesMeta};
 
 use fixed::SCALE;

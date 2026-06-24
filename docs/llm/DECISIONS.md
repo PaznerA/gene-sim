@@ -1016,6 +1016,48 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-025 — Emergent-discovery D2b: widened search space + the evolutionary proposer
+
+- **Date:** 2026-06-24
+- **Status:** Accepted (D2b — random + evolutionary search; the surrogate D3 + showcase D4 are later).
+- **Context:** D2a (ADR-024) ran but the narrow 4-species Primordial space CLUSTERS — most configs land in one
+  fingerprint neighborhood, so the novelty-dedup kept only ~1 distinct gem. To surface a DIVERSE gem library the
+  search must (a) explore a wider, mixed-species space and (b) exploit the best finds, not just sample i.i.d.
+- **Decision (all in `crates/discovery::search`, still std + serde ONLY — NO `rand` crate):**
+  - **Widened `SearchSpace::default`:** 7 free-living species axes with a per-species PRESENCE knob `include_bp`
+    so proposed rosters differ in the species MIX (not just counts): `default` always present (`include_bp=SCALE`,
+    so a run is never empty), then `ecoli` 7000 · `bacillus` 6000 · `pseudomonas` 5500 · `staph` 5000 ·
+    `aspergillus-niger` 4500 · `bdellovibrio` 4000 (descending presence bp), broader count ranges, containment
+    0..=3, temp 0.15..=0.85.
+  - **Deterministic std-only EVOLUTIONARY operators** (salted disjoint splitmix64 streams `MUTATE_SALT`/
+    `CROSS_SALT`/`EVOLVE_SALT`, pure functions of `(search_seed, step, field)`): `mutate(parent)` (bounded ±
+    count perturbation clamped to the axis, occasional presence flip, env tweak), `crossover(a, b)` (per-species
+    pick count/presence from a parent via an ordered Vec key-union — no HashMap iteration), and `propose_evolved`
+    (dispatch mutate vs crossover). `ensure_autotroph` guarantees a non-empty, in-bounds roster always.
+  - **`crates/harness::discover_evolved(search_seed, pop_size, generations, keep, gens, out_dir)`:** generation 0
+    = `pop_size` RANDOM configs; then each generation proposes `pop_size` NEW configs — an EXPLORE fraction
+    `EVOLVE_EXPLORE_BP = 2500` (25%) fresh-random + the rest mutate/crossover of the CURRENT kept gems (elites) —
+    folded into the same `GemLibrary` (top-K + novelty-dedup). The gem WRITE still goes through the shared
+    `verify_and_write_library` (`record_episode → replay == recorded_hash` or DROP — the reproducibility contract
+    is unchanged). CLI `--evolve-gens G` (G>0 → evolutionary; **G=0 reduces EXACTLY to the D2a random `discover`**)
+    + `--pop-size P` (default 16).
+- **Determinism / hash (inv #3):** **the pinned literal `0x47a0_3c8f_6701_f240` is UNTOUCHED** — the evolutionary
+  search is meta-level (splitmix proposal RNG, distinct from the sim `ChaCha8Rng`); no sim-path change. A test
+  (`discover_evolved.rs::pinned_determinism_literal_is_unmoved_by_the_evolutionary_slice`) asserts both `run_headless`
+  and the stepwise path still hash the literal. A full `discover_evolved` run is byte-reproducible per `search_seed`
+  (identical saved gems); every gem round-trips.
+- **Invariants:** **#1** discovery std+serde, operators std-only splitmix (no `rand`, no engine dep); **#2** the
+  operators carry no genotype→phenotype; **#3** integer/off-hash/reproducible (above); **#4** headless; **#5** the
+  proposer is swappable; **#6** config/operator level. Verified 3/3 on every dimension; the diversity win is pinned
+  by `evolutionary_keeps_more_distinct_gems_than_same_budget_random` (matched budget `pop*(gens+1)`, STRICT
+  `evo_distinct > rnd_distinct`, both on the SAME widened space → the win is the explore/exploit machinery).
+- **Consequences:** the search now escapes the single cluster and grows a DIVERSE gem set. FOLLOW-UP: D3 (the
+  surrogate "brute-force gradient" model biasing the proposer), D4 (the autonomous night-batch + showcase gallery);
+  at D3/D4 SCALE the flat-JSON gem dir + linear novelty scan is the trigger to add a behind-the-boundary sqlite-vec
+  gem-index SIDECAR (the ADR-014 pattern — a derived index rebuildable from the source-of-truth JSON gems).
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).

@@ -4,6 +4,25 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Emergent-discovery D2b — widened search space + the evolutionary proposer (feat, discovery) — HASH-NEUTRAL
+ADR-025. D2a clustered (the narrow Primordial space kept ~1 distinct gem); D2b widens the space + adds an
+evolutionary proposer so the search surfaces a DIVERSE gem library. **The pinned literal `0x47a0_3c8f_6701_f240` is
+UNTOUCHED** (meta-level search, no sim-path change; a dedicated test asserts it). Full `tools/gate.sh` GREEN;
+adversarially verified 3/3 on every dimension.
+- **`crates/discovery::search`** (still std+serde, no `rand`): `SearchSpace::default` widened to 7 free-living
+  species with a per-species PRESENCE knob (`include_bp` — rosters differ in species MIX, not just counts) + broader
+  count/temp ranges; deterministic std-only `mutate`/`crossover`/`propose_evolved` operators (salted splitmix64;
+  `ensure_autotroph` keeps every config non-empty + in-bounds).
+- **`crates/harness::discover_evolved`** + `--evolve-gens G` / `--pop-size P` CLI: gen 0 random → keep top-K → each
+  generation proposes a new population (25% fresh-explore + 75% mutate/crossover of the elites) folded into the
+  `GemLibrary`. Gems still written only after the `record_episode → replay == recorded_hash` round-trip. `G=0`
+  reduces exactly to the D2a random `discover`.
+- **Diversity win pinned by a test:** `evolutionary_keeps_more_distinct_gems_than_same_budget_random` (matched budget,
+  STRICT `evo_distinct > rnd_distinct`, same widened space → the win is the explore/exploit machinery). 32 discovery
+  tests + 6 harness `discover_evolved` tests (determinism, round-trip, diversity, the pinned-literal guard).
+- **Next:** D3 surrogate model; D4 night-batch + showcase. At D3/D4 scale, a behind-the-boundary sqlite-vec gem-index
+  sidecar (the ADR-014 pattern — derived, rebuildable from the JSON gems) is the trigger.
+
 ### Relations FULL-WINDOW view + always-on top-right VIEW+SCOPE switcher (feat, renderer) — HASH-NEUTRAL
 Two UI reworks (renderer-only `godot/main.gd`). **ZERO Rust touched → pinned literal `0x47a0_3c8f_6701_f240`
 byte-identical** (full `tools/gate.sh` GREEN). Adversarially verified 3/3 on every dimension.
