@@ -52,10 +52,13 @@ OPTIONS:
     --discover            Run the emergent-run SEARCH (D2a): propose N configs, capture+score each off-hash,
                           verify each kept gem round-trips, write the survivors to data/runs/gems/, and print a
                           ranked summary. The proposal is the meta-RNG; the pinned sim literal is untouched.
-    --trials <u64>        Number of search trials for --discover. Default: 64
+    --trials <u64>        Number of search trials for --discover (pure-random D2a). Default: 64
     --keep <usize>        Top-K deduped gems to keep for --discover. Default: 8
     --search-seed <u64>   Meta-RNG seed for --discover's proposal sampler. Default: 7
     --discover-gens <u32> Generations captured per trial for --discover. Default: 200
+    --evolve-gens <u64>   Run the EVOLUTIONARY discover loop (D2b) for G generations (mutate/crossover of the
+                          kept gems + fresh exploration). G=0 keeps the pure-random D2a behavior. Default: 0
+    --pop-size <u64>      Population proposed per evolutionary generation (and gen 0). Default: 16
     --campaign <FILE>     Grade a JSON campaign manifest (scenarios = world + region objective + budget):
                           replay one journal subdir per scenario from --journals <DIR>/<index>/ and print each
                           Won/Lost + score + the total. Win/score rules live in the core (inv #2), not GDScript.
@@ -375,6 +378,22 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         let gens: u32 = val("--discover-gens")
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
+        // D2b STAGE 2 — the EVOLUTIONARY discover loop. `--evolve-gens G` (G > 0) routes to discover_evolved
+        // (mutate/crossover of the kept gems + fresh exploration); G == 0 (the default) keeps the pure-random
+        // D2a behaviour. `--pop-size` sizes each evolutionary generation (default 16).
+        let evolve_gens: u64 = val("--evolve-gens")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if evolve_gens > 0 {
+            let pop_size: u64 = val("--pop-size").and_then(|s| s.parse().ok()).unwrap_or(16);
+            return Some(run_discover_evolved(
+                search_seed,
+                pop_size,
+                evolve_gens,
+                keep,
+                gens,
+            ));
+        }
         return Some(run_discover(search_seed, trials, keep, gens));
     }
 
@@ -411,37 +430,103 @@ fn run_discover(search_seed: u64, trials: u64, keep: usize, gens: u32) -> ExitCo
     );
     match harness::discover::discover(search_seed, trials, keep, gens, &species_dir, &out_dir) {
         Ok(lib) => {
-            println!("kept {} gem(s) (best first):", lib.len());
-            for (rank, gem) in lib.gems.iter().enumerate() {
-                // roster as "key:count" pairs (positive counts only — the run's nominal richness).
-                let roster: Vec<String> = gem
-                    .config
-                    .roster
-                    .iter()
-                    .filter(|(_, c)| *c > 0)
-                    .map(|(k, c)| format!("{k}:{c}"))
-                    .collect();
-                println!(
-                    "  #{:<2} score={:<9} Q={:<8} nov={:<5} g={:<5} | {} | seed={:016x} cont={} temp={:.2} season={} | {}",
-                    rank + 1,
-                    gem.score,
-                    gem.quality,
-                    gem.novelty,
-                    gem.gens,
-                    gem.caption,
-                    gem.config.master_seed,
-                    gem.config.containment_level,
-                    f64::from(gem.config.temp_q) / 1000.0,
-                    gem.config.season,
-                    roster.join(" "),
-                );
-            }
+            print_gem_library(&lib);
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("discover error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Run the EVOLUTIONARY emergent-run SEARCH (D2b STAGE 2) into `data/runs/gems/` and print a ranked summary +
+/// the DISTINCT-gem count (the diversity win the evolutionary loop targets). `gen 0` proposes `pop_size`
+/// random configs; each later generation mutates/crosses the kept gems plus a fresh-exploration fraction.
+/// Defaults mirror [`run_discover`] (same `data/species` boundary + gitignored `data/runs/gems/`).
+fn run_discover_evolved(
+    search_seed: u64,
+    pop_size: u64,
+    evolve_gens: u64,
+    keep: usize,
+    gens: u32,
+) -> ExitCode {
+    let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
+    let out_dir = PathBuf::from("data/runs/gems");
+
+    println!(
+        "gene-sim discover (EVOLUTIONARY) · search_seed={search_seed} · pop_size={pop_size} · evolve_gens={evolve_gens} · keep={keep} · gens={gens}\n  evaluated {} configs over {} generations; writing verified gems to {}",
+        pop_size * (evolve_gens + 1),
+        evolve_gens + 1,
+        out_dir.display()
+    );
+    match harness::discover::discover_evolved(
+        search_seed,
+        pop_size,
+        evolve_gens,
+        keep,
+        gens,
+        &species_dir,
+        &out_dir,
+    ) {
+        Ok(lib) => {
+            print_gem_library(&lib);
+            // The DIVERSITY win: how many DISTINCT gems (by roster shape — the present-species set) were kept.
+            // Evolution + novelty-dedup should keep a broader spread of community shapes than pure random.
+            let mut shapes: Vec<Vec<&str>> = Vec::new();
+            for gem in &lib.gems {
+                let shape: Vec<&str> = gem
+                    .config
+                    .roster
+                    .iter()
+                    .filter(|(_, c)| *c > 0)
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                if !shapes.contains(&shape) {
+                    shapes.push(shape);
+                }
+            }
+            println!(
+                "distinct community shapes kept: {} / {} gems (the D2b diversity win)",
+                shapes.len(),
+                lib.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("discover error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Print a kept [`discovery::search::GemLibrary`] as a ranked, best-first summary (score · caption · config).
+/// Shared by the random ([`run_discover`]) and evolutionary ([`run_discover_evolved`]) CLI paths.
+fn print_gem_library(lib: &discovery::search::GemLibrary) {
+    println!("kept {} gem(s) (best first):", lib.len());
+    for (rank, gem) in lib.gems.iter().enumerate() {
+        // roster as "key:count" pairs (positive counts only — the run's nominal richness).
+        let roster: Vec<String> = gem
+            .config
+            .roster
+            .iter()
+            .filter(|(_, c)| *c > 0)
+            .map(|(k, c)| format!("{k}:{c}"))
+            .collect();
+        println!(
+            "  #{:<2} score={:<9} Q={:<8} nov={:<5} g={:<5} | {} | seed={:016x} cont={} temp={:.2} season={} | {}",
+            rank + 1,
+            gem.score,
+            gem.quality,
+            gem.novelty,
+            gem.gens,
+            gem.caption,
+            gem.config.master_seed,
+            gem.config.containment_level,
+            f64::from(gem.config.temp_q) / 1000.0,
+            gem.config.season,
+            roster.join(" "),
+        );
     }
 }
 
