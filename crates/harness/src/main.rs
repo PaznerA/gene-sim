@@ -49,6 +49,13 @@ OPTIONS:
                           injections.json (stamped injection generations) for the renderer timeline (P2)
     --replay <DIR>        Replay a recorded episode dir (seed.json + actions.ndjson) and print its stats hash;
                           equals the recorded hash bit-for-bit on the same build (SPEC §6, inv #3)
+    --discover            Run the emergent-run SEARCH (D2a): propose N configs, capture+score each off-hash,
+                          verify each kept gem round-trips, write the survivors to data/runs/gems/, and print a
+                          ranked summary. The proposal is the meta-RNG; the pinned sim literal is untouched.
+    --trials <u64>        Number of search trials for --discover. Default: 64
+    --keep <usize>        Top-K deduped gems to keep for --discover. Default: 8
+    --search-seed <u64>   Meta-RNG seed for --discover's proposal sampler. Default: 7
+    --discover-gens <u32> Generations captured per trial for --discover. Default: 200
     --campaign <FILE>     Grade a JSON campaign manifest (scenarios = world + region objective + budget):
                           replay one journal subdir per scenario from --journals <DIR>/<index>/ and print each
                           Won/Lost + score + the total. Win/score rules live in the core (inv #2), not GDScript.
@@ -355,6 +362,22 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         });
     }
 
+    // D2a STAGE 2 — the emergent-run SEARCH (ADR-023). `--discover` runs N trials of propose→capture→score→
+    // consider, verifies each kept gem round-trips, writes the survivors to data/runs/gems/, and prints a
+    // ranked summary. The proposal is the meta-RNG (NOT the sim RNG); the sim runs are pure functions of their
+    // configs — the pinned literal 0x47a0_3c8f_6701_f240 is untouched.
+    if argv.iter().any(|a| a == "--discover") {
+        let trials: u64 = val("--trials").and_then(|s| s.parse().ok()).unwrap_or(64);
+        let keep: usize = val("--keep").and_then(|s| s.parse().ok()).unwrap_or(8);
+        let search_seed: u64 = val("--search-seed")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7);
+        let gens: u32 = val("--discover-gens")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        return Some(run_discover(search_seed, trials, keep, gens));
+    }
+
     if let Some(dir) = val("--record-episode") {
         let seed = val("--seed").and_then(|s| s.parse().ok()).unwrap_or(42);
         let entities = val("--entities")
@@ -372,6 +395,54 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
     }
 
     None
+}
+
+/// Run the emergent-run SEARCH (D2a STAGE 2, ADR-023) into `data/runs/gems/` and print a ranked summary of the
+/// VERIFIED saved gems (score · caption · config). Defaults match the CLI flags' documented values. The
+/// `data/species` root is resolved relative to this binary's manifest dir (the same byte-mover boundary the
+/// menu/CLI species loader uses); `data/runs/gems/` is gitignored (generated artifacts).
+fn run_discover(search_seed: u64, trials: u64, keep: usize, gens: u32) -> ExitCode {
+    let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
+    let out_dir = PathBuf::from("data/runs/gems");
+
+    println!(
+        "gene-sim discover · search_seed={search_seed} · trials={trials} · keep={keep} · gens={gens}\n  writing verified gems to {}",
+        out_dir.display()
+    );
+    match harness::discover::discover(search_seed, trials, keep, gens, &species_dir, &out_dir) {
+        Ok(lib) => {
+            println!("kept {} gem(s) (best first):", lib.len());
+            for (rank, gem) in lib.gems.iter().enumerate() {
+                // roster as "key:count" pairs (positive counts only — the run's nominal richness).
+                let roster: Vec<String> = gem
+                    .config
+                    .roster
+                    .iter()
+                    .filter(|(_, c)| *c > 0)
+                    .map(|(k, c)| format!("{k}:{c}"))
+                    .collect();
+                println!(
+                    "  #{:<2} score={:<9} Q={:<8} nov={:<5} g={:<5} | {} | seed={:016x} cont={} temp={:.2} season={} | {}",
+                    rank + 1,
+                    gem.score,
+                    gem.quality,
+                    gem.novelty,
+                    gem.gens,
+                    gem.caption,
+                    gem.config.master_seed,
+                    gem.config.containment_level,
+                    f64::from(gem.config.temp_q) / 1000.0,
+                    gem.config.season,
+                    roster.join(" "),
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("discover error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// The representative demo action sequence (reset + Advance/ApplyEdit mix) — the SINGLE source for both the

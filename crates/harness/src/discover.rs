@@ -1,0 +1,336 @@
+//! D2a STAGE 2 — the SEARCH RUNNER: the engine that turns the Stage-1 [`discovery::search`] data model into
+//! saved, replay-verified [`Gem`](discovery::search::Gem)s (the emergent-run discovery harness, ADR-023).
+//!
+//! ## What it does (the search loop)
+//! [`discover`] is the meta-loop. For each `trial`:
+//!   1. PROPOSE a [`SearchConfig`] from the meta-RNG ([`discovery::search::propose`] — std-only splitmix64, NOT
+//!      the sim RNG; the pinned literal `0x47a0_3c8f_6701_f240` is untouched because the sim runs are unchanged
+//!      pure functions of their config — inv #3).
+//!   2. BUILD a [`GeneSimEnv`] from the config — `set_roster` (each `(key, count)` resolved through the SAME
+//!      `data/species/<key>.json` boundary the menu/CLI uses, [`species::load_species_file`]), `set_environment`
+//!      (temp/season), `set_containment` (the airborne immigration knob).
+//!   3. CAPTURE an off-hash [`PerGenTrace`](discovery::trace::PerGenTrace) via [`capture::capture_trace`] and
+//!      SCORE it ([`DefaultScorer`] → [`discovery::final_score`] vs the kept-gem fingerprints).
+//!   4. CONSIDER it for the [`GemLibrary`] (deduped top-K by novelty-adjusted final score).
+//!
+//! After the search, for every KEPT gem it REBUILDS the `(seed, EnvConfig, journal)` and
+//! `record_episode → assert replay() == recorded_hash` BEFORE writing the gem JSON; a gem that fails the
+//! round-trip is DROPPED (logged), never written (the gem reproducibility contract, discovery-scorer-spec).
+//!
+//! ## Determinism (inv #3)
+//! The SIM runs are pure functions of their `SearchConfig` (one master seed → all sub-seeds). The PROPOSAL
+//! sampler is the META-RNG ([`propose`](discovery::search::propose)), a std-only splitmix over `(search_seed,
+//! trial, field)` — it never touches `SimRng`. So a fixed `(search_seed, trials, keep, gens, species_dir)`
+//! produces a byte-identical set of saved gems, and the search adds NO sim-path change → the pinned literal is
+//! unmoved.
+
+use std::io;
+use std::path::Path;
+
+use discovery::search::{caption, propose, Gem, GemLibrary, SearchConfig, SearchSpace};
+use discovery::{final_score, DefaultScorer};
+use genome::spec::BuiltSpecies;
+use sim_core::{ConsortiumConfig, ContainmentLevel, EnvParams};
+
+use crate::capture::capture_trace;
+use crate::replay::{record_episode, replay, EnvConfig};
+use crate::species::load_species_file;
+use crate::Action;
+
+/// The pinned-build fingerprint stored on every gem (inv #7). Anchored to the determinism literal so a re-pin
+/// (which moves the literal) self-invalidates stored scores — a gem carrying an OLD `build_id` must be
+/// recomputed by replay before its score is trusted (discovery-scorer-spec gem-validity contract).
+pub const BUILD_ID: &str = "ecology-d0@47a03c8f6701f240";
+
+/// The fallback population spawned at `reset` for the env's non-roster bookkeeping. The roster's per-species
+/// counts drive the actual spawn (a search config always proposes a non-empty roster), so this only feeds the
+/// metadata `entity_count` folded into the run hash — fixed so a config's hash is a pure function of the config.
+const DISCOVER_ENTITY_COUNT: u32 = 1000;
+
+/// Build the replay [`EnvConfig`] for a proposed [`SearchConfig`]: resolve the roster keys through the
+/// `data/species/<key>.json` boundary, map the temp/season knobs to [`EnvParams`], and map the containment
+/// ordinal to a `(ContainmentLevel, ConsortiumConfig)` pair (Sealed → `None`, hash-neutral).
+///
+/// A roster entry with a zero count, or a key whose species file fails to load, is SKIPPED — so a config that
+/// references an absent species degrades to the species it CAN resolve (never a panic). Returns `None` (in the
+/// first tuple slot) if the resolved roster is empty (nothing to run); the second slot is the `(key, error)`
+/// skip list. Public so the gem-replay boundary (renderer/CLI loading a saved gem) can rebuild the SAME env a
+/// gem was scored under from its `SearchConfig` alone — the gem reproducibility contract.
+#[must_use]
+pub fn env_config_for(
+    cfg: &SearchConfig,
+    species_dir: &Path,
+) -> (Option<EnvConfig>, Vec<(String, String)>) {
+    let mut roster: Vec<(BuiltSpecies, u32)> = Vec::with_capacity(cfg.roster.len());
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    // The consortium (loaded contaminant resolver) the containment schedule's keys resolve against. We load the
+    // Mode-A airborne keys so a non-Sealed level can actually inoculate; an unresolved key is a logged skip.
+    let mut consortium: Vec<BuiltSpecies> = Vec::new();
+
+    for (key, count) in &cfg.roster {
+        if *count == 0 {
+            continue; // a zero-count axis contributes no organisms (the proposal allows count_lo == 0 in theory)
+        }
+        match load_species_file(species_dir.join(format!("{key}.json"))) {
+            Ok(built) => roster.push((built, *count)),
+            Err(e) => skipped.push((key.clone(), e.to_string())),
+        }
+    }
+    if roster.is_empty() {
+        return (None, skipped);
+    }
+
+    // Map the containment ordinal → (level, config). Sealed (0) → None (the hash-neutral default: empty
+    // schedule, no events). A dirtier level arms the Mode-A airborne consortium so immigration actually fires.
+    let containment = if cfg.containment_level == 0 {
+        None
+    } else {
+        let level = match cfg.containment_level {
+            1 => ContainmentLevel::Clean,
+            2 => ContainmentLevel::Lab,
+            _ => ContainmentLevel::Open,
+        };
+        let consortium_config = ConsortiumConfig::default_mode_a();
+        // Pre-load the consortium keys so a scheduled RegionInoculate resolves a genome on replay (ADR-019 R2).
+        for key in &consortium_config.species_keys {
+            if consortium.iter().any(|b| &b.key == key) {
+                continue;
+            }
+            match load_species_file(species_dir.join(format!("{key}.json"))) {
+                Ok(built) => consortium.push(built),
+                Err(e) => skipped.push((key.clone(), e.to_string())),
+            }
+        }
+        Some((level, consortium_config))
+    };
+
+    let env = EnvParams {
+        lat: 0.0,
+        lon: 0.0,
+        // temp_q is q16 permille (0..=1000 ↔ 0.0..=1.0); avg_temp is the normalized [0,1] climate knob.
+        avg_temp: f64::from(cfg.temp_q) / 1000.0,
+        season: i64::from(cfg.season),
+    };
+
+    let env_config = EnvConfig {
+        entity_count: DISCOVER_ENTITY_COUNT,
+        env,
+        roster,
+        species: None,
+        consortium,
+        containment,
+    };
+    (Some(env_config), skipped)
+}
+
+/// Capture + score one [`SearchConfig`] into a [`Gem`] (the per-trial scoring step). Runs the off-hash
+/// [`capture_trace`] over `gens` generations of the freshly-built env (NO journaled actions — the search probes
+/// the INITIAL-CONFIG space; mid-run edits are a later axis), scores it vs the already-kept fingerprints, and
+/// packages the full integer signal set + the reproducible config into a gem.
+fn score_config(
+    cfg: &SearchConfig,
+    env_config: &EnvConfig,
+    gens: u32,
+    saved_fps: &[[u16; discovery::FP_DIMS]],
+) -> Gem {
+    // Build the env from the config (roster + climate + containment), exactly as record_episode/replay rebuild it.
+    let mut env = crate::GeneSimEnv::new(env_config.entity_count);
+    env.set_environment(env_config.env);
+    env.set_roster(env_config.roster.clone());
+    for built in &env_config.consortium {
+        env.register_contaminant(built.clone());
+    }
+    if let Some((level, config)) = &env_config.containment {
+        env.set_containment(*level, config.clone());
+    }
+
+    // Off-hash capture of the pure-config run, then the D0 score + the save-time novelty multiplier vs the kept set.
+    let trace = capture_trace(&mut env, cfg.master_seed, gens, &[]);
+    let scorer = DefaultScorer::default();
+    let scored = final_score(&scorer, &trace, saved_fps);
+    let sv = scored.score;
+
+    Gem {
+        config: cfg.clone(),
+        score: scored.final_score,
+        quality: sv.quality,
+        novelty: scored.novelty_bp.min(u64::from(u16::MAX)) as u16,
+        breakdown: sv.breakdown,
+        fingerprint: sv.fingerprint,
+        recorded_hash: trace.recorded_hash,
+        build_id: BUILD_ID.to_string(),
+        caption: caption(&sv, cfg),
+        gens: trace.g,
+    }
+}
+
+/// The deterministic gem file name: `<final_score>-<master_seed>.json` (zero-padded score so a lexical listing
+/// of `data/runs/gems/` is also a rank ordering). No wall-clock — the path is reproducible (mirrors the replay
+/// run-id discipline).
+#[must_use]
+pub fn gem_file_name(gem: &Gem) -> String {
+    format!("{:020}-{:016x}.json", gem.score, gem.config.master_seed)
+}
+
+/// Run the emergent-run SEARCH and write the verified top-`keep` gems to `out_dir` (ADR-023 D2a STAGE 2).
+///
+/// For `trial` in `0..trials`: PROPOSE a [`SearchConfig`] from the [`SearchSpace::default`] Primordial anchor
+/// via the meta-RNG, BUILD a [`GeneSimEnv`] from it (roster via the `data/species/<key>.json` boundary, climate,
+/// containment), CAPTURE an off-hash trace over `gens` generations, SCORE it, and CONSIDER it for the deduped
+/// top-K [`GemLibrary`]. After the search, for every KEPT gem rebuild the `(seed, EnvConfig, journal)` and
+/// `record_episode → assert replay() == recorded_hash` BEFORE writing `<out_dir>/<final_score>-<seed>.json`; a
+/// gem that fails the round-trip is DROPPED (logged to stderr), never written.
+///
+/// Returns the [`GemLibrary`] of gems that PASSED the round-trip and were written (so a dropped gem is absent
+/// from the returned library too). Deterministic: same `(search_seed, trials, keep, gens, species_dir)` →
+/// identical saved files + scores (the proposal is the only RNG and it is the meta-RNG; the sim runs are pure
+/// functions of their configs — the pinned literal is untouched).
+///
+/// `species_dir` is the `data/species` root the roster keys resolve against (the filesystem boundary; the core
+/// stays filesystem-free, inv #2). `out_dir` is created if absent; existing files with a colliding name are
+/// overwritten (the name is a pure function of the gem).
+///
+/// # Errors
+/// Returns an [`io::Error`] only for a failure to create `out_dir` or write a gem file. A per-config species
+/// resolution failure or a per-gem round-trip failure is handled internally (skip / drop + log), never an error.
+pub fn discover(
+    search_seed: u64,
+    trials: u64,
+    keep: usize,
+    gens: u32,
+    species_dir: &Path,
+    out_dir: &Path,
+) -> io::Result<GemLibrary> {
+    let space = SearchSpace::default();
+    let mut lib = GemLibrary::new(keep);
+
+    // --- SEARCH: propose → build → capture → score → consider, in trial order (deterministic) ---
+    for trial in 0..trials {
+        let cfg = propose(search_seed, trial, &space);
+        let (env_config, skipped) = env_config_for(&cfg, species_dir);
+        for (key, err) in &skipped {
+            eprintln!("discover: trial {trial}: skipped species {key:?} ({err})");
+        }
+        let Some(env_config) = env_config else {
+            eprintln!("discover: trial {trial}: empty resolved roster — skipped");
+            continue;
+        };
+        // Score against the CURRENTLY-kept fingerprints (the save-time novelty multiplier). The library is the
+        // running set; novelty protects diversity among already-good runs (it never manufactures score).
+        let gem = score_config(&cfg, &env_config, gens, &lib.fingerprints());
+        lib.consider(gem);
+    }
+
+    // --- VERIFY + WRITE: each kept gem must round-trip (record_episode → replay == recorded_hash) before it is
+    // written; a gem that fails is DROPPED so the on-disk library only ever holds reproducible gems. ---
+    std::fs::create_dir_all(out_dir)?;
+    let mut verified = GemLibrary::new(keep);
+    for gem in &lib.gems {
+        let (env_config, _skipped) = env_config_for(&gem.config, species_dir);
+        let Some(env_config) = env_config else {
+            eprintln!(
+                "discover: dropping gem (seed {:016x}): roster no longer resolves",
+                gem.config.master_seed
+            );
+            continue;
+        };
+        // The gem's journal is a SINGLE Advance over the generations the capture actually ran (the search probes
+        // the INITIAL-CONFIG space — no mid-run edits this slice). `capture_trace` drives `Advance(1)*g` which is
+        // byte-identical to one `Advance(g)` (one seeded stream, no re-seed — proven in tests/trace_capture.rs),
+        // and the capture EARLY-STOPS at `gem.gens` (== `trace.g`), so this reproduces the captured run exactly.
+        let journal: Vec<Action> = vec![Action::Advance(u64::from(gem.gens))];
+
+        // Round-trip the gem through the on-disk record/replay contract into a TEMP subdir, then compare.
+        let stage = out_dir.join(format!(".verify-{:016x}", gem.config.master_seed));
+        let _ = std::fs::remove_dir_all(&stage);
+        let recorded = match record_episode(&env_config, gem.config.master_seed, &journal, &stage) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "discover: dropping gem (seed {:016x}): record failed ({e})",
+                    gem.config.master_seed
+                );
+                let _ = std::fs::remove_dir_all(&stage);
+                continue;
+            }
+        };
+        let replayed = match replay(&recorded.dir) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!(
+                    "discover: dropping gem (seed {:016x}): replay failed ({e})",
+                    gem.config.master_seed
+                );
+                let _ = std::fs::remove_dir_all(&stage);
+                continue;
+            }
+        };
+        let _ = std::fs::remove_dir_all(&stage);
+
+        if replayed != recorded.hash || recorded.hash != gem.recorded_hash {
+            eprintln!(
+                "discover: dropping gem (seed {:016x}): round-trip mismatch (recorded {:016x}, replay {:016x}, gem {:016x})",
+                gem.config.master_seed, recorded.hash, replayed, gem.recorded_hash
+            );
+            continue;
+        }
+
+        // The gem reproduces — write it (pretty JSON, git-friendly), keyed by <final_score>-<seed>.
+        let path = out_dir.join(gem_file_name(gem));
+        let json = serde_json::to_string_pretty(gem)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, format!("{json}\n"))?;
+        verified.consider(gem.clone());
+    }
+
+    Ok(verified)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The repo-root `data/species` dir (the byte-mover boundary; mirrors the species/replay test helpers).
+    fn species_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"))
+    }
+
+    #[test]
+    fn env_config_maps_roster_climate_containment() {
+        // A proposed config resolves its roster keys through the data dir and maps temp/season/containment.
+        let cfg = SearchConfig {
+            master_seed: 7,
+            roster: vec![("default".to_string(), 400), ("ecoli".to_string(), 200)],
+            containment_level: 2, // Lab → a (level, config) pair, Mode-A consortium pre-loaded
+            temp_q: 600,
+            season: 1,
+        };
+        let (env_config, skipped) = env_config_for(&cfg, &species_dir());
+        let env_config = env_config.expect("roster resolves");
+        assert!(skipped.is_empty(), "all keys resolve: {skipped:?}");
+        assert_eq!(env_config.roster.len(), 2);
+        assert!(
+            (env_config.env.avg_temp - 0.6).abs() < 1e-9,
+            "temp_q 600 → 0.6"
+        );
+        assert_eq!(env_config.env.season, 1);
+        assert!(
+            matches!(env_config.containment, Some((ContainmentLevel::Lab, _))),
+            "containment ordinal 2 → Lab"
+        );
+        assert!(
+            !env_config.consortium.is_empty(),
+            "a non-Sealed level pre-loads the Mode-A consortium so immigration resolves"
+        );
+        // Sealed (0) → None (hash-neutral).
+        let sealed = SearchConfig {
+            containment_level: 0,
+            ..cfg
+        };
+        let (sealed_cfg, _) = env_config_for(&sealed, &species_dir());
+        assert!(
+            sealed_cfg.unwrap().containment.is_none(),
+            "Sealed → no containment"
+        );
+    }
+}

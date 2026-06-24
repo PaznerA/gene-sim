@@ -14,14 +14,22 @@
 //! ## What ships at D0
 //! [`DefaultScorer`] (`id = "ecology-d0"`) implementing the 6 metrics M1..M6 (see [`ecology`]), the gated
 //! combine → `quality ∈ [0, SCORE_SCALE]`, the 12-dim [`fingerprint`](ScoreVec::fingerprint), a unit-tested
-//! [`novelty_l1`], and [`final_score`]. Gem-library persistence (the saved-fingerprint store) is D2.
+//! [`novelty_l1`], and [`final_score`].
+//!
+//! ## What ships at D2a (STAGE 1)
+//! The SEARCH data model in [`search`] (no engine): [`SearchConfig`] (a deterministic description of one run),
+//! a std-only splitmix64 sampler [`propose`] over a bounded [`SearchSpace`] (NO `rand` crate — inv #3), the
+//! [`Gem`] type + [`caption`], and the deduped top-K [`GemLibrary`]. All integer / ordered / serde — the
+//! same std+serde boundary as the rest of the crate.
 
 #![forbid(unsafe_code)]
 
 pub mod ecology;
 pub mod fixed;
+pub mod search;
 pub mod trace;
 
+pub use search::{caption, propose, Gem, GemLibrary, SearchConfig, SearchSpace, SpeciesAxis};
 pub use trace::{GenRow, InocRec, PerGenTrace, SpeciesMeta};
 
 use fixed::SCALE;

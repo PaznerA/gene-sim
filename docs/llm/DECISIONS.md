@@ -976,6 +976,46 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-024 — Emergent-discovery D2a: the random-search gem loop (propose → run → score → save replayable gems)
+
+- **Date:** 2026-06-24
+- **Status:** Accepted (D2a — random search; the evolutionary proposer D2b + the surrogate D3 are later).
+- **Context:** ADR-023 gave a reproducible SCORER (D0) + per-gen TRACE (D1). D2a makes the loop actually RUN: search
+  the config space, score each run, and SAVE the gems — the autonomous "find the dramatic runs" step.
+- **Decision:**
+  - **`crates/discovery::search`** (still std + serde ONLY): `SearchConfig` (master_seed + per-species start counts +
+    containment + temp_q/season — a DETERMINISTIC description of one run); a `SearchSpace` pinning the proposal ranges
+    (Primordial roster: plant 200..=1200, ecoli 50..=600, bacillus 30..=400, bdellovibrio …, containment 0..=3, a temp
+    range); a std-only DETERMINISTIC proposal sampler (`propose(search_seed, trial, field)` = a splitmix64 integer hash
+    + Lemire range draw — **NO `rand` crate**, so discovery stays std+serde); a `Gem` record (config + score/quality/
+    novelty/breakdown/fingerprint + `recorded_hash` + `build_id` + an integer-derived `caption`, serde); and a
+    `GemLibrary::consider` that keeps top-K by `rank_key` (score desc, then `recorded_hash`/seed) and rejects
+    near-duplicates via integer `novelty_l1` (`nn < DEDUP_MIN`).
+  - **`crates/harness::discover`** (`discover(search_seed, trials, keep, gens, out_dir)`): per trial → `propose` a
+    config → build a `GeneSimEnv` (`set_roster`/`set_environment`/`set_containment`) → `capture_trace` → `DefaultScorer`
+    → `GemLibrary.consider`. Each KEPT gem is written to `data/runs/gems/<score>-<seed>.json` **only after**
+    `record_episode → replay() == recorded_hash` (the reproducibility contract — a failed round-trip is DROPPED). A CLI
+    subcommand `--discover --trials N --keep K --search-seed S --discover-gens G` prints a ranked summary. `data/runs/*`
+    is gitignored (gems are generated artifacts; a curated showcase set lands in D4).
+  - **`BUILD_ID = "ecology-d0@47a03c8f6701f240"`** anchors every stored gem to the pinned sim hash (inv #7) — a re-pin
+    self-invalidates stored scores (cheaply recomputed by replay).
+- **Determinism / hash (inv #3):** **the pinned literal `0x47a0_3c8f_6701_f240` is UNTOUCHED.** The search adds a new
+  module + CLI and changes NO sim-path; the proposal sampler is a META-level splitmix RNG, distinct from the sim
+  `ChaCha8Rng`. A dedicated test (`harness/tests/discover.rs::pinned_determinism_literal_is_unmoved_by_the_search_slice`)
+  asserts both `run_headless` and the stepwise path still hash the literal. A full `discover()` run is byte-reproducible
+  per `search_seed` (identical gem files); every saved gem round-trips. Verified 5/5 (std+serde, sim-hash-untouched,
+  gems-round-trip, search-deterministic, novelty-dedup-real).
+- **Invariants:** **#1** discovery std+serde (the engine touch — build/run/replay — is in the harness); **#2** scores
+  read exported numbers only; **#3** integer/off-hash/reproducible (above); **#4** headless; **#5** the proposer/scorer
+  are swappable; **#6** the search acts at the CONFIG/operator level (rosters + env), never per-organism.
+- **Consequences:** the discovery loop now produces real, replayable gems. KNOWN (→ D2b): the Primordial space clusters
+  in one fingerprint neighborhood (most configs score alike → dedup keeps ~1 distinct gem) — D2b WIDENS the space
+  (broader count ranges / species mixes / scheduled mid-run edits) + adds the evolutionary proposer; the gem-staging dir
+  is keyed by the run's content-addressed id (a same-master-seed collision is ~2⁻⁶⁴, negligible — tighten if D2b
+  reuses seeds). FOLLOW-UP: D3 surrogate, D4 night-batch showcase gallery.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).
