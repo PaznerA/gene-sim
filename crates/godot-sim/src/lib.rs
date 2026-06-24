@@ -503,16 +503,19 @@ impl LiveSim {
         d
     }
 
-    /// Apply a CRISPR edit to the **species** genome live (P4 / R6.1) and return its outcome.
+    /// Apply a CRISPR edit to the **chosen species'** genome live (P4 / R6.1) and return its outcome.
     ///
-    /// `cas` = Cas-variant id, `target` = species-genome locus id, `guide` = the ACGT guide string. Builds a
-    /// species-granular [`harness::EditAction`] (invariant #6 — no organism handle) and steps it through the
-    /// env's single seeded stream (invariant #3 — the edit draws only from that stream, exactly as the gym
-    /// env does). Returns `{applied: bool, detail: String, generation: int}` — never a silent no-op (the core
-    /// always yields an explicit Applied/Failed outcome). Authoritative PAM/score/gate logic stays in
-    /// `crispr` (invariant #2): GDScript only assembles ids + a guide string and reads the verdict.
+    /// `cas` = Cas-variant id, `target` = species-genome locus id, `guide` = the ACGT guide string, `species` =
+    /// the target species ORDINAL (Variant-Lab A — picked in the CRISPR panel, default `0` = the resident
+    /// primary). Builds a species-granular [`harness::EditAction`] (invariant #6 — no organism handle) and steps
+    /// it through the env's single seeded stream (invariant #3 — the edit draws only from that stream, exactly
+    /// as the gym env does). The raw `species: i64` is CLAMPED to a `u16` ordinal and resolved to a `SpeciesId`
+    /// at the env boundary — the SAME `species: u16 → SpeciesId` mapping the SP-3 `pcr_amplify` / `cull` tools
+    /// use. Returns `{applied: bool, detail: String, generation: int}` — never a silent no-op (the core always
+    /// yields an explicit Applied/Failed outcome). Authoritative PAM/score/gate logic stays in `crispr`
+    /// (invariant #2): GDScript only assembles ids + a guide string + a species ordinal and reads the verdict.
     #[func]
-    fn apply_edit(&mut self, cas: i64, target: i64, guide: GString) -> VarDictionary {
+    fn apply_edit(&mut self, cas: i64, target: i64, guide: GString, species: i64) -> VarDictionary {
         let Some(env) = self.env.as_mut() else {
             godot_error!("LiveSim::apply_edit called before reset()");
             return edit_dict(false, "not reset", 0);
@@ -531,6 +534,9 @@ impl LiveSim {
             cas: CasVariantId(cas.clamp(0, i64::from(u16::MAX)) as u16),
             target: LocusId(target.max(0) as u32),
             guide: g,
+            // Variant-Lab A: the CRISPR panel's target-species picker. Clamp to u16 like pcr_amplify/cull; the
+            // env resolves it to a SpeciesId (default 0 = the resident primary when the picker has no selection).
+            species: species.clamp(0, i64::from(u16::MAX)) as u16,
         };
         let action = Action::ApplyEdit(edit);
         env.step(action.clone());
@@ -593,6 +599,7 @@ impl LiveSim {
             cas: CasVariantId(cas.clamp(0, i64::from(u16::MAX)) as u16),
             target: LocusId(target.max(0) as u32),
             guide: g,
+            species: 0, // the resident primary (region edits target the resident; per-species picker is a later UI slice)
         };
         let region = RegionSpec {
             cx: cx.max(0) as u32,

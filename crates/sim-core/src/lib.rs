@@ -2953,46 +2953,99 @@ impl Simulation {
     /// Mutate the **species** genome with access to the run's single seeded RNG, then re-express the
     /// `BaseGrowthRate` so the edit changes subsequent selection dynamics (SPEC §4; invariant #2, #3, #6).
     ///
-    /// This is the species/operator-granular hook the harness's `ApplyEdit` action uses: `f` receives
-    /// `(&mut Genome, &mut ChaCha8Rng)` — the SAME `ChaCha8Rng` that drives the rest of the run, so the
-    /// edit draws only from the single seeded stream (inv. #3). The closure's return value is passed
-    /// back to the caller. After `f` runs, the genome→phenotype is re-expressed (invariant #2: the only
-    /// place biology is computed) and the [`BaseGrowthRate`] resource updated, so a species edit affects
-    /// the next [`step`](Self::step)'s fitness.
+    /// Edits the PRIMARY species (`SpeciesId(0)`, the resident). A thin alias for
+    /// [`with_species_genome_and_rng`](Self::with_species_genome_and_rng)`(SpeciesId(0), f)` — kept so the
+    /// existing single-species callers are byte-unchanged.
     pub fn with_genome_and_rng<R>(
         &mut self,
         f: impl FnOnce(&mut Genome, &mut ChaCha8Rng) -> R,
     ) -> R {
+        self.with_species_genome_and_rng(SpeciesId(0), f)
+    }
+
+    /// Mutate a CHOSEN species' genome with access to the run's single seeded RNG, then re-express that
+    /// species' phenotype so the edit changes subsequent selection dynamics (SPEC §4; invariant #2, #3, #6).
+    ///
+    /// This is the species/operator-granular hook the harness's `ApplyEdit` action targets (Variant-Lab A):
+    /// `f` receives `(&mut Genome, &mut ChaCha8Rng)` — the SAME `ChaCha8Rng` that drives the rest of the run,
+    /// so the edit draws only from the single seeded stream, and it draws the SAME way regardless of which
+    /// species is targeted (inv. #3 — a `SpeciesId(0)` edit is byte-identical to the pre-Variant-Lab hook).
+    /// The closure's return value is passed back to the caller. After `f` runs, that species' genome→phenotype
+    /// is re-expressed (invariant #2: the only place biology is computed) so the edit feeds the next
+    /// [`step`](Self::step)'s fitness for THAT species only.
+    ///
+    /// `sid == 0` (the resident primary) ALSO updates the run's primary [`GenomeRes`] + [`BaseGrowthRate`]
+    /// resources (which mirror entry 0), so the single-species path is unchanged. A non-primary `sid` edits
+    /// ONLY `entries[sid]` and re-expresses ITS base growth + cached [`gp::Strategy`] — the primary resources
+    /// and every other entry are untouched. An out-of-range `sid` is a clean NO-OP that STILL draws the RNG
+    /// exactly as an in-range edit would (so the stream position is `sid`-independent — replay-stable).
+    pub fn with_species_genome_and_rng<R>(
+        &mut self,
+        sid: SpeciesId,
+        f: impl FnOnce(&mut Genome, &mut ChaCha8Rng) -> R,
+    ) -> R {
+        let idx = sid.0 as usize;
         // Briefly take the RNG out of the world so we can hand both it and the genome to `f` (Bevy
         // resources can't be borrowed mutably two at a time). The RNG is the same instance; its stream
-        // position is preserved — no re-seeding (inv. #3).
+        // position is preserved — no re-seeding (inv. #3). The RNG move + the `f` draw happen IDENTICALLY
+        // for every `sid` (incl. out-of-range), so a `SpeciesId(0)` edit is byte-for-byte the old behavior.
         let mut rng = std::mem::replace(
             &mut self.world.resource_mut::<SimRng>().0,
             ChaCha8Rng::seed_from_u64(0),
         );
+        // The targeted species' genome lives in the registry; for `sid == 0` it is mirrored by `GenomeRes`.
+        // We edit the registry entry's genome in place so a non-primary edit never touches the primary
+        // resources. A `scratch` stands in for an out-of-range `sid` so `f` (and its RNG draw) still runs.
+        let mut scratch = Genome {
+            version: 0,
+            loci: Vec::new(),
+        };
         let out = {
-            let genome = &mut self.world.resource_mut::<GenomeRes>().0;
+            let registry = &mut self.world.resource_mut::<SpeciesRegistry>();
+            let genome = registry
+                .entries
+                .get_mut(idx)
+                .map_or(&mut scratch, |e| &mut e.genome);
             f(genome, &mut rng)
         };
         self.world.resource_mut::<SimRng>().0 = rng;
 
-        // Re-express phenotype after the genome change THROUGH this run's stored species map, so the edit feeds
-        // subsequent fitness consistently (e.g. an E. coli gltA knockout drops GrowthRate; invariant #2, ADR-017).
-        let phenotype = self.gp_map.express(&self.world.resource::<GenomeRes>().0);
-        let base_growth = phenotype.get(Trait::GrowthRate).unwrap_or(0.5);
-        self.world.resource_mut::<BaseGrowthRate>().0 = base_growth;
-        // R3-B: a species edit targets the PRIMARY species — mirror the edited genome + base growth into the
-        // registry, which is now what `selection` reads, so the edit actually changes subsequent dynamics.
-        let edited = self.world.resource::<GenomeRes>().0.clone();
+        // Re-express the EDITED species' phenotype so the edit feeds subsequent fitness consistently (e.g. an
+        // E. coli gltA knockout drops GrowthRate; invariant #2, ADR-017). Read the edited genome back out, then
+        // re-express base growth + the cached ecological Strategy from it. An out-of-range `sid` re-expresses
+        // nothing (the edit went to scratch) — a clean no-op past the RNG draw.
+        let Some(edited) = self
+            .world
+            .resource::<SpeciesRegistry>()
+            .entries
+            .get(idx)
+            .map(|e| e.genome.clone())
+        else {
+            return out;
+        };
         {
-            let primary = &mut self.world.resource_mut::<SpeciesRegistry>().entries[0];
+            let entry = &mut self.world.resource_mut::<SpeciesRegistry>().entries[idx];
+            // Re-express through the entry's OWN map (invariant #2): an E. coli entry yields microbe traits, a
+            // plant entry plant traits. base_growth = GrowthRate (name-keyed, resolves under any species map).
+            let base_growth = entry
+                .gp_map
+                .express(&edited)
+                .get(Trait::GrowthRate)
+                .unwrap_or(0.5);
             // ADR-013 F2: re-express the cached Strategy from the edited genome so the cache stays consistent
-            // after a species edit (its FIRST reader is F3 metabolism). Still UNREAD by selection → still
-            // hash-neutral. Uses the entry's own map/role; the role is categorical (unchanged by the edit).
-            let strategy = gp::express_strategy(&primary.gp_map, &edited, primary.strategy.role);
-            primary.genome = edited;
-            primary.base_growth = base_growth;
-            primary.strategy = strategy;
+            // after a species edit (its FIRST reader is F3 metabolism). Uses the entry's own map/role; the role
+            // is categorical (unchanged by the edit).
+            let strategy = gp::express_strategy(&entry.gp_map, &edited, entry.strategy.role);
+            entry.base_growth = base_growth;
+            entry.strategy = strategy;
+        }
+        // The primary species (`sid == 0`) ALSO mirrors into the run's `GenomeRes` + `BaseGrowthRate`, which
+        // `observe()` reads — so the single-species path is byte-unchanged. A non-primary edit leaves these
+        // (and every other entry) untouched.
+        if idx == 0 {
+            let base_growth = self.world.resource::<SpeciesRegistry>().entries[0].base_growth;
+            self.world.resource_mut::<GenomeRes>().0 = edited;
+            self.world.resource_mut::<BaseGrowthRate>().0 = base_growth;
         }
         out
     }
@@ -4073,6 +4126,129 @@ mod tests {
         assert!(
             after > before,
             "species edit should raise GrowthRate ({before} -> {after})"
+        );
+    }
+
+    #[test]
+    fn species0_edit_via_targeted_hook_is_byte_identical_to_legacy_hook() {
+        // Variant-Lab A (inv #3): targeting `SpeciesId(0)` through the new per-species hook must draw the RNG
+        // and mutate state EXACTLY like the legacy `with_genome_and_rng`, so a `species: 0` edit reproduces the
+        // pre-change run hash bit-for-bit. Two sims, SAME seed + SAME edit closure (one through the legacy alias,
+        // one through the explicit `SpeciesId(0)` path), then advance + hash: the hashes must match.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 0,
+            entity_count: 80,
+        };
+        let edit = |g: &mut Genome, rng: &mut ChaCha8Rng| {
+            let _draw = rng.next_u64(); // the edit DRAWS from the single stream (inv #3)
+            if let genome::ParamValue::Numeric { value, max, .. } =
+                &mut g.loci[0].parameters[0].value
+            {
+                *value = *max;
+            }
+        };
+
+        let mut a = Simulation::reset(&cfg);
+        a.with_genome_and_rng(edit); // legacy alias = SpeciesId(0)
+        a.step(20);
+        let ha = a.run_stats().hash;
+
+        let mut b = Simulation::reset(&cfg);
+        b.with_species_genome_and_rng(SpeciesId(0), edit); // explicit primary
+        b.step(20);
+        let hb = b.run_stats().hash;
+
+        assert_eq!(
+            ha, hb,
+            "a SpeciesId(0) edit must be byte-identical to the legacy hook"
+        );
+    }
+
+    #[test]
+    fn editing_a_nonprimary_species_changes_only_that_species_phenotype() {
+        // Variant-Lab A (inv #2, #6): in a multi-species run, an edit targeting a NON-primary species changes
+        // THAT species' expressed phenotype while the primary's is untouched — and it is deterministic/replayable.
+        let mk_roster = || {
+            vec![
+                RosterEntry {
+                    name: "plant-0".to_string(),
+                    key: "default".to_string(),
+                    genome: genome::sample_genome(),
+                    gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                    entity_count: 40,
+                    role: gp::TrophicRole::Autotroph,
+                    host_key: None,
+                },
+                RosterEntry {
+                    name: "plant-1".to_string(),
+                    key: "ecoli-core".to_string(),
+                    genome: genome::sample_genome(),
+                    gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+                    entity_count: 40,
+                    role: gp::TrophicRole::Heterotroph,
+                    host_key: None,
+                },
+            ]
+        };
+        let cfg = SimConfig {
+            seed: 13,
+            generations: 0,
+            entity_count: 80,
+        };
+
+        let run_edit = || {
+            let mut sim =
+                Simulation::reset_with_roster(&cfg, &climate::EnvParams::default(), mk_roster());
+            let g0_before = sim.observe_all()[0]
+                .phenotype
+                .get(Trait::GrowthRate)
+                .unwrap();
+            let g1_before = sim.observe_all()[1]
+                .phenotype
+                .get(Trait::GrowthRate)
+                .unwrap();
+            // Edit ONLY species 1: raise its growth param to the top of its domain (drawing from the run RNG).
+            sim.with_species_genome_and_rng(SpeciesId(1), |g, rng| {
+                let _draw = rng.next_u64();
+                if let genome::ParamValue::Numeric { value, max, .. } =
+                    &mut g.loci[0].parameters[0].value
+                {
+                    *value = *max;
+                }
+            });
+            let g0_after = sim.observe_all()[0]
+                .phenotype
+                .get(Trait::GrowthRate)
+                .unwrap();
+            let g1_after = sim.observe_all()[1]
+                .phenotype
+                .get(Trait::GrowthRate)
+                .unwrap();
+            sim.step(10);
+            (
+                g0_before,
+                g1_before,
+                g0_after,
+                g1_after,
+                sim.run_stats().hash,
+            )
+        };
+
+        let (g0b, g1b, g0a, g1a, h1) = run_edit();
+        // The edited (non-primary) species' phenotype CHANGED…
+        assert!(g1a > g1b, "species 1 growth should rise ({g1b} -> {g1a})");
+        // …while the primary species' phenotype is UNTOUCHED.
+        assert_eq!(
+            g0a, g0b,
+            "species 0 phenotype must not change from a species-1 edit"
+        );
+
+        // Deterministic / replayable: same seed + same edit ⇒ identical run hash.
+        let (.., h2) = run_edit();
+        assert_eq!(
+            h1, h2,
+            "a non-primary edit must be deterministic / replayable"
         );
     }
 

@@ -567,12 +567,14 @@ mod tests {
                 cas: cas_id("SpCas9"),
                 target: LocusId(0),
                 guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                species: 0,
             }),
             Action::Advance(20),
             Action::ApplyEdit(EditAction {
                 cas: cas_id("AsCas12a"),
                 target: LocusId(1),
                 guide: GuideSequence::new(*b"TTTACCGGTTTAGGGCAAAC").unwrap(),
+                species: 0,
             }),
             Action::Advance(15),
         ]
@@ -757,6 +759,7 @@ mod tests {
                 cas: cas_id("SpCas9"),
                 target: LocusId(0),
                 guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                species: 0,
             },
             crate::RegionSpec {
                 cx: 16,

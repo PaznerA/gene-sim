@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Variant Lab A — per-species CRISPR edit (whole-species inject targets ANY roster species) (feat, core/renderer) — HASH-NEUTRAL
+The whole-species CRISPR inject (and the journaled `Action::ApplyEdit`) now target a CHOSEN species, not just the
+resident primary — the foundation for the edit→save-variant→reseed loop (Variant Lab) + the auto-research's mid-run
+edit space. **The pinned literal `0x47a0_3c8f_6701_f240` is byte-identical** (full `tools/gate.sh` GREEN, 180/180
+sim-core); adversarially verified 5/5 on every dimension.
+- **Core:** `EditAction` gains `species: u16` with `#[serde(default)]` (absent → 0 = primary), resolved in the env's
+  `Action::ApplyEdit` via the same `species:u16 → SpeciesId` boundary the SP-3 interventions use. A species-0 edit is
+  PROVEN byte-identical to the legacy hook (`species0_edit_via_targeted_hook_is_byte_identical_to_legacy_hook`); the
+  RNG threading is unchanged (a non-primary edit draws the same words); an out-of-range species id is panic-free.
+  `#[serde(default)]` keeps OLD journals (no field → species 0) + the recorded-episode golden + the R2 save/load
+  round-trip byte-identical (no journal-format break). No new ADR — it extends the SP-3 `species:u16` + serde-default
+  patterns.
+- **Boundary:** godot-sim `apply_edit(cas, target, guide, species)` gains the `species:i64` param (mirroring
+  `pcr_amplify`/`cull`).
+- **UI:** the CRISPR inject panel gains a target-species picker (`_crispr_species`, populated from `observe_species`
+  like `_pcr_species`); `_on_inject_pressed` passes the chosen species (default the active/primary), and the appended
+  specimen variant attributes to the EDITED species.
+- **Next (Variant Lab):** B save-named-variant (`export_species_json` via `from_built`), C reseed (register +
+  inoculate), D auto-research scheduled edits (then D3 surrogate can steer over edits).
+
 ### Emergent-discovery D2b — widened search space + the evolutionary proposer (feat, discovery) — HASH-NEUTRAL
 ADR-025. D2a clustered (the narrow Primordial space kept ~1 distinct gem); D2b widens the space + adds an
 evolutionary proposer so the search surfaces a DIVERSE gem library. **The pinned literal `0x47a0_3c8f_6701_f240` is
