@@ -141,16 +141,18 @@ var _hud: Label
 var _legend_label: Label
 var _legend: Control
 var _timer: Timer
-var _view_button: Button
+var _view_buttons: Array = []  # the 3 segmented VIEW toggles (Ecosystem/Specimen/Relations), top-right panel
+var _viewscope_panel: Control  # the always-on top-right VIEW + SCOPE switcher (separated from the CONTROLS deck)
 var _play_button: Button
 var _layer_picker: OptionButton
 var _specimen_bounds := Rect2()
 var _focus: int = 0  # which specimen (index into _specimen_list()) is focused in the specimen view
 var _specimen_panel: Control
 var _specimen_picker: OptionButton
-# Relations view (Rel-UI.0): a fixed (NOT world-space) docked S×S heatmap of the core FlowMatrix.
+# Relations view: a FULL-WINDOW graph/heatmap (like the specimen view) + a compact docked info/toggle card.
 var _relations_root: Node2D  # holds the relations heatmap (parallels _specimen_root)
-var _relations_panel: Control  # PanelChrome wrapper (🔗 RELATIONS)
+var _relations_panel: Control  # PanelChrome wrapper (🔗 RELATIONS) — now the compact info/toggle card only
+var _relations_full: Control  # full-window container holding the graph + heatmap (fills the field, like _specimen_root)
 var _relations_heatmap: Control  # the RelationsHeatmap _draw() node
 var _relations_graph: Control  # Item 4: the RelationsGraph node-link _draw() node (companion to the heatmap)
 var _relations_show_graph: bool = true  # Item 4: which relations representation is visible (Graph default vs Matrix)
@@ -967,7 +969,7 @@ func _build_intervention_ui(ui: CanvasLayer) -> void:
 
 	var fs := _field_screen_size()
 	_intervention_panel = PanelChrome.new()
-	_intervention_panel.setup("🧪 INTERVENE", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 70.0), _pill_rail)
+	_intervention_panel.setup("🧪 INTERVENE", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 176.0), _pill_rail)  # y=176 clears the always-on VIEW+SCOPE panel
 	_intervention_panel.set_active(_live != null)
 
 
@@ -1036,7 +1038,7 @@ func _build_contamination_ui(ui: CanvasLayer) -> void:
 
 	var fs := _field_screen_size()
 	_containment_panel = PanelChrome.new()
-	_containment_panel.setup("🦠 CONTAMINATION", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 320.0), _pill_rail)
+	_containment_panel.setup("🦠 CONTAMINATION", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 380.0), _pill_rail)  # below the lowered INTERVENE panel
 	_containment_panel.set_active(_live != null)
 
 
@@ -1881,6 +1883,7 @@ func _build_scene() -> void:
 	_build_hud(ui, field_screen)
 	_build_vitals_ui(ui)
 	_build_controls(ui, field_screen)
+	_build_viewscope_ui(ui)  # the always-on top-right VIEW + SCOPE switcher (built after _build_controls owns _scope_buttons)
 	_build_specimen_ui(ui, field_screen)
 	_build_relations_ui(ui, field_screen)
 	_build_interaction_ui(ui)
@@ -2233,15 +2236,10 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	rows.add_theme_constant_override("separation", 8)
 	body.add_child(rows)
 
-	# Row 1 — view / playback / step / layer.
+	# Row 1 — playback / step / layer. (VIEW switching moved to the dedicated top-right VIEW+SCOPE panel.)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 8)
 	rows.add_child(row)
-
-	_view_button = Button.new()
-	_view_button.text = "View: Ecosystem"
-	_view_button.pressed.connect(_on_view_pressed)
-	row.add_child(_view_button)
 
 	_play_button = Button.new()
 	_play_button.text = "⏸ Pause"
@@ -2270,7 +2268,7 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	_layer_picker.item_selected.connect(_on_layer_selected)
 	row.add_child(_layer_picker)
 
-	# Row 2 — speed / scope / generation scrubber.
+	# Row 2 — playback speed. (Zoom SCOPE moved to the dedicated top-right VIEW+SCOPE panel.)
 	var row2 := HBoxContainer.new()
 	row2.add_theme_constant_override("separation", 8)
 	rows.add_child(row2)
@@ -2284,18 +2282,6 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	_speed_slider.custom_minimum_size = Vector2(90, 0)
 	_speed_slider.value_changed.connect(_on_speed_changed)
 	row2.add_child(_speed_slider)
-
-	row2.add_child(_dim_label("  Scope:"))
-	var group := ButtonGroup.new()
-	group.allow_unpress = true  # _scope_label() buckets continuous zoom; no preset may be active
-	for i in SCOPES.size():
-		var b := Button.new()
-		b.text = str(SCOPES[i]["name"]).capitalize()
-		b.toggle_mode = true
-		b.button_group = group
-		b.pressed.connect(_set_scope.bind(i))
-		row2.add_child(b)
-		_scope_buttons.append(b)
 
 	# (The generation scrubber is gone — the bottom timeline owns seek with a play-head + labels.)
 
@@ -2342,6 +2328,86 @@ func _build_controls(ui: CanvasLayer, field_px: Vector2) -> void:
 	_controls_panel = PanelChrome.new()
 	_controls_panel.setup("🎛 CONTROLS", body, ui, Vector2(12, field_px.y + 16), _pill_rail)
 	_sync_controls()
+
+
+## The always-on top-right VIEW + SCOPE switcher (UI rework): a segmented VIEW row (Ecosystem / Specimen / Relations)
+## on top, the zoom SCOPE row (Field / Patch / Cells) below it — SEPARATED from the CONTROLS deck so view + scope are
+## always reachable in the same spot, in every view. Anchored to the top-right corner (grows leftward) so it hugs the
+## corner at any window size. Renderer-only (inv #2): pure view/camera state, no biology. Built AFTER _build_controls
+## (which no longer owns these) so _scope_buttons / _view_buttons live here.
+func _build_viewscope_ui(ui: CanvasLayer) -> void:
+	var body := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.06, 0.09, 0.08, 0.9)
+	sb.set_corner_radius_all(8)
+	sb.set_border_width_all(1)
+	sb.border_color = Color(0.2, 0.46, 0.32, 0.7)
+	sb.shadow_size = 6
+	sb.shadow_color = Color(0.0, 0.0, 0.0, 0.4)
+	sb.set_content_margin_all(8)
+	body.add_theme_stylebox_override("panel", sb)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 5)
+	body.add_child(col)
+
+	# VIEW switcher — 3 segmented toggles (one active, synced by _set_view_mode → _sync_view_buttons).
+	var vcap := _dim_label("VIEW")
+	vcap.add_theme_font_size_override("font_size", 10)
+	col.add_child(vcap)
+	var view_row := HBoxContainer.new()
+	view_row.add_theme_constant_override("separation", 3)
+	col.add_child(view_row)
+	var vgrp := ButtonGroup.new()
+	_view_buttons.clear()
+	for i in VIEW_NAMES.size():
+		var vb := Button.new()
+		vb.text = VIEW_NAMES[i]
+		vb.toggle_mode = true
+		vb.button_group = vgrp
+		vb.custom_minimum_size = Vector2(80, 0)
+		vb.pressed.connect(_on_view_selected.bind(i))
+		view_row.add_child(vb)
+		_view_buttons.append(vb)
+	_sync_view_buttons()
+
+	# SCOPE — the zoom presets (pure camera zoom; _scope_buttons synced by _sync_scope_buttons() on any zoom change).
+	# allow_unpress so an in-between (wheel) zoom shows none active. The scope drives the camera in every view.
+	var scap := _dim_label("SCOPE")
+	scap.add_theme_font_size_override("font_size", 10)
+	col.add_child(scap)
+	var scope_row := HBoxContainer.new()
+	scope_row.add_theme_constant_override("separation", 3)
+	col.add_child(scope_row)
+	var sgrp := ButtonGroup.new()
+	sgrp.allow_unpress = true
+	_scope_buttons.clear()
+	for i in SCOPES.size():
+		var sbn := Button.new()
+		sbn.text = str(SCOPES[i]["name"]).capitalize()
+		sbn.toggle_mode = true
+		sbn.button_group = sgrp
+		sbn.custom_minimum_size = Vector2(62, 0)
+		sbn.pressed.connect(_set_scope.bind(i))
+		scope_row.add_child(sbn)
+		_scope_buttons.append(sbn)
+
+	# Pin to the top-right corner BELOW the title bar, sizing to content: all four anchors at the corner point +
+	# grow LEFT/DOWN, with a zero-size offset rect (offset_left==offset_right, offset_top==offset_bottom) that the
+	# container's min-size then expands. (Setting only 2 of 4 offsets leaves a degenerate rect → invisible.)
+	ui.add_child(body)
+	body.anchor_left = 1.0
+	body.anchor_right = 1.0
+	body.anchor_top = 0.0
+	body.anchor_bottom = 0.0
+	body.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	body.grow_vertical = Control.GROW_DIRECTION_END
+	body.offset_left = -12
+	body.offset_right = -12
+	body.offset_top = 44  # clear the full-width title bar
+	body.offset_bottom = 44
+	_viewscope_panel = body
+	_sync_scope_buttons()
 
 
 ## A small dimmed label used as an inline caption in the control bar.
@@ -2513,8 +2579,15 @@ func _sync_scope_buttons() -> void:
 		(_scope_buttons[i] as Button).set_pressed_no_signal(str(SCOPES[i]["name"]) == active)
 
 
-func _on_view_pressed() -> void:
-	_set_view_mode((_view_mode + 1) % VIEW_COUNT)
+func _on_view_selected(m: int) -> void:
+	_set_view_mode(m)
+
+
+## Reflect the current view in the segmented VIEW toggles (one pressed). Synced by _set_view_mode so KEY_V cycling
+## and the --view shot flag keep the top-right switcher in step.
+func _sync_view_buttons() -> void:
+	for i in _view_buttons.size():
+		(_view_buttons[i] as Button).set_pressed_no_signal(i == _view_mode)
 
 
 func _on_play_pressed() -> void:
@@ -2553,6 +2626,8 @@ func _set_view_mode(m: int) -> void:
 	_specimen_root.visible = (m == VIEW_SPECIMEN)
 	if _relations_root != null:
 		_relations_root.visible = (m == VIEW_RELATIONS)
+	if _relations_full != null:
+		_relations_full.visible = (m == VIEW_RELATIONS)  # the full-window graph/heatmap content (like _specimen_root)
 	if _vignette != null:
 		_vignette.visible = (m == VIEW_ECOSYSTEM)  # screen-space edge darkening only suits the field view
 	if _detail_panel != null:
@@ -2570,8 +2645,7 @@ func _set_view_mode(m: int) -> void:
 			_set_brush_mode(false)  # the brush only makes sense in the ecosystem view
 		if _mission_panel != null:
 			_mission_panel.set_active(_mission_on and m == VIEW_ECOSYSTEM)
-	if _view_button != null:
-		_view_button.text = "View: " + VIEW_NAMES[m]
+	_sync_view_buttons()  # keep the top-right segmented VIEW switcher in step (KEY_V cycle / --view flag / button)
 	if _layer_picker != null:
 		_layer_picker.disabled = (m != VIEW_ECOSYSTEM)  # the data-layer picker only drives the ecosystem overlay
 	if _specimen_panel != null:
@@ -2595,7 +2669,7 @@ func _set_view_mode(m: int) -> void:
 		_frame_specimens()
 	elif m == VIEW_RELATIONS:
 		_refresh_relations()  # pull species names + the flat FlowMatrix, feed the heatmap (degrades gracefully)
-		_frame_world()  # the heatmap is a fixed Control panel, not world-space — keep the camera neutral
+		_frame_world()  # the relations graph/heatmap are full-window Controls (screen-space) — keep the world camera neutral
 	else:
 		_frame_world()
 	_sync_controls()  # enable/disable scrubber + step for the new mode
@@ -3166,7 +3240,7 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 		_trait_rows.append({"name": name_lbl, "bar": bar, "value": val_lbl, "delta": delta_lbl})
 
 	_specimen_panel = PanelChrome.new()
-	_specimen_panel.setup("🌱 SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 70.0), _pill_rail)
+	_specimen_panel.setup("🌱 SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 176.0), _pill_rail)  # y=176 clears the always-on VIEW+SCOPE panel
 	_specimen_panel.set_active(false)
 
 
@@ -3174,49 +3248,45 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 ## a degrade-state banner, and a diverging sign/magnitude legend. The heatmap reads core-measured integers only
 ## (inv #2): the renderer paints them as colored cells + printed numbers and computes no biology.
 func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
+	# FULL-WINDOW relations content (UI rework): the graph + heatmap fill the field area between the title bar and the
+	# bottom timeline — like the specimen view — instead of a cramped corner panel. Visible only in the Relations view;
+	# the compact info/toggle CARD (below) floats over it. mouse-IGNORE so the floating card still receives clicks.
+	_relations_full = Control.new()
+	_relations_full.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_relations_full.offset_top = 44.0       # clear the full-width title bar
+	_relations_full.offset_bottom = -58.0   # clear the bottom timeline
+	_relations_full.offset_left = 8.0
+	_relations_full.offset_right = -8.0
+	_relations_full.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_relations_full.visible = false
+	ui.add_child(_relations_full)
+
+	# The node-link GRAPH (default) + the S×S heatmap, BOTH full-rect inside the container; the toggle swaps which is
+	# shown. Each reads the core-MEASURED FlowMatrix (+ populations) in _refresh_relations — only the drawing differs.
+	_relations_graph = RelationsGraph.new()
+	_relations_graph.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_relations_graph.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_relations_full.add_child(_relations_graph)
+
+	_relations_heatmap = RelationsHeatmap.new()
+	_relations_heatmap.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_relations_heatmap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_relations_full.add_child(_relations_heatmap)
+
+	# ── The compact info / toggle CARD (docked top-right, below the always-on VIEW+SCOPE panel) ──
 	var body := PanelContainer.new()
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.0, 0.0, 0.0, 0.5)
+	sb.bg_color = Color(0.0, 0.0, 0.0, 0.62)
 	sb.set_corner_radius_all(6)
 	sb.set_content_margin_all(10)
 	body.add_theme_stylebox_override("panel", sb)
-	body.custom_minimum_size = Vector2(360, 0)
+	body.custom_minimum_size = Vector2(300, 0)
 
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 6)
 	body.add_child(col)
 
-	var cap := Label.new()
-	cap.text = "rows = sink (gains) · cols = source (gives)"
-	cap.add_theme_font_size_override("font_size", 11)
-	cap.add_theme_color_override("font_color", Color(0.7, 0.78, 0.7))
-	col.add_child(cap)
-
-	# Degrade-state banner: shown in State 1 (no flow_matrix method) / State 2 (present but all-zero); hidden in
-	# State 3 (live non-zero). The DATA picks the state (see _refresh_relations) — never a version flag.
-	_relations_banner = Label.new()
-	_relations_banner.add_theme_font_size_override("font_size", 11)
-	_relations_banner.add_theme_color_override("font_color", Color(0.98, 0.8, 0.4))
-	_relations_banner.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_relations_banner.custom_minimum_size = Vector2(340, 0)
-	_relations_banner.visible = false
-	col.add_child(_relations_banner)
-
-	# Plain-language "who's eating whom" summary (Item a): the top few NONZERO inter-species flows parsed from the
-	# MEASURED FlowMatrix, e.g. "Primary flows: plant → ecoli (+450 J/gen), ecoli → bdellovibrio (−200 J/gen)". This
-	# is the SAME data the heatmap below paints — just narrated. GDScript only sorts already-finished integers by
-	# magnitude + names them (no biology / inv #2). Hidden when all flows are zero (State 1/2).
-	_relations_flowsum = Label.new()
-	_relations_flowsum.add_theme_font_size_override("font_size", 11)
-	_relations_flowsum.add_theme_color_override("font_color", Color(0.82, 0.93, 0.84))
-	_relations_flowsum.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_relations_flowsum.custom_minimum_size = Vector2(340, 0)
-	_relations_flowsum.visible = false
-	col.add_child(_relations_flowsum)
-
-	# Item 4: Graph / Matrix segmented toggle. The user expected a node-link GRAPH of the trophic web but only had
-	# the S×S heatmap; the GRAPH is now the DEFAULT representation, with the matrix one click away. Both read the same
-	# core-MEASURED FlowMatrix (+ populations) — only the drawing differs (inv #2). A ButtonGroup keeps one selected.
+	# Graph / Matrix segmented toggle (the GRAPH is the default representation; the matrix is one click away).
 	var rep_row := HBoxContainer.new()
 	rep_row.add_theme_constant_override("separation", 4)
 	var rep_grp := ButtonGroup.new()
@@ -3236,15 +3306,31 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	rep_row.add_child(_relations_matrix_btn)
 	col.add_child(rep_row)
 
-	# Item 4: the node-link GRAPH (default-visible). Built before the heatmap; _on_relations_rep_selected swaps which
-	# of the two is shown. Reads names/keys/roles/populations + the flat FlowMatrix in _refresh_relations (inv #2).
-	_relations_graph = RelationsGraph.new()
-	_relations_graph.custom_minimum_size = Vector2(340, 320)
-	col.add_child(_relations_graph)
+	var cap := Label.new()
+	cap.text = "rows = sink (gains) · cols = source (gives)"
+	cap.add_theme_font_size_override("font_size", 11)
+	cap.add_theme_color_override("font_color", Color(0.7, 0.78, 0.7))
+	col.add_child(cap)
 
-	_relations_heatmap = RelationsHeatmap.new()
-	_relations_heatmap.custom_minimum_size = Vector2(340, 300)
-	col.add_child(_relations_heatmap)
+	# Degrade-state banner: shown in State 1 (no flow_matrix method) / State 2 (present but all-zero); hidden in
+	# State 3 (live non-zero). The DATA picks the state (see _refresh_relations) — never a version flag.
+	_relations_banner = Label.new()
+	_relations_banner.add_theme_font_size_override("font_size", 11)
+	_relations_banner.add_theme_color_override("font_color", Color(0.98, 0.8, 0.4))
+	_relations_banner.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_relations_banner.custom_minimum_size = Vector2(280, 0)
+	_relations_banner.visible = false
+	col.add_child(_relations_banner)
+
+	# Plain-language "who's eating whom" summary (Item a): the top few NONZERO inter-species flows parsed from the
+	# MEASURED FlowMatrix. GDScript only sorts already-finished integers by magnitude + names them (no biology, inv #2).
+	_relations_flowsum = Label.new()
+	_relations_flowsum.add_theme_font_size_override("font_size", 11)
+	_relations_flowsum.add_theme_color_override("font_color", Color(0.82, 0.93, 0.84))
+	_relations_flowsum.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_relations_flowsum.custom_minimum_size = Vector2(280, 0)
+	_relations_flowsum.visible = false
+	col.add_child(_relations_flowsum)
 
 	# Default representation: GRAPH (the user's expectation). The toggle reflects + swaps it.
 	_relations_graph_btn.set_pressed_no_signal(true)
@@ -3290,7 +3376,7 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	col.add_child(_relations_nearest)
 
 	_relations_panel = PanelChrome.new()
-	_relations_panel.setup("🔗 RELATIONS", body, ui, Vector2(maxf(220.0, field_px.x - 376.0), 70.0), _pill_rail)
+	_relations_panel.setup("🔗 RELATIONS", body, ui, Vector2(maxf(220.0, field_px.x - 320.0), 176.0), _pill_rail)  # y=176 clears the always-on VIEW+SCOPE panel
 	_relations_panel.set_active(false)
 
 

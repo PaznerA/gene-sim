@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Relations FULL-WINDOW view + always-on top-right VIEW+SCOPE switcher (feat, renderer) — HASH-NEUTRAL
+Two UI reworks (renderer-only `godot/main.gd`). **ZERO Rust touched → pinned literal `0x47a0_3c8f_6701_f240`
+byte-identical** (full `tools/gate.sh` GREEN). Adversarially verified 3/3 on every dimension.
+- **Relations view is now FULL-WINDOW** (like the specimen view): the node-link graph + the heatmap render in a
+  full-rect `_relations_full` Control that fills the field area between the title bar and the timeline, gated visible
+  in `VIEW_RELATIONS` like `_specimen_root` — not a cramped panel on a black screen. The Graph/Matrix toggle + flow
+  summary + legend + nearest moved to a compact floating card; the full container + graph/heatmap are
+  `MOUSE_FILTER_IGNORE` so the card still receives the toggle clicks. The heatmap/graph `_draw` already size to their
+  rect, so both scale to the window.
+- **Always-on top-right VIEW + SCOPE panel:** a segmented `Ecosystem / Specimen / Relations` switcher with
+  `Field / Patch / Cells` below it, anchored top-right and **separated from the CONTROLS deck** (which shed the old
+  single cycling view button + the scope buttons). `_set_view_mode → _sync_view_buttons()` keeps the switcher in step
+  with the `KEY_V` cycle / the `--view` shot flag / a button press; `KEY_1/2/3` scope shortcuts intact. The per-view
+  top-right cards (INTERVENE/CONTAMINATION/SPECIMEN/RELATIONS) shifted down (y=176) to clear the always-on panel.
+
 ### Emergent-discovery D2a — the random-search GEM loop (propose → run → score → save replayable gems) (feat, discovery) — HASH-NEUTRAL
 ADR-024. Makes the D0 scorer + D1 trace actually PRODUCE gems: the autonomous "find the dramatic runs" loop. **The
 pinned literal `0x47a0_3c8f_6701_f240` is UNTOUCHED** (the search adds no sim-path change; the proposal RNG is a
