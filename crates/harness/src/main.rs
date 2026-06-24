@@ -541,6 +541,7 @@ fn demo_episode_actions() -> Vec<Action> {
             cas: sp.id,
             target: LocusId(0),
             guide: g,
+            species: 0, // the resident primary — the golden edit is byte-identical to pre-Variant-Lab
         }));
     }
     actions.push(Action::Advance(20));
@@ -552,6 +553,7 @@ fn demo_episode_actions() -> Vec<Action> {
             cas: asc.id,
             target: LocusId(1),
             guide: g,
+            species: 0, // the resident primary — the golden edit is byte-identical to pre-Variant-Lab
         }));
     }
     actions.push(Action::Advance(20));
@@ -903,6 +905,7 @@ fn demo_edits() -> Vec<(&'static str, EditAction)> {
                 cas: sp.id,
                 target: LocusId(0),
                 guide: g,
+                species: 0, // the resident primary
             },
         ));
     }
@@ -916,6 +919,7 @@ fn demo_edits() -> Vec<(&'static str, EditAction)> {
                 cas: asc.id,
                 target: LocusId(3),
                 guide: g,
+                species: 0, // the resident primary
             },
         ));
     }

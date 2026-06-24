@@ -326,6 +326,7 @@ mod tests {
                 cas: crispr::CasVariantId(0),
                 target: genome::LocusId(0),
                 guide: crispr::GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                species: 0,
             },
             RegionSpec {
                 cx: 16,

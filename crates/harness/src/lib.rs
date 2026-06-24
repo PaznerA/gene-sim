@@ -74,15 +74,15 @@ pub trait Env {
     fn seed(&mut self, seed: u64);
 }
 
-/// A CRISPR edit expressed at **species** granularity (invariant #6): which Cas variant, which locus on
-/// the species genome, and the guide. It carries **no organism handle** — it edits the one shared
-/// species genome, never an individual.
+/// A CRISPR edit expressed at **species** granularity (invariant #6): which species' genome, which Cas
+/// variant, which locus on that genome, and the guide. It carries **no organism handle** — it edits one
+/// shared species genome, never an individual (Variant-Lab A: the species is CHOSEN, default the primary).
 ///
-/// Resolved through [`crispr::apply_edit`] against the env's Cas-variant table and the species genome.
+/// Resolved through [`crispr::apply_edit`] against the env's Cas-variant table and the chosen species genome.
 ///
 /// Serde-(de)serializable so it can be logged to `actions.ndjson` and replayed bit-identically (SPEC
-/// §5/§6): `cas`/`target` ride as their integer ids; `guide` as its validated ACGT string (a malformed
-/// guide in a log fails to deserialize — see [`crispr::GuideSequence`]).
+/// §5/§6): `cas`/`target`/`species` ride as their integer ids; `guide` as its validated ACGT string (a
+/// malformed guide in a log fails to deserialize — see [`crispr::GuideSequence`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditAction {
     /// Which Cas variant performs the edit (resolved by id against the variant table).
@@ -91,6 +91,14 @@ pub struct EditAction {
     pub target: LocusId,
     /// The guide (spacer) sequence.
     pub guide: GuideSequence,
+    /// Which species' genome to edit (operator/species granularity — inv #6; never a per-organism handle).
+    /// Raw registry ordinal → [`sim_core::SpeciesId`] at the env boundary, the SAME way the SP-3 interventions
+    /// resolve `species: u16`. `#[serde(default)]` makes this `0` = the resident PRIMARY species when absent,
+    /// so a pre-Variant-Lab `actions.ndjson` line (without the field) deserializes to EXACTLY today's
+    /// primary-species edit and replays byte-identically (the recorded-episode golden + the R2 round-trip + the
+    /// pinned config are all unmoved).
+    #[serde(default)]
+    pub species: u16,
 }
 
 /// The species/operator-granular action space (invariant #6). There is deliberately **no** per-organism
@@ -820,15 +828,20 @@ impl Env for GeneSimEnv {
                 self.last_edit = None;
             }
             Action::ApplyEdit(edit) => {
-                // Apply the edit to the SPECIES genome, threading the run's own RNG (inv. #3, #6): the
-                // edit draws ONLY from the single seeded stream handed in here. `with_genome_and_rng`
-                // re-expresses phenotype afterwards, so the edit changes subsequent selection dynamics.
+                // Apply the edit to the CHOSEN species' genome, threading the run's own RNG (inv. #3, #6): the
+                // edit draws ONLY from the single seeded stream handed in here, and draws the SAME way for any
+                // species (so a `species: 0` edit is byte-identical to the pre-Variant-Lab behavior — the
+                // pinned literal is unmoved). `edit.species` resolves to a `SpeciesId` at THIS boundary, the
+                // SAME `species: u16 → SpeciesId` mapping the SP-3 interventions use (default 0 = the resident
+                // primary). `with_species_genome_and_rng` re-expresses THAT species' phenotype afterwards, so
+                // the edit changes only its subsequent selection dynamics (inv #6 species-granular).
+                let sid = sim_core::SpeciesId::new(edit.species);
                 let crispr_edit = Edit {
                     cas: edit.cas,
                     target: edit.target,
                     guide: edit.guide,
                 };
-                let outcome = sim.with_genome_and_rng(|g, rng| {
+                let outcome = sim.with_species_genome_and_rng(sid, |g, rng| {
                     apply_edit(g, &crispr_edit, variants, on, off, thresholds, rng)
                 });
                 self.last_edit = Some(outcome);
@@ -1187,6 +1200,7 @@ mod tests {
             cas: cas_id("SpCas9"),
             target: LocusId(0),
             guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+            species: 0,
         };
         let r = env.step(Action::ApplyEdit(edit));
         assert!(!r.done);
@@ -1211,12 +1225,14 @@ mod tests {
                     cas: cas_id("SpCas9"),
                     target: LocusId(0),
                     guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                    species: 0,
                 }),
                 Action::Advance(20),
                 Action::ApplyEdit(EditAction {
                     cas: cas_id("AsCas12a"),
                     target: LocusId(1),
                     guide: GuideSequence::new(*b"TTTACCGGTTTAGGGCAAAC").unwrap(),
+                    species: 0,
                 }),
                 Action::Advance(15),
             ]
@@ -1268,11 +1284,18 @@ mod tests {
             cas: cas_id("SpCas9"),
             target: LocusId(0),
             guide: GuideSequence::new(*b"ACGTGG").unwrap(),
+            species: 0,
         });
         match a {
             Action::Advance(_) => {}
-            // EditAction targets a species LocusId — never an organism/entity id (inv. #6).
-            Action::ApplyEdit(EditAction { target: _, .. }) => {}
+            // EditAction targets a species LocusId + a `species: u16` registry ordinal — never an
+            // organism/entity id (inv. #6). The destructure names `species` so a future organism-handle
+            // field would stop this compiling and force a review.
+            Action::ApplyEdit(EditAction {
+                target: _,
+                species: _,
+                ..
+            }) => {}
             // ApplyEditRegion targets a species LocusId + a CELL region (cx/cy/radius) — still no organism
             // handle, so per-organism targeting stays unrepresentable (ADR-011 invariant-#6 ruling).
             Action::ApplyEditRegion(EditAction { target: _, .. }, RegionSpec { .. }) => {}
@@ -1349,6 +1372,7 @@ mod tests {
                     cas: cas_id("SpCas9"),
                     target: LocusId(0),
                     guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                    species: 0,
                 },
                 RegionSpec {
                     cx: 16,
@@ -1392,14 +1416,29 @@ mod tests {
             cas: cas_id("SpCas9"),
             target: LocusId(0),
             guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+            species: 3,
         });
         let j = serde_json::to_string(&edit).unwrap();
-        // The guide rides as its validated ACGT string; ids as bare integers.
+        // The guide rides as its validated ACGT string; ids as bare integers; the chosen species rides too.
         assert!(
             j.contains("\"ACGTGGACGTTTTAGGCCGG\""),
             "guide string missing: {j}"
         );
+        assert!(j.contains("\"species\":3"), "chosen species missing: {j}");
         assert_eq!(serde_json::from_str::<Action>(&j).unwrap(), edit);
+
+        // BACK-COMPAT (Variant-Lab A): a pre-Variant-Lab `actions.ndjson` line has NO `species` field. The
+        // `#[serde(default)]` makes it deserialize to `species: 0` (the resident primary) — EXACTLY today's
+        // behavior — so an old recorded journal replays byte-identically.
+        let old_line = r#"{"ApplyEdit":{"cas":0,"target":0,"guide":"ACGTGGACGTTTTAGGCCGG"}}"#;
+        let parsed = serde_json::from_str::<Action>(old_line).unwrap();
+        match parsed {
+            Action::ApplyEdit(e) => assert_eq!(
+                e.species, 0,
+                "an old line without `species` must default to the primary (0)"
+            ),
+            other => panic!("expected ApplyEdit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1839,6 +1878,7 @@ mod tests {
                     cas: cas_id("SpCas9"),
                     target: LocusId(0),
                     guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+                    species: 0,
                 }),
                 Action::Advance(12),
             ]

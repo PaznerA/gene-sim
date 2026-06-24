@@ -190,6 +190,7 @@ var _live = null  # LiveSim gdext node when --live is active (drives an open-end
 var _menu = null  # the pre-run main-menu overlay while it is open (ADR-012 E4); null once dismissed
 var _intervention_panel: Control  # live-mode CRISPR injection UI
 var _cas_picker: OptionButton
+var _crispr_species: OptionButton  # Variant-Lab A: which species the whole-species CRISPR edit targets (default primary)
 var _locus_picker: OptionButton
 var _guide_edit: LineEdit
 var _inject_button: Button  # Item 1: explicit whole-species inject (CRISPR sub-panel); mirrors the Guide-Enter hook
@@ -1083,6 +1084,14 @@ func _on_apply_containment_pressed() -> void:
 func _build_crispr_params() -> VBoxContainer:
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 4)
+	# Variant-Lab A: the TARGET-SPECIES picker for the whole-species edit (mirrors _pcr_species in the PCR panel;
+	# populated by _populate_species_pickers from observe_species(), SpeciesId order). The chosen ordinal flows
+	# through to LiveSim.apply_edit; with no explicit selection it resolves to species 0 (the resident primary).
+	var r0 := HBoxContainer.new()
+	r0.add_child(_dim_label("Species:"))
+	_crispr_species = OptionButton.new()
+	r0.add_child(_crispr_species)
+	col.add_child(r0)
 	var r1 := HBoxContainer.new()
 	r1.add_child(_dim_label("Cas:"))
 	_cas_picker = OptionButton.new()
@@ -1247,7 +1256,7 @@ func _make_spin(lo: float, hi: float, step: float, val: float) -> SpinBox:
 ## SpeciesId order, inv #3). The item's metadata carries the raw SpeciesId ordinal the core resolves (the
 ## RequestEcoliEdit / RegionInoculate u16-scaffold convention). Called at UI build + after a species change/reset.
 func _populate_species_pickers() -> void:
-	for ob in [_pcr_species, _cull_species]:
+	for ob in [_crispr_species, _pcr_species, _cull_species]:
 		if ob == null:
 			continue
 		var prev: int = ob.selected
@@ -1329,17 +1338,22 @@ func _on_inject_pressed() -> void:
 	# shows. Seeding it here guarantees baseline + edit N both appear in the row. (_log_live_genome dedups, so this
 	# is a no-op once a baseline already exists.)
 	_log_live_genome("baseline — gen %d" % int(_live.observe().get("generation", 0)))
-	var outcome: Dictionary = _live.apply_edit(cas_id, locus_id, _guide_edit.text)
+	# Variant-Lab A: the whole-species edit targets the species the CRISPR panel's picker resolves to (default the
+	# active/primary when nothing is explicitly selected). The same ordinal is the one we attribute the appended
+	# specimen variant to below — so a multi-species roster's history grows on the EDITED row, not always the primary.
+	var target_sid := _picker_species_id(_crispr_species) if _has_target_species(_crispr_species) else _active_species_id()
+	var outcome: Dictionary = _live.apply_edit(cas_id, locus_id, _guide_edit.text, max(target_sid, 0))
 	_record_edit_outcome(outcome)
 	if bool(outcome.get("applied", false)):
 		# Issue 4 (regression): a whole-species edit is a deliberate user action → it must ALWAYS append a NEW
 		# specimen variant to the EDITED species' history, even when its 5-trait projection is visually unchanged
 		# this frame (the core may re-express the phenotype only on the next generation, OR the edited param maps
 		# to a trait already saturated / outside the projection). The old path logged via _log_live_genome, whose
-		# dedup-on-traits then SUPPRESSED the variant ("Před tím přibývaly" → stopped). _append_active_edit_variant
-		# force-appends to the active species, so baseline + edit 1 + … always grow to the right. The passive
-		# refresh path (_log_live_genome on view re-entry) keeps its trait dedup so it never double-logs.
-		_append_active_edit_variant(int(outcome.get("generation", 0)))
+		# dedup-on-traits then SUPPRESSED the variant ("Před tím přibývaly" → stopped). _append_edit_variant_for
+		# force-appends to the EDITED species (target_sid), so baseline + edit 1 + … always grow to the right on the
+		# right row. The passive refresh path (_log_live_genome on view re-entry) keeps its trait dedup so it never
+		# double-logs.
+		_append_edit_variant_for(target_sid if target_sid >= 0 else _active_species_id(), "edit", int(outcome.get("generation", 0)))
 		# Re-render the specimen view NOW so the new variant glyph appears immediately (it used to only show on a
 		# view re-entry). Cheap + idempotent when not in the specimen view (the root is hidden); keeps the picker +
 		# framing in sync with the freshly-appended variant.
