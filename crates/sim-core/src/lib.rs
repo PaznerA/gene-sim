@@ -305,6 +305,15 @@ struct MetabolismScratch {
     frozen_toxin: Vec<i32>,
     demand: Vec<[i64; resource::RESOURCE_CHANNELS]>,
     granted: Vec<[i64; resource::RESOURCE_CHANNELS]>,
+    /// Pass-2 apportion scratch (hoisted out of the per-tick loop — perf, hash-neutral: cleared + refilled
+    /// each tick, never carried state, never folded into `hash_world`).
+    weights: Vec<u64>,
+    shares: Vec<i64>,
+    rem_scratch: Vec<(u128, usize)>,
+    /// Pass-3 convert-split scratch (same discipline as Pass-2).
+    split: Vec<i64>,
+    split_w: Vec<u64>,
+    split_rem: Vec<(u128, usize)>,
 }
 
 /// REUSABLE per-tick scratch buffers for [`reproduce_or_die`]'s canonical-order row vector + the two frozen
@@ -900,9 +909,12 @@ fn metabolism(
     let mut granted = std::mem::take(&mut scratch.granted);
     granted.clear();
     granted.resize(n, [0i64; resource::RESOURCE_CHANNELS]);
-    let mut weights: Vec<u64> = Vec::new();
-    let mut shares: Vec<i64> = Vec::new();
-    let mut rem_scratch: Vec<(u128, usize)> = Vec::new();
+    let mut weights = std::mem::take(&mut scratch.weights);
+    weights.clear();
+    let mut shares = std::mem::take(&mut scratch.shares);
+    shares.clear();
+    let mut rem_scratch = std::mem::take(&mut scratch.rem_scratch);
+    rem_scratch.clear();
     for c in 0..resource::RESOURCE_CHANNELS {
         // Walk items in canonical order; items in the same cell are CONTIGUOUS (cell is the primary key).
         let mut i = 0usize;
@@ -963,9 +975,12 @@ fn metabolism(
         std::collections::BTreeMap::new();
     // Reusable convert-split buffers (perf, hash-neutral): `split_budget_into` is bit-identical to
     // `split_budget`; only the per-org output/scratch ownership moves out of the loop.
-    let mut split: Vec<i64> = Vec::new();
-    let mut split_w: Vec<u64> = Vec::new();
-    let mut split_rem: Vec<(u128, usize)> = Vec::new();
+    let mut split = std::mem::take(&mut scratch.split);
+    split.clear();
+    let mut split_w = std::mem::take(&mut scratch.split_w);
+    split_w.clear();
+    let mut split_rem = std::mem::take(&mut scratch.split_rem);
+    split_rem.clear();
     for (id, sp, mut energy, mut biomass, mut age, _d, _t, p) in q.iter_mut() {
         age.0 = age.0.saturating_add(1);
         let granted_total = match by_org.get(&id.0) {
@@ -1072,6 +1087,12 @@ fn metabolism(
     scratch.demand = demand;
     scratch.granted = granted;
     scratch.frozen_toxin = frozen_toxin;
+    scratch.weights = weights;
+    scratch.shares = shares;
+    scratch.rem_scratch = rem_scratch;
+    scratch.split = split;
+    scratch.split_w = split_w;
+    scratch.split_rem = split_rem;
 }
 
 /// One organism's metabolism row in canonical `(cell, species, org)` order.
@@ -1870,6 +1891,7 @@ impl Simulation {
         world.insert_resource(MetabolismScratch::default());
         world.insert_resource(ReproScratch::default());
         world.insert_resource(chem::ChemEmitScratch::default());
+        world.insert_resource(trophic::MineralizeScratch::default());
         world.insert_resource(ResourceFieldRes(resource_field));
         // ADR-013 F5: the chemical/signal field (toxin/kin/alarm), seeded ALL-ZERO — chem is ENDOGENOUS
         // (emitted by organisms, never seed-generated), so it draws NO derive_seed / SimRng. Because Σchem == 0
