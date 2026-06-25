@@ -543,6 +543,11 @@ struct EmitRow {
 #[derive(Resource, Default)]
 pub(crate) struct ChemEmitScratch {
     rows: Vec<EmitRow>,
+    /// PERF-2 (hash-neutral): the per-org J-spent map, a reused SORTED-by-OrgId `Vec<(org, J)>` replacing a
+    /// per-tick `BTreeMap<u64, i64>`. An org can spend on BOTH the kin AND the alarm arm within one row, so its
+    /// key is PUSHED twice; [`crate::sort_merge_org_i64`] SUMS the consecutive duplicates — byte-identical to the
+    /// `entry().or_insert(0) += spend` accumulate. [`crate::org_lookup`] `binary_search` == `BTreeMap::get`.
+    spent: Vec<(u64, i64)>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -568,7 +573,10 @@ pub(crate) fn emit_chem(
 
     // Per-org J spent (debited from Energy in a second pass). Each is a PAIRED move: the J leaves Energy and
     // appears 1:1 as a milli-unit in ChemField → Σ unchanged.
-    let mut spent: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): a reused SORTED-by-OrgId `Vec<(org, J)>` instead of a per-tick `BTreeMap<u64, i64>`
+    // (the kin/alarm arms PUSH the same org twice; `sort_merge_org_i64` SUMS them — see the field doc).
+    let mut spent = std::mem::take(&mut scratch.spent);
+    spent.clear();
     let mut overflow: i64 = 0;
     for r in &rows {
         let cell = r.cell as usize;
@@ -586,7 +594,7 @@ pub(crate) fn emit_chem(
             kin_prov.deposit(cell, r.species as usize, accepted);
             energy -= kin_spend; // the WHOLE spend leaves Energy; the rejected part is booked to overflow
             overflow += i64::from(rejected);
-            *spent.entry(r.org).or_insert(0) += kin_spend;
+            spent.push((r.org, kin_spend));
         }
         // LIVE-DISTRESS alarm: a low-energy org signals (reads the post-kin Energy so the two spends compose).
         if energy < ALARM_TRIGGER {
@@ -598,22 +606,26 @@ pub(crate) fn emit_chem(
                     alarm_spend as i32,
                 );
                 overflow += i64::from(rejected);
-                *spent.entry(r.org).or_insert(0) += alarm_spend;
+                spent.push((r.org, alarm_spend));
             }
         }
     }
     ledger.overflow += overflow;
 
+    // PERF-2 (hash-neutral): sort+merge the pushed spends ONCE (kin/alarm dup keys SUMMED) so the apply below is
+    // a `binary_search` lookup byte-identical to the `BTreeMap` accumulate + get.
+    crate::sort_merge_org_i64(&mut spent);
     // ── Apply the Energy debits (paired move complete; never mutate-during-query — inv #3). ──
     if !spent.is_empty() {
         for (id, _sp, mut e, _p) in q.iter_mut() {
-            if let Some(&debit) = spent.get(&id.0) {
+            if let Some(debit) = crate::org_lookup(&spent, id.0) {
                 e.0 -= debit;
             }
         }
     }
-    // Return the reused row buffer to the scratch resource (its allocation survives to the next tick).
+    // Return the reused buffers to the scratch resource (their allocations survive to the next tick).
     scratch.rows = rows;
+    scratch.spent = spent;
 }
 
 /// **ASSERT CHEM CONSERVED (semantic)** (ADR-013 F5) — re-derives the chem book across the whole tick: the

@@ -46,8 +46,19 @@ with `godot --path godot -- --live [--roster "stem:count,…"] [--steps N] [--vi
    in the sandbox (the SP-2 composer loads the EnvConfig, the journal replays the edits) → the emergent-systems gallery.
 
 ## Deferred / parked
-- **Perf for bigger maps** (memory `perf-bigger-maps-needs-structural-change`): structural cost-profile change, NOT a
-  parallel library (ADR-020). Revisit when gameplay/UI is solid.
+- **PERF chapter (hash-neutral micro-opt)**: PERF-1 (scratch-Vec hoist) merged; **PERF-2** (per-tick OrgId
+  BTreeMap/BTreeSet → reused sorted-Vec — profiling insight: items/rows are already sorted by (cell, species,
+  OrgId)) is **DONE, hash-neutral, −48% tick_loop** (ADR-026) — clean full conversion **rebased onto + composed
+  with PERF-1** on the `worktree-perf2-roadmap-workflow` branch (supersedes the earlier half-broken
+  `auto/perf2-btreemap-to-vec` WIP). Full `tools/gate.sh` GREEN incl. `--features determinism` (`0x47a0` byte-
+  identical after the compose); back-to-back criterion `--baseline` confirms the −48% is PERF-2's MARGINAL gain
+  over PERF-1 (PERF-1 was itself perf-neutral on this bench). **READY TO MERGE** to main (`git merge --no-ff
+  worktree-perf2-roadmap-workflow` from main, local gate green = the merge gate per `no-ci-wait-autonomous-roadmap`).
+  Optional cheap follow-up: pin a golden hash on a predator/symbiont roster (the plant-only pinned config doesn't
+  exercise predation/host_coupling). See roadmap §10.
+- **Perf for bigger maps** (memory `perf-bigger-maps-needs-structural-change`): the BIGGER structural cost-profile
+  change (aggregate stepping / LOD / new data layout), NOT a parallel library (ADR-020), and beyond PERF-2's
+  byte-identical micro-opt. Revisit when gameplay/UI is solid.
 - OVERSIGHT in-game UI; UE5/web renderer; open-system predator/decomposer (§7 item 8); contamination S5b + loaded-
   session journal_actions markers (roadmap §8/§9); relations graph guild-colour + force-directed layout (ADR-022 follow-up).
 

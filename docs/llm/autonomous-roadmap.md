@@ -269,3 +269,46 @@ Rides the deterministic headless core + the R2 journal/replay. Full plan + slice
 **`docs/llm/proposals/emergent-discovery-harness-draft.md`**. FIRST STEP: D0 the interestingness scorer +
 D1 the per-gen trace (a new std-only `crates/discovery`), anchored on the Primordial starter preset. See
 the memory note [[autonomous-emergent-run-discovery-ml]].
+
+---
+
+## §10. PERF chapter — per-tick BTreeMap → reused sorted-Vec (hash-neutral micro-opt)
+
+**Profiling insight (the win rationale).** The hot-path `items` / `rows` vectors are already SORTED by
+`(cell, species, OrgId)`, so OrgId is ascending within each cell-group. The per-tick OrgId-keyed
+`BTreeMap`/`BTreeSet` scratch maps (built + dropped EVERY tick) can therefore be replaced by REUSED sorted-`Vec`
+buffers: `push → sort_unstable → merge-sum duplicates → binary_search`. This kills the per-tick map heap
+allocation (one+ node alloc per map per tick × ~9 maps) and the pointer-chasing cache misses, replacing them
+with contiguous, cache-friendly buffers held in `World` scratch resources (the proven PERF-1 `mem::take + clear`
+discipline). N = living orgs, so the win compounds on the **bigger maps** the user wants
+([[perf-bigger-maps-needs-structural-change]] — this is the "new data layout" lever, the byte-identical first
+step before the larger structural cost-profile change).
+
+**Hash-neutral, inv #3 (the determinism argument is airtight).** A sorted unique-key Vec iterates identically
+to a `BTreeMap` (both ascending by key); `binary_search` == `BTreeMap::get`; `sort_merge` summing duplicate keys
+== `entry().or_insert(0) += v` (i64 add is order-independent, bounded ≪ i64::MAX → no overflow); a sorted Vec +
+`binary_search` == `BTreeSet::contains`. The pinned literal `0x47a0_3c8f_6701_f240` is the correctness oracle —
+it MUST stay byte-identical (this is NOT a re-pin). The "even-better zero-lookup flat Vec indexed by items
+position" idea only applies where the APPLY iterates the buffer in `(cell,…)` order (litterfall / toxin_mints —
+already lookup-free); the maps applied via the arbitrary-order `q.iter_mut()` ECS query (ECS table order is NOT
+canonical — the very reason collect-then-apply exists) CANNOT be position-indexed, so `binary_search` is the
+correct ceiling there.
+
+- **PERF-1** ✅ merged (`432d072`/`ed558d7`): hoist metabolism/mineralize scratch Vecs into reused resources.
+- **PERF-2** ✅ DONE (ADR-026), hash-neutral, via the `perf2-btreemap-to-vec-impl` workflow (clean full
+  conversion on a worktree off main; the earlier half-broken `auto/perf2-btreemap-to-vec` WIP is superseded).
+  ALL OrgId-keyed per-tick `BTreeMap`s/`BTreeSet`s → reused sorted-`Vec`: `by_org`/`maint_energy`/`parent_debit`
+  (lib.rs), `spent` (chem.rs, kin+alarm dup-sum), `pred_credit`/`symb_credit` + the struct maps
+  `prey_debit`(PreyDebit{eaten,dead}) / `host_debit`(HostDebit{drawn}) (struct-aware three-phase merge) + the two
+  `despawn_set`s + `dead_set` (trophic.rs); `litterfall`/`toxin_mints` kept lookup-free. Helpers
+  `sort_merge_org_i64` / `org_lookup` + the new `PredationScratch` / `HostCouplingScratch` resources. Pinned
+  literal `0x47a0_3c8f_6701_f240` byte-identical (180/180 sim-core); **tick_loop −48 %** (32.0/151.3/305.2 ms vs
+  61.7/295.4/590.8). The render-only off-hash `dominant_species` `tally: Vec<BTreeMap>` argmax was OUT of scope.
+  **Rebased onto + composed with PERF-1** (`3886fc6`); full `tools/gate.sh` GREEN after the compose; a back-to-back
+  criterion `--baseline` re-bench (PERF-1 `ed558d7` vs PERF-2 `3886fc6`, same machine) confirms the marginal gain
+  is **−47.4 / −48.9 / −47.8 %** — i.e. PERF-1's scratch-Vec hoist was perf-neutral on this bench and the −48 % is
+  genuinely PERF-2's. **READY TO MERGE** to main (local gate green = the merge gate; no CI wait).
+- **PERF-2 follow-up** (cheap, optional): the pinned config is plant-only and early-returns out of
+  predation/host_coupling, so those kernels' byte-stability rests on construction-equivalence + the green
+  `f6_`/`s5_` determinism+conservation tests, NOT a pinned literal. Pin a golden hash on a predator/symbiont
+  roster to lock those paths in CI.
