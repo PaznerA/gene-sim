@@ -59,6 +59,9 @@ OPTIONS:
     --evolve-gens <u64>   Run the EVOLUTIONARY discover loop (D2b) for G generations (mutate/crossover of the
                           kept gems + fresh exploration). G=0 keeps the pure-random D2a behavior. Default: 0
     --pop-size <u64>      Population proposed per evolutionary generation (and gen 0). Default: 16
+    --save-evals          Also write EVERY evaluated (config → ScoreVec) to data/runs/evals/<search_seed>.jsonl
+                          (one JSON per line, in evaluation order — the D3-A surrogate training data). OFF-HASH:
+                          read-only over already-computed gem fields; the pinned sim literal is untouched.
     --campaign <FILE>     Grade a JSON campaign manifest (scenarios = world + region objective + budget):
                           replay one journal subdir per scenario from --journals <DIR>/<index>/ and print each
                           Won/Lost + score + the total. Win/score rules live in the core (inv #2), not GDScript.
@@ -384,6 +387,12 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         let evolve_gens: u64 = val("--evolve-gens")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        // D3-A — the eval log prerequisite. `--save-evals` writes EVERY evaluated (config → ScoreVec) to
+        // data/runs/evals/<search_seed>.jsonl (one JSON per line, in evaluation order). OFF-HASH (read-only over
+        // already-computed gem fields; the pinned sim literal is untouched). `data/runs/*` is gitignored.
+        let save_evals = argv.iter().any(|a| a == "--save-evals");
+        let evals_path =
+            save_evals.then(|| PathBuf::from(format!("data/runs/evals/{search_seed:016x}.jsonl")));
         if evolve_gens > 0 {
             let pop_size: u64 = val("--pop-size").and_then(|s| s.parse().ok()).unwrap_or(16);
             return Some(run_discover_evolved(
@@ -392,9 +401,16 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
                 evolve_gens,
                 keep,
                 gens,
+                evals_path.as_deref(),
             ));
         }
-        return Some(run_discover(search_seed, trials, keep, gens));
+        return Some(run_discover(
+            search_seed,
+            trials,
+            keep,
+            gens,
+            evals_path.as_deref(),
+        ));
     }
 
     if let Some(dir) = val("--record-episode") {
@@ -420,7 +436,13 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
 /// VERIFIED saved gems (score · caption · config). Defaults match the CLI flags' documented values. The
 /// `data/species` root is resolved relative to this binary's manifest dir (the same byte-mover boundary the
 /// menu/CLI species loader uses); `data/runs/gems/` is gitignored (generated artifacts).
-fn run_discover(search_seed: u64, trials: u64, keep: usize, gens: u32) -> ExitCode {
+fn run_discover(
+    search_seed: u64,
+    trials: u64,
+    keep: usize,
+    gens: u32,
+    evals_path: Option<&std::path::Path>,
+) -> ExitCode {
     let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let out_dir = PathBuf::from("data/runs/gems");
 
@@ -428,8 +450,25 @@ fn run_discover(search_seed: u64, trials: u64, keep: usize, gens: u32) -> ExitCo
         "gene-sim discover · search_seed={search_seed} · trials={trials} · keep={keep} · gens={gens}\n  writing verified gems to {}",
         out_dir.display()
     );
-    match harness::discover::discover(search_seed, trials, keep, gens, &species_dir, &out_dir) {
+    if let Some(p) = evals_path {
+        println!("  writing eval log to {}", p.display());
+    }
+    match harness::discover::discover(
+        search_seed,
+        trials,
+        keep,
+        gens,
+        &species_dir,
+        &out_dir,
+        evals_path,
+    ) {
         Ok(lib) => {
+            if let Some(p) = evals_path {
+                let count = std::fs::read_to_string(p)
+                    .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+                    .unwrap_or(0);
+                println!("  wrote {count} eval records to {}", p.display());
+            }
             print_gem_library(&lib);
             ExitCode::SUCCESS
         }
@@ -450,6 +489,7 @@ fn run_discover_evolved(
     evolve_gens: u64,
     keep: usize,
     gens: u32,
+    evals_path: Option<&std::path::Path>,
 ) -> ExitCode {
     let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let out_dir = PathBuf::from("data/runs/gems");
@@ -460,6 +500,9 @@ fn run_discover_evolved(
         evolve_gens + 1,
         out_dir.display()
     );
+    if let Some(p) = evals_path {
+        println!("  writing eval log to {}", p.display());
+    }
     match harness::discover::discover_evolved(
         search_seed,
         pop_size,
@@ -468,8 +511,15 @@ fn run_discover_evolved(
         gens,
         &species_dir,
         &out_dir,
+        evals_path,
     ) {
         Ok(lib) => {
+            if let Some(p) = evals_path {
+                let count = std::fs::read_to_string(p)
+                    .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+                    .unwrap_or(0);
+                println!("  wrote {count} eval records to {}", p.display());
+            }
             print_gem_library(&lib);
             // The DIVERSITY win: how many DISTINCT gems (by roster shape — the present-species set) were kept.
             // Evolution + novelty-dedup should keep a broader spread of community shapes than pure random.

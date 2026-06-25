@@ -77,8 +77,10 @@ fn discover_evolved_is_deterministic_same_search_seed() {
     let a_dir = temp_dir("det_a");
     let b_dir = temp_dir("det_b");
 
-    let lib_a = discover_evolved(2024, 8, 3, 6, 60, &species_dir(), &a_dir).expect("evolve a");
-    let lib_b = discover_evolved(2024, 8, 3, 6, 60, &species_dir(), &b_dir).expect("evolve b");
+    let lib_a =
+        discover_evolved(2024, 8, 3, 6, 60, &species_dir(), &a_dir, None).expect("evolve a");
+    let lib_b =
+        discover_evolved(2024, 8, 3, 6, 60, &species_dir(), &b_dir, None).expect("evolve b");
 
     assert_eq!(
         lib_a, lib_b,
@@ -107,7 +109,7 @@ fn every_evolved_gem_round_trips() {
     // record→replay round-trip before writing; this independently re-derives the hash to prove the on-disk
     // contract held — the UNCHANGED verify_and_write_library guarantee.)
     let dir = temp_dir("roundtrip");
-    let lib = discover_evolved(99, 8, 3, 6, 60, &species_dir(), &dir).expect("evolve");
+    let lib = discover_evolved(99, 8, 3, 6, 60, &species_dir(), &dir, None).expect("evolve");
     let saved = read_saved_gems(&dir);
     assert!(!saved.is_empty(), "at least one gem saved");
     assert_eq!(
@@ -159,9 +161,27 @@ fn evolutionary_keeps_more_distinct_gems_than_same_budget_random() {
     let evo_dir = temp_dir("div_evo");
     let rnd_dir = temp_dir("div_rnd");
 
-    let evo = discover_evolved(4242, pop, gens, keep, trace_gens, &species_dir(), &evo_dir)
-        .expect("evolve");
-    let rnd = discover(4242, budget, keep, trace_gens, &species_dir(), &rnd_dir).expect("random");
+    let evo = discover_evolved(
+        4242,
+        pop,
+        gens,
+        keep,
+        trace_gens,
+        &species_dir(),
+        &evo_dir,
+        None,
+    )
+    .expect("evolve");
+    let rnd = discover(
+        4242,
+        budget,
+        keep,
+        trace_gens,
+        &species_dir(),
+        &rnd_dir,
+        None,
+    )
+    .expect("random");
 
     let evo_distinct = distinct_shapes(&evo.gems);
     let rnd_distinct = distinct_shapes(&rnd.gems);
@@ -196,9 +216,19 @@ fn evolutionary_best_score_does_not_regress_below_random() {
     let evo_dir = temp_dir("score_evo");
     let rnd_dir = temp_dir("score_rnd");
 
-    let evo =
-        discover_evolved(7, pop, gens, keep, trace_gens, &species_dir(), &evo_dir).expect("evolve");
-    let rnd = discover(7, budget, keep, trace_gens, &species_dir(), &rnd_dir).expect("random");
+    let evo = discover_evolved(
+        7,
+        pop,
+        gens,
+        keep,
+        trace_gens,
+        &species_dir(),
+        &evo_dir,
+        None,
+    )
+    .expect("evolve");
+    let rnd =
+        discover(7, budget, keep, trace_gens, &species_dir(), &rnd_dir, None).expect("random");
 
     let evo_best = evo.gems.iter().map(|g| g.score).max().unwrap_or(0);
     let rnd_best = rnd.gems.iter().map(|g| g.score).max().unwrap_or(0);
@@ -220,8 +250,9 @@ fn evolve_gens_zero_reduces_to_random_d2a() {
     let rnd_dir = temp_dir("zero_rnd");
 
     let pop = 10u64;
-    let evo = discover_evolved(555, pop, 0, 5, 60, &species_dir(), &evo_dir).expect("evolve g=0");
-    let rnd = discover(555, pop, 5, 60, &species_dir(), &rnd_dir).expect("random");
+    let evo =
+        discover_evolved(555, pop, 0, 5, 60, &species_dir(), &evo_dir, None).expect("evolve g=0");
+    let rnd = discover(555, pop, 5, 60, &species_dir(), &rnd_dir, None).expect("random");
 
     assert_eq!(
         evo, rnd,

@@ -18,3 +18,6 @@ proptest = []
 # the workspace serde (inv #7).
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }  # round-trip the serde-derived EvalRecord in tests (D3-A, SPEC §5)

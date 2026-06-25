@@ -29,7 +29,7 @@ use std::io;
 use std::path::Path;
 
 use discovery::search::{
-    caption, propose, propose_evolved, Gem, GemLibrary, SearchConfig, SearchSpace,
+    caption, propose, propose_evolved, EvalRecord, Gem, GemLibrary, SearchConfig, SearchSpace,
 };
 use discovery::{final_score, DefaultScorer};
 use genome::spec::BuiltSpecies;
@@ -191,11 +191,14 @@ pub fn gem_file_name(gem: &Gem) -> String {
 ///
 /// `species_dir` is the `data/species` root the roster keys resolve against (the filesystem boundary; the core
 /// stays filesystem-free, inv #2). `out_dir` is created if absent; existing files with a colliding name are
-/// overwritten (the name is a pure function of the gem).
+/// overwritten (the name is a pure function of the gem). `evals_path`, when `Some`, writes EVERY evaluated
+/// `(config → ScoreVec)` as one JSONL line to that path (D3-A surrogate training data; OFF-HASH — read-only
+/// over already-computed gem fields, in evaluation order; `data/runs/*` is gitignored).
 ///
 /// # Errors
-/// Returns an [`io::Error`] only for a failure to create `out_dir` or write a gem file. A per-config species
-/// resolution failure or a per-gem round-trip failure is handled internally (skip / drop + log), never an error.
+/// Returns an [`io::Error`] only for a failure to create `out_dir` or write a gem file (or the eval log). A
+/// per-config species resolution failure or a per-gem round-trip failure is handled internally (skip / drop +
+/// log), never an error.
 pub fn discover(
     search_seed: u64,
     trials: u64,
@@ -203,14 +206,30 @@ pub fn discover(
     gens: u32,
     species_dir: &Path,
     out_dir: &Path,
+    evals_path: Option<&Path>,
 ) -> io::Result<GemLibrary> {
     let space = SearchSpace::default();
     let mut lib = GemLibrary::new(keep);
+    let mut evals: Vec<EvalRecord> = Vec::with_capacity(usize::try_from(trials).unwrap_or(0));
 
     // --- SEARCH: propose → build → capture → score → consider, in trial order (deterministic) ---
     for trial in 0..trials {
         let cfg = propose(search_seed, trial, &space);
-        capture_and_consider(&cfg, species_dir, gens, &mut lib, "trial", trial);
+        capture_and_consider(
+            &cfg,
+            species_dir,
+            gens,
+            &mut lib,
+            &mut evals,
+            "trial",
+            trial,
+        );
+    }
+
+    // OFF-HASH eval log: write ALL evaluations in order (D3-A surrogate training data). Independent of gem
+    // verification — written as soon as the search completes. `data/runs/*` is gitignored.
+    if let Some(path) = evals_path {
+        write_eval_log(path, &evals)?;
     }
 
     verify_and_write_library(&lib, keep, species_dir, out_dir)
@@ -221,11 +240,17 @@ pub fn discover(
 /// `data/species` boundary (a skip/empty roster is LOGGED + dropped, never a panic), scores against `lib`'s
 /// CURRENTLY-kept fingerprints (the save-time novelty multiplier), and folds the gem in. `phase`/`step` only
 /// flavour the log line. Returns `true` iff a gem was produced (the config resolved to a non-empty roster).
+///
+/// **Eval recording (D3-A):** every produced gem is pushed onto `evals` as an [`EvalRecord`] BEFORE
+/// `lib.consider` moves the gem, in EVALUATION ORDER — the surrogate trains on the sequence of evaluations as
+/// they happened, not just the kept top-K. The record is OFF-HASH: read-only over the fields `score_config`
+/// already computed (no `SimRng`/`hash_world` touched; the pinned literal is unmoved).
 fn capture_and_consider(
     cfg: &SearchConfig,
     species_dir: &Path,
     gens: u32,
     lib: &mut GemLibrary,
+    evals: &mut Vec<EvalRecord>,
     phase: &str,
     step: u64,
 ) -> bool {
@@ -238,8 +263,39 @@ fn capture_and_consider(
         return false;
     };
     let gem = score_config(cfg, &env_config, gens, &lib.fingerprints());
+    // OFF-HASH eval record: read-only over the Gem fields score_config already computed. Pushed BEFORE
+    // lib.consider moves the gem, in EVALUATION ORDER, so the log captures EVERY evaluation (not just the
+    // kept top-K). No SimRng/hash_world change — the pinned literal 0x47a0_3c8f_6701_f240 is untouched.
+    evals.push(EvalRecord {
+        config: gem.config.clone(),
+        quality: gem.quality,
+        breakdown: gem.breakdown,
+        fingerprint: gem.fingerprint,
+        recorded_hash: gem.recorded_hash,
+    });
     lib.consider(gem);
     true
+}
+
+/// Write the eval log: one [`EvalRecord`] per line as JSON (JSONL), in EVALUATION ORDER. OFF-HASH (read-only
+/// over already-computed gem fields — no `SimRng`/`hash_world` touched; the pinned literal is unmoved). The
+/// parent dir is created if absent; an existing file is OVERWRITTEN so the log is deterministic per
+/// `search_seed` (same seed + same build → byte-identical bytes). `serde_json::to_string` emits struct fields
+/// in declaration order, so the bytes are stable across runs (inv #3).
+fn write_eval_log(path: &Path, evals: &[EvalRecord]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut buf = String::with_capacity(evals.len() * 256);
+    for rec in evals {
+        let line = serde_json::to_string(rec)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    std::fs::write(path, buf)
 }
 
 /// VERIFY + WRITE the kept gems: each must round-trip (`record_episode → replay == recorded_hash`) before it is
@@ -346,7 +402,9 @@ const BP_SCALE: u64 = 10_000;
 /// adds NO sim-path change, so the pinned literal `0x47a0_3c8f_6701_f240` is untouched.
 ///
 /// # Errors
-/// Returns an [`io::Error`] only for a failure to create `out_dir` or write a gem file (mirrors [`discover`]).
+/// Returns an [`io::Error`] only for a failure to create `out_dir` or write a gem file (mirrors [`discover`]);
+/// or the eval log when `evals_path` is `Some`.
+#[allow(clippy::too_many_arguments)] // the 8 knobs are all independent run parameters; grouping would obscure the CLI mapping
 pub fn discover_evolved(
     search_seed: u64,
     pop_size: u64,
@@ -355,9 +413,12 @@ pub fn discover_evolved(
     gens: u32,
     species_dir: &Path,
     out_dir: &Path,
+    evals_path: Option<&Path>,
 ) -> io::Result<GemLibrary> {
     let space = SearchSpace::default();
     let mut lib = GemLibrary::new(keep);
+    let total_evals = pop_size.saturating_mul(generations + 1);
+    let mut evals: Vec<EvalRecord> = Vec::with_capacity(usize::try_from(total_evals).unwrap_or(0));
 
     // The explore cut: the leading `explore` individuals of every post-0 generation are fresh random proposals,
     // the rest are evolved from the parents. At least 1 explorer per generation (a degenerate pop_size still
@@ -384,8 +445,21 @@ pub fn discover_evolved(
                 // handled inside propose_evolved). Drawn off the evolve stream salt (disjoint from propose).
                 propose_evolved(&parents, search_seed, step, &space)
             };
-            capture_and_consider(&cfg, species_dir, gens, &mut lib, "gen", generation);
+            capture_and_consider(
+                &cfg,
+                species_dir,
+                gens,
+                &mut lib,
+                &mut evals,
+                "gen",
+                generation,
+            );
         }
+    }
+
+    // OFF-HASH eval log: write ALL evaluations in generation×individual order (D3-A surrogate training data).
+    if let Some(path) = evals_path {
+        write_eval_log(path, &evals)?;
     }
 
     verify_and_write_library(&lib, keep, species_dir, out_dir)
@@ -436,6 +510,196 @@ mod tests {
         assert!(
             sealed_cfg.unwrap().containment.is_none(),
             "Sealed → no containment"
+        );
+    }
+
+    // ---- D3-A: EvalRecord emission + byte-reproducibility ----
+
+    /// A tiny but real config (resolves through the data dir → a real off-hash run → a real recorded_hash).
+    fn tiny_config(seed: u64) -> SearchConfig {
+        SearchConfig {
+            master_seed: seed,
+            roster: vec![("default".to_string(), 300)],
+            containment_level: 0, // Sealed → hash-neutral default
+            temp_q: 500,
+            season: 0,
+        }
+    }
+
+    #[test]
+    fn capture_and_consider_emits_eval_record_mirroring_gem() {
+        // The EvalRecord pushed onto `evals` must carry EXACTLY the Gem's (config, quality, breakdown,
+        // fingerprint, recorded_hash) — the surrogate trains on the same numbers gems carry. OFF-HASH: built
+        // from fields score_config already computed (no SimRng/hash_world change).
+        let cfg = tiny_config(0xABCD_1234);
+        let (env_config, skipped) = env_config_for(&cfg, &species_dir());
+        assert!(skipped.is_empty(), "all keys resolve: {skipped:?}");
+        let env_config = env_config.expect("roster resolves");
+
+        // Score the config directly to get the reference Gem.
+        let gens = 40;
+        let gem = score_config(&cfg, &env_config, gens, &[]);
+
+        // Drive capture_and_consider and capture the emitted EvalRecord.
+        let mut lib = GemLibrary::new(8);
+        let mut evals: Vec<EvalRecord> = Vec::new();
+        let produced =
+            capture_and_consider(&cfg, &species_dir(), gens, &mut lib, &mut evals, "test", 0);
+        assert!(produced, "the config resolves to a non-empty roster");
+        assert_eq!(evals.len(), 1, "exactly one eval record is emitted");
+        let rec = &evals[0];
+
+        // The record mirrors the Gem's (config, quality, breakdown, fingerprint, recorded_hash).
+        assert_eq!(rec.config, gem.config, "config must mirror the gem");
+        assert_eq!(rec.quality, gem.quality, "quality must mirror the gem");
+        assert_eq!(
+            rec.breakdown, gem.breakdown,
+            "breakdown must mirror the gem"
+        );
+        assert_eq!(
+            rec.fingerprint, gem.fingerprint,
+            "fingerprint must mirror the gem"
+        );
+        assert_eq!(
+            rec.recorded_hash, gem.recorded_hash,
+            "recorded_hash must mirror the gem"
+        );
+    }
+
+    /// A RAII temp dir guard (the harness has no `tempfile` dep — std-only cleanup). Removes the dir on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!("gene-sim-eval-test-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            TempDir(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn discover_eval_log_is_byte_reproducible_per_seed() {
+        // The D3-A contract: same `search_seed` → byte-identical `<search_seed>.jsonl`. Two independent runs
+        // over the SAME seed produce the SAME bytes (determinism inv #3 — the eval log is OFF-HASH: read-only
+        // over already-computed gem fields; no SimRng/hash_world change).
+        let tmp = TempDir::new("repro");
+        let path_a = tmp.path().join("evals.jsonl");
+        let path_b = tmp.path().join("evals_b.jsonl");
+        let out_dir = tmp.path().join("gems");
+        let trials = 6; // small + fast, but enough to exercise multiple distinct configs
+        let gens = 40;
+
+        // Run A.
+        discover(42, trials, 4, gens, &species_dir(), &out_dir, Some(&path_a)).expect("discover A");
+        let bytes_a = std::fs::read(&path_a).expect("read A");
+
+        // Run B (fresh lib, fresh file — overwrites path_b).
+        discover(42, trials, 4, gens, &species_dir(), &out_dir, Some(&path_b)).expect("discover B");
+        let bytes_b = std::fs::read(&path_b).expect("read B");
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "same search_seed → byte-identical eval log (D3-A determinism contract)"
+        );
+
+        // A different seed produces a DIFFERENT log (so we're not trivially writing a constant).
+        let path_c = tmp.path().join("evals_c.jsonl");
+        discover(43, trials, 4, gens, &species_dir(), &out_dir, Some(&path_c))
+            .expect("discover C (different seed)");
+        let bytes_c = std::fs::read(&path_c).expect("read C");
+        assert_ne!(
+            bytes_a, bytes_c,
+            "different search_seed should produce a different eval log"
+        );
+
+        // Every line is valid JSON (an EvalRecord) and the line count == trials (every evaluation logged).
+        let text = std::str::from_utf8(&bytes_a).expect("utf8");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            trials as usize,
+            "expected one eval record per trial, got {}",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            serde_json::from_str::<discovery::search::EvalRecord>(line)
+                .unwrap_or_else(|e| panic!("line {i} is not a valid EvalRecord: {e} — {line:?}"));
+        }
+    }
+
+    #[test]
+    fn discover_evolved_eval_log_is_byte_reproducible_per_seed() {
+        // The evolutionary loop must also produce a byte-identical eval log per seed (generation×individual
+        // order). generations=0 reduces to a single random generation (the D2a base case).
+        let tmp = TempDir::new("evolved");
+        let path_a = tmp.path().join("evals.jsonl");
+        let path_b = tmp.path().join("evals_b.jsonl");
+        let out_dir = tmp.path().join("gems");
+        let pop_size = 4;
+        let gens = 40;
+
+        discover_evolved(
+            99,
+            pop_size,
+            1, // one evolved generation (gen 0 random + gen 1 evolved)
+            4,
+            gens,
+            &species_dir(),
+            &out_dir,
+            Some(&path_a),
+        )
+        .expect("discover_evolved A");
+        let bytes_a = std::fs::read(&path_a).expect("read A");
+
+        discover_evolved(
+            99,
+            pop_size,
+            1,
+            4,
+            gens,
+            &species_dir(),
+            &out_dir,
+            Some(&path_b),
+        )
+        .expect("discover_evolved B");
+        let bytes_b = std::fs::read(&path_b).expect("read B");
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "same search_seed → byte-identical evolved eval log"
+        );
+
+        // Line count == pop_size * (generations + 1) — every individual is logged, in gen×individual order.
+        let text = std::str::from_utf8(&bytes_a).expect("utf8");
+        let n = text.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            n,
+            (pop_size * 2) as usize,
+            "expected pop_size*2 eval records, got {n}"
+        );
+    }
+
+    #[test]
+    fn discover_without_evals_path_writes_no_log() {
+        // `evals_path = None` → no eval log written (the feature is opt-in via --save-evals).
+        let tmp = TempDir::new("none");
+        let out_dir = tmp.path().join("gems");
+        let stray = tmp.path().join("evals.jsonl");
+        discover(7, 4, 4, 30, &species_dir(), &out_dir, None).expect("discover");
+        assert!(
+            !stray.exists(),
+            "no eval log should be written when evals_path is None"
         );
     }
 }

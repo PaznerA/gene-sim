@@ -57,8 +57,8 @@ fn discover_is_deterministic_same_search_seed() {
     let a_dir = temp_dir("det_a");
     let b_dir = temp_dir("det_b");
 
-    let lib_a = discover(2024, 12, 4, 60, &species_dir(), &a_dir).expect("discover a");
-    let lib_b = discover(2024, 12, 4, 60, &species_dir(), &b_dir).expect("discover b");
+    let lib_a = discover(2024, 12, 4, 60, &species_dir(), &a_dir, None).expect("discover a");
+    let lib_b = discover(2024, 12, 4, 60, &species_dir(), &b_dir, None).expect("discover b");
 
     // The returned libraries match exactly (config + every integer signal).
     assert_eq!(
@@ -89,7 +89,7 @@ fn every_saved_gem_round_trips() {
     // already asserts the record→replay round-trip before writing, so any saved gem is reproducible by
     // construction; this independently re-derives the hash from the config to prove the on-disk contract.)
     let dir = temp_dir("roundtrip");
-    let lib = discover(99, 12, 4, 60, &species_dir(), &dir).expect("discover");
+    let lib = discover(99, 12, 4, 60, &species_dir(), &dir, None).expect("discover");
     let saved = read_saved_gems(&dir);
     assert!(!saved.is_empty(), "at least one gem saved");
     assert_eq!(
@@ -136,7 +136,7 @@ fn saved_gems_are_novelty_deduped() {
     // (3) NOVELTY DEDUP: no two kept gems are within dedup_min (SCALE) of each other in fingerprint L1 — the
     // GemLibrary dedup invariant survives onto disk. Also assert each gem is internally below the K cap.
     let dir = temp_dir("dedup");
-    let lib = discover(31337, 16, 6, 60, &species_dir(), &dir).expect("discover");
+    let lib = discover(31337, 16, 6, 60, &species_dir(), &dir, None).expect("discover");
     let saved = read_saved_gems(&dir);
     assert!(!saved.is_empty(), "at least one gem saved");
     assert!(saved.len() <= 6, "no more than keep=6 gems kept");
@@ -170,7 +170,7 @@ fn discover_finds_a_non_degenerate_gem() {
     // multi-species run that is more than mere survival (the M6 gate / coexistence metrics fire). A degenerate
     // search (every config dead/monoculture) would keep only quality==0 gems.
     let dir = temp_dir("nondegen");
-    let lib = discover(7, 24, 8, 120, &species_dir(), &dir).expect("discover");
+    let lib = discover(7, 24, 8, 120, &species_dir(), &dir, None).expect("discover");
     assert!(!lib.is_empty(), "the search must keep at least one gem");
     assert!(
         lib.gems.iter().any(|g| g.quality > 0),
