@@ -545,6 +545,24 @@ struct MineralizeRow {
     body: i64,
 }
 
+/// REUSABLE per-tick scratch buffers for [`mineralize`] (perf optimization, hash-neutral; the
+/// [`crate::MetabolismScratch`] rationale). Cleared + refilled each tick; never carried state; never folded
+/// into `hash_world`. Eliminates the per-tick `Vec` reallocation + the `pools.detritus.clone()` snapshot.
+#[derive(Resource, Default)]
+pub(crate) struct MineralizeScratch {
+    rows: Vec<MineralizeRow>,
+    /// Frozen start-of-tick detritus snapshot (reused buffer — replaces the per-tick `pools.detritus.clone()`).
+    frozen_detritus: Vec<i64>,
+    demand: Vec<i64>,
+    granted: Vec<i64>,
+    weights: Vec<u64>,
+    shares: Vec<i64>,
+    rem_scratch: Vec<(u128, usize)>,
+    split: Vec<i64>,
+    split_w: Vec<u64>,
+    split_rem: Vec<(u128, usize)>,
+}
+
 /// **MINERALIZE** (ADR-013 F4 KEYSTONE) — the decomposer detritus→free_nutrient loop, run AFTER
 /// [`crate::metabolism`] so decomposers tap the SAME frozen-snapshot detritus plants/carcasses fed, and BEFORE
 /// `reproduce_or_die`. RNG-free, all `i64`.
@@ -558,7 +576,7 @@ struct MineralizeRow {
 ///    tagged), the residual → RESPIRED. Paired detritus-debit / (free_nutrient-credit + RESPIRED) — conserves
 ///    J, so `assert_ledger_closes` holds.
 /// 4. the harvested detritus J is attributed via [`PoolProvenance`] → [`FlowMatrix`] `flow[decomposer][plant]`.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn mineralize(
     registry: Res<SpeciesRegistry>,
     edit_mod: Res<crate::EditModifierRes>,
@@ -566,34 +584,39 @@ pub(crate) fn mineralize(
     mut prov: ResMut<PoolProvenance>,
     mut flow: ResMut<FlowMatrix>,
     mut ledger: ResMut<ledger::Ledger>,
+    mut scratch: ResMut<MineralizeScratch>,
     q: Query<(&OrgId, &Species, &Biomass, &Position)>,
 ) {
     let width = pools.width;
     // ── Canonical order over the LIVING Decomposer set (inv #3). Non-decomposers contribute nothing here. ──
-    let mut rows: Vec<MineralizeRow> = q
-        .iter()
-        .filter_map(|(id, sp, biomass, p)| {
-            let strat = &registry.entries[sp.0 .0 as usize].strategy;
-            if strat.role != TrophicRole::Decomposer {
-                return None;
-            }
-            Some(MineralizeRow {
-                cell: cell_index(p, width),
-                species: sp.0 .0,
-                org: id.0,
-                body: biomass.0.max(crate::OFFSPRING_SEED_BIOMASS),
-            })
+    let mut rows = std::mem::take(&mut scratch.rows);
+    rows.clear();
+    rows.extend(q.iter().filter_map(|(id, sp, biomass, p)| {
+        let strat = &registry.entries[sp.0 .0 as usize].strategy;
+        if strat.role != TrophicRole::Decomposer {
+            return None;
+        }
+        Some(MineralizeRow {
+            cell: cell_index(p, width),
+            species: sp.0 .0,
+            org: id.0,
+            body: biomass.0.max(crate::OFFSPRING_SEED_BIOMASS),
         })
-        .collect();
+    }));
     if rows.is_empty() {
+        scratch.rows = rows;
         return;
     }
     rows.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
 
     // ── Pass 1: per-decomposer DEMAND against the FROZEN start-of-tick detritus stock. ──
-    let frozen_detritus = pools.detritus.clone();
+    let mut frozen_detritus = std::mem::take(&mut scratch.frozen_detritus);
+    frozen_detritus.clear();
+    frozen_detritus.extend_from_slice(&pools.detritus);
     let n = rows.len();
-    let mut demand = vec![0i64; n];
+    let mut demand = std::mem::take(&mut scratch.demand);
+    demand.clear();
+    demand.resize(n, 0i64);
     for (i, r) in rows.iter().enumerate() {
         let strat = &registry.entries[r.species as usize].strategy;
         let cell = r.cell as usize;
@@ -611,10 +634,15 @@ pub(crate) fn mineralize(
     // ── Pass 2: per-cell APPORTION available detritus across co-located decomposers (canonical order). ──
     // Reuse the `weights`/`shares`/`rem_scratch` buffers across every cell group (hash-neutral: `apportion_into`
     // is bit-identical to `apportion`; only the buffer ownership moved out of the loop).
-    let mut granted = vec![0i64; n];
-    let mut weights: Vec<u64> = Vec::new();
-    let mut shares: Vec<i64> = Vec::new();
-    let mut rem_scratch: Vec<(u128, usize)> = Vec::new();
+    let mut granted = std::mem::take(&mut scratch.granted);
+    granted.clear();
+    granted.resize(n, 0i64);
+    let mut weights = std::mem::take(&mut scratch.weights);
+    weights.clear();
+    let mut shares = std::mem::take(&mut scratch.shares);
+    shares.clear();
+    let mut rem_scratch = std::mem::take(&mut scratch.rem_scratch);
+    rem_scratch.clear();
     let mut i = 0usize;
     while i < n {
         let cell = rows[i].cell;
@@ -644,9 +672,12 @@ pub(crate) fn mineralize(
     // ── Pass 3: SPLIT each grant (respire maint/defense + (1−mineralize_rate) residual; mint the rest as
     //    free_nutrient), record provenance flow. Canonical order; integer; conserves J. ──
     // Reuse the convert-split buffers across decomposers (perf, hash-neutral: `split_budget_into` is bit-identical).
-    let mut split: Vec<i64> = Vec::new();
-    let mut split_w: Vec<u64> = Vec::new();
-    let mut split_rem: Vec<(u128, usize)> = Vec::new();
+    let mut split = std::mem::take(&mut scratch.split);
+    split.clear();
+    let mut split_w = std::mem::take(&mut scratch.split_w);
+    split_w.clear();
+    let mut split_rem = std::mem::take(&mut scratch.split_rem);
+    split_rem.clear();
     for (idx, r) in rows.iter().enumerate() {
         let g = granted[idx];
         if g <= 0 {
@@ -692,6 +723,18 @@ pub(crate) fn mineralize(
         // this cell's detritus (carcasses + litterfall). flow[decomposer][plant] += attributed share.
         prov.withdraw_detritus(cellu, r.species as usize, g, &mut flow);
     }
+
+    // Return the reused buffers to the scratch resource so their backing allocations survive to the next tick.
+    scratch.rows = rows;
+    scratch.frozen_detritus = frozen_detritus;
+    scratch.demand = demand;
+    scratch.granted = granted;
+    scratch.weights = weights;
+    scratch.shares = shares;
+    scratch.rem_scratch = rem_scratch;
+    scratch.split = split;
+    scratch.split_w = split_w;
+    scratch.split_rem = split_rem;
 }
 
 /// Assert every row of the [`FlowMatrix`] sums to zero — the relation-conservation analogue of

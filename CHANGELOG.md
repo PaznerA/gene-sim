@@ -4,6 +4,22 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### PERF-1 — hoist metabolism/mineralize scratch Vecs into reused resources (perf, sim-core) — HASH-NEUTRAL
+The first perf slice: eliminate per-tick `Vec` allocations in the two heaviest systems (`metabolism` +
+`mineralize`) by hoisting their scratch buffers into reused Bevy resources (the `MetabolismScratch` /
+`ReproScratch` / `ChemEmitScratch` discipline already proven on the F5 allocation sweep). **The pinned literal
+`0x47a0_3c8f_6701_f240` is byte-identical** (the buffers are cleared + refilled each tick — never carried
+state, never folded into `hash_world`). Full `tools/gate.sh` GREEN; the `determinism_hash_is_pinned` test PASS.
+- **`MetabolismScratch`** gains 6 reused buffers: `weights`/`shares`/`rem_scratch` (Pass-2 apportion) +
+  `split`/`split_w`/`split_rem` (Pass-3 convert-split). Previously allocated fresh `Vec::new()` per tick.
+- **`MineralizeScratch`** (NEW resource): `rows` + `frozen_detritus` (replaces the per-tick
+  `pools.detritus.clone()` — a full 1024-i64 plane copy eliminated) + `demand`/`granted`/`weights`/`shares`/
+  `rem_scratch`/`split`/`split_w`/`split_rem`. All previously allocated fresh or cloned per tick.
+- **Next (PERF-2):** replace the 10 OrgId-keyed `BTreeMap`s in the hot path (`by_org`, `maint_energy`,
+  `parent_debit`, `spent`, `litterfall`, `toxin_mints`, `prey_debit`, `pred_credit`, `host_debit`,
+  `symb_credit`) with reused sorted-`Vec`/indexed buffers — the deferred F1-pattern perf win
+  (DECISIONS.md:1097-1100).
+
 ### Emergent-discovery D3-B.1 — the surrogate feature encoder (feat, discovery) — HASH-NEUTRAL
 D3-B.1 (first sub-slice of D3-B from `docs/llm/proposals/surrogate-model-spec.md` §"Feature encoding").
 The pure integer feature encoder the D3 `RidgeInt` surrogate will train on. **The pinned literal
