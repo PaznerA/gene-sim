@@ -4,6 +4,23 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Emergent-discovery D3-B.1 — the surrogate feature encoder (feat, discovery) — HASH-NEUTRAL
+D3-B.1 (first sub-slice of D3-B from `docs/llm/proposals/surrogate-model-spec.md` §"Feature encoding").
+The pure integer feature encoder the D3 `RidgeInt` surrogate will train on. **The pinned literal
+`0x47a0_3c8f_6701_f240` is byte-identical** (the encoder is OFF-HASH: a pure function of
+`SearchConfig`/`SearchSpace` numbers; no `SimRng`/`hash_world` touched). Full `tools/gate.sh` GREEN; reviewer
+APPROVE on every invariant.
+- **`crates/discovery::surrogate`** (new module, still std+serde): `encode(cfg, space) -> FeatureVec([i32; 28])`
+  with a PINNED layout (guarded by `ENCODER_ID = "encode-v1@28"`): `[0]` bias · `[1..=7]` presence bit per
+  species axis · `[8..=14]` normalized count per axis (bp) · `[15]` richness · `[16]` predator×prey
+  (AND-gated bdellovibrio × prey-share) · `[17]` autotroph share · `[18..=21]` containment one-hot ·
+  `[22..=25]` season one-hot · `[26]` temp · `[27]` temp-extremity. `master_seed` is EXCLUDED (entropy, not
+  steerable — two configs differing only in seed encode identically).
+- 24 tests pin the layout, the bounds, the `master_seed` exclusion, the determinism (byte-identical for the
+  same `(cfg, space)`), and the serde round-trip.
+- **Next (D3-B.2):** `DramaWeights` + the drama target `D`; then D3-B.3 the `RidgeInt` model + `Surrogate`
+  trait; then D3-B.4 the `discover_evolved_steered` loop.
+
 ### Emergent-discovery D3-A — the eval log prerequisite (feat, discovery) — HASH-NEUTRAL
 D3-A (the prerequisite for the D3 surrogate model — `docs/llm/proposals/surrogate-model-spec.md` §D3-A). The discover
 loop previously saved only the top-K *kept* gems; the surrogate needs ALL evaluations. This adds the
