@@ -27,12 +27,14 @@
 pub mod ecology;
 pub mod fixed;
 pub mod search;
+pub mod surrogate;
 pub mod trace;
 
 pub use search::{
     caption, crossover, mutate, propose, propose_evolved, EvalRecord, Gem, GemLibrary,
     SearchConfig, SearchSpace, SpeciesAxis,
 };
+pub use surrogate::{encode, FeatureVec, ENCODER_ID, FEAT_DIMS};
 pub use trace::{GenRow, InocRec, PerGenTrace, SpeciesMeta};
 
 use fixed::SCALE;
