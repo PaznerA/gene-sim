@@ -10,40 +10,45 @@
 > `[~]` in progress · `[x]` done · `RED` failed gate/verify (left for human) · 🛑 needs human sign-off.
 > **Driver:** `workflow` = run the named `.js` · `slice` = one implementer+gate+reviewer pass · `direct` = trivial inline edit.
 >
-> **Lead thrust (chosen 2026-06-27): Gameplay / sandbox-first** (`[[gameplay-sandbox-first]]`). Discovery/ML
-> chain + beta-hardening remainder are queued below as the next pipeline.
+> **Lead thrust (chosen 2026-06-27): Gameplay / sandbox-first** (`[[gameplay-sandbox-first]]`). The Variant Lab
+> epic (edit→save→reseed for player AND auto-research) leads; the discovery/ML chain + beta-hardening remainder
+> are the next pipeline. **Frontier: `main` @ `8415199`** — re-planned 2026-06-28.
 
 ---
 
-## ▶ ACTIVE QUEUE (gameplay/sandbox)
+## ▶ ACTIVE QUEUE (gameplay/sandbox + Variant Lab)
 
 | # | Status | Item | Driver | Goal | Hash | Deps |
 |---|--------|------|--------|------|------|------|
-| 1 | `[x]` | **beta-license-dual** | direct | `LICENSE-MIT` + `LICENSE-APACHE` at root matching the declared `MIT OR Apache-2.0` SPDX (beta-distribution blocker) | ✅ | — |
-| 2 | `[ ]` | **variant-lab-save-reseed** | workflow | Slice B: read-only `export_species_json` of a species' post-edit genome+niche; Slice C: specimen-view "💾 Save variant" + a "Saved variants" reseed section reusing the contaminant/inoculate path | ✅ | — |
-| 3 | `[ ]` | **oversight-ingame-ui-impl** | workflow | In-game OVERSIGHT panel: render the earned-credit ledger, let the player request → preview (FBA KO result) → commit an E. coli edit that ripples via the F4 loop; renderer drives the existing `RequestEcoliEdit`/`CommitEcoliImpact` journal | ✅ | — |
-| 4 | `[def]` | **codex-browse-panel-impl** | workflow | Browsable CODEX panel (SP-4 §2.3 follow-up): a scrollable species/gene/role/flow browser over `data/codex/codex.json`, read-only loader (`godot/codex.gd` is staged into res://) | ✅ | — |
-| 5 | `[def]` | **sandbox-load-starter-impl** | workflow | Wire "Load Starter" into the SP-2 composer: the menu reads `data/presets/primordial.json` → pre-fills roster + env + containment (the sandbox onboarding ramp) | ✅ | SP-2 (done) |
-| 6 | `[def]` | **live-session-save-load-impl** | workflow | Mid-run `save_session`/`load_session` via the action journal (the `run_stats()` clone-fold) + a per-gen effect sparkline on the injection markers (P4/P6 follow-ups) | ✅ | P4/P6 (done) |
+| 1 | `[ ]` | **variant-lab-save-reseed** | workflow | Variant Lab B+C: read-only `export_species_json` of a species' post-edit genome+niche; specimen-view "💾 Save variant" + a "Saved variants" reseed section reusing the contaminant/inoculate path | ✅ | A (done) |
+| 2 | `[ ]` | **variant-lab-autoresearch-edits** | workflow | Variant Lab D: give the brute-force auto-research the CRISPR-edit action — a scheduled-edits axis on `SearchConfig` (serde-default, default-OFF via `edit_budget`) threaded as the EXISTING `Action::ApplyEdit` into `capture_trace` + the verify journal; edited gems round-trip | ✅ | A (done) + discovery D2a/D2b/D3-A (done) |
+| 3 | `[ ]` | **oversight-ingame-ui-impl** | workflow | In-game OVERSIGHT panel: render the earned-credit ledger, request → preview (FBA KO) → commit an E. coli edit rippling via the F4 loop; drives the existing `RequestEcoliEdit`/`CommitEcoliImpact` journal | ✅ | — |
+| 4 | `[ ]` | **codex-browse-panel-impl** | workflow | Browsable CODEX panel (SP-4 §2.3 follow-up): a scrollable species/gene/role/flow browser over `res://data/codex/codex.json`, reusing the staged+gated `godot/codex.gd` loader (the SP-4 res:// blocker is RESOLVED) | ✅ | codex staging (done) |
+| 5 | `[ ]` | **sandbox-load-starter-impl** | workflow | Wire "Load Starter" into the SP-2 composer: read `res://data/presets/primordial.json` → pre-fill roster + env + containment (the onboarding ramp); ensure `data/presets` is res:// staged + byte-gated | ✅ | SP-2 (done) |
 
-**Queue depth (forward, non-done): 5** (1 READY+1 authored READY + 3 DEFINED). ≥5 ✅.
+**Queue depth (forward READY, non-done): 5** — 2 pre-authored + 3 newly-authored this pass (`variant-lab-autoresearch-edits`, `codex-browse-panel-impl`, `sandbox-load-starter-impl`). ≥5 ✅. All ✅ hash-neutral.
 
 ---
 
 ## ▶ NEXT PIPELINE (defined; promote when the active queue drains)
 
-**Discovery / ML chain** (precisely-sequenced B→C→D; `surrogate-model-spec.md`; all ✅ hash-neutral, `crates/discovery`):
+**Discovery / ML chain** (precisely-sequenced; `surrogate-model-spec.md`; all ✅ hash-neutral, `crates/discovery`).
+**D3-A (eval log) + D3-B.1 (feature encoder) DONE** (`3ad7b9e` / `370d888`). Remaining:
 - `[def]` **discovery-dramaweights-impl** — D3-B.2: the drama-weighted target `D` (M3+M5 dominant) + reweighted scorer.
 - `[def]` **discovery-ridgeint-impl** — D3-B.3: integer ridge regressor (fixed-point GD, no f64, row-order-independent, `build_id` anchor). *dep: dramaweights.*
-- `[def]` **discovery-steered-loop-impl** — D3-B.4: wire RidgeInt into D2b (oversample→predict→select, explore floor), retrain per gen. *dep: ridgeint.*
-- `[def]` **discovery-batch-showcase** — D4: night-cron batch + gem-index sidecar + curated showcase gallery. *dep: steered-loop; ADR on steering target.*
+- `[def]` **discovery-steered-loop-impl** — D3-B.4: wire RidgeInt into D2b (oversample→predict→select, explore floor), retrain per gen. *dep: ridgeint.* **Composes with item #2** — the steered loop can also steer the new mid-run-EDIT axis once both land.
+- `[def]` **discovery-batch-showcase** — D4: night-cron batch + gem-index sidecar + curated showcase gallery. *dep: steered-loop; ADR on the steering target (drama-weighted vs raw Q).*
 
-**Beta-hardening remainder** (`glmTakeover/` audit; mostly ✅ infra/docs):
+**Beta-hardening remainder** (`glmTakeover/` audit folded in; mostly ✅ infra/docs — NOT blocking the Variant Lab,
+largely orthogonal; only a future spatial-index re-pin touches an invariant and is flagged below):
 - `[def]` **beta-contributing-md** (`slice`) — `CONTRIBUTING.md`: branch workflow + `tools/gate.sh` + ADR process + commit format.
 - `[def]` **slim-hermeticity-impl** — `env_clear()` + `LC_ALL=C` on the SLiM subprocess (oracle golden-file robustness, inv #1-adjacent).
 - `[def]` **replay-error-handling-impl** — `seed.json`/`actions.ndjson` corruption → `ReplayError` enum (not panic) + a corrupted-input proptest.
 - `[def]` **unsafe-policy-adr** (`direct`) — ADR documenting the `forbid(unsafe_code)` rule + the one `godot-sim` `unsafe impl` exception.
-- `[def]` **docs-housekeeping** (`direct`) — delete the stale (untracked) `docs/llm/weakspots.md` (hallucinates a non-existent Python project); add `ADR-INDEX.md`.
+- `[def]` **docs-housekeeping** (`direct`) — delete the stale untracked `docs/llm/weakspots.md` (hallucinates a non-existent Python project) + triage `docs/llm/glmTakeover/` (keep as an audit snapshot or archive); add `ADR-INDEX.md`.
+
+**Sandbox QoL (re-scoped — partly already shipped):**
+- `[def]` **live-session-sparkline-impl** — `save_session`/`load_session` ALREADY EXIST (`main.gd:2503/2511` + `journal_actions`); the remaining piece is a per-gen effect sparkline on the injection/timeline markers (P4/P6 follow-up). Minor — deprioritized below the discovery chain.
 
 **Flagged for human sign-off (do NOT auto-run):**
 - 🛑 **R3-F3 resource coupling** — per-cell local Wright-Fisher selection rewrite; blocked on the R1.2/R1.3 spatial-`Cell` design collision (a re-pin + an ADR-005 change). Needs a design workflow + sign-off first.
@@ -53,4 +58,5 @@
 
 ## ▶ LOG (append per item: date · item · PASS/RED · merge sha · note)
 
-- 2026-06-27 — QUEUE seeded (gameplay/sandbox lead). `beta-license-dual` done in the same commit. `variant-lab-save-reseed.js` brought into git (was untracked) + `oversight-ingame-ui-impl.js` authored → both READY. 4 DEFINED + the discovery/beta pipeline behind them.
+- 2026-06-27 — QUEUE seeded (gameplay/sandbox lead). `beta-license-dual` done in the same commit. `variant-lab-save-reseed.js` + `oversight-ingame-ui-impl.js` authored → READY. 4 DEFINED + the discovery/beta pipeline behind them.
+- 2026-06-28 — **Re-plan @ `main` 8415199.** Reconciled the real frontier: D3-A (`3ad7b9e`) + D3-B.1 (`370d888`) + PERF-1/2 (`ed558d7`/`81ef729`) + dual-LICENSE (`8415199`) all LANDED since the seed. Confirmed `beta-license-dual` `[x]` done; codex res:// staging + `godot/codex.gd` loader landed (SP-4 blocker RESOLVED); `save_session`/`load_session` already exist. **Authored 3 new READY workflows:** `variant-lab-autoresearch-edits` (Slice D — the user's explicit "auto-research must get the edit action" gap), `codex-browse-panel-impl`, `sandbox-load-starter-impl`. Re-scoped `live-session-save-load` → `live-session-sparkline-impl` (save/load done; only the sparkline remains) + deprioritized. glmTakeover reconciled: NOT blocking — its valid items are the beta-hardening pipeline above. Queue depth 5 READY (gameplay/sandbox) ✅.
