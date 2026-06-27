@@ -4,6 +4,25 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Roadmap loop infra — `/roadmap-plan` + `/roadmap-iterate` skills + the workflow queue (tooling/docs) — HASH-NEUTRAL
+A two-skill loop over the prepared `.claude/workflows/*.js` orchestrations, one tier above the existing per-slice
+`/iterate` (one queue item = one multi-agent Workflow = one merge). State lives in `docs/llm/QUEUE.md` + git → resumable.
+- **`docs/llm/QUEUE.md`** — the workflow zásobník: an ordered table (status/driver/goal/hash-risk/deps) + per-entry detail.
+  Seeded with the **gameplay/sandbox** lead (`[[gameplay-sandbox-first]]`): LICENSE → variant-lab-save-reseed →
+  oversight-ingame-ui → codex-browse-panel → sandbox-load-starter → live-session-save-load, with the discovery/ML chain
+  + the beta-hardening remainder defined behind it. ≥5 forward items maintained.
+- **`/roadmap-plan`** — surveys the roadmap + the real frontier (trust git, not the prose), keeps ≥5 robustly-defined
+  workflows queued, authoring/refreshing the `.js` in house style. Plans only — never production code.
+- **`/roadmap-iterate`** — pops the next ready item → `Workflow({name})` → gate GREEN + 3-skeptic verify CONFIRMED →
+  merge to `main` (`--no-ff` temp-worktree, on the LOCAL gate per `[[no-ci-wait-autonomous-roadmap]]`) → mark `[x]`.
+  Autonomous until red / 🛑 / empty; recommends `/roadmap-plan` when depth `< 3`.
+- Tracked `variant-lab-save-reseed.js` (was untracked) + authored `oversight-ingame-ui-impl.js` → 2 immediately-runnable.
+
+### LICENSE — dual `LICENSE-MIT` + `LICENSE-APACHE` at repo root (docs) — beta-distribution blocker
+Materializes the `MIT OR Apache-2.0` SPDX already declared in the workspace `Cargo.toml` (GitHub showed "No license";
+SPDX alone is insufficient for distribution). Apache-2.0 copied verbatim from the canonical toolchain text. From the
+`glmTakeover/` audit (B0.1).
+
 ### PERF-2 follow-up — golden-hash pins on the predator/symbiont byte-paths (test, sim-core) — HASH-NEUTRAL
 Closes the ADR-026 coverage caveat. PERF-2 converted the predation/host_coupling OrgId-keyed maps/sets
 (`pred_credit`/`symb_credit`, the `prey_debit`/`host_debit` struct maps, the `despawn_set`s) to sorted-`Vec`s, but
