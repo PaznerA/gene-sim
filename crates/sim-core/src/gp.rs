@@ -422,6 +422,23 @@ pub fn role_from_override(override_role: Option<&str>, key: &str) -> TrophicRole
         .unwrap_or_else(|| role_for(key))
 }
 
+/// The canonical lowercase `niche.trophic_role` string for a [`TrophicRole`] — the INVERSE of
+/// [`role_from_str`] (`role_from_str(role_to_str(r)) == Some(r)` for every role). Ordered `match` (inv #3).
+/// The Variant-Lab species export (`Simulation::export_species_spec`) writes this so a reseeded variant
+/// resolves back to the SAME role through [`role_from_override`] (the save→reseed contract). `ObligateSymbiont`
+/// emits `"symbiont"` (the primary spelling `role_from_str` accepts).
+#[must_use]
+pub fn role_to_str(role: TrophicRole) -> &'static str {
+    match role {
+        TrophicRole::Autotroph => "autotroph",
+        TrophicRole::Heterotroph => "heterotroph",
+        TrophicRole::Mixotroph => "mixotroph",
+        TrophicRole::Decomposer => "decomposer",
+        TrophicRole::Predator => "predator",
+        TrophicRole::ObligateSymbiont => "symbiont",
+    }
+}
+
 /// The five conserved metabolic-budget channels (ADR-013 §Decision pillar 2, DECISIONS.md:537), in fixed
 /// declaration order. The INDEX is the channel id — the load-bearing contract F3/F4 read by index, never by
 /// name (never a `HashMap`, inv #3). DECISIONS.md:537 pins only the SHAPE `[u16; 5]` summing to 1000 permille;
@@ -1235,6 +1252,27 @@ mod tests {
             role_from_override(Some("bogus"), "default"),
             TrophicRole::Autotroph
         );
+    }
+
+    #[test]
+    fn role_to_str_is_the_inverse_of_role_from_str() {
+        // The Variant-Lab export round-trip contract (Slice B): every TrophicRole serializes to a string that
+        // role_from_str (and thus role_from_override) reads back to the SAME role, so a reseeded variant keeps
+        // its trophic_role. Exhaustive over the role set — a new role MUST extend role_to_str (no `_` arm).
+        for role in [
+            TrophicRole::Autotroph,
+            TrophicRole::Heterotroph,
+            TrophicRole::Mixotroph,
+            TrophicRole::Decomposer,
+            TrophicRole::Predator,
+            TrophicRole::ObligateSymbiont,
+        ] {
+            assert_eq!(
+                role_from_str(role_to_str(role)),
+                Some(role),
+                "role_to_str({role:?}) must round-trip through role_from_str"
+            );
+        }
     }
 
     #[test]

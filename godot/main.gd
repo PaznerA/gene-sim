@@ -275,6 +275,21 @@ var _inoc_species: OptionButton  # the contaminant the seed brush drops (and a f
 var _inoc_count: SpinBox         # organisms per inoculation disc
 var _inoc_endow: SpinBox         # joules per inoculated organism (minted from the core's `immigration` tap)
 var _registered_contaminants: Dictionary = {}  # key:String → true once register_contaminant_json succeeded this run
+# Variant Lab (Slices B+C, renderer-only — inv #2): named snapshots of a species' CURRENT (post-edit) genome,
+# exported as an OPAQUE SpeciesSpec JSON STRING by LiveSim.export_species_json (the single biology→spec mapping lives
+# in the core). GDScript moves only the inert JSON text + a display name + ints — it never parses the genome. Each
+# entry: {name:String, json:String, key:String, species_id:int, role:String, traits:Dictionary}. `key` is the
+# species' core key (== the JSON's key, captured at save time) so a reseed resolves the SAME genome through
+# register_contaminant_json — the very res:// boundary the airborne consortium uses; `role`/`key`/`traits` only drive
+# the list glyph + caption.
+var _saved_variants: Array = []
+var _saved_variants_box: VBoxContainer  # the dynamic 🌱 Reseed list inside the CONTAMINATION panel (Slice C)
+# Slice C arming: a "reseeded" saved variant is registered with the core + becomes the ACTIVE Inoculate payload, so
+# the next Inoculate brush stroke (TOOL_INOCULATE) seeds THAT variant — reusing 100% of the inoculate machinery.
+# -1 = none armed (the Inoculate brush falls back to the contaminant picker). Indexes into _saved_variants.
+var _armed_variant_idx: int = -1
+var _save_variant_name: LineEdit  # the specimen-view name field for the next saved variant (Slice B)
+var _save_variant_button: Button
 # ContainmentLevel knob (ADR-019 S3, the ISO-14644 ladder) + consortium menu. The level + the checked consortium
 # keys + the pressure params are pushed to the core via set_containment BEFORE reset, which deterministically
 # expands them into a journaled immigration schedule off the off-stream IMMG family (zero SimRng draws, inv #3).
@@ -1020,6 +1035,21 @@ func _build_contamination_ui(ui: CanvasLayer) -> void:
 	inoc_note.add_theme_color_override("font_color", Color(0.6, 0.66, 0.6))
 	col.add_child(inoc_note)
 
+	# Variant Lab — Slice C: the SAVED VARIANTS section (mirrors the consortium menu above). Each variant the player
+	# saved in the SPECIMEN view (💾 Save variant) gets a 🌱 Reseed affordance that registers it with the core (once,
+	# tracked like the consortium) + arms it as the ACTIVE Inoculate payload — the next Inoculate brush stroke seeds
+	# THAT variant into the painted disc, reusing 100% of the inoculate machinery. Manual seeds work at ANY
+	# containment (ADR-019). The list is rebuilt by _refresh_saved_variants_section on each save. GDScript moves only
+	# the inert JSON + name (inv #2).
+	var saved_hdr := _dim_label("Saved variants (🌱 Reseed → arm, then paint with the 🦠 Inoculate brush):")
+	saved_hdr.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	saved_hdr.custom_minimum_size = Vector2(248, 0)
+	col.add_child(saved_hdr)
+	_saved_variants_box = VBoxContainer.new()
+	_saved_variants_box.add_theme_constant_override("separation", 3)
+	col.add_child(_saved_variants_box)
+	_refresh_saved_variants_section()
+
 	# Schedule pressure: per-immigrant J endowment (radius + horizon are fixed defaults; the level scales frequency
 	# in the core). The disc/horizon stay constant so the level is the single legible knob.
 	var ej_row := HBoxContainer.new()
@@ -1078,6 +1108,70 @@ func _on_apply_containment_pressed() -> void:
 		_ensure_contaminant_registered(str(key))
 	var lvl_name := str(CONTAINMENT_LABELS[_containment_level]) if _containment_level < CONTAINMENT_LABELS.size() else "?"
 	_flash_status("🦠 containment → %s · %d in consortium" % [lvl_name, keys.size()], true)
+
+
+## Variant Lab — Slice C: (re)build the CONTAMINATION panel's "Saved variants" list from _saved_variants. One row per
+## saved variant: a morphotype glyph (key+role) + the name + a 🌱 Reseed button (reads "Armed ✓" for the armed one).
+## Pure renderer state (inv #2). Safe before the panel exists (no-op) and on an empty store (shows a hint).
+func _refresh_saved_variants_section() -> void:
+	if _saved_variants_box == null:
+		return
+	for c in _saved_variants_box.get_children():
+		_saved_variants_box.remove_child(c)
+		c.queue_free()
+	if _saved_variants.is_empty():
+		var empty := _dim_label("— none yet · save one in the 🌱 SPECIMEN view (💾 Save variant)")
+		empty.add_theme_color_override("font_color", Color(0.55, 0.58, 0.55))
+		_saved_variants_box.add_child(empty)
+		return
+	for i in _saved_variants.size():
+		var v: Dictionary = _saved_variants[i]
+		var rowh := HBoxContainer.new()
+		rowh.add_theme_constant_override("separation", 6)
+		var glyph := Label.new()
+		glyph.text = GlyphFactory.emoji_for(str(v.get("key", "default")), str(v.get("role", "")))
+		rowh.add_child(glyph)
+		var nm := Label.new()
+		nm.text = str(v.get("name", "variant"))
+		nm.custom_minimum_size = Vector2(132, 0)
+		nm.clip_text = true
+		nm.add_theme_font_size_override("font_size", 11)
+		nm.add_theme_color_override("font_color", Color(0.9, 0.94, 0.9))
+		rowh.add_child(nm)
+		var btn := Button.new()
+		btn.text = "🌱 Armed ✓" if i == _armed_variant_idx else "🌱 Reseed"
+		btn.tooltip_text = "Register + arm this variant as the Inoculate payload, then paint the 🦠 Inoculate brush to seed it"
+		btn.pressed.connect(_on_reseed_variant_pressed.bind(i))
+		rowh.add_child(btn)
+		_saved_variants_box.add_child(rowh)
+
+
+## Variant Lab — Slice C: REGISTER + ARM a saved variant as the active Inoculate payload (ADR-019 manual seed —
+## works at ANY containment). Registers the variant's opaque JSON with the core (the same register_contaminant_json
+## res:// boundary the consortium uses — inv #2: GDScript hands over inert text, the core does serde + build), tracks
+## it like _registered_contaminants, then arms the Inoculate tool + brush so the NEXT stroke seeds this variant. The
+## core REPLACES a same-key entry, so reseeding a different variant of the same species overwrites cleanly.
+func _on_reseed_variant_pressed(idx: int) -> void:
+	if idx < 0 or idx >= _saved_variants.size():
+		return
+	if _live == null or not _live.has_method("register_contaminant_json") or not _live.has_method("inoculate"):
+		_flash_status("✗ Reseed unsupported by this build", false)
+		return
+	var v: Dictionary = _saved_variants[idx]
+	var key := str(v.get("key", ""))
+	if key == "" or not _live.register_contaminant_json(str(v.get("json", ""))):
+		_flash_status("✗ variant '%s' failed to register" % v.get("name", "?"), false)
+		return
+	_registered_contaminants[key] = true  # tracked like the consortium (idempotent across reseeds)
+	_armed_variant_idx = idx
+	# Arm the Inoculate brush: select the tool, reflect the palette radio, and turn the brush on so the next stroke
+	# seeds this variant. _select_tool also swaps the visible per-tool param panel.
+	if _tool_buttons.size() == TOOL_KEYS.size():
+		_tool_buttons[TOOL_INOCULATE].set_pressed_no_signal(true)
+	_select_tool(TOOL_INOCULATE)
+	_set_brush_mode(true)
+	_refresh_saved_variants_section()  # repaint so the armed row reads "Armed ✓"
+	_flash_status("🌱 armed '%s' — paint the 🦠 Inoculate brush to seed it" % v.get("name", "?"), true)
 
 
 ## CRISPR param sub-panel: the EXISTING Cas / Locus / Guide pickers verbatim (fires Action::ApplyEditRegion).
@@ -1542,17 +1636,33 @@ func _apply_active_tool() -> void:
 ## like a fired schedule event. POSITION MATTERS: (cx, cy, r) is the disc the core spawns into. Returns nothing —
 ## establish/displace/die emerges from the core economy (this only supplies the arrival).
 func _inoculate_at(cx: int, cy: int, r: int) -> void:
-	var key := _inoc_selected_key()
-	if key == "" or not _ensure_contaminant_registered(key):
-		_flash_status("✗ contaminant '%s' could not be registered" % key, false)
-		return
+	# Slice C: an ARMED saved variant takes precedence over the contaminant picker. It is NOT a res:// file, so it is
+	# re-registered from its stored JSON each stroke (robust across a _do_reset that cleared the core consortium /
+	# _registered_contaminants) instead of going through _ensure_contaminant_registered (which reads res://).
+	var key: String
+	var label: String
+	if _armed_variant_idx >= 0 and _armed_variant_idx < _saved_variants.size():
+		var v: Dictionary = _saved_variants[_armed_variant_idx]
+		key = str(v.get("key", ""))
+		if key == "" or not _live.has_method("register_contaminant_json") \
+				or not _live.register_contaminant_json(str(v.get("json", ""))):
+			_flash_status("✗ armed variant could not be re-registered", false)
+			return
+		_registered_contaminants[key] = true
+		label = str(v.get("name", key))
+	else:
+		key = _inoc_selected_key()
+		if key == "" or not _ensure_contaminant_registered(key):
+			_flash_status("✗ contaminant '%s' could not be registered" % key, false)
+			return
+		label = key
 	var cnt := int(_inoc_count.value) if _inoc_count != null else 1
 	var endow := int(_inoc_endow.value) if _inoc_endow != null else 0
 	var minted: int = int(_live.inoculate(key, cx, cy, r, cnt, endow))
 	var gen := int(_live.observe().get("generation", 0)) if _live.has_method("observe") else 0
 	_record_tool_outcome(TOOL_INOCULATE, {
 		"applied": cnt > 0,
-		"detail": "🦠 %s ×%d @ (%d,%d) r%d · tap %d J" % [key, cnt, cx, cy, r, minted],
+		"detail": "🦠 %s ×%d @ (%d,%d) r%d · tap %d J" % [label, cnt, cx, cy, r, minted],
 		"generation": gen,
 	})
 
@@ -3253,6 +3363,32 @@ func _build_specimen_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 
 		_trait_rows.append({"name": name_lbl, "bar": bar, "value": val_lbl, "delta": delta_lbl})
 
+	# Variant Lab — Slice B: SAVE the focused species' CURRENT (post-edit) genome as a named variant. Exports the
+	# opaque SpeciesSpec JSON via LiveSim.export_species_json (the single biology→spec mapping lives in the core,
+	# inv #2) into the renderer-side _saved_variants store; the CONTAMINATION panel's "Saved variants" section then
+	# offers each one as a 🌱 Reseed inoculate payload (Slice C). Guarded: enabled only in --live with the export
+	# #[func] present (a has_method probe, like observe_species) — disabled otherwise (file replay / older cdylib).
+	var save_hdr := Label.new()
+	save_hdr.text = "Variant Lab"
+	save_hdr.add_theme_font_size_override("font_size", 12)
+	save_hdr.add_theme_color_override("font_color", Color(0.7, 0.78, 0.7))
+	col.add_child(save_hdr)
+	var save_row := HBoxContainer.new()
+	save_row.add_theme_constant_override("separation", 6)
+	col.add_child(save_row)
+	_save_variant_name = LineEdit.new()
+	_save_variant_name.placeholder_text = "variant name…"
+	_save_variant_name.custom_minimum_size = Vector2(150, 0)
+	save_row.add_child(_save_variant_name)
+	_save_variant_button = Button.new()
+	_save_variant_button.text = "💾 Save variant"
+	_save_variant_button.tooltip_text = "Snapshot the focused species' current genome as a reusable variant; reseed it from the 🦠 CONTAMINATION panel"
+	_save_variant_button.pressed.connect(_on_save_variant_pressed)
+	save_row.add_child(_save_variant_button)
+	var can_save: bool = _live != null and _live.has_method("export_species_json")
+	_save_variant_button.disabled = not can_save
+	_save_variant_name.editable = can_save
+
 	_specimen_panel = PanelChrome.new()
 	_specimen_panel.setup("🌱 SPECIMEN", body, ui, Vector2(maxf(240.0, field_px.x - 304.0), 176.0), _pill_rail)  # y=176 clears the always-on VIEW+SCOPE panel
 	_specimen_panel.set_active(false)
@@ -3717,6 +3853,63 @@ func _on_specimen_selected(idx: int) -> void:
 	_focus = idx
 	_update_trait_readout()
 	_emphasise_focus()
+
+
+## Variant Lab — Slice B: snapshot the FOCUSED species' current (post-edit) genome into the renderer-side
+## _saved_variants store. Exports the opaque SpeciesSpec JSON via LiveSim.export_species_json (biology→spec lives in
+## the core, inv #2); GDScript only carries the inert text + a display name + the species_id/role/traits for the
+## list glyph. A blank/duplicate name gets a sensible default + a numeric suffix. Refreshes the CONTAMINATION
+## panel's "Saved variants" section so the new variant is immediately reseedable (Slice C).
+func _on_save_variant_pressed() -> void:
+	if _live == null or not _live.has_method("export_species_json"):
+		_flash_status("✗ Save variant unsupported by this build", false)
+		return
+	var row := _focused_species_row()
+	var sid := int(row.get("species_id", 0))
+	var json := str(_live.export_species_json(sid))  # opaque SpeciesSpec JSON; never parsed in GDScript (inv #2)
+	if json == "":
+		_flash_status("✗ could not export species %d" % sid, false)
+		return
+	var raw := _save_variant_name.text.strip_edges() if _save_variant_name != null else ""
+	var vname := _unique_variant_name(raw, str(row.get("name", "species")))
+	_saved_variants.append({
+		"name": vname,
+		"json": json,
+		"key": str(row.get("key", _focused_key())),  # the core key the reseed resolves against
+		"species_id": sid,
+		"role": _focused_role(),
+		"traits": _focused_traits(),
+	})
+	if _save_variant_name != null:
+		_save_variant_name.text = ""
+	_refresh_saved_variants_section()
+	_flash_status("💾 saved variant '%s'" % vname, true)
+
+
+## A snapshot of the focused specimen's trait dict (for the saved-variant list glyph/role only — presentation, inv #2).
+func _focused_traits() -> Dictionary:
+	var list := _specimen_list()
+	if list.is_empty():
+		return {}
+	return ((list[clampi(_focus, 0, list.size() - 1)] as Dictionary).get("traits", {}) as Dictionary).duplicate()
+
+
+## A non-empty, unique saved-variant name: blank → "<species> variant"; a collision gets a " #N" suffix (inv #2).
+func _unique_variant_name(raw: String, fallback: String) -> String:
+	var base := raw if raw != "" else ("%s variant" % fallback)
+	var name := base
+	var n := 2
+	while _variant_name_taken(name):
+		name = "%s #%d" % [base, n]
+		n += 1
+	return name
+
+
+func _variant_name_taken(name: String) -> bool:
+	for v in _saved_variants:
+		if str((v as Dictionary).get("name", "")) == name:
+			return true
+	return false
 
 
 ## Whether the ACTIVE species is the microbe (E. coli) rather than the abstract plant. Routes on the menu stem

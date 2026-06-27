@@ -2418,6 +2418,37 @@ impl Simulation {
         &self.world.resource::<SpeciesRegistry>().entries[sid.0 as usize].strategy
     }
 
+    /// Build a read-only [`genome::spec::SpeciesSpec`] from species `sid`'s CURRENT (post-edit) genome plus its
+    /// niche — the Variant-Lab "save the edited genome" export (Slice B). The single biology→spec mapping lives
+    /// HERE in the core (inv #2); the renderer/CLI only serializes + writes the bytes.
+    ///
+    /// Pure exactly like [`observe_all`](Self::observe_all) / [`species_signatures`](Self::species_signatures):
+    /// it reads the registry, draws ZERO `SimRng`, mutates nothing, and is NEVER folded into `hash_world`, so
+    /// exporting cannot move the determinism hash (inv #3 — the pinned literal is unmoved).
+    ///
+    /// Uses [`SpeciesSpec::from_genome`](genome::spec::SpeciesSpec::from_genome) (lossless) then patches the
+    /// `niche` so a reseeded variant carries its ecology: `entity_count` (the species' spawn target),
+    /// `trophic_role` (from the cached [`gp::Strategy::role`] via [`gp::role_to_str`], so the reseed resolves
+    /// the SAME role through `role_from_override`), and `host_key` (the registered host species' key, for an
+    /// obligate symbiont). Returns `None` for an out-of-range `sid`.
+    #[must_use]
+    pub fn export_species_spec(&self, sid: SpeciesId) -> Option<genome::spec::SpeciesSpec> {
+        let registry = self.world.resource::<SpeciesRegistry>();
+        let entry = registry.entries.get(sid.0 as usize)?;
+        // Lossless genome → spec, then patch the niche the roster/consortium boundary reads back (the same
+        // fields `SpeciesSpec::from_built` carries — entity_count / trophic_role / host_key).
+        let mut spec =
+            genome::spec::SpeciesSpec::from_genome(&entry.genome, &entry.key, &entry.name);
+        spec.niche.entity_count = entry.target_pop;
+        spec.niche.trophic_role = Some(gp::role_to_str(entry.strategy.role).to_string());
+        // Resolve the cached host SpeciesId back to its DATA key (the form the boundary re-resolves at reset).
+        spec.niche.host_key = entry
+            .host
+            .and_then(|h| registry.entries.get(h.0 as usize))
+            .map(|h| h.key.clone());
+        Some(spec)
+    }
+
     /// Commit a deep-edit growth-ratio (ADR-017 S6 — the load-bearing OVERSIGHT wire). Maps the firewall's
     /// committed `growth_ratio_q` (permille, `1000` = wild-type) + the [`EditEffect`] verb to a strictly-positive
     /// `[0.5,1.5]` PERMILLE demand factor via [`edit_factor_q`] and stores it for `sid`, so the NEXT `step` makes
@@ -3707,6 +3738,77 @@ mod tests {
             .count();
         assert!(s0 > 0, "species 0 persists (emergent population)");
         assert!(s1 > 0, "species 1 persists (emergent population)");
+    }
+
+    #[test]
+    fn export_species_spec_reflects_the_current_edited_genome() {
+        // Variant-Lab Slice B (core side): export_species_spec builds a LOSSLESS SpeciesSpec from a species'
+        // CURRENT (post-edit) genome + its niche (entity_count + role from the cached Strategy + host from the
+        // registry). Read-only (zero SimRng, no mutation) and round-trips: spec.build().genome == the edited
+        // genome, and the carried role resolves back to the SAME TrophicRole (the save→reseed contract).
+        let roster = vec![RosterEntry {
+            name: "Plant".to_string(),
+            key: "default".to_string(),
+            genome: genome::sample_genome(),
+            gp_map: gp::OntologyMap::new(gp::default_plant_trait_map()),
+            entity_count: 80,
+            // A NON-default role so the test proves the role round-trips (not just the Autotroph default).
+            role: gp::TrophicRole::Decomposer,
+            host_key: None,
+        }];
+        let cfg = SimConfig {
+            seed: 5,
+            generations: 0,
+            entity_count: 80,
+        };
+        let mut sim = Simulation::reset_with_roster(&cfg, &EnvParams::default(), roster);
+
+        // EDIT the live genome: move locus-0's first numeric param to a bound it is not already at, so the
+        // exported genome MUST differ from the pristine starter (proves "export is the CURRENT genome").
+        sim.with_genome_and_rng(|g, _rng| {
+            if let genome::ParamValue::Numeric { value, min, max } =
+                &mut g.loci[0].parameters[0].value
+            {
+                *value = if (*value - *min).abs() > f64::EPSILON {
+                    *min
+                } else {
+                    *max
+                };
+            }
+        });
+
+        let spec = sim
+            .export_species_spec(SpeciesId(0))
+            .expect("species 0 exports");
+        assert_eq!(spec.key, "default");
+        assert_eq!(spec.niche.entity_count, 80);
+        assert_eq!(spec.niche.host_key, None);
+        assert_eq!(
+            spec.niche.trophic_role.as_deref(),
+            Some("decomposer"),
+            "the niche carries the cached Strategy role (round-trips via role_from_override)"
+        );
+        assert_eq!(
+            gp::role_from_override(spec.niche.trophic_role.as_deref(), &spec.key),
+            gp::TrophicRole::Decomposer,
+            "the exported role string resolves back to the SAME role"
+        );
+
+        // Lossless: the rebuilt genome equals the live (edited) registry genome, NOT the pristine starter.
+        let rebuilt = spec.build().expect("export rebuilds");
+        assert_eq!(
+            rebuilt.genome,
+            *sim.species_genome(),
+            "export reflects the CURRENT edited genome"
+        );
+        assert_ne!(
+            rebuilt.genome,
+            genome::sample_genome(),
+            "the edit actually changed the genome (export is post-edit, not the starter)"
+        );
+
+        // Out-of-range sid → None (the guard the boundary surfaces as empty + error).
+        assert!(sim.export_species_spec(SpeciesId(9)).is_none());
     }
 
     #[test]

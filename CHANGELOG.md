@@ -4,6 +4,22 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Variant Lab B+C — save→name→reseed loop (renderer + read-only core export) — HASH-NEUTRAL
+The player can save a roster species' CURRENT (post-edit) genome as a named variant and reseed it like a contaminant.
+- **Slice B (save):** read-only `Simulation::export_species_spec(sid) -> SpeciesSpec` (`&self`, zero SimRng, never
+  folded into `hash_world`) carrying the niche — `entity_count`, `trophic_role` (via the new exhaustive
+  `gp::role_to_str`, the proven inverse of `role_from_str`), and `host_key`; `godot-sim`
+  `export_species_json(species_id) -> GString`; a specimen-view "💾 Save variant" action storing
+  `{name, json, key, species_id, role, traits}` in a renderer `_saved_variants` registry (the JSON is opaque text —
+  never parsed in GDScript, inv #2).
+- **Slice C (reseed):** a "Saved variants" section (mirrors the contaminant consortium menu) that registers a variant
+  via the EXISTING `register_contaminant_json` + arms it for the `inoculate`/`TOOL_INOCULATE` brush — no new core action
+  (manual inoculation works at any containment, ADR-019).
+- Round-trip test (`export_species_json_round_trips_to_the_live_phenotype`): export → `build_species_from_str` → a
+  `BuiltSpecies` whose expressed phenotype + role + host match the live species. Pinned literal
+  `0x47a0_3c8f_6701_f240` unmoved (`export_species_json_is_hash_neutral_and_guarded`). Gate GREEN; 3-skeptic verify
+  CONFIRMED (5/5 claims at 3/3). From the QUEUE gameplay/sandbox lead (item #1).
+
 ### Roadmap loop infra — `/roadmap-plan` + `/roadmap-iterate` skills + the workflow queue (tooling/docs) — HASH-NEUTRAL
 A two-skill loop over the prepared `.claude/workflows/*.js` orchestrations, one tier above the existing per-slice
 `/iterate` (one queue item = one multi-agent Workflow = one merge). State lives in `docs/llm/QUEUE.md` + git → resumable.

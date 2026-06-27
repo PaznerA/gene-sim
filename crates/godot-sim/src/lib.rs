@@ -657,6 +657,33 @@ impl LiveSim {
         }
     }
 
+    /// Export species `species_id`'s CURRENT (post-edit) genome + niche as a `SpeciesSpec` JSON STRING
+    /// (Variant-Lab Slice B — the "save the edited variant" boundary). The renderer writes the returned text to
+    /// a `user://` file; loading it back through [`register_contaminant_json`](Self::register_contaminant_json)
+    /// (or the roster loader) reseeds a variant with the SAME expressed phenotype + trophic role (the save→reseed
+    /// contract). Delegates to [`harness::GeneSimEnv::export_species_json`] →
+    /// [`sim_core::Simulation::export_species_spec`] (the single biology→spec mapping; no genome logic here, inv
+    /// #2). Read-only: draws no RNG, mutates nothing, never folded into the determinism hash (inv #3). Returns an
+    /// EMPTY GString (+ a `godot_error!`) before `reset` or for an out-of-range `species_id`, like the other
+    /// guarded `#[func]`s.
+    #[func]
+    fn export_species_json(&self, species_id: i64) -> GString {
+        let Some(env) = self.env.as_ref() else {
+            godot_error!("LiveSim::export_species_json called before reset()");
+            return GString::new();
+        };
+        match u16::try_from(species_id)
+            .ok()
+            .and_then(|s| env.export_species_json(s))
+        {
+            Some(json) => GString::from(json.as_str()),
+            None => {
+                godot_error!("LiveSim::export_species_json: no species with id {species_id}");
+                GString::new()
+            }
+        }
+    }
+
     /// Fire a CONTAMINATION / IMMIGRATION event (ADR-019 S1 — the SP-3-deferred seed/inoculate tool): spawn
     /// `count` organisms of the contaminant `species_key` (must be registered via
     /// [`register_contaminant_json`](Self::register_contaminant_json)) inside the disc `(cx, cy, radius)`, each
