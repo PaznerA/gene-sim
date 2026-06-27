@@ -60,6 +60,14 @@ For each queued workflow, in order:
 
 Commit message convention: `feat(<area>): <slice> — <hash-neutral|design-only>, gate green` + trailers.
 
+**Renderer / godot verify gotchas (folded from the retired HANDOFF.md):** renderer changes are hash-neutral
+(`godot/*.gd` + the off-hash snapshot). Build the cdylib first
+(`cargo build --manifest-path crates/godot-sim/Cargo.toml`) + stage
+`cp data/{species,codex,presets}/*.json godot/data/{species,codex,presets}/`, then verify the UI with
+`godot --path godot -- --live [--roster "stem:count,…"] [--steps N] [--view relations|specimen] [--zoom 1..12] --shot /tmp/x.png`
+and Read the png. **macOS note:** `check_godot_snapshot.sh` uses `timeout` + file capture — a `$(godot …)`
+pipe-capture HANGS on macOS.
+
 ---
 
 ## 2. BATCH 1 — fires 2026-06-21 22:00 CEST (`cron 2 22 21 6 *`, one-shot, durable)
@@ -77,7 +85,7 @@ Goal: ship a **visibly-alive multi-species sim** + land the **Strategy core subs
 
 Rationale for order: core/boundary (1,2) → signoff-ready keystone designs (3,4) → liveliness polish (5).
 3 and 4 are safe to run unattended **because they never merge the re-pin** — they produce
-`docs/llm/proposals/f3-metabolism-keystone-draft.md` and `f4-trophic-decomposer-draft.md` + hash-neutral
+the ADR-013 F3 + F4 design (DECISIONS.md) + hash-neutral
 infra/data and STOP. The FlowMatrix contract that batch 1 pins in the F4 draft is what batch 2's relations
 view consumes.
 
@@ -128,8 +136,8 @@ candidates (F5 chem-field design, S8 vector-DB sidecar design) — always design
 - 2026-06-21 22:02 CEST — **BATCH 1 START.** Branch `auto/night-2026-06-21` created from main; setup committed `53fb3d2`. Queue: [1 ecoli-visibility-impl, 2 f2-strategy-substrate-impl, 3 f3-metabolism-keystone-design🔁, 4 f4-trophic-decomposer-design🔁, 5 ui-multispecies-liveliness].
   - [x] 1 ecoli-visibility-impl — **PASS** (gate GREEN 9/9 + bench-skip; determinism literal unchanged → hash-neutral confirmed independently). Added: harness `build_species_from_str` res:// boundary, godot-sim `set_species_json` #[func], `godot/microbe.gd` microbe specimen view, run.sh species mirror + `godot/data/` gitignored, species-mirror gate. Fixes the cwd species-not-found bug. Commit `d7391cf`.
   - [x] 2 f2-strategy-substrate-impl — **PASS** (gate GREEN; determinism literal unchanged → hash-neutral; verified UNWIRED: `selection()` fitness uses base_growth only, `.strategy` only in `species_strategy()` accessor + reset-time re-express). Added gp.rs `Strategy{budget[5],role,affinity}` + `TrophicRole` + `express_strategy` (first caller of fixed.rs apportion) + `role_for`; cached in `SpeciesEntry.strategy`. Commit `42dea23`.
-  - [x] 3 f3-metabolism-keystone-design🔁 — **SIGNOFF-READY** (gate GREEN; literal unchanged; sim path INTACT — metabolism/selection/fitness untouched, NO births/deaths merged). Delivered hash-neutral: `docs/llm/proposals/f3-metabolism-keystone-draft.md` (ADR-013 F3 design: PoolStock i64, uptake→convert→excrete, energy-funded reproduce_or_die replacing constant-N, Biomass+Age, carcass→detritus, MaxPopulation guard), ledger.rs `closes()` assertion harness + tests, `tools/check_determinism_multi_isa.sh` + gate.sh wire (SKIP local / CI matrix is the gate) + ci.yml x86_64+aarch64 job. **⏸ HUMAN RE-PIN SIGN-OFF REQUIRED before implementing births/deaths.** Commit `eb18034`.
-  - [x] 4 f4-trophic-decomposer-design🔁 — **SIGNOFF-READY** (pure design; literal unchanged; schedule chain `(advance_tick,metabolism,selection)` INTACT; NO trophic.rs/relations.rs/coupling merged — only the draft + log changed, so gate is identical to GREEN @ eb18034, not re-run for a 2-markdown-file change). Delivered: `docs/llm/proposals/f4-trophic-decomposer-draft.md` — obligate plant→detritus→**E.coli(re-roled Decomposer via niche.trophic_role)**→free_nutrient loop (deletes F3's free_nutrient INFLUX tap so nutrient is endogenous), emergent MEASURED FlowMatrix S×S (inverts fabricated-cosine ADR-014), mineralize_rate gene-anchored on pta/GO-8959, CRISPRi ripple levers (ptsG/gltA/pta). **⏸ HUMAN RE-PIN SIGN-OFF REQUIRED before F4 coupling.** Commit `d5906c8`.
+  - [x] 3 f3-metabolism-keystone-design🔁 — **SIGNOFF-READY** (gate GREEN; literal unchanged; sim path INTACT — metabolism/selection/fitness untouched, NO births/deaths merged). Delivered hash-neutral: the ADR-013 F3 design ( PoolStock i64, uptake→convert→excrete, energy-funded reproduce_or_die replacing constant-N, Biomass+Age, carcass→detritus, MaxPopulation guard), ledger.rs `closes()` assertion harness + tests, `tools/check_determinism_multi_isa.sh` + gate.sh wire (SKIP local / CI matrix is the gate) + ci.yml x86_64+aarch64 job. **⏸ HUMAN RE-PIN SIGN-OFF REQUIRED before implementing births/deaths.** Commit `eb18034`.
+  - [x] 4 f4-trophic-decomposer-design🔁 — **SIGNOFF-READY** (pure design; literal unchanged; schedule chain `(advance_tick,metabolism,selection)` INTACT; NO trophic.rs/relations.rs/coupling merged — only the draft + log changed, so gate is identical to GREEN @ eb18034, not re-run for a 2-markdown-file change). Delivered: the ADR-013 F4 design — obligate plant→detritus→**E.coli(re-roled Decomposer via niche.trophic_role)**→free_nutrient loop (deletes F3's free_nutrient INFLUX tap so nutrient is endogenous), emergent MEASURED FlowMatrix S×S (inverts fabricated-cosine ADR-014), mineralize_rate gene-anchored on pta/GO-8959, CRISPRi ripple levers (ptsG/gltA/pta). **⏸ HUMAN RE-PIN SIGN-OFF REQUIRED before F4 coupling.** Commit `d5906c8`.
   - [x] 5 ui-multispecies-liveliness — **PASS** (gate GREEN; literal unchanged; new core export has its own `observe_all_is_read_only_does_not_change_hash` test). Added read-only `Simulation::observe_all()→Vec<SpeciesObservation>` (every registry species, ID-order, zero RNG, off-hash) + harness/godot-sim passthrough `observe_species()`; renderer fan-out so specimen view shows EVERY species with its OWN traits (plant L-system row + microbe rod row in one view) and ecosystem sprites are trait-driven per species (branchiness→branches, stature→size, hue/reflectance→palette; microbe rod whose length/width/tint encode growth/glucose/respiration). Biology stays in core (inv #2).
 - 2026-06-21 23:2x CEST — **BATCH 1 COMPLETE.** 5/5 workflows, every gate GREEN, determinism literal `0xf795_eac4_112f_acd5` held through all 5 (zero re-pins merged). Commits on `auto/night-2026-06-21`: setup `53fb3d2` → `d7391cf` (ecoli visible) → `42dea23` (F2 strategy) → `eb18034` (F3 design⏸) → `d5906c8` (F4 design⏸) → ui-liveliness (next commit). **Two ⏸ signoff-ready re-pin packages await the human** (F3 births/deaths, F4 trophic coupling). No pushes, main untouched. Batch 2 cron (04:03) stands.
 - 2026-06-22 04:03 CEST — **BATCH 2 START.** Batch 1 confirmed complete (last commit `6d06857`); on branch `auto/night-2026-06-21`, tree clean, literal intact. No resume needed.
@@ -147,7 +155,7 @@ candidates (F5 chem-field design, S8 vector-DB sidecar design) — always design
 
 When the human returns:
 1. Review the `auto/night-2026-06-21` branch commits (hash-neutral impls + design docs).
-2. Read `docs/llm/proposals/f3-metabolism-keystone-draft.md` + `f4-trophic-decomposer-draft.md` and the
+2. Read ADR-013 F3 + F4 (DECISIONS.md) and the
    multi-ISA CI gate; **sign off the F3 then F4 re-pins** (these are the only blocked merges).
 3. Smoke-test the Godot build (`./run.sh`) for the liveliness + relations UI.
 4. Anything tagged `RED:`/`BLOCKED:` in §4 is the human's first fix target.
@@ -214,7 +222,7 @@ gate → commit; respect dependencies; on resume, restart from the first uncheck
   default consortium. Draft §5.
 - [ ] 4. **SP-2 sandbox composer** (hash-neutral) — compose a run (roster/env/starting-pop/edits) → run + observe;
   the `SpeciesSpec` JSON is the vehicle. Design + impl.
-- [ ] 5. **SP-4 codex UI** (hash-neutral) — inspect/tooltip/codex panel surfacing `sp4-codex-content-draft.md`.
+- [ ] 5. **SP-4 codex UI** (hash-neutral) — inspect/tooltip/codex panel surfacing `data/codex/codex.json`.
 - [ ] 6. **Contamination S4 — spore/dormancy reservoir** (🔁 RE-PIN) — vegetative-cull-leaves-a-regerminating-
   reservoir (real Bacillus-spore biology, NOT a balance fudge). Draft §5.4.
 - [ ] 7. **Contamination S5 — Mode B obligate symbionts** (🔁 RE-PIN) — `ObligateSymbiont` role + host-coupling
@@ -307,7 +315,7 @@ correct ceiling there.
   **Rebased onto + composed with PERF-1** (`3886fc6`); full `tools/gate.sh` GREEN after the compose; a back-to-back
   criterion `--baseline` re-bench (PERF-1 `ed558d7` vs PERF-2 `3886fc6`, same machine) confirms the marginal gain
   is **−47.4 / −48.9 / −47.8 %** — i.e. PERF-1's scratch-Vec hoist was perf-neutral on this bench and the −48 % is
-  genuinely PERF-2's. **READY TO MERGE** to main (local gate green = the merge gate; no CI wait).
+  genuinely PERF-2's. **MERGED to main** (`81ef729`, `--no-ff`; tree-identical to the gate-green commit).
 - **PERF-2 follow-up** ✅ DONE (2026-06-27): the predation/host_coupling byte-paths (which the plant-only
   `0x47a0…` config early-returns out of) are now locked by two GOLDEN-literal pins — `predation_roster_hash_is_pinned`
   (`0xd4eb_7676_531f_b2bf`, the f6 3-species predator roster) + `host_coupling_roster_hash_is_pinned`

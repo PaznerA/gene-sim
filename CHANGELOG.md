@@ -166,7 +166,7 @@ ADR-023. The first phase of the autonomous emergent-run discovery epic: a reprod
 per-generation trace it reads. **ZERO sim hash impact → pinned literal `0x47a0_3c8f_6701_f240` byte-identical**
 (capture READS only `observe_all()`/`flow_matrix()`, both proven zero-`SimRng`/off-`hash_world`; a real predator/prey
 run scored both ways asserts captured-hash == plain-hash; full `tools/gate.sh` GREEN). Adversarially verified 3/3 on
-every dimension; the metric set was pinned by a 3-lens design panel (`docs/llm/proposals/discovery-scorer-spec.md`).
+every dimension; the metric set was pinned by a 3-lens design panel.
 - **`crates/discovery`** (NEW, std + serde ONLY — no sim-core/harness dep, GPL-clean): a `PerGenTrace` it is handed →
   an integer interestingness score. Six basis-point, RNG-free metrics over the stable window — M1 coexistence, M2
   integer-Simpson evenness, M3 amp+turns **dynamism** (single-boom-capped), M4 FlowMatrix-aggregate trophic structure,

@@ -522,7 +522,7 @@ only invariant-touching step (climate→selection coupling) is a single ledgered
 **Status: ACCEPTED (human sign-off 2026-06-21) — IN PROGRESS.** Supersedes **ADR-005** (constant-N /
 no-extinction). Re-grounds the R3 multi-species, Rel relations, and Phase-T trait DRAFTS (now folded in as
 phases, not separate ADRs — see `docs/llm/proposals/`). Designed by the bold/anti-safe `ecology-substrate-design`
-workflow (18 agents) + adversarial pressure-test; full draft in `docs/llm/proposals/ecology-substrate-draft.md`.
+workflow (18 agents) + adversarial pressure-test; the design draft is folded into this ADR + the F3/F4/F5 records.
 This is a **stop-the-line, multi-week, multi-crate rewrite with 6+ deliberate re-pins** — the human explicitly
 rejected the safe incremental path ("be on the edge") and approved the honest cost.
 
@@ -938,7 +938,7 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
   memory `autonomous-emergent-run-discovery-ml`) wants to autonomously SEARCH the (config + edit) space, SCORE each
   run for "interestingness", and SAVE the gems as bit-identically-replayable showcases. The load-bearing first piece
   is a reproducible SCORER; everything else is search plumbing. The metric set was pinned by the
-  `emergent-scorer-design` 3-lens panel → [discovery-scorer-spec.md](proposals/discovery-scorer-spec.md).
+  `emergent-scorer-design` 3-lens panel (the spec is folded into this ADR).
 - **Decision:**
   - **New crate `crates/discovery`** (added to the workspace members) — **std + serde ONLY** (no `sim-core`, no
     `harness` dep): it scores a PLAIN `PerGenTrace` it is handed, so the scorer stays on the clean side of the

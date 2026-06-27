@@ -2,7 +2,7 @@
 
 > Output of the `surrogate-model-design` 3-lens panel → judge. The buildable spec for D3 of the emergent-discovery
 > epic. Awaiting human sign-off on the two flagged decisions (steering target + model choice) before implementation.
-> Companion: [discovery-scorer-spec.md](discovery-scorer-spec.md), ADR-023/024/025.
+> Companion: ADR-023/024/025 (the D0/D1 scorer + trace, in DECISIONS.md).
 >
 > **Invariants:** #1 std+serde, GPL-clean (heavy ML stays at the process boundary — never linked). #2 reads config +
 > score NUMBERS only, no biology. #3 integer/deterministic/off-hash (the pinned literal `0x47a0_3c8f_6701_f240`

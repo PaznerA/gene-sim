@@ -69,7 +69,7 @@ on this principle; the predator's overshoot-crash is real and is recovered by re
   → containment schedule → renderer panel+markers); **S4 (spore/dormancy reservoir) + S5 (Mode B obligate symbionts:
   Carsonella/Syn3.0/Hodgkinia — `ObligateSymbiont` role + host edge) are 🔁 RE-PINS** (separate sign-off).
 - [~] **SP-4 codex + specimen-view upgrade** — phenology/ontology/taxonomy descriptions + evidence-driven
-  morphology + rich inspect (`docs/llm/proposals/sp4-codex-content-draft.md`). **DELIVERED (HASH-NEUTRAL, pin
+  morphology + rich inspect. **DELIVERED (HASH-NEUTRAL, pin
   `0x47a0` unchanged):** `data/codex/codex.json` (12 species + 12 genes + 6 roles + 4 flows) + `godot/codex.gd`
   loader; the key-led `godot/glyph_factory.gd` + generalized `godot/microbe.gd` (rod/coccus/vibrioid/wall-less +
   endospore/biofilm/host-ring) + new `godot/mold.gd` (hyphae + conidiophore); the 6-section `_fill_specimen_detail`
@@ -123,7 +123,7 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
 - [~] **ADR-013 — Ecology substrate (CHEMOSTAT-J): the foundational joule-economy epic** 🛑 (ACCEPTED 2026-06-21,
   IN PROGRESS). Replaces the abstract Wright-Fisher core with a conserved `i64`-joule economy organisms interact
   THROUGH; supersedes ADR-005 (extinction approved); **re-grounds R3 / Rel / Phase-T as phases, not separate
-  ADRs.** Full plan in `docs/llm/proposals/ecology-substrate-draft.md`; ADR in DECISIONS.md. 10 phases, 6+ re-pins:
+  ADRs.** Full plan in ADR-013 (DECISIONS.md). 10 phases, 6+ re-pins:
   - [x] **F-1** — `crates/sim-core/src/fixed.rs` deterministic largest-remainder apportionment contract (the
     integer-division backbone; conserves the total exactly). Hash-neutral, gate-green.
   - [x] **F0a** — `crates/sim-core/src/ledger.rs` conserved-energy `Ledger` + `ledger_closes` invariant +
@@ -169,7 +169,7 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   - [x] **F2-1 ontology re-key (HASH-NEUTRAL!)** — `gp.rs` per-species `TraitMap` (`LocusSelector` ByIndex/ByGoAnchor
     + `TraitBinding` + `OntologyMap`); `WeightedSumMap` = thin wrapper over `default_plant_trait_map` so the plant
     expresses BYTE-IDENTICALLY (re-key proven hash-neutral by the unchanged pin). Unblocks microbe species.
-    *(Plan: `docs/llm/proposals/ecoli-genome-f2-draft.md` — F2 verified hash-neutral, not the feared re-pin.)*
+    *(F2 verified hash-neutral, not the feared re-pin.)*
   - [x] **B-1 data bake** — `scripts/bake_ecoli_species.py` (pinned BiGG `e_coli_core` roster × real NCBI
     `GCF_000005845.2` CDS × curated GO) → `data/species/ecoli.json`: **136 real genes, 171,723 bp real K-12 CDS**,
     pure ACGT, id==index by b-number, so_term 704, one Numeric activity param. Gate test `shipped_ecoli_species_loads`.
@@ -181,7 +181,7 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
     default delegates `default_plant_trait_map` (byte-identical). Boundary: harness `--species <file>`,
     `GeneSimEnv::set_species`, `LiveSim::set_species` + a menu Species dropdown. **E. coli runs deterministically
     off gltA (GrowthRate 1.0), pop 800 from the niche, own hash; default pinned literal unchanged.** Designed +
-    adversarially verified (run-ecoli-mapseam-design wf, 3/3 claims HOLD); plan `ecoli-genome-f2-draft.md`.
+    adversarially verified (run-ecoli-mapseam-design wf, 3/3 claims HOLD).
     - Adversarial code review (run-ecoli-review wf, 4 confirmed — no determinism regressions) → all FIXED:
       shipped-build species path (exe-dir fallback in `LiveSim::set_species` + `release.yml` stages
       `data/species/` beside the binary); the live CRISPR edit picker is now SPECIES-AWARE (`loci()` returns the
@@ -204,8 +204,8 @@ Everything below rides on the completed ADR-011 spatial epic + save/load + sandb
   - [ ] Later: S4 Oversight game-mode economy · S5 journaled `RequestEcoliEdit`/`CommitEcoliImpact` · S2/`oracle-fba`
     KO-table bake · S8 `relations-index` vector DB. **Re-pins 🛑:** S6 EcoliEditModifier activation · S7 decomposer.
 
-- [~] **Multi-species CORE SPINE** (user order: core logic → ecosystem → UI; design+verified
-  `docs/llm/proposals/multispecies-core-spine-draft.md`, R3-A "holds", R3-B "uncertain"→scoped re-pin).
+- [~] **Multi-species CORE SPINE** (user order: core logic → ecosystem → UI; design+verified,
+  R3-A "holds", R3-B "uncertain"→scoped re-pin).
   - [x] **R3-A registry + tag (HASH-NEUTRAL)** — `SpeciesId(u16)`, `Species(SpeciesId)` component (off-stream,
     heritable), `SpeciesEntry{name,genome,gp_map,base_growth,target_pop}` + `SpeciesRegistry{entries:Vec}` (ordered,
     inv #3), `reset_with_roster(config,env,Vec<RosterEntry>)` (`reset_with_genome_and_map` delegates a 1-entry
