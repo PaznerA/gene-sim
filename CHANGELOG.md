@@ -4,6 +4,28 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### PERF-2 — per-tick OrgId-keyed `BTreeMap`/`BTreeSet` → reused sorted-`Vec` (perf, sim-core) — HASH-NEUTRAL
+ADR-026. The hot path built a fistful of OrgId-keyed `BTreeMap`s + `BTreeSet`s fresh EVERY tick over the whole living
+set; profiling noted the `items`/`rows` vectors are already sorted by `(cell, species, OrgId)`, so each map is
+reproducible from a sorted `Vec`. Swapped them all for REUSED sorted-`Vec` scratch buffers — **the pinned literal
+`0x47a0_3c8f_6701_f240` is byte-identical** (full `tools/gate.sh` GREEN, 180/180 sim-core incl. `--features
+determinism`); adversarially verified (the CODE) on every dimension. Rebased onto + composed with PERF-1 (both land together; the compose is byte-identical — the `determinism` gate stays `0x47a0`).
+- **Helpers (lib.rs):** `sort_merge_org_i64` (sort + sum-merge dup keys == `entry().or_insert(0)+=v`) and `org_lookup`
+  (`binary_search` == `BTreeMap::get`). The reusable pattern for any future OrgId-keyed collect/apply map.
+- **Sites:** `by_org`/`maint_energy`/`parent_debit` (lib.rs), `spent` (chem.rs, genuine kin+alarm dup-sum),
+  `pred_credit`/`symb_credit` + the `prey_debit`/`host_debit` struct maps (`PreyDebit{eaten,dead}`/`HostDebit{drawn}`,
+  three-phase build→get_mut→get preserved) + the two `despawn_set`s + `dead_set` membership sets (sorted `Vec` +
+  `binary_search` == `BTreeSet::contains`); `litterfall`/`toxin_mints` stay collect-then-iterate (lookup-free). Two
+  new scratch resources `PredationScratch`/`HostCouplingScratch` (trophic.rs), registered in `Simulation::new`.
+- **Result:** tick_loop **−48 %** — re-benched BACK-TO-BACK on the same machine after rebasing onto PERF-1 (criterion
+  `--baseline`): marginal **−47.4 % / −48.9 % / −47.8 %** (p < 0.05) at 1 k / 5 k / 10 k = 32.2 / 151.8 / 308.2 ms vs
+  PERF-1's own 61.4 / 297.3 / 590.9 ms (~1.6 M updates/s, ≈1.9×). PERF-1's scratch-Vec hoist was itself perf-neutral on
+  this bench (it eliminated allocations off the critical path), so the −48 % is genuinely PERF-2's marginal gain. The
+  zero-lookup position-indexed `Vec` is NOT achievable for the maps applied via the arbitrary-order `q.iter_mut()` ECS
+  query — `binary_search` is the correct ceiling there.
+- **Follow-up:** the plant-only pinned config early-returns out of predation/host_coupling, so a golden-hash pin on a
+  predator/symbiont roster would lock those byte-paths in CI (today covered by the green `f6_`/`s5_` determinism tests).
+
 ### PERF-1 — hoist metabolism/mineralize scratch Vecs into reused resources (perf, sim-core) — HASH-NEUTRAL
 The first perf slice: eliminate per-tick `Vec` allocations in the two heaviest systems (`metabolism` +
 `mineralize`) by hoisting their scratch buffers into reused Bevy resources (the `MetabolismScratch` /

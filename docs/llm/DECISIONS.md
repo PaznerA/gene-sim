@@ -1058,6 +1058,49 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
 
 ---
 
+## ADR-026 — PERF-2: per-tick OrgId-keyed `BTreeMap`/`BTreeSet` → reused sorted-`Vec` (hash-neutral)
+
+- **Status:** Accepted (2026-06-26). **Hash-neutral** — the pinned literal `0x47a0_3c8f_6701_f240` is byte-identical
+  (`same_seed_same_hash` green; 180/180 sim-core tests incl. `--features determinism`). NOT a re-pin.
+- **Context:** post-F5, the hot path still built a fistful of OrgId-keyed `BTreeMap`s + `BTreeSet`s FRESH every tick
+  over the whole living set (`by_org`, `maint_energy`, `parent_debit` in lib.rs; `spent` in chem.rs; `pred_credit`,
+  `symb_credit`, the `prey_debit`/`host_debit` struct maps, the collect maps `litterfall`/`toxin_mints`, and the
+  `dead_set`/`despawn_set` membership sets in trophic.rs). The post-F5 baseline note had DEFERRED these as "would
+  re-pin." Profiling re-opened it: the hot `items`/`rows` vectors are already sorted by `(cell, species, OrgId)`, so
+  every map's iteration/lookup order is reproducible from a sorted `Vec` — the conversion can be byte-identical.
+- **Decision:** replace each with a REUSED sorted-`Vec` scratch buffer held in a `Resource` (the PERF-1
+  `mem::take` + `clear()` discipline). Two helpers in lib.rs: `sort_merge_org_i64` (sort by key + sum-merge dup keys
+  — byte-identical to `entry().or_insert(0)+=v`) and `org_lookup` (`binary_search` == `BTreeMap::get`). By shape:
+  i64 maps → `Vec<(u64,i64)>` + the helpers; collect-then-iterate maps (`litterfall`/`toxin_mints`) → row `Vec`
+  sorted by `(cell,..)` then iterated (NO lookup — already the zero-lookup ideal); membership sets → sorted
+  `Vec<Entity>` + `binary_search` (== `BTreeSet::contains`); struct-valued maps (`prey_debit` `PreyDebit{eaten,dead}`,
+  `host_debit` `HostDebit{drawn}`) → `Vec<(u64,T)>` sorted by org with a struct-aware sum-merge + `binary_search`
+  get/get_mut (the three-phase build→get_mut(dead)→get(apply) preserved). Two new scratch structs
+  `PredationScratch` / `HostCouplingScratch` (trophic.rs), registered in `Simulation::new`.
+- **Why hash-neutral (and why NOT the "even-better" zero-lookup everywhere):** the ECS-mutating apply passes keep
+  using the arbitrary-order `q.iter_mut()` query (ECS table order is NOT canonical — the reason collect-then-apply
+  exists), so a zero-lookup `Vec` indexed by items-position is NOT achievable there; `binary_search` is the correct
+  ceiling. Only `litterfall`/`toxin_mints`, applied by iterating the buffer itself, are lookup-free.
+- **Result:** tick_loop **−48 %** across the board (1 k 32.0 ms / 5 k 151.3 ms / 10 k 305.2 ms vs the PERF-1 baseline
+  61.7 / 295.4 / 590.8 ms; ~1.64 M updates/s at 10 k, ≈1.9×), all p < 0.05 — the per-node heap alloc + pointer-chase
+  of a per-tick `BTreeMap` over thousands of orgs was a large fraction of the plant-only tick.
+  - **Back-to-back re-confirmation (2026-06-27, after rebasing PERF-2 onto PERF-1):** criterion `--baseline` on the
+    same machine, PERF-1 (`ed558d7`) vs PERF-2 composed (`3886fc6`) → marginal **−47.4 % / −48.9 % / −47.8 %**
+    (p < 0.05) at 1 k / 5 k / 10 k = 32.2 / 151.8 / 308.2 ms vs 61.4 / 297.3 / 590.9 ms. Note PERF-1's own bench
+    (61.4 / 297.3 / 590.9) matches this "PERF-1 baseline" row: PERF-1's scratch-Vec hoist was perf-NEUTRAL on this
+    bench (it eliminated allocations off the critical path), so the −48 % is genuinely PERF-2's marginal contribution,
+    not PERF-1 + PERF-2 conflated. The recorded table numbers (32.0 / 151.3 / 305.2) sit within run-to-run noise of
+    the fresh 32.2 / 151.8 / 308.2.
+- **Coverage caveat (follow-up):** the pinned config is plant-only and early-returns out of predation/host_coupling,
+  so the `prey_debit`/`host_debit`/`pred_credit`/`symb_credit`/`despawn_set` conversions are NOT locked by the
+  pinned literal — they rest on the construction-equivalence above + the green `f6_predation_*` / `s5_host_coupling_*`
+  conservation + run-to-run determinism tests. A cheap follow-up: pin a golden hash on a predator/symbiont roster to
+  lock those byte-paths in CI.
+- **Consequences:** supersedes the post-F5 "Deferred — would re-pin" note. `sort_merge_org_i64` / `org_lookup` are
+  the reusable pattern for any future OrgId-keyed per-tick collect/apply map.
+
+---
+
 ## Baseline benchmarks — perf threshold (SPEC §11, §10.7)
 
 Reference platform: Apple M4 Max, native aarch64, `release` profile (`lto = "thin"`, `codegen-units = 1`).
@@ -1065,14 +1108,15 @@ Source: `cargo bench -p sim-core` (`crates/sim-core/benches/tick.rs`), run via `
 The perf gate (§10.7) fails on a regression **below the CURRENT baseline**. Re-baseline at each stage that
 changes the hot path, in the same slice (this is anticipated — see the Stage 0 row note).
 
-### Current baseline — post-F5 full F3→F4→F5 pipeline (energy-funded births/deaths + obligate trophic loop + chem field), after the hash-neutral scratch-buffer pass
+### Current baseline — post-F5 pipeline, after the PERF-2 BTreeMap→sorted-Vec pass (ADR-026, hash-neutral)
 | Workload (entities × generations) | Median wall time | Throughput |
 |---|---|---|
-| 1 000 × 50  | **61.7 ms** | ~0.81 M organism-updates/s |
-| 5 000 × 50  | **295.4 ms** | ~0.85 M organism-updates/s |
-| 10 000 × 50 | **590.8 ms** | ~0.85 M organism-updates/s |
+| 1 000 × 50  | **32.0 ms** | ~1.56 M organism-updates/s |
+| 5 000 × 50  | **151.3 ms** | ~1.65 M organism-updates/s |
+| 10 000 × 50 | **305.2 ms** | ~1.64 M organism-updates/s |
 
-**Headline (current):** ~**0.85 M organism-updates/s** at 10 k entities. The ~25× slowdown vs the stale R1.1
+**Headline (current):** ~**1.64 M organism-updates/s** at 10 k entities (≈1.9× the post-PERF-1 row below).
+The large slowdown vs the stale R1.1
 row is the real cost of the post-F0b biology, NOT a regression: F3 replaced constant-N Wright-Fisher with a
 variable-N energy-funded births/deaths chemostat (per-cell Monod uptake, largest-remainder apportionment over
 co-located demanders, per-org `split_budget` convert, conserved-J ledger asserted every tick), F4 added the
@@ -1080,7 +1124,7 @@ decomposer mineralization loop + the measured `FlowMatrix`, and F5 added the tox
 and the `entities_N` count is the SPAWN count; population then grows over the 50 generations, so each "tick"
 processes well more than N orgs. (The R1.1 row is kept under Historical for the record.)
 
-**Hash-neutral perf pass (this baseline):** an allocation-elimination sweep that preserved the EXACT integer
+**Prior pass — PERF-1 (scratch-buffer reuse, the post-F5 row this PERF-2 baseline supersedes):** an allocation-elimination sweep that preserved the EXACT integer
 sequence (`determinism_hash_is_pinned` = `0x47a0_3c8f_6701_f240`, byte-identical throughout). Changes, all
 reusing scratch across ticks or hoisting a constant out of the hot loop — never touching iteration/accumulation
 order or any value: (1) `fixed::apportion_into` / `split_budget_into` — buffer-reusing cores of `apportion` /
@@ -1094,10 +1138,16 @@ snapshots, now `clear()`+refill / `extend_from_slice`), and the per-channel `src
 (reused `ChemField.src_buf`). Net: 1 k −13 %, 5 k −8 %, 10 k −6 % vs the pre-pass post-F5 numbers (70.9 / 321.2
 / 631.4 ms), all p < 0.05.
 
-**Deferred (would re-pin — NOT taken here):** the remaining per-tick `BTreeMap`s (`by_org`, `maint_energy`,
-`parent_debit`, `spent`, `litterfall`, `toxin_mints`) are OrgId-keyed lookup/collect maps; swapping them for a
-sorted-`Vec` + binary-search is allocation-lighter but is a structural change worth its own slice, and any
-mis-step there moves the hash — so it is left as a follow-up, not folded into this hash-neutral pass.
+**PERF-2 (ADR-026) — DONE, hash-neutral (supersedes the prior "deferred — would re-pin" note):** the remaining
+per-tick OrgId-keyed `BTreeMap`s (`by_org`, `maint_energy`, `parent_debit`, `spent`, `pred_credit`, `symb_credit`,
+the `litterfall`/`toxin_mints` collect maps, the `prey_debit`/`host_debit` struct maps) and `BTreeSet`s
+(`dead_set`, the two `despawn_set`s) were all swapped for REUSED sorted-`Vec` scratch buffers
+(`sort_merge_org_i64` + `org_lookup`/`binary_search`). The "any mis-step moves the hash" worry did NOT
+materialize — careful construction-equivalence (sorted-unique-key Vec ≡ BTreeMap iteration; binary_search ≡
+`get`; sort-merge sum ≡ `entry().or_insert(0)+=`; sorted Vec + binary_search ≡ `BTreeSet::contains`) kept the
+pinned literal `0x47a0_3c8f_6701_f240` byte-identical (180/180 sim-core tests green). Net vs the post-F5 PERF-1
+row above: **1 k −48 %, 5 k −49 %, 10 k −48 %** (32.0 / 151.3 / 305.2 ms vs 61.7 / 295.4 / 590.8 ms), all
+p < 0.05 — the BTreeMap per-node heap-alloc + pointer-chase was a large fraction of the plant-only tick.
 
 ### Historical — Stage 0 (slice S0): empty deterministic loop (no selection)
 | 1 000 × 50 → **302.6 µs** · 5 000 × 50 → **1.438 ms** · 10 000 × 50 → **2.856 ms** (~175 M updates/s). |

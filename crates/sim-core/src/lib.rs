@@ -314,6 +314,18 @@ struct MetabolismScratch {
     split: Vec<i64>,
     split_w: Vec<u64>,
     split_rem: Vec<(u128, usize)>,
+    /// PERF-2 (hash-neutral): the Pass-3 per-org granted-total map, a reused SORTED-by-OrgId `Vec<(org, J)>`
+    /// replacing a per-tick `BTreeMap<u64, i64>`. A sorted unique-key Vec + `binary_search` ([`org_lookup`]) is
+    /// byte-identical to `BTreeMap::get`; the keys are unique so [`sort_merge_org_i64`]'s merge is a no-op.
+    by_org: Vec<(u64, i64)>,
+    /// PERF-2 (hash-neutral): per-org litterfall deposit rows `(cell, species, org, amt)`, a reused `Vec`
+    /// replacing a per-tick OrgId-keyed `BTreeMap` that was re-collected + sorted to `(cell, species, org)`.
+    /// Sorting the rows directly by `(cell, species, org)` yields the IDENTICAL applied order (org-keyed map
+    /// intermediate order is discarded by the re-sort) → byte-identical.
+    litterfall: Vec<(u32, u16, u64, i64)>,
+    /// PERF-2 (hash-neutral): per-org toxin-mint deposit rows `(cell, org, amt)`, a reused `Vec` replacing a
+    /// per-tick OrgId-keyed `BTreeMap` re-collected + sorted to `(cell, org)` (the litterfall precedent).
+    toxin_mints: Vec<(u32, u64, i64)>,
 }
 
 /// REUSABLE per-tick scratch buffers for [`reproduce_or_die`]'s canonical-order row vector + the two frozen
@@ -324,6 +336,47 @@ struct ReproScratch {
     rows: Vec<ReproRow>,
     frozen_toxin: Vec<i32>,
     frozen_alarm: Vec<i32>,
+    /// PERF-2 (hash-neutral): the post-maintenance per-org Energy map, a reused SORTED-by-OrgId `Vec<(org, J)>`
+    /// replacing a per-tick `BTreeMap<u64, i64>`. Unique keys ([`sort_merge_org_i64`] merge is a no-op);
+    /// [`org_lookup`] `binary_search` == `BTreeMap::get` → byte-identical.
+    maint_energy: Vec<(u64, i64)>,
+    /// PERF-2 (hash-neutral): the dead-entity membership set, a reused SORTED `Vec<Entity>` replacing a per-tick
+    /// `BTreeSet<Entity>`. `binary_search(&e).is_ok()` == `BTreeSet::contains` (both need `Entity: Ord`).
+    dead_set: Vec<Entity>,
+    /// PERF-2 (hash-neutral): the per-parent endowment-debit map, a reused SORTED-by-OrgId `Vec<(org, J)>`
+    /// replacing a per-tick `BTreeMap<u64, i64>` (unique keys; the [`by_org`](MetabolismScratch::by_org) shape).
+    parent_debit: Vec<(u64, i64)>,
+}
+
+/// PERF-2 (hash-neutral): sort a `(OrgId, i64)` collect-buffer by key and merge consecutive duplicate keys by
+/// SUMMING their values — byte-identical to a `BTreeMap<u64, i64>` `entry().or_insert(0) += v` accumulate
+/// (sorted ascending by key, each key once carrying the SUM). `i64` addition is order-independent and the
+/// per-tick magnitudes are bounded `<< i64::MAX` (J quanta), so the merge cannot overflow.
+pub(crate) fn sort_merge_org_i64(buf: &mut Vec<(u64, i64)>) {
+    buf.sort_unstable_by_key(|(k, _)| *k);
+    if buf.len() <= 1 {
+        return;
+    }
+    let mut write = 0usize;
+    for read in 1..buf.len() {
+        if buf[read].0 == buf[write].0 {
+            buf[write].1 += buf[read].1;
+        } else {
+            write += 1;
+            if write != read {
+                buf[write] = buf[read];
+            }
+        }
+    }
+    buf.truncate(write + 1);
+}
+
+/// PERF-2 (hash-neutral): `binary_search` on a sorted unique-key `(OrgId, i64)` buffer — byte-identical to
+/// `BTreeMap::get` (the buffer must have been passed through [`sort_merge_org_i64`] first).
+pub(crate) fn org_lookup(buf: &[(u64, i64)], key: u64) -> Option<i64> {
+    buf.binary_search_by_key(&key, |(k, _)| *k)
+        .ok()
+        .map(|i| buf[i].1)
 }
 
 /// Stable per-organism id, assigned monotonically from [`NextOrgId`] (ADR-013 F3 — widened to `u64` now that
@@ -959,20 +1012,30 @@ fn metabolism(
     // ── Pass 3: CONVERT each org's granted J + per-tick Age bump. ──
     // Map OrgId→granted-total in canonical order; per-org effects are then a pure function of that total, so
     // the (order-independent) query mutation below is deterministic (inv #3).
-    let mut by_org: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): a reused SORTED-by-OrgId `Vec<(org, J)>` instead of a per-tick `BTreeMap<u64, i64>`.
+    // Each org appears exactly once in `items`, so [`sort_merge_org_i64`]'s dup-merge is a defensive no-op and a
+    // sorted unique-key Vec + [`org_lookup`] `binary_search` is byte-identical to `BTreeMap`'s insert/get.
+    let mut by_org = std::mem::take(&mut scratch.by_org);
+    by_org.clear();
     for (i, it) in items.iter().enumerate() {
-        by_org.insert(it.org, granted[i].iter().sum());
+        by_org.push((it.org, granted[i].iter().sum()));
     }
+    sort_merge_org_i64(&mut by_org);
     // Per-org litterfall deposits, COLLECTED here (the q.iter_mut() walk is arbitrary order) and applied to the
     // shared detritus pool in a SEPARATE canonical (cell, SpeciesId, OrgId) pass so the cap-overflow routing is
     // order-pinned (ADR-013 F4, adversarial #2).
-    let mut litterfall: std::collections::BTreeMap<u64, (u32, u16, i64)> =
-        std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): a reused row `Vec<(cell, species, org, amt)>` instead of a per-tick OrgId-keyed
+    // `BTreeMap` that was re-collected + sorted to `(cell, species, org)`. Sorting these rows directly by
+    // `(cell, species, org)` produces the IDENTICAL applied order (the org-keyed intermediate order is discarded
+    // by the re-sort) — byte-identical, with no per-tick allocation.
+    let mut litterfall = std::mem::take(&mut scratch.litterfall);
+    litterfall.clear();
     // ADR-013 F5: per-org toxin mints, COLLECTED here (the q.iter_mut() walk is arbitrary order) and applied to
     // the chem toxin plane in a SEPARATE canonical (cell, SpeciesId, OrgId) pass so the cap-overflow routing is
     // order-pinned (the litterfall precedent). Each is a paired respired↔toxin split that conserves J.
-    let mut toxin_mints: std::collections::BTreeMap<u64, (u32, i64)> =
-        std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): a reused row `Vec<(cell, org, amt)>` sorted to `(cell, org)` (the litterfall shape).
+    let mut toxin_mints = std::mem::take(&mut scratch.toxin_mints);
+    toxin_mints.clear();
     // Reusable convert-split buffers (perf, hash-neutral): `split_budget_into` is bit-identical to
     // `split_budget`; only the per-org output/scratch ownership moves out of the loop.
     let mut split = std::mem::take(&mut scratch.split);
@@ -983,8 +1046,8 @@ fn metabolism(
     split_rem.clear();
     for (id, sp, mut energy, mut biomass, mut age, _d, _t, p) in q.iter_mut() {
         age.0 = age.0.saturating_add(1);
-        let granted_total = match by_org.get(&id.0) {
-            Some(&g) if g > 0 => g,
+        let granted_total = match org_lookup(&by_org, id.0) {
+            Some(g) if g > 0 => g,
             _ => continue,
         };
         // CONVERT: split granted J across the 5 budget channels (conserved by split_budget).
@@ -1037,21 +1100,17 @@ fn metabolism(
         ledger.respired += respired_convert - toxin_minted - litter;
         ledger.overflow += b_over + e_over;
         if litter > 0 {
-            litterfall.insert(id.0, (cell_index(p, width), sp.0 .0, litter));
+            litterfall.push((cell_index(p, width), sp.0 .0, id.0, litter));
         }
         if toxin_minted > 0 {
-            toxin_mints.insert(id.0, (cell_index(p, width), toxin_minted));
+            toxin_mints.push((cell_index(p, width), id.0, toxin_minted));
         }
     }
     // Apply toxin mints in canonical (cell, OrgId) order (the BTreeMap is OrgId-keyed; sort by (cell, org) so a
     // cap-saturation spill is order-pinned — the litterfall precedent). Each deposit is the paired half of the
     // respired↔toxin move debited above; the cap-rejected part routes to overflow (nets out — never silent clamp).
-    let mut toxin_rows: Vec<(u32, u64, i64)> = toxin_mints
-        .into_iter()
-        .map(|(org, (cell, amt))| (cell, org, amt))
-        .collect();
-    toxin_rows.sort_unstable_by_key(|r| (r.0, r.1));
-    for (cell, _org, amt) in toxin_rows {
+    toxin_mints.sort_unstable_by_key(|r| (r.0, r.1));
+    for &(cell, _org, amt) in &toxin_mints {
         let cellu = cell as usize;
         // milli == J 1:1; amt is bounded by the Defense slice << i32::MAX.
         let rejected = chem::deposit_capped_plane(
@@ -1065,12 +1124,8 @@ fn metabolism(
     // the rows by (cell, species, org) so a cap-saturation spill is order-pinned — adversarial #2). Each is a
     // paired respired↔detritus split that conserves J; provenance tags the depositing species (the FlowMatrix
     // attributes the decomposer's later harvest of it to this plant).
-    let mut litter_rows: Vec<(u32, u16, u64, i64)> = litterfall
-        .into_iter()
-        .map(|(org, (cell, sp, amt))| (cell, sp, org, amt))
-        .collect();
-    litter_rows.sort_unstable_by_key(|r| (r.0, r.1, r.2));
-    for (cell, sp, _org, amt) in litter_rows {
+    litterfall.sort_unstable_by_key(|r| (r.0, r.1, r.2));
+    for &(cell, sp, _org, amt) in &litterfall {
         let cellu = cell as usize;
         let headroom = (POOL_CAP - pools.detritus[cellu]).max(0);
         let accepted = amt.min(headroom);
@@ -1093,6 +1148,9 @@ fn metabolism(
     scratch.split = split;
     scratch.split_w = split_w;
     scratch.split_rem = split_rem;
+    scratch.by_org = by_org;
+    scratch.litterfall = litterfall;
+    scratch.toxin_mints = toxin_mints;
 }
 
 /// One organism's metabolism row in canonical `(cell, species, org)` order.
@@ -1346,7 +1404,11 @@ fn reproduce_or_die(
     // ── Step 1+2: maintenance debit, then death (carcass→detritus) — all RNG-free, canonical order. ──
     let mut dead: Vec<Entity> = Vec::new();
     // Track per-entity post-maintenance Energy so the birth pass reads the debited value.
-    let mut maint_energy: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): a reused SORTED-by-OrgId `Vec<(org, J)>` instead of a per-tick `BTreeMap<u64, i64>`.
+    // Rows carry unique orgs, so [`sort_merge_org_i64`]'s dup-merge is a no-op; [`org_lookup`] `binary_search` ==
+    // `BTreeMap::get`. Pushed during the death pass, then sorted ONCE before any read (byte-identical).
+    let mut maint_energy = std::mem::take(&mut repro_scratch.maint_energy);
+    maint_energy.clear();
     for r in &rows {
         let strat = &registry.entries[r.species as usize].strategy;
         let cellu = r.cell as usize;
@@ -1370,7 +1432,7 @@ fn reproduce_or_die(
         let paid = total_debit.min(r.energy.max(0)); // never below 0 (no saturating_sub silent floor)
         let energy_after = r.energy - paid;
         ledger.respired += paid;
-        maint_energy.insert(r.org, energy_after);
+        maint_energy.push((r.org, energy_after));
 
         let starved = energy_after < MAINTENANCE_FLOOR;
         let senescent = r.age >= AGE_MAX;
@@ -1400,13 +1462,21 @@ fn reproduce_or_die(
             dead.push(r.entity);
         }
     }
+    // PERF-2 (hash-neutral): the death pass pushed one unique `(org, energy_after)` per row; sort+merge ONCE so
+    // the survivor + birth reads below are `binary_search` lookups byte-identical to `BTreeMap::get`.
+    sort_merge_org_i64(&mut maint_energy);
     // Apply the maintenance debit to the LIVE survivors (deaths are despawned below regardless).
-    let dead_set: std::collections::BTreeSet<Entity> = dead.iter().copied().collect();
+    // PERF-2 (hash-neutral): a reused SORTED `Vec<Entity>` instead of a per-tick `BTreeSet<Entity>`;
+    // `binary_search(&e).is_ok()` == `BTreeSet::contains` (both rely on `Entity: Ord`).
+    let mut dead_set = std::mem::take(&mut repro_scratch.dead_set);
+    dead_set.clear();
+    dead_set.extend(dead.iter().copied());
+    dead_set.sort_unstable();
     for (entity, id, _sp, mut energy, _b, _a, _g, _d, _t, _p) in q.iter_mut() {
-        if dead_set.contains(&entity) {
+        if dead_set.binary_search(&entity).is_ok() {
             continue; // about to despawn; its J already deposited
         }
-        if let Some(&e) = maint_energy.get(&id.0) {
+        if let Some(e) = org_lookup(&maint_energy, id.0) {
             energy.0 = e;
         }
     }
@@ -1419,7 +1489,10 @@ fn reproduce_or_die(
     let live_count = rows.len() - dead.len();
     let mut population = live_count as u32;
     // Collect parent updates + child spawns, then apply (no mutate-during-query for spawns; Commands defers).
-    let mut parent_debit: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): a reused SORTED-by-OrgId `Vec<(org, J)>` instead of a per-tick `BTreeMap<u64, i64>`
+    // (unique parent orgs; the `maint_energy` shape). Pushed during the birth pass, sorted ONCE before the apply.
+    let mut parent_debit = std::mem::take(&mut repro_scratch.parent_debit);
+    parent_debit.clear();
     struct Child {
         species: u16,
         org: u64,
@@ -1433,10 +1506,10 @@ fn reproduce_or_die(
     }
     let mut children: Vec<Child> = Vec::new();
     for r in &rows {
-        if dead_set.contains(&r.entity) {
+        if dead_set.binary_search(&r.entity).is_ok() {
             continue; // a dead org does not breed (death pins the draw set cleanly)
         }
-        let energy = *maint_energy.get(&r.org).unwrap_or(&r.energy);
+        let energy = org_lookup(&maint_energy, r.org).unwrap_or(r.energy);
         if energy < REPRO_THRESHOLD {
             continue; // below threshold: no draws (draw order = pure fn of the survivor list)
         }
@@ -1454,7 +1527,7 @@ fn reproduce_or_die(
             continue;
         }
         // Conserved endowment transfer (no minting): parent spends OFFSPRING_ENDOWMENT.
-        parent_debit.insert(r.org, OFFSPRING_ENDOWMENT);
+        parent_debit.push((r.org, OFFSPRING_ENDOWMENT));
         // Inheritance with mutation — SAME per-birth draw-shape as before, now integer mutation steps on the
         // f64 traits (heritable f64 stays f64 at F3 — the multi-ISA gate proves byte-stability, finding #3).
         let child_g = mutate_unit(r.genotype, dg);
@@ -1488,10 +1561,13 @@ fn reproduce_or_die(
         });
         population += 1;
     }
+    // PERF-2 (hash-neutral): sort+merge the pushed parent debits ONCE (unique keys → merge no-op) so the apply
+    // below is a `binary_search` lookup byte-identical to `BTreeMap::get`.
+    sort_merge_org_i64(&mut parent_debit);
     // Apply parent debits (the endowment spent) to the live survivors.
     if !parent_debit.is_empty() {
         for (_entity, id, _sp, mut energy, _b, _a, _g, _d, _t, _p) in q.iter_mut() {
-            if let Some(&debit) = parent_debit.get(&id.0) {
+            if let Some(debit) = org_lookup(&parent_debit, id.0) {
                 energy.0 -= debit;
             }
         }
@@ -1514,6 +1590,9 @@ fn reproduce_or_die(
     repro_scratch.rows = rows;
     repro_scratch.frozen_toxin = frozen_toxin;
     repro_scratch.frozen_alarm = frozen_alarm;
+    repro_scratch.maint_energy = maint_energy;
+    repro_scratch.dead_set = dead_set;
+    repro_scratch.parent_debit = parent_debit;
 }
 
 /// Mutate a `[0,1]` heritable scalar by a small symmetric integer step derived from a `SimRng` word — no
@@ -1892,6 +1971,10 @@ impl Simulation {
         world.insert_resource(ReproScratch::default());
         world.insert_resource(chem::ChemEmitScratch::default());
         world.insert_resource(trophic::MineralizeScratch::default());
+        // PERF-2 (hash-neutral): the reused per-tick scratch for the org-eats-org kernels (sorted-Vec replacements
+        // for the per-tick OrgId-keyed BTreeMap/BTreeSet collections).
+        world.insert_resource(trophic::PredationScratch::default());
+        world.insert_resource(trophic::HostCouplingScratch::default());
         world.insert_resource(ResourceFieldRes(resource_field));
         // ADR-013 F5: the chemical/signal field (toxin/kin/alarm), seeded ALL-ZERO — chem is ENDOGENOUS
         // (emitted by organisms, never seed-generated), so it draws NO derive_seed / SimRng. Because Σchem == 0

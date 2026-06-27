@@ -767,8 +767,8 @@ pub(crate) fn reset_flow(mut flow: ResMut<FlowMatrix>) {
 // → respired). It DEBITS prey Energy/Biomass, marks-and-deposits its own kills' carcass residual + despawns
 // them (predation runs AFTER reproduce_or_die, so a prey drained to 0 by predation would otherwise survive as a
 // 0-J zombie). RNG-free (DrawCount untouched → births stay the sole RNG consumer), all `i64`, no `HashMap`
-// iterated (BTreeMap for the org-keyed prey-debit set), walked in canonical `(cell, SpeciesId, OrgId)` order
-// (inv #3). On a predator-free roster the predator row vector is empty → early `return` (the mineralize no-op
+// iterated (a sorted `Vec` for the org-keyed prey-debit set — PERF-2), walked in canonical `(cell, SpeciesId,
+// OrgId)` order (inv #3). On a predator-free roster the predator row vector is empty → early `return` (the mineralize no-op
 // precedent) → it moves no value and draws nothing → HASH-NEUTRAL on the pinned plant run.
 
 /// A predator's `predation` row, snapshotted in canonical `(cell, SpeciesId, OrgId)` order.
@@ -794,9 +794,24 @@ struct PreyRow {
 
 /// A pending debit applied to a prey org after the canonical walk (never mutate-during-query — the
 /// reproduce_or_die discipline). `eaten >= 0`; the prey loses `eaten` J Energy-first-then-Biomass.
+#[derive(Clone, Copy)]
 struct PreyDebit {
     eaten: i64,
     dead: bool,
+}
+
+/// PERF-2 (hash-neutral): reused per-tick scratch buffers for [`predation`], replacing the per-tick OrgId-keyed
+/// `BTreeMap`/`BTreeSet` collections with SORTED `Vec`s (cleared + refilled each tick; never carried state, never
+/// hashed). A sorted unique-key `Vec` + `binary_search` is byte-identical to a `BTreeMap::get`/`BTreeSet::contains`;
+/// dup keys (a predator that eats multiple prey) are SUMMED by [`crate::sort_merge_org_i64`] == `entry().or_insert`.
+#[derive(Resource, Default)]
+pub(crate) struct PredationScratch {
+    /// Per-predator credited J, sorted by OrgId; dup orgs (eating multiple prey) SUMMED.
+    pred_credit: Vec<(u64, i64)>,
+    /// Per-prey debit `(org, PreyDebit)`, sorted by OrgId (the struct-valued three-phase build/get_mut/get path).
+    prey_debit: Vec<(u64, PreyDebit)>,
+    /// The despawn membership set, sorted (`binary_search` == `BTreeSet::contains`).
+    despawn: Vec<Entity>,
 }
 
 /// **PREDATION** (ADR-013 F6 KEYSTONE) — Bdellovibrio consume co-located prey J on a FROZEN start-of-tick census,
@@ -821,6 +836,7 @@ pub(crate) fn predation(
     registry: Res<SpeciesRegistry>,
     edit_mod: Res<crate::EditModifierRes>,
     mut commands: Commands,
+    mut scratch: ResMut<PredationScratch>,
     mut pools: ResMut<crate::PoolStock>,
     mut prov: ResMut<PoolProvenance>,
     mut flow: ResMut<FlowMatrix>,
@@ -955,9 +971,13 @@ pub(crate) fn predation(
     // predators by their grant share, and likewise split the predator's grant across the prey it ate — so the
     // FlowMatrix edge + predator credit are attributed per (predator, prey-species) with no over-eat. Conserves
     // J exactly: Σ prey-loss == Σ predator-grant == Σ (kept + tax). All canonical-ordered, integer (inv #3).
-    let mut prey_debit: std::collections::BTreeMap<u64, PreyDebit> =
-        std::collections::BTreeMap::new();
-    let mut pred_credit: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): reused SORTED `Vec`s instead of per-tick `BTreeMap`s. `prey_debit` is built (push),
+    // sorted+merged (summing `eaten` over dup orgs — defensive, each prey org is touched in exactly one cell),
+    // then `binary_search`ed for the get_mut/get phases; `pred_credit` SUMS a predator's per-prey credits.
+    let mut prey_debit = std::mem::take(&mut scratch.prey_debit);
+    prey_debit.clear();
+    let mut pred_credit = std::mem::take(&mut scratch.pred_credit);
+    pred_credit.clear();
 
     let mut prey_w: Vec<u64> = Vec::new();
     let mut prey_eaten: Vec<i64> = Vec::new(); // per cell-prey: total J this prey loses this tick
@@ -992,13 +1012,8 @@ pub(crate) fn predation(
                     continue;
                 }
                 // Record the prey debit (it loses exactly `eaten`, Energy-first-then-Biomass, applied below).
-                prey_debit
-                    .entry(pr.org)
-                    .or_insert(PreyDebit {
-                        eaten: 0,
-                        dead: false,
-                    })
-                    .eaten += eaten;
+                // PERF-2 (hash-neutral): push then sort+merge below (dup orgs SUM `eaten`) == the BTreeMap accumulate.
+                prey_debit.push((pr.org, PreyDebit { eaten, dead: false }));
                 // (2) Split this prey's `eaten` back across the cell's predators by their grant share, so the
                 // predator credit + FlowMatrix edge are attributed per (predator, prey-species). Σ pred_share == eaten.
                 pred_share.resize(pj - pi, 0);
@@ -1021,7 +1036,7 @@ pub(crate) fn predation(
                     let kept = take * crate::EFF_NUM / crate::EFF_DEN;
                     let tax = take - kept;
                     ledger.respired += tax;
-                    *pred_credit.entry(pred_org).or_insert(0) += kept;
+                    pred_credit.push((pred_org, kept));
                     // FlowMatrix: net assimilated J flowed FROM prey species INTO predator species (the off-
                     // diagonal predation edge; the diagonal pairing keeps the predator row summing to 0).
                     flow.record(pred_species, pr.species as usize, kept);
@@ -1031,13 +1046,21 @@ pub(crate) fn predation(
         pi = pj;
     }
 
+    // PERF-2 (hash-neutral): sort+merge `prey_debit` by OrgId (summing `eaten` over dup orgs — defensive, each
+    // prey org is debited in exactly one cell; `dead` is `false` for every build-time row) and sort+merge
+    // `pred_credit` (SUMMING a predator's per-prey credits) ONCE so the get_mut/get phases below are
+    // `binary_search` lookups byte-identical to `BTreeMap::get`.
+    sort_merge_prey_debit(&mut prey_debit);
+    crate::sort_merge_org_i64(&mut pred_credit);
+
     // Apply prey debits: Energy-first-then-Biomass; a prey drained to 0 J is fully eaten (despawn, no residual);
     // a partial bite leaving a sub-floor residual deposits the carcass to detritus (the reproduce_or_die path).
     let mut to_despawn: Vec<Entity> = Vec::new();
     for r in &prey {
-        let Some(d) = prey_debit.get_mut(&r.org) else {
+        let Ok(di) = prey_debit.binary_search_by_key(&r.org, |(k, _)| *k) else {
             continue;
         };
+        let d = &mut prey_debit[di].1;
         if d.eaten <= 0 {
             continue;
         }
@@ -1067,19 +1090,25 @@ pub(crate) fn predation(
 
     // Apply the surviving-prey debits + predator credits via the live query (AFTER the walk; never mutate-during-
     // query for the despawned set). Despawns are deferred through Commands.
-    let despawn_set: std::collections::BTreeSet<Entity> = to_despawn.iter().copied().collect();
+    // PERF-2 (hash-neutral): a reused SORTED `Vec<Entity>` instead of a per-tick `BTreeSet<Entity>`;
+    // `binary_search(&e).is_ok()` == `BTreeSet::contains`.
+    let mut despawn_set = std::mem::take(&mut scratch.despawn);
+    despawn_set.clear();
+    despawn_set.extend(to_despawn.iter().copied());
+    despawn_set.sort_unstable();
     for (entity, id, _sp, mut energy, mut biomass, _p) in q.iter_mut() {
-        if despawn_set.contains(&entity) {
+        if despawn_set.binary_search(&entity).is_ok() {
             continue; // about to despawn; its J already deposited as carcass / fully consumed
         }
-        if let Some(d) = prey_debit.get(&id.0) {
+        if let Ok(di) = prey_debit.binary_search_by_key(&id.0, |(k, _)| *k) {
             // Survivor: debit Energy-first-then-Biomass by the eaten amount.
+            let d = &prey_debit[di].1;
             let eaten = d.eaten.min(energy.0.max(0) + biomass.0.max(0));
             let from_energy = eaten.min(energy.0.max(0));
             energy.0 -= from_energy;
             biomass.0 -= eaten - from_energy;
         }
-        if let Some(&kept) = pred_credit.get(&id.0) {
+        if let Some(kept) = crate::org_lookup(&pred_credit, id.0) {
             // Predator gains the kept J into Energy; past the cap → overflow (never a silent clamp).
             let (new_e, over) = credit_capped(energy.0, kept, ENERGY_CAP);
             energy.0 = new_e;
@@ -1089,6 +1118,34 @@ pub(crate) fn predation(
     for e in &to_despawn {
         commands.entity(*e).despawn();
     }
+    // Return the reused buffers to the scratch resource (their allocations survive to the next tick).
+    scratch.prey_debit = prey_debit;
+    scratch.pred_credit = pred_credit;
+    scratch.despawn = despawn_set;
+}
+
+/// PERF-2 (hash-neutral): sort a `(OrgId, PreyDebit)` collect-buffer by key and merge consecutive duplicate orgs
+/// by SUMMING their `eaten` — byte-identical to a `BTreeMap<u64, PreyDebit>` `entry().or_insert(..).eaten += v`
+/// accumulate. `dead` is `false` on every build-time row (set later in the get_mut phase), so the merge only ever
+/// folds `eaten`. The struct-valued analogue of [`crate::sort_merge_org_i64`] (the plain `i64` helper does not
+/// apply to a struct value).
+fn sort_merge_prey_debit(buf: &mut Vec<(u64, PreyDebit)>) {
+    buf.sort_unstable_by_key(|(k, _)| *k);
+    if buf.len() <= 1 {
+        return;
+    }
+    let mut write = 0usize;
+    for read in 1..buf.len() {
+        if buf[read].0 == buf[write].0 {
+            buf[write].1.eaten += buf[read].1.eaten;
+        } else {
+            write += 1;
+            if write != read {
+                buf[write] = buf[read];
+            }
+        }
+    }
+    buf.truncate(write + 1);
 }
 
 // ── ADR-019 S5: the obligate-symbiont HOST-COUPLING interaction kernel — the host→symbiont J draw ─────────────
@@ -1100,8 +1157,8 @@ pub(crate) fn predation(
 // HOST→SYMBIONT DRAW ARM ONLY (a single conserved transfer like predation); "provisioning" is modeled as a
 // benign-low net draw (low `host_draw_rate` + the 7/10 efficiency tax) so coexistence is reachable, not a pure
 // parasitic drain — the genuine bidirectional reverse credit-back is a documented S5b stretch (sign-off, not v1).
-// RNG-free (DrawCount untouched → births stay the sole RNG consumer), all `i64`, no `HashMap` iterated (BTreeMap
-// for the org-keyed host-debit set), walked in canonical `(cell, SpeciesId, OrgId)` order (inv #3). On a
+// RNG-free (DrawCount untouched → births stay the sole RNG consumer), all `i64`, no `HashMap` iterated (a sorted
+// `Vec` for the org-keyed host-debit set — PERF-2), walked in canonical `(cell, SpeciesId, OrgId)` order (inv #3). On a
 // symbiont-free roster the symbiont row vector is empty → early `return` (the mineralize/predation no-op
 // precedent) → it moves no value and draws nothing → HASH-NEUTRAL on the pinned plant run. PINNED schedule slot:
 // immediately BEFORE `predation`, both on independently-frozen start-of-tick snapshots, so "host dies → symbiont
@@ -1132,8 +1189,21 @@ struct HostRow {
 
 /// A pending debit applied to a host org after the canonical walk (never mutate-during-query). `drawn >= 0`;
 /// the host loses `drawn` J Energy-first-then-Biomass.
+#[derive(Clone, Copy)]
 struct HostDebit {
     drawn: i64,
+}
+
+/// PERF-2 (hash-neutral): reused per-tick scratch buffers for [`host_coupling`], the structural twin of
+/// [`PredationScratch`] (sorted-`Vec` replacements for the per-tick OrgId-keyed `BTreeMap`/`BTreeSet`).
+#[derive(Resource, Default)]
+pub(crate) struct HostCouplingScratch {
+    /// Per-symbiont credited J, sorted by OrgId; dup orgs (drawing from multiple hosts) SUMMED.
+    symb_credit: Vec<(u64, i64)>,
+    /// Per-host debit `(org, HostDebit)`, sorted by OrgId (the struct-valued build/get/get path).
+    host_debit: Vec<(u64, HostDebit)>,
+    /// The despawn membership set, sorted (`binary_search` == `BTreeSet::contains`).
+    despawn: Vec<Entity>,
 }
 
 /// **HOST COUPLING** (ADR-019 S5 KEYSTONE) — obligate symbionts draw kept-J from their co-located declared HOST
@@ -1158,6 +1228,7 @@ pub(crate) fn host_coupling(
     registry: Res<SpeciesRegistry>,
     edit_mod: Res<crate::EditModifierRes>,
     mut commands: Commands,
+    mut scratch: ResMut<HostCouplingScratch>,
     mut pools: ResMut<crate::PoolStock>,
     mut prov: ResMut<PoolProvenance>,
     mut chem: ResMut<crate::chem::ChemField>,
@@ -1270,9 +1341,13 @@ pub(crate) fn host_coupling(
     //    capped at the host's frozen J) across the host orgs by frozen_j (each host gives ≤ its frozen_j EXACTLY),
     //    and back-split each host's `drawn` across the symbionts by their demand share, so the FlowMatrix edge +
     //    symbiont credit are attributed per (symbiont, host species) with no over-draw. Conserves J exactly. ──
-    let mut host_debit: std::collections::BTreeMap<u64, HostDebit> =
-        std::collections::BTreeMap::new();
-    let mut symb_credit: std::collections::BTreeMap<u64, i64> = std::collections::BTreeMap::new();
+    // PERF-2 (hash-neutral): reused SORTED `Vec`s instead of per-tick `BTreeMap`s (the predation precedent).
+    // `host_debit` is built (push), sorted+merged (summing `drawn` over dup orgs — defensive), then
+    // `binary_search`ed; `symb_credit` SUMS a symbiont's per-host credits.
+    let mut host_debit = std::mem::take(&mut scratch.host_debit);
+    host_debit.clear();
+    let mut symb_credit = std::mem::take(&mut scratch.symb_credit);
+    symb_credit.clear();
 
     let mut host_w: Vec<u64> = Vec::new();
     let mut host_drawn: Vec<i64> = Vec::new(); // per cell-host: total J this host org loses this tick
@@ -1330,10 +1405,8 @@ pub(crate) fn host_coupling(
                     continue;
                 }
                 // Record the host debit (it loses exactly `drawn`, Energy-first-then-Biomass, applied below).
-                host_debit
-                    .entry(hr.org)
-                    .or_insert(HostDebit { drawn: 0 })
-                    .drawn += drawn;
+                // PERF-2 (hash-neutral): push then sort+merge below (dup orgs SUM `drawn`) == the BTreeMap accumulate.
+                host_debit.push((hr.org, HostDebit { drawn }));
                 // (2) Back-split this host's `drawn` across the group's symbionts by their demand share, so the
                 // symbiont credit + FlowMatrix edge are attributed per (symbiont, host species). Σ symb_share == drawn.
                 symb_share.resize(group_symb.len(), 0);
@@ -1356,7 +1429,7 @@ pub(crate) fn host_coupling(
                     let kept = take * crate::EFF_NUM / crate::EFF_DEN;
                     let tax = take - kept;
                     ledger.respired += tax;
-                    *symb_credit.entry(symb_org).or_insert(0) += kept;
+                    symb_credit.push((symb_org, kept));
                     // FlowMatrix: net assimilated J flowed FROM the host species INTO the symbiont species (the
                     // host↔symbiont off-diagonal; the diagonal pairing keeps the symbiont row summing to 0).
                     flow.record(symb_species, hr.species as usize, kept);
@@ -1366,14 +1439,21 @@ pub(crate) fn host_coupling(
         si = sj;
     }
 
+    // PERF-2 (hash-neutral): sort+merge `host_debit` by OrgId (summing `drawn` over dup orgs — defensive, each
+    // host org is debited in exactly one cell) and sort+merge `symb_credit` (SUMMING a symbiont's per-host
+    // credits) ONCE so the get phases below are `binary_search` lookups byte-identical to `BTreeMap::get`.
+    sort_merge_host_debit(&mut host_debit);
+    crate::sort_merge_org_i64(&mut symb_credit);
+
     // Apply host debits: Energy-first-then-Biomass; a host drained to a sub-floor residual with no body left dies
     // (its residual → carcass→detritus, the standard conserved death path). The benign draw normally leaves the
     // host alive to integrate next tick.
     let mut to_despawn: Vec<Entity> = Vec::new();
     for r in &hosts {
-        let Some(d) = host_debit.get(&r.org) else {
+        let Ok(di) = host_debit.binary_search_by_key(&r.org, |(k, _)| *k) else {
             continue;
         };
+        let d = &host_debit[di].1;
         if d.drawn <= 0 {
             continue;
         }
@@ -1403,19 +1483,24 @@ pub(crate) fn host_coupling(
 
     // Apply the surviving-host debits + symbiont credits via the live query (AFTER the walk; never mutate-during-
     // query for the despawned set). Despawns are deferred through Commands.
-    let despawn_set: std::collections::BTreeSet<Entity> = to_despawn.iter().copied().collect();
+    // PERF-2 (hash-neutral): a reused SORTED `Vec<Entity>` instead of a per-tick `BTreeSet<Entity>`.
+    let mut despawn_set = std::mem::take(&mut scratch.despawn);
+    despawn_set.clear();
+    despawn_set.extend(to_despawn.iter().copied());
+    despawn_set.sort_unstable();
     for (entity, id, _sp, mut energy, mut biomass, _p) in q.iter_mut() {
-        if despawn_set.contains(&entity) {
+        if despawn_set.binary_search(&entity).is_ok() {
             continue; // about to despawn; its J already deposited as carcass
         }
-        if let Some(d) = host_debit.get(&id.0) {
+        if let Ok(di) = host_debit.binary_search_by_key(&id.0, |(k, _)| *k) {
             // Surviving host: debit Energy-first-then-Biomass by the drawn amount.
+            let d = &host_debit[di].1;
             let drawn = d.drawn.min(energy.0.max(0) + biomass.0.max(0));
             let from_energy = drawn.min(energy.0.max(0));
             energy.0 -= from_energy;
             biomass.0 -= drawn - from_energy;
         }
-        if let Some(&kept) = symb_credit.get(&id.0) {
+        if let Some(kept) = crate::org_lookup(&symb_credit, id.0) {
             // Symbiont gains the kept J into Energy; past the cap → overflow (never a silent clamp).
             let (new_e, over) = credit_capped(energy.0, kept, ENERGY_CAP);
             energy.0 = new_e;
@@ -1425,6 +1510,32 @@ pub(crate) fn host_coupling(
     for e in &to_despawn {
         commands.entity(*e).despawn();
     }
+    // Return the reused buffers to the scratch resource (their allocations survive to the next tick).
+    scratch.host_debit = host_debit;
+    scratch.symb_credit = symb_credit;
+    scratch.despawn = despawn_set;
+}
+
+/// PERF-2 (hash-neutral): sort a `(OrgId, HostDebit)` collect-buffer by key and merge consecutive duplicate orgs
+/// by SUMMING their `drawn` — byte-identical to a `BTreeMap<u64, HostDebit>` `entry().or_insert(..).drawn += v`
+/// accumulate (the [`sort_merge_prey_debit`] twin; the plain `i64` helper does not apply to a struct value).
+fn sort_merge_host_debit(buf: &mut Vec<(u64, HostDebit)>) {
+    buf.sort_unstable_by_key(|(k, _)| *k);
+    if buf.len() <= 1 {
+        return;
+    }
+    let mut write = 0usize;
+    for read in 1..buf.len() {
+        if buf[read].0 == buf[write].0 {
+            buf[write].1.drawn += buf[read].1.drawn;
+        } else {
+            write += 1;
+            if write != read {
+                buf[write] = buf[read];
+            }
+        }
+    }
+    buf.truncate(write + 1);
 }
 
 /// **ASSERT FLOW CLOSES** (ADR-013 F4) — runs near the END of the tick (after every transfer recorded into the
