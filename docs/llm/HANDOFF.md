@@ -54,8 +54,9 @@ with `godot --path godot -- --live [--roster "stem:count,…"] [--steps N] [--vi
   identical after the compose); back-to-back criterion `--baseline` confirms the −48% is PERF-2's MARGINAL gain
   over PERF-1 (PERF-1 was itself perf-neutral on this bench). **READY TO MERGE** to main (`git merge --no-ff
   worktree-perf2-roadmap-workflow` from main, local gate green = the merge gate per `no-ci-wait-autonomous-roadmap`).
-  Optional cheap follow-up: pin a golden hash on a predator/symbiont roster (the plant-only pinned config doesn't
-  exercise predation/host_coupling). See roadmap §10.
+  **Follow-up DONE** (2026-06-27): the predation/host_coupling byte-paths are now locked by two golden-literal pins
+  `predation_roster_hash_is_pinned` (`0xd4eb…b2bf`) + `host_coupling_roster_hash_is_pinned` (`0xf723…bb64`) —
+  hash-neutral to `0x47a0…` (test-only). The PERF chapter is fully closed. See roadmap §10 / ADR-026.
 - **Perf for bigger maps** (memory `perf-bigger-maps-needs-structural-change`): the BIGGER structural cost-profile
   change (aggregate stepping / LOD / new data layout), NOT a parallel library (ADR-020), and beyond PERF-2's
   byte-identical micro-opt. Revisit when gameplay/UI is solid.

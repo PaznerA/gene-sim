@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### PERF-2 follow-up — golden-hash pins on the predator/symbiont byte-paths (test, sim-core) — HASH-NEUTRAL
+Closes the ADR-026 coverage caveat. PERF-2 converted the predation/host_coupling OrgId-keyed maps/sets
+(`pred_credit`/`symb_credit`, the `prey_debit`/`host_debit` struct maps, the `despawn_set`s) to sorted-`Vec`s, but
+the plant-only `0x47a0_3c8f_6701_f240` config early-returns out of those kernels, so the literal never locked them —
+they rested on construction-equivalence + the run==run `f6_`/`s5_` tests. This adds two GOLDEN-literal pins that DO
+exercise those paths, so any future byte-drift fails CI:
+- **`predation_roster_hash_is_pinned`** → `0xd4eb_7676_531f_b2bf` (the f6 3-species predator roster: plant + decomposer
+  + vigorous Bdellovibrio, seed 57 / 50 gens / 600).
+- **`host_coupling_roster_hash_is_pinned`** → `0xf723_26af_466e_bb64` (the s5 inoculate→couple run: plant +
+  Carsonella symbiont via `register_symbiont` + `region_inoculate`, seed 47).
+- Both are NEW pins on NEW configs → **hash-neutral to `0x47a0…`** (test-only, no sim-logic change); 182/182 sim-core.
+
 ### PERF-2 — per-tick OrgId-keyed `BTreeMap`/`BTreeSet` → reused sorted-`Vec` (perf, sim-core) — HASH-NEUTRAL
 ADR-026. The hot path built a fistful of OrgId-keyed `BTreeMap`s + `BTreeSet`s fresh EVERY tick over the whole living
 set; profiling noted the `items`/`rows` vectors are already sorted by `(cell, species, OrgId)`, so each map is
