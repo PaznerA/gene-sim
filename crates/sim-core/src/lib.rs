@@ -5314,6 +5314,29 @@ mod tests {
     }
 
     #[test]
+    fn predation_roster_hash_is_pinned() {
+        // PERF-2 follow-up (ADR-026 coverage caveat). The plant-only `determinism_hash_is_pinned` config
+        // early-returns out of the predation kernel, so the PERF-2 sorted-`Vec` conversions of `pred_credit`,
+        // the `prey_debit` (`PreyDebit{eaten,dead}`) struct map and the `despawn_set` are NOT locked by the
+        // `0x47a0…` literal — only by construction-equivalence + the run==run `f6_predation_is_deterministic`
+        // test. Pin a GOLDEN literal on a 3-species predator roster (the f6 determinism config) so any future
+        // change that perturbs those byte-paths is caught in CI. Change the literal DELIBERATELY (same commit)
+        // only when predation LOGIC changes. History: `d4eb…b2bf` initial pin after PERF-2 (sorted-Vec predation).
+        let cfg = SimConfig {
+            seed: 57,
+            generations: 50,
+            entity_count: 600,
+        };
+        let mut sim = Simulation::reset_with_roster(
+            &cfg,
+            &EnvParams::default(),
+            obligate_predator_roster(true, true),
+        );
+        sim.step(cfg.generations);
+        assert_eq!(sim.run_stats().hash, 0xd4eb_7676_531f_b2bf);
+    }
+
+    #[test]
     fn f6_trophic_cascade_throttling_the_predator_lifts_ecoli_and_the_plant() {
         // THE HEADLINE: the first top-down 3-level cascade. Two 3-species runs differing ONLY in the predator's
         // attack rate (PredationCapacity gene: vigorous vs ~0 throttled). Throttling the predator → E. coli rises
@@ -6848,6 +6871,36 @@ mod tests {
             a.1, b.1,
             "the symbiont population is byte-identical across runs"
         );
+    }
+
+    #[test]
+    fn host_coupling_roster_hash_is_pinned() {
+        // PERF-2 follow-up (ADR-026 coverage caveat). Like the predator path, the plant-only pinned config never
+        // enters the host-coupling kernel, so the PERF-2 sorted-`Vec` conversions of `symb_credit`, the
+        // `host_debit` (`HostDebit{drawn}`) struct map and the host `despawn_set` are NOT locked by `0x47a0…`.
+        // Pin a GOLDEN literal on the s5 inoculate→couple run so those byte-paths are locked in CI. Change the
+        // literal DELIBERATELY only when host-coupling LOGIC changes. History: `f723…bb64` initial pin after PERF-2.
+        let cfg = SimConfig {
+            seed: 47,
+            generations: 0,
+            entity_count: 0,
+        };
+        let mut sim =
+            Simulation::reset_with_roster(&cfg, &EnvParams::default(), obligate_roster(false));
+        sim.step(5);
+        let symb = register_symbiont(&mut sim, "carsonella", "plant", 0.8);
+        sim.region_inoculate(
+            symb,
+            Region {
+                cx: 16,
+                cy: 16,
+                radius: 30,
+            },
+            40,
+            900_000,
+        );
+        sim.step(15);
+        assert_eq!(sim.run_stats().hash, 0xf723_26af_466e_bb64);
     }
 
     #[cfg(feature = "proptest")]

@@ -1091,11 +1091,14 @@ roster is S=2 (→3 with the future predator), where EXACT integer k-NN is corre
     bench (it eliminated allocations off the critical path), so the −48 % is genuinely PERF-2's marginal contribution,
     not PERF-1 + PERF-2 conflated. The recorded table numbers (32.0 / 151.3 / 305.2) sit within run-to-run noise of
     the fresh 32.2 / 151.8 / 308.2.
-- **Coverage caveat (follow-up):** the pinned config is plant-only and early-returns out of predation/host_coupling,
-  so the `prey_debit`/`host_debit`/`pred_credit`/`symb_credit`/`despawn_set` conversions are NOT locked by the
-  pinned literal — they rest on the construction-equivalence above + the green `f6_predation_*` / `s5_host_coupling_*`
-  conservation + run-to-run determinism tests. A cheap follow-up: pin a golden hash on a predator/symbiont roster to
-  lock those byte-paths in CI.
+- **Coverage caveat — CLOSED (follow-up done, 2026-06-27):** the pinned `0x47a0…` config is plant-only and
+  early-returns out of predation/host_coupling, so the `prey_debit`/`host_debit`/`pred_credit`/`symb_credit`/
+  `despawn_set` conversions were not locked by it — only by construction-equivalence + the run-to-run
+  `f6_predation_*` / `s5_host_coupling_*` tests. Now LOCKED by two GOLDEN-literal pins: `predation_roster_hash_is_pinned`
+  (`0xd4eb_7676_531f_b2bf`, the f6 3-species predator roster — seed 57, 50 gens, 600) and
+  `host_coupling_roster_hash_is_pinned` (`0xf723_26af_466e_bb64`, the s5 inoculate→couple run — seed 47). Any future
+  change that perturbs those byte-paths now fails CI, exactly like `0x47a0…` guards the plant path. These are NEW pins
+  on NEW configs — hash-neutral to `0x47a0…` (test-only addition, no sim-logic change).
 - **Consequences:** supersedes the post-F5 "Deferred — would re-pin" note. `sort_merge_org_i64` / `org_lookup` are
   the reusable pattern for any future OrgId-keyed per-tick collect/apply map.
 

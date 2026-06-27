@@ -308,7 +308,8 @@ correct ceiling there.
   criterion `--baseline` re-bench (PERF-1 `ed558d7` vs PERF-2 `3886fc6`, same machine) confirms the marginal gain
   is **−47.4 / −48.9 / −47.8 %** — i.e. PERF-1's scratch-Vec hoist was perf-neutral on this bench and the −48 % is
   genuinely PERF-2's. **READY TO MERGE** to main (local gate green = the merge gate; no CI wait).
-- **PERF-2 follow-up** (cheap, optional): the pinned config is plant-only and early-returns out of
-  predation/host_coupling, so those kernels' byte-stability rests on construction-equivalence + the green
-  `f6_`/`s5_` determinism+conservation tests, NOT a pinned literal. Pin a golden hash on a predator/symbiont
-  roster to lock those paths in CI.
+- **PERF-2 follow-up** ✅ DONE (2026-06-27): the predation/host_coupling byte-paths (which the plant-only
+  `0x47a0…` config early-returns out of) are now locked by two GOLDEN-literal pins — `predation_roster_hash_is_pinned`
+  (`0xd4eb_7676_531f_b2bf`, the f6 3-species predator roster) + `host_coupling_roster_hash_is_pinned`
+  (`0xf723_26af_466e_bb64`, the s5 inoculate→couple run). Hash-neutral to `0x47a0…` (test-only). The PERF chapter
+  (PERF-1 + PERF-2 + this lock) is now fully closed.
