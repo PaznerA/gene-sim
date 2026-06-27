@@ -586,6 +586,23 @@ impl GeneSimEnv {
             .species_signatures()
     }
 
+    /// Export species `species`'s CURRENT (post-edit) genome + niche as a `SpeciesSpec` JSON STRING (Variant-Lab
+    /// Slice B — the "save the edited variant" boundary). Delegates to
+    /// [`sim_core::Simulation::export_species_spec`] (the single biology→spec mapping, inv #2) then serializes
+    /// with `serde_json`. Read-only: draws ZERO `SimRng`, mutates nothing, never folded into the determinism
+    /// hash (inv #3 — modeled on [`observe_all`](Self::observe_all) / [`species_signatures`](Self::species_signatures)).
+    /// The JSON re-loads through [`species::build_species_from_str`] to the SAME expressed phenotype (the
+    /// save→reseed contract). Returns `None` before `reset`, for an out-of-range `species`, or on the
+    /// (impossible-by-construction) serialize error — the boundary maps `None` to an empty string + an error.
+    #[must_use]
+    pub fn export_species_json(&self, species: u16) -> Option<String> {
+        let spec = self
+            .sim
+            .as_ref()?
+            .export_species_spec(sim_core::SpeciesId::new(species))?;
+        serde_json::to_string_pretty(&spec).ok()
+    }
+
     /// A read-only, derived per-cell [`sim_core::GridSnapshot`] of the current state (delegates to
     /// [`sim_core::Simulation::snapshot`]; panics if called before `reset`).
     ///
@@ -1439,6 +1456,90 @@ mod tests {
             ),
             other => panic!("expected ApplyEdit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn export_species_json_round_trips_to_the_live_phenotype() {
+        // Variant-Lab Slice B (the save→reseed contract): exporting species S's CURRENT genome + niche as
+        // SpeciesSpec JSON, then rebuilding through the SAME res:// loader (build_species_from_str), yields a
+        // BuiltSpecies whose EXPRESSED PHENOTYPE is identical to the live species' phenotype — across the full
+        // JSON boundary, after an edit step (export reflects the CURRENT genome, whatever the gate decided).
+        use sim_core::gp::{trait_map_for, GenotypePhenotypeMap, OntologyMap, Trait};
+
+        let mut env = GeneSimEnv::new(300);
+        env.set_species(load_stem("ecoli")); // key "ecoli-core", role Decomposer
+        env.reset(7);
+
+        // Edit the live species genome (the export must read whatever the genome is NOW).
+        env.step(Action::ApplyEdit(EditAction {
+            cas: cas_id("SpCas9"),
+            target: LocusId(0),
+            guide: GuideSequence::new(*b"ACGTGGACGTTTTAGGCCGG").unwrap(),
+            species: 0,
+        }));
+
+        // The LIVE phenotype the renderer shows for species 0.
+        let live = env.observe_all()[0].phenotype.clone();
+
+        // EXPORT → rebuild through the res:// boundary the loader uses.
+        let json = env.export_species_json(0).expect("export species 0");
+        let rebuilt =
+            crate::species::build_species_from_str(&json).expect("rebuild from exported JSON");
+
+        // The niche carried the key + role, so the reseed resolves the SAME trait map + role.
+        assert_eq!(rebuilt.key, "ecoli-core");
+        assert_eq!(rebuilt.trophic_role.as_deref(), Some("decomposer"));
+
+        // Expressed through ITS key's trait map, the rebuilt genome reproduces the live phenotype EXACTLY.
+        let reseeded = OntologyMap::new(trait_map_for(&rebuilt.key)).express(&rebuilt.genome);
+        assert_eq!(
+            reseeded, live,
+            "save→reseed must reproduce the live species' expressed phenotype"
+        );
+        assert!(
+            reseeded.get(Trait::GrowthRate).is_some(),
+            "the E. coli GrowthRate trait expresses under the reseeded map"
+        );
+    }
+
+    #[test]
+    fn export_species_json_is_hash_neutral_and_guarded() {
+        // Read-only (inv #3): exporting between reset and advance draws ZERO SimRng and mutates nothing, so the
+        // subsequent run hashes IDENTICALLY to a run that never exported. Plus the boundary guards: None before
+        // reset and for an out-of-range species id (the renderer maps those to an empty GString + godot_error).
+        let baseline = {
+            let mut env = GeneSimEnv::new(200);
+            env.reset(7);
+            env.step(Action::Advance(20));
+            env.run_stats().hash
+        };
+        let with_export = {
+            let mut env = GeneSimEnv::new(200);
+            env.reset(7);
+            let _ = env.export_species_json(0).expect("export mid-run");
+            env.step(Action::Advance(20));
+            env.run_stats().hash
+        };
+        assert_eq!(
+            baseline, with_export,
+            "export must be hash-neutral (zero SimRng, no mutation)"
+        );
+
+        // Guards.
+        let mut fresh = GeneSimEnv::new(50);
+        assert!(
+            fresh.export_species_json(0).is_none(),
+            "None before reset (the boundary returns an empty GString)"
+        );
+        fresh.reset(1);
+        assert!(
+            fresh.export_species_json(0).is_some(),
+            "the primary species exports after reset"
+        );
+        assert!(
+            fresh.export_species_json(7).is_none(),
+            "an out-of-range species id → None"
+        );
     }
 
     #[test]
