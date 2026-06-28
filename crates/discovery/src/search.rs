@@ -195,6 +195,179 @@ impl Default for SearchSpace {
     }
 }
 
+/// The canonical free-living roster keys, in the FIXED order every [`SearchSpace`] (the [`Default`] anchor AND
+/// every [`scenario`](SearchSpace::scenario) preset) preserves — the autotroph anchor (`default`) first. NEVER
+/// reorder: this order is the field-index + roster determinism contract (a stored config replays against it).
+const SCENARIO_KEYS: [&str; 7] = [
+    "default",
+    "ecoli",
+    "bacillus",
+    "pseudomonas",
+    "staph",
+    "aspergillus-niger",
+    "bdellovibrio",
+];
+
+/// The named SCENARIO presets accepted by [`SearchSpace::scenario`] (drives the harness `--space` flag + docs /
+/// tests). Each biases the search toward one family of emergent dynamics (the discovery "starters").
+pub const SCENARIOS: [&str; 6] = [
+    "predator-prey",
+    "decomposer",
+    "contamination-open",
+    "spore-resilience",
+    "edit-rescue",
+    "extreme-climate",
+];
+
+/// Build the seven species axes from per-key `(count_lo, count_hi, include_bp)` tuples, preserving
+/// [`SCENARIO_KEYS`] order (autotroph anchor first). The fixed order is the determinism contract — the caller
+/// supplies the tuples in that order.
+fn scenario_axes(specs: [(u32, u32, u16); 7]) -> Vec<SpeciesAxis> {
+    SCENARIO_KEYS
+        .iter()
+        .zip(specs)
+        .map(|(key, (count_lo, count_hi, include_bp))| SpeciesAxis {
+            key: (*key).to_string(),
+            count_lo,
+            count_hi,
+            include_bp,
+        })
+        .collect()
+}
+
+impl SearchSpace {
+    /// A named SCENARIO preset — a [`SearchSpace`] biased toward one family of emergent dynamics (the discovery
+    /// "starters"), selected by the harness `--space` flag. Every preset keeps the SAME fixed species order
+    /// ([`SCENARIO_KEYS`], autotroph `default` first — NEVER reordered), is in-bounds (`count_lo <= count_hi`,
+    /// containment/season within `0..=3`, temp q16 within `0..=1000`), and never proposes an empty roster (the
+    /// autotroph fallback holds). An UNKNOWN name returns `None` (the caller logs a note + falls back to
+    /// [`SearchSpace::default`]). Pure meta-level config — NO `sim-core` dep, integer-only (inv #1/#3/#5).
+    ///
+    /// - `"predator-prey"`: `bdellovibrio` always present + a strong prey base (`ecoli`/`staph` always present,
+    ///   higher counts), the plant producer OPTIONAL; containment `0..=1`; mid-warm temp. Hunts M3 limit-cycles
+    ///   + M4 predation.
+    /// - `"decomposer"`: `default` + `ecoli` always present (the rest sparse); sealed containment; mid temp.
+    ///   Hunts M1/M2 stable coexistence.
+    /// - `"contamination-open"`: containment `2..=3` (Lab/Open → airborne immigration fires); smaller starting
+    ///   counts. Hunts M5 invasion/displacement.
+    /// - `"spore-resilience"`: `bacillus` + `aspergillus-niger` at high presence; temp on the COLD edge;
+    ///   containment any. Hunts M5 crash→regerminate + M6 survival.
+    /// - `"edit-rescue"`: the broad default roster with the mid-run-edit axis ON (`edit_budget = 3`). Hunts
+    ///   edit-driven M3+M5 flips (the Variant Lab D axis).
+    /// - `"extreme-climate"`: temp pinned to a COLD edge band (`150..=300`); broad default roster. Hunts M6 + M1
+    ///   under stress.
+    #[must_use]
+    pub fn scenario(name: &str) -> Option<SearchSpace> {
+        let scale = SCALE as u16;
+        let space = match name {
+            // bdellovibrio + a strong prey base (ecoli/staph) ALWAYS present; the autotroph plant optional. A
+            // tight, livable containment (0..=1) + mid-warm temp lets a predator–prey limit cycle establish.
+            "predator-prey" => SearchSpace {
+                species: scenario_axes([
+                    (100, 1000, 6_000), // default — the plant producer, OPTIONAL.
+                    (200, 900, scale),  // ecoli — strong prey, always present.
+                    (20, 400, 3_000),   // bacillus
+                    (20, 400, 3_000),   // pseudomonas
+                    (150, 800, scale),  // staph — strong prey, always present.
+                    (10, 200, 2_000),   // aspergillus-niger
+                    (50, 400, scale),   // bdellovibrio — the PREDATOR, always present.
+                ]),
+                containment_lo: 0,
+                containment_hi: 1,
+                temp_lo: 550,
+                temp_hi: 750,
+                season_lo: 0,
+                season_hi: 3,
+                edit_budget: 0,
+            },
+            // The producer (default) + a generalist decomposer (ecoli) ALWAYS present, everything else sparse;
+            // a SEALED jar (containment 0) + mid temp gives the calmest substrate for stable coexistence.
+            "decomposer" => SearchSpace {
+                species: scenario_axes([
+                    (100, 1500, scale), // default — always present.
+                    (50, 800, scale),   // ecoli — always present.
+                    (20, 400, 2_500),   // bacillus
+                    (20, 400, 2_500),   // pseudomonas
+                    (20, 300, 2_000),   // staph
+                    (10, 300, 2_500),   // aspergillus-niger
+                    (5, 150, 1_500),    // bdellovibrio
+                ]),
+                containment_lo: 0,
+                containment_hi: 0,
+                temp_lo: 400,
+                temp_hi: 600,
+                season_lo: 0,
+                season_hi: 3,
+                edit_budget: 0,
+            },
+            // OPEN containment (2..=3) so deterministic airborne immigration fires; SMALL starting counts so an
+            // immigrant can actually invade/displace a thin resident community (M5).
+            "contamination-open" => SearchSpace {
+                species: scenario_axes([
+                    (50, 400, scale), // default — anchor, smaller.
+                    (20, 200, 6_000), // ecoli
+                    (15, 150, 5_000), // bacillus
+                    (15, 150, 5_000), // pseudomonas
+                    (15, 120, 4_500), // staph
+                    (10, 100, 4_000), // aspergillus-niger
+                    (5, 80, 3_500),   // bdellovibrio
+                ]),
+                containment_lo: 2,
+                containment_hi: 3,
+                temp_lo: 200,
+                temp_hi: 800,
+                season_lo: 0,
+                season_hi: 3,
+                edit_budget: 0,
+            },
+            // The two spore-formers (bacillus endospores, aspergillus-niger conidia) at HIGH presence, temp on
+            // the COLD edge to stress the community into a crash the spore-formers can re-germinate out of.
+            "spore-resilience" => SearchSpace {
+                species: scenario_axes([
+                    (100, 1000, scale), // default — anchor.
+                    (20, 300, 3_000),   // ecoli
+                    (100, 600, 9_000),  // bacillus — endospore-former, HIGH presence.
+                    (15, 200, 2_500),   // pseudomonas
+                    (20, 250, 3_000),   // staph
+                    (80, 400, 9_000),   // aspergillus-niger — conidia-former, HIGH presence.
+                    (5, 100, 2_000),    // bdellovibrio
+                ]),
+                containment_lo: 0,
+                containment_hi: 3,
+                temp_lo: 150,
+                temp_hi: 350, // cold edge — a crash the spore-formers regerminate out of.
+                season_lo: 0,
+                season_hi: 3,
+                edit_budget: 0,
+            },
+            // The broad default roster with the mid-run-CRISPR-edit axis ON — the Variant Lab D "rescue" space.
+            "edit-rescue" => SearchSpace {
+                species: SearchSpace::default().species,
+                containment_lo: 0,
+                containment_hi: 3,
+                temp_lo: 150,
+                temp_hi: 850,
+                season_lo: 0,
+                season_hi: 3,
+                edit_budget: 3, // up to 3 scheduled edits per proposal (the axis is LIVE).
+            },
+            // The broad default roster with temp PINNED to a cold edge band — climate-stress survival search.
+            "extreme-climate" => SearchSpace {
+                species: SearchSpace::default().species,
+                containment_lo: 0,
+                containment_hi: 3,
+                temp_lo: 150,
+                temp_hi: 300, // pinned cold-edge band.
+                season_lo: 0,
+                season_hi: 3,
+                edit_budget: 0,
+            },
+            _ => return None,
+        };
+        Some(space)
+    }
+}
+
 /// splitmix64 — the canonical std-only integer scrambler (NO `rand` crate). A pure function of its input word:
 /// avalanches every input bit, so `mix64(stream(seed, trial, field))` gives an independent, reproducible draw
 /// per field. Public for tests/callers that want the same stream the sampler uses.
@@ -1751,4 +1924,176 @@ mod tests {
             "an empty schedule must omit the key: {ejson}"
         );
     }
+
+    // ---- Named SCENARIO presets (--space) ----
+
+    #[test]
+    fn scenario_unknown_name_is_none() {
+        // An unknown name → None (the caller logs a note + falls back to default). "default" is NOT a scenario
+        // (the harness handles the default/absent path itself).
+        assert!(SearchSpace::scenario("nope").is_none());
+        assert!(SearchSpace::scenario("").is_none());
+        assert!(SearchSpace::scenario("default").is_none());
+        // Every advertised name resolves.
+        for name in SCENARIOS {
+            assert!(
+                SearchSpace::scenario(name).is_some(),
+                "advertised scenario {name} must resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn scenario_spaces_keep_the_fixed_seven_axis_order() {
+        // The autotroph anchor is ALWAYS first and the key order is the SCENARIO_KEYS contract (never reordered).
+        for name in SCENARIOS {
+            let space = SearchSpace::scenario(name).expect("known scenario");
+            assert_eq!(
+                space.species.len(),
+                SCENARIO_KEYS.len(),
+                "{name}: must keep all seven axes"
+            );
+            assert_eq!(
+                space.species[0].key, "default",
+                "{name}: autotroph anchor first"
+            );
+            for (axis, key) in space.species.iter().zip(SCENARIO_KEYS) {
+                assert_eq!(axis.key, key, "{name}: fixed key order");
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_spaces_are_self_consistent_in_bounds() {
+        // Every axis range + env range is well-formed (count_lo<=count_hi, containment/season 0..=3, temp q16
+        // 0..=1000) and the autotroph anchor has count_lo>=1 (so the fallback can never produce an empty roster).
+        for name in SCENARIOS {
+            let space = SearchSpace::scenario(name).expect("known scenario");
+            for axis in &space.species {
+                assert!(
+                    axis.count_lo <= axis.count_hi,
+                    "{name}/{}: count_lo {} > count_hi {}",
+                    axis.key,
+                    axis.count_lo,
+                    axis.count_hi
+                );
+            }
+            assert!(
+                space.species[0].count_lo >= 1,
+                "{name}: autotroph count_lo>=1"
+            );
+            assert!(
+                space.containment_lo <= space.containment_hi && space.containment_hi <= 3,
+                "{name}: containment range {}..={} out of 0..=3",
+                space.containment_lo,
+                space.containment_hi
+            );
+            assert!(
+                space.season_lo <= space.season_hi && space.season_hi <= 3,
+                "{name}: season range out of 0..=3"
+            );
+            assert!(
+                space.temp_lo <= space.temp_hi && space.temp_hi <= 1000,
+                "{name}: temp range {}..={} out of q16 0..=1000",
+                space.temp_lo,
+                space.temp_hi
+            );
+        }
+    }
+
+    #[test]
+    fn scenario_spaces_propose_valid_nonempty_over_many_trials() {
+        // Mirror propose_respects_space_bounds for EACH named space: every proposal is in-bounds + non-empty.
+        for name in SCENARIOS {
+            let space = SearchSpace::scenario(name).expect("known scenario");
+            for trial in 0..256u64 {
+                let cfg = propose(2024, trial, &space);
+                assert_valid(&cfg, &space);
+                assert_eq!(cfg.roster.len(), space.species.len(), "{name}: roster len");
+                // edit_budget==0 scenarios schedule NO edits; the budgeted one stays within budget.
+                assert!(
+                    cfg.edits.len() <= space.edit_budget as usize,
+                    "{name}: schedule exceeds budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_predator_prey_always_has_predator_and_strong_prey() {
+        // The signature of predator-prey: bdellovibrio + ecoli + staph are ALWAYS present (include_bp==SCALE).
+        let space = SearchSpace::scenario("predator-prey").expect("known");
+        let bp_of = |key: &str| {
+            space
+                .species
+                .iter()
+                .find(|a| a.key == key)
+                .unwrap()
+                .include_bp
+        };
+        assert_eq!(bp_of("bdellovibrio"), SCALE as u16);
+        assert_eq!(bp_of("ecoli"), SCALE as u16);
+        assert_eq!(bp_of("staph"), SCALE as u16);
+        // Over many trials the predator + both prey are present in EVERY proposed roster.
+        for trial in 0..128u64 {
+            let cfg = propose(5, trial, &space);
+            for key in ["bdellovibrio", "ecoli", "staph"] {
+                let present = cfg.roster.iter().any(|(k, c)| k == key && *c > 0);
+                assert!(present, "{key} must be present at trial {trial}");
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_edit_rescue_turns_the_edit_axis_on() {
+        let space = SearchSpace::scenario("edit-rescue").expect("known");
+        assert!(space.edit_budget > 0, "edit-rescue opts into the edit axis");
+        // The axis is LIVE: edits get scheduled on a good fraction of trials (but not all — count draws [0,b]).
+        let scheduled = (0..256u64)
+            .filter(|&t| !propose(7, t, &space).edits.is_empty())
+            .count();
+        assert!(scheduled > 0, "edit-rescue must schedule some edits");
+        assert!(scheduled < 256, "the count draw should sometimes be zero");
+    }
+
+    #[test]
+    fn scenario_spaces_are_distinct_from_each_other_and_default() {
+        // The named spaces must differ (in species presence / ranges / env) from one another AND from default.
+        let mut spaces: Vec<(&str, SearchSpace)> = vec![("default", SearchSpace::default())];
+        for name in SCENARIOS {
+            spaces.push((name, SearchSpace::scenario(name).expect("known scenario")));
+        }
+        for i in 0..spaces.len() {
+            for j in (i + 1)..spaces.len() {
+                assert_ne!(
+                    spaces[i].1, spaces[j].1,
+                    "scenario {} must differ from {}",
+                    spaces[i].0, spaces[j].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_space_propose_is_byte_identical_golden() {
+        // BYTE-IDENTITY pin: adding the scenario presets must NOT perturb the default search path. propose over
+        // the default space is byte-stable AND equals these golden values captured before the named-space slice.
+        let space = SearchSpace::default();
+        let cfg = propose(42, 7, &space);
+        // Re-running is byte-identical (the determinism contract).
+        assert_eq!(cfg, propose(42, 7, &space));
+        // The default anchor is the widened 7-free-living-species roster, edit-axis OFF.
+        assert_eq!(space.edit_budget, 0);
+        assert!(cfg.edits.is_empty(), "default path schedules no edits");
+        // Golden serialized bytes for one (seed,trial) — a regression tripwire on the default proposal sampler.
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert_eq!(
+            json, GOLDEN_DEFAULT_PROPOSE_42_7,
+            "default propose bytes moved"
+        );
+    }
+
+    /// Golden JSON for `propose(42, 7, &SearchSpace::default())` — captured from the build at this slice as a
+    /// regression tripwire that the named-space presets did not move the default proposal sampler.
+    const GOLDEN_DEFAULT_PROPOSE_42_7: &str = r#"{"master_seed":15359761929758187801,"roster":[["default",1385],["ecoli",182],["bacillus",0],["pseudomonas",0],["staph",148],["aspergillus-niger",0],["bdellovibrio",0]],"containment_level":0,"temp_q":270,"season":0}"#;
 }

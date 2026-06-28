@@ -4,6 +4,16 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Discovery scenario starters — named `SearchSpace` presets + `--space` CLI (discovery + harness) — HASH-NEUTRAL
+Six named `SearchSpace` scenario presets (predator-prey / decomposer / contamination-open / spore-resilience /
+edit-rescue / extreme-climate) that bias the brute-force search toward a drama type (per-species `include_bp` + count
+ranges + containment/temp/season + `edit_budget`), behind `SearchSpace::scenario(name)` + a `--space <name>` CLI flag.
+The default/absent path is byte-identical (golden-pinned `default_space_propose_is_byte_identical_golden`); a named
+space is a meta-level alternative search config (std+serde, no SimRng) → pinned literal `0x47a0_3c8f_6701_f240`
+unmoved. Unknown name degrades to the default space with a note (no panic). The 7-axis order is fixed + test-guarded
+(`scenario_spaces_keep_the_fixed_seven_axis_order`). Gate GREEN; 3-skeptic verify CONFIRMED (4/4 at 3/3). QUEUE item
+#1 (scenarios arc — the "more starters" ask, grounded in the wave-1+2 research).
+
 ### Codex browse panel — scrollable in-game species/gene/role/flow browser (renderer) — HASH-NEUTRAL
 A 4th "Codex" VIEW (full-window, modelled on the relations/specimen views) over `res://data/codex/codex.json` via the
 EXISTING `godot/codex.gd` loader (no inline JSON parse) — a left `ItemList` (declared order) + a case-insensitive

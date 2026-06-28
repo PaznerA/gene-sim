@@ -62,6 +62,11 @@ OPTIONS:
     --edit-budget <u8>    Variant Lab D: MAX mid-run CRISPR edits a proposed config may schedule. 0 (default) =
                           the edit axis OFF → byte-identical to the no-edit search. > 0 turns it ON; each
                           discovered gem then carries + REPRODUCES its scheduled edits (round-trip-verified).
+                          Overrides a named --space's own edit_budget when given explicitly.
+    --space <name>        Named SearchSpace SCENARIO preset for --discover (the discovery starters). One of:
+                          predator-prey · decomposer · contamination-open · spore-resilience · edit-rescue ·
+                          extreme-climate. Absent or `default` → the widened 7-species default space
+                          (BYTE-IDENTICAL to before this flag). An unknown name logs a note + falls back.
     --save-evals          Also write EVERY evaluated (config → ScoreVec) to data/runs/evals/<search_seed>.jsonl
                           (one JSON per line, in evaluation order — the D3-A surrogate training data). OFF-HASH:
                           read-only over already-computed gem fields; the pinned sim literal is untouched.
@@ -401,6 +406,12 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         let edit_budget: u8 = val("--edit-budget")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        // A named --space SCENARIO preset (the discovery starters). Absent/`default` → the widened default space
+        // built BYTE-IDENTICALLY to before this flag; a known name → that preset; unknown → a logged fallback.
+        // An EXPLICIT --edit-budget overrides a named space's own edit_budget.
+        let edit_budget_explicit = argv.iter().any(|a| a == "--edit-budget");
+        let (space_label, space) =
+            resolve_space(val("--space").as_deref(), edit_budget, edit_budget_explicit);
         if evolve_gens > 0 {
             let pop_size: u64 = val("--pop-size").and_then(|s| s.parse().ok()).unwrap_or(16);
             return Some(run_discover_evolved(
@@ -409,7 +420,8 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
                 evolve_gens,
                 keep,
                 gens,
-                edit_budget,
+                &space,
+                &space_label,
                 evals_path.as_deref(),
             ));
         }
@@ -418,7 +430,8 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
             trials,
             keep,
             gens,
-            edit_budget,
+            &space,
+            &space_label,
             evals_path.as_deref(),
         ));
     }
@@ -442,6 +455,46 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
     None
 }
 
+/// Resolve the `--space` flag into a labelled [`discovery::search::SearchSpace`] for the discovery search.
+///
+/// - `None` / `Some("default")` → the widened default space with the requested `edit_budget` applied — the
+///   `SearchSpace { edit_budget, ..default() }` expression byte-for-byte, so the default/absent path is
+///   UNCHANGED from before this flag (the discovery byte-identity contract).
+/// - a known SCENARIO name → that preset; an EXPLICIT `--edit-budget` (`edit_budget_explicit`) overrides the
+///   preset's own `edit_budget`, otherwise the preset keeps its baked-in value.
+/// - an UNKNOWN name → a logged note + the same default-space fallback (so a typo never silently runs a wrong
+///   preset).
+///
+/// Returns `(label, space)`; the label is only used in the human-readable banner (never the hash).
+fn resolve_space(
+    name: Option<&str>,
+    edit_budget: u8,
+    edit_budget_explicit: bool,
+) -> (String, discovery::search::SearchSpace) {
+    let default_space = || discovery::search::SearchSpace {
+        edit_budget,
+        ..discovery::search::SearchSpace::default()
+    };
+    match name {
+        None | Some("default") => ("default".to_string(), default_space()),
+        Some(n) => match discovery::search::SearchSpace::scenario(n) {
+            Some(mut sp) => {
+                if edit_budget_explicit {
+                    sp.edit_budget = edit_budget;
+                }
+                (n.to_string(), sp)
+            }
+            None => {
+                eprintln!(
+                    "note: unknown --space {n:?}; falling back to the default search space (known: {})",
+                    discovery::search::SCENARIOS.join(", ")
+                );
+                ("default".to_string(), default_space())
+            }
+        },
+    }
+}
+
 /// Run the emergent-run SEARCH (D2a STAGE 2, ADR-023) into `data/runs/gems/` and print a ranked summary of the
 /// VERIFIED saved gems (score · caption · config). Defaults match the CLI flags' documented values. The
 /// `data/species` root is resolved relative to this binary's manifest dir (the same byte-mover boundary the
@@ -451,26 +504,23 @@ fn run_discover(
     trials: u64,
     keep: usize,
     gens: u32,
-    edit_budget: u8,
+    space: &discovery::search::SearchSpace,
+    space_label: &str,
     evals_path: Option<&std::path::Path>,
 ) -> ExitCode {
     let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let out_dir = PathBuf::from("data/runs/gems");
-    // Variant Lab D: a raised edit_budget turns the mid-run-edit axis ON; 0 is byte-identical to discover().
-    let space = discovery::search::SearchSpace {
-        edit_budget,
-        ..discovery::search::SearchSpace::default()
-    };
 
     println!(
-        "gene-sim discover · search_seed={search_seed} · trials={trials} · keep={keep} · gens={gens} · edit_budget={edit_budget}\n  writing verified gems to {}",
+        "gene-sim discover · space={space_label} · search_seed={search_seed} · trials={trials} · keep={keep} · gens={gens} · edit_budget={}\n  writing verified gems to {}",
+        space.edit_budget,
         out_dir.display()
     );
     if let Some(p) = evals_path {
         println!("  writing eval log to {}", p.display());
     }
     match harness::discover::discover_in_space(
-        &space,
+        space,
         search_seed,
         trials,
         keep,
@@ -507,19 +557,16 @@ fn run_discover_evolved(
     evolve_gens: u64,
     keep: usize,
     gens: u32,
-    edit_budget: u8,
+    space: &discovery::search::SearchSpace,
+    space_label: &str,
     evals_path: Option<&std::path::Path>,
 ) -> ExitCode {
     let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let out_dir = PathBuf::from("data/runs/gems");
-    // Variant Lab D: a raised edit_budget turns the mid-run-edit axis ON; 0 is byte-identical to discover_evolved().
-    let space = discovery::search::SearchSpace {
-        edit_budget,
-        ..discovery::search::SearchSpace::default()
-    };
 
     println!(
-        "gene-sim discover (EVOLUTIONARY) · search_seed={search_seed} · pop_size={pop_size} · evolve_gens={evolve_gens} · keep={keep} · gens={gens} · edit_budget={edit_budget}\n  evaluated {} configs over {} generations; writing verified gems to {}",
+        "gene-sim discover (EVOLUTIONARY) · space={space_label} · search_seed={search_seed} · pop_size={pop_size} · evolve_gens={evolve_gens} · keep={keep} · gens={gens} · edit_budget={}\n  evaluated {} configs over {} generations; writing verified gems to {}",
+        space.edit_budget,
         pop_size * (evolve_gens + 1),
         evolve_gens + 1,
         out_dir.display()
@@ -528,7 +575,7 @@ fn run_discover_evolved(
         println!("  writing eval log to {}", p.display());
     }
     match harness::discover::discover_evolved_in_space(
-        &space,
+        space,
         search_seed,
         pop_size,
         evolve_gens,
@@ -1210,6 +1257,89 @@ mod tests {
         assert_eq!(
             per_gen_header(Some(&built)),
             "run_index,generation,population_size,allele_freq,growth_rate,glucose_uptake,respiration_mode,acetate_overflow,fermentation_capacity"
+        );
+    }
+
+    // ---- --space routing (resolve_space) ----
+
+    use discovery::search::SearchSpace;
+
+    /// The pre-flag default-space expression: the byte-identity reference for the default/absent path.
+    fn default_space_expr(edit_budget: u8) -> SearchSpace {
+        SearchSpace {
+            edit_budget,
+            ..SearchSpace::default()
+        }
+    }
+
+    #[test]
+    fn resolve_space_default_and_absent_are_byte_identical() {
+        // Absent (None) and explicit "default" both build the EXACT pre-flag expression — the discovery default
+        // path is unchanged. Checked across edit_budget values (the existing --edit-budget routing is preserved).
+        for eb in [0u8, 3] {
+            let (label_none, sp_none) = resolve_space(None, eb, eb != 0);
+            let (label_def, sp_def) = resolve_space(Some("default"), eb, eb != 0);
+            assert_eq!(label_none, "default");
+            assert_eq!(label_def, "default");
+            assert_eq!(
+                sp_none,
+                default_space_expr(eb),
+                "None path must match the pre-flag space"
+            );
+            assert_eq!(
+                sp_def,
+                default_space_expr(eb),
+                "\"default\" path must match the pre-flag space"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_space_unknown_name_falls_back_to_default() {
+        // A typo routes to the default space (with a logged note), never an empty/garbage space.
+        let (label, sp) = resolve_space(Some("not-a-scenario"), 0, false);
+        assert_eq!(label, "default");
+        assert_eq!(sp, default_space_expr(0));
+    }
+
+    #[test]
+    fn resolve_space_named_routes_to_the_preset() {
+        // A known name routes to that preset; its label is the name; its space equals the constructor's.
+        for name in discovery::search::SCENARIOS {
+            let (label, sp) = resolve_space(Some(name), 0, false);
+            assert_eq!(label, name);
+            assert_eq!(sp, SearchSpace::scenario(name).expect("known scenario"));
+            // A named preset is DISTINCT from the default space (different presence/ranges/env/edit axis).
+            assert_ne!(
+                sp,
+                SearchSpace::default(),
+                "{name} must differ from default"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_space_edit_budget_override_is_explicit_only() {
+        // edit-rescue bakes in a positive edit_budget; an EXPLICIT --edit-budget overrides it, an implicit
+        // (default 0, not present) leaves the preset's own value intact.
+        let baked = SearchSpace::scenario("edit-rescue").unwrap().edit_budget;
+        assert!(baked > 0);
+        // implicit (not present) → preset keeps its baked budget.
+        let (_, implicit) = resolve_space(Some("edit-rescue"), 0, false);
+        assert_eq!(
+            implicit.edit_budget, baked,
+            "implicit budget keeps the preset value"
+        );
+        // explicit → override (here forcing the axis OFF).
+        let (_, explicit) = resolve_space(Some("edit-rescue"), 0, true);
+        assert_eq!(
+            explicit.edit_budget, 0,
+            "explicit --edit-budget overrides the preset"
+        );
+        let (_, explicit_up) = resolve_space(Some("predator-prey"), 5, true);
+        assert_eq!(
+            explicit_up.edit_budget, 5,
+            "explicit --edit-budget overrides a 0-budget preset"
         );
     }
 }
