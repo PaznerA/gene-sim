@@ -46,10 +46,11 @@ arc → the VISUAL-POLISH epic below** (the user: the screen is "spammed"/clutte
 - `[x]` **visual-declutter-colony-design** (`workflow`, DESIGN) — DONE → `proposals/visual-declutter-colony-draft.md`
   (470 lines: ADR-029 draft + the airtight off-hash argument — `hash_world` omits `Species`, so a heritable `Variant`
   tag is hash-neutral the same way — + the 6-slice plan). The colony impl slices below come from §7 of the draft.
-- `[def]` **S1 `colony-snapshot-channel-impl`** 🛑 — the off-hash heritable `Variant(u16)` tag + `NextVariantId` +
-  `dominant_variant_id` GSS6 channel + brush mint/stamp in `apply_edit_region` + the `snapshot.gd`/byte-gate bump.
-  **STOP-THE-LINE: the only core/snapshot touch — designed hash-neutral (NOT a re-pin) but must PROVE `0x47a0` unmoved
-  at the gate before merge; needs human sign-off to run.** *(deps: ADR-029 sign-off.)*
+- `[ ]` **S1 `colony-snapshot-channel-impl`** 🛑→**SIGNED OFF (2026-06-28)** — the off-hash heritable `Variant(u16)` tag +
+  `NextVariantId` + `dominant_variant_id` GSS6 channel + brush mint/stamp in `apply_edit_region` + the `snapshot.gd`/byte-gate
+  bump. `.js` authored. Runs AFTER the in-flight #3-v2 finishes (both compile sim-core — not parallelized). **The gate
+  STOP-THE-LINE determinism check is the safety net: if `0x47a0` moves (unexpected — designed hash-neutral, NOT a re-pin),
+  HALT + report.** *(dep: #3-v2 merge — to avoid a shared-`sim-core` compile race.)*
 - `[def]` **S2 `colony-polygon-render-impl`** ✅ — `colonies.gd`: deterministic connected-components → contour → fill/outline/label (renderer-only). *dep: S1.*
 - `[def]` **S3 `lod-pop-impl`** ✅ — the footprint (`cell×zoom×size_scale`) pop ladder; plants pop first; no per-frame redraw. *dep: S2.*
 - `[def]` **S4 `brush-colony-binding-impl`** ✅ — render the brushed disc as a nested district (intra-species hue shift) + selected-pop. *dep: S2 (+ S1 core bind).*
@@ -79,9 +80,13 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 - `[def]` **oversight-ui-polish** (`slice`) — the ADR-028 #3-verify follow-ups (renderer-only): default the "growth ratio q" knob to `1000` (wild-type) not `0` (lethal KO); align the timeline "due epoch" marker label with the immediate-commit semantics; re-enable oversight in `load_session`.
 - `[def]` **live-session-sparkline-impl** — `save_session`/`load_session` already exist; add a per-gen effect sparkline on the injection/timeline markers (P4/P6 follow-up). Minor.
 
-**Flagged for human sign-off (do NOT auto-run):**
-- 🛑 **R3-F3 resource coupling** — per-cell local Wright-Fisher selection rewrite; blocked on the R1.2/R1.3 spatial-`Cell` design collision (a re-pin + an ADR-005 change). Needs a design workflow + sign-off first.
-- 🔁 **Rel-4 sqlite-vec sidecar** — only when the roster size crosses the trigger; designed, executes when warranted.
+**Sign-off granted 2026-06-28 ("zelená všem blockerům") — but gated by readiness, not approval:**
+- 🛑 **R3-F3 resource coupling** — SIGNED OFF, **but still UNDESIGNED** (blocked on the R1.2/R1.3 spatial-`Cell` design
+  collision; a re-pin + an ADR-005 change). An undesigned invariant rewrite is NOT auto-run even with sign-off — it needs
+  a **design workflow first** (`r3-f3-spatial-cell-design`, to author), then the executed re-pin. Lower priority than the
+  scenarios/colony epics; queue the design when those drain.
+- 🔁 **Rel-4 sqlite-vec sidecar** — SIGNED OFF; designed; executes when the roster size crosses the trigger (conditional —
+  not warranted now).
 
 ---
 
