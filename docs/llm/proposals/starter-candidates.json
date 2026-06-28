@@ -1,0 +1,548 @@
+[
+  {
+    "rank": 1,
+    "dynamics": "coexistence",
+    "score": 565682,
+    "caption": "coexistence \u00b7 4 spp \u00b7 takeovers",
+    "gens": 250,
+    "recorded_hash": "c73cd965d3631252",
+    "config": {
+      "master_seed": 18021835060145944617,
+      "roster": [
+        [
+          "default",
+          0
+        ],
+        [
+          "ecoli",
+          474
+        ],
+        [
+          "bacillus",
+          355
+        ],
+        [
+          "pseudomonas",
+          463
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          260
+        ]
+      ],
+      "containment_level": 3,
+      "temp_q": 815,
+      "season": 3,
+      "edits": [
+        {
+          "gen": 6294,
+          "species_index": 0,
+          "target": 15,
+          "guide": "TTCACCTGCAGATAGCGTTC"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 2,
+    "dynamics": "coexistence",
+    "score": 532995,
+    "caption": "coexistence \u00b7 5 spp \u00b7 takeovers",
+    "gens": 250,
+    "recorded_hash": "6e31a9c463b1c730",
+    "config": {
+      "master_seed": 2047811310841374595,
+      "roster": [
+        [
+          "default",
+          0
+        ],
+        [
+          "ecoli",
+          229
+        ],
+        [
+          "bacillus",
+          96
+        ],
+        [
+          "pseudomonas",
+          348
+        ],
+        [
+          "staph",
+          88
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          205
+        ]
+      ],
+      "containment_level": 3,
+      "temp_q": 361,
+      "season": 0,
+      "edits": [
+        {
+          "gen": 3745,
+          "species_index": 3,
+          "target": 10,
+          "guide": "CGAGAACGGTGGCAAGAATG"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 3,
+    "dynamics": "limit-cycle",
+    "score": 519676,
+    "caption": "limit-cycle \u00b7 4 spp \u00b7 takeovers",
+    "gens": 250,
+    "recorded_hash": "4b497fe2f8d4553c",
+    "config": {
+      "master_seed": 10562790716582683927,
+      "roster": [
+        [
+          "default",
+          0
+        ],
+        [
+          "ecoli",
+          343
+        ],
+        [
+          "bacillus",
+          0
+        ],
+        [
+          "pseudomonas",
+          254
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          281
+        ],
+        [
+          "bdellovibrio",
+          44
+        ]
+      ],
+      "containment_level": 3,
+      "temp_q": 752,
+      "season": 1
+    }
+  },
+  {
+    "rank": 4,
+    "dynamics": "coexistence",
+    "score": 510681,
+    "caption": "coexistence \u00b7 3 spp \u00b7 takeovers",
+    "gens": 270,
+    "recorded_hash": "3ccd41b9341811eb",
+    "config": {
+      "master_seed": 17795524700274724811,
+      "roster": [
+        [
+          "default",
+          0
+        ],
+        [
+          "ecoli",
+          265
+        ],
+        [
+          "bacillus",
+          0
+        ],
+        [
+          "pseudomonas",
+          86
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          142
+        ]
+      ],
+      "containment_level": 3,
+      "temp_q": 463,
+      "season": 1,
+      "edits": [
+        {
+          "gen": 16007,
+          "species_index": 5,
+          "target": 27,
+          "guide": "CTAGACGATCCGACACTACG"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 5,
+    "dynamics": "limit-cycle",
+    "score": 497718,
+    "caption": "limit-cycle \u00b7 3 spp \u00b7 steady",
+    "gens": 600,
+    "recorded_hash": "872624e9574b698e",
+    "config": {
+      "master_seed": 2788117678867344846,
+      "roster": [
+        [
+          "default",
+          895
+        ],
+        [
+          "ecoli",
+          385
+        ],
+        [
+          "bacillus",
+          0
+        ],
+        [
+          "pseudomonas",
+          166
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          0
+        ]
+      ],
+      "containment_level": 0,
+      "temp_q": 476,
+      "season": 2,
+      "edits": [
+        {
+          "gen": 20179,
+          "species_index": 6,
+          "target": 14,
+          "guide": "ATCCGTAAGCGTCTGGACCA"
+        },
+        {
+          "gen": 26894,
+          "species_index": 5,
+          "target": 14,
+          "guide": "TGCGTCCTAGGTCAGATGCC"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 6,
+    "dynamics": "eventful",
+    "score": 471151,
+    "caption": "eventful \u00b7 4 spp \u00b7 takeovers",
+    "gens": 250,
+    "recorded_hash": "9b6660475a238018",
+    "config": {
+      "master_seed": 9313418225334606798,
+      "roster": [
+        [
+          "default",
+          969
+        ],
+        [
+          "ecoli",
+          752
+        ],
+        [
+          "bacillus",
+          590
+        ],
+        [
+          "pseudomonas",
+          0
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          161
+        ]
+      ],
+      "containment_level": 0,
+      "temp_q": 822,
+      "season": 2
+    }
+  },
+  {
+    "rank": 7,
+    "dynamics": "limit-cycle",
+    "score": 468283,
+    "caption": "limit-cycle \u00b7 2 spp \u00b7 steady",
+    "gens": 600,
+    "recorded_hash": "a25483a28bd19f2c",
+    "config": {
+      "master_seed": 9221119159302866839,
+      "roster": [
+        [
+          "default",
+          322
+        ],
+        [
+          "ecoli",
+          469
+        ],
+        [
+          "bacillus",
+          0
+        ],
+        [
+          "pseudomonas",
+          0
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          0
+        ]
+      ],
+      "containment_level": 0,
+      "temp_q": 220,
+      "season": 3,
+      "edits": [
+        {
+          "gen": 57304,
+          "species_index": 1,
+          "target": 16,
+          "guide": "TGATGTGCGCAGCACGCGCG"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 8,
+    "dynamics": "boom-bust",
+    "score": 448966,
+    "caption": "boom-bust \u00b7 5 spp \u00b7 crashes",
+    "gens": 400,
+    "recorded_hash": "50b32df22e73a13b",
+    "config": {
+      "master_seed": 16862755984272895524,
+      "roster": [
+        [
+          "default",
+          439
+        ],
+        [
+          "ecoli",
+          302
+        ],
+        [
+          "bacillus",
+          0
+        ],
+        [
+          "pseudomonas",
+          397
+        ],
+        [
+          "staph",
+          436
+        ],
+        [
+          "aspergillus-niger",
+          116
+        ],
+        [
+          "bdellovibrio",
+          0
+        ]
+      ],
+      "containment_level": 1,
+      "temp_q": 654,
+      "season": 1
+    }
+  },
+  {
+    "rank": 9,
+    "dynamics": "boom-bust",
+    "score": 448590,
+    "caption": "boom-bust \u00b7 5 spp \u00b7 crashes",
+    "gens": 600,
+    "recorded_hash": "c518798d8aef58bd",
+    "config": {
+      "master_seed": 2176525205343495764,
+      "roster": [
+        [
+          "default",
+          264
+        ],
+        [
+          "ecoli",
+          239
+        ],
+        [
+          "bacillus",
+          404
+        ],
+        [
+          "pseudomonas",
+          493
+        ],
+        [
+          "staph",
+          446
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          0
+        ]
+      ],
+      "containment_level": 3,
+      "temp_q": 737,
+      "season": 0,
+      "edits": [
+        {
+          "gen": 64257,
+          "species_index": 2,
+          "target": 15,
+          "guide": "GGTCTCTAATTCAATCAAGT"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 10,
+    "dynamics": "drift",
+    "score": 416018,
+    "caption": "drift \u00b7 5 spp \u00b7 steady",
+    "gens": 250,
+    "recorded_hash": "232b8317de93952e",
+    "config": {
+      "master_seed": 15353919299062158320,
+      "roster": [
+        [
+          "default",
+          1067
+        ],
+        [
+          "ecoli",
+          577
+        ],
+        [
+          "bacillus",
+          480
+        ],
+        [
+          "pseudomonas",
+          0
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          95
+        ],
+        [
+          "bdellovibrio",
+          34
+        ]
+      ],
+      "containment_level": 2,
+      "temp_q": 268,
+      "season": 0,
+      "edits": [
+        {
+          "gen": 15126,
+          "species_index": 0,
+          "target": 16,
+          "guide": "CTGCCTGCGAACTCGGATCT"
+        }
+      ]
+    }
+  },
+  {
+    "rank": 11,
+    "dynamics": "limit-cycle",
+    "score": 358351,
+    "caption": "limit-cycle \u00b7 3 spp \u00b7 takeovers",
+    "gens": 600,
+    "recorded_hash": "4eb778011ec80e5d",
+    "config": {
+      "master_seed": 15086230643072980587,
+      "roster": [
+        [
+          "default",
+          817
+        ],
+        [
+          "ecoli",
+          571
+        ],
+        [
+          "bacillus",
+          0
+        ],
+        [
+          "pseudomonas",
+          0
+        ],
+        [
+          "staph",
+          0
+        ],
+        [
+          "aspergillus-niger",
+          0
+        ],
+        [
+          "bdellovibrio",
+          50
+        ]
+      ],
+      "containment_level": 3,
+      "temp_q": 732,
+      "season": 2
+    }
+  }
+]
