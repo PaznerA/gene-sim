@@ -153,7 +153,10 @@ pub fn env_config_for(
 ///
 /// An EMPTY schedule (the default `edit_budget == 0`) yields an EMPTY `Vec`, so `capture_trace(.., &[])` is
 /// recovered byte-for-byte and the pinned literal `0x47a0_3c8f_6701_f240` is untouched.
-fn edits_to_actions(
+///
+/// `pub(crate)` so the STARTER-MAP PROMOTE tool ([`crate::promote`]) can rebuild a gem's checkpoint journal
+/// against the SAME edit→action mapping the capture/verify path uses (the gem reproducibility contract).
+pub(crate) fn edits_to_actions(
     cfg: &SearchConfig,
     roster: &[(BuiltSpecies, u32)],
     gens: u32,
@@ -215,7 +218,10 @@ fn edits_to_actions(
 /// `Advance(gens)` — proven by `tests/trace_capture.rs::capture_is_hash_neutral_on_a_real_multi_species_run`
 /// (one seeded stream, no re-seed) — so an UNEDITED gem's round-trip is unchanged. `gens` here is the CAPTURED
 /// `gem.gens` (the capture early-stops at it), so an edit scheduled past it is naturally excluded.
-fn build_journal(actions: &[(u32, Action)], gens: u32) -> Vec<Action> {
+///
+/// `pub(crate)` so the STARTER-MAP PROMOTE tool ([`crate::promote`]) can build a gem's GEN-N checkpoint
+/// journal (Advance up to gen N with the scheduled edits interleaved) the same way the verify path does.
+pub(crate) fn build_journal(actions: &[(u32, Action)], gens: u32) -> Vec<Action> {
     let mut journal: Vec<Action> = Vec::with_capacity(gens as usize + actions.len());
     for gen in 1..=gens {
         for (g, a) in actions {

@@ -12,6 +12,10 @@ signal start_run(cfg)  # { seed, lat, lon, temp, season, entities, mission, spec
 # ABSOLUTE filesystem path, NOT res://) to replay. main.gd reads + composes the run from the gem's config and asks
 # the CORE to resolve its mid-run CRISPR edit schedule (no biology here — inv #2; the menu only hands the path).
 signal load_gem(path)  # absolute path to a gem .json the player chose in the Load-Gem FileDialog
+# STARTERS GALLERY: the menu's "Starters Gallery" button opens the RollerCoaster-Tycoon-style scenario picker
+# (gallery.gd) over data/presets/starters/. main.gd shows it; the gallery routes Play back to this menu's proven
+# Start path (gen-1 fresh run) or LiveSim.load_session (gen-N checkpoint). The menu only requests the open.
+signal open_gallery()
 
 const SEASONS := ["Spring", "Summer", "Autumn", "Winter"]
 # SP-2: the multi-species ROSTER master list. [label, file stem under data/species/]. Each stem is the FILE name
@@ -143,6 +147,15 @@ func _build() -> void:
 	load_gem_btn.tooltip_text = "Open a saved emergent-run gem (data/runs/gems/*.json) and replay it,\nincluding its mid-run CRISPR edit schedule (resolved by the core)."
 	load_gem_btn.pressed.connect(_on_load_gem_pressed)
 	col.add_child(load_gem_btn)
+
+	# STARTERS GALLERY: open the scenario picker over the promoted starter library (gen-1 fresh-config starters +
+	# gen-N checkpoint sessions). A RollerCoaster-Tycoon-style list + a description/preview/scrub panel. Renderer-
+	# only (inv #2): the menu just requests the open; the gallery moves inert JSON + drives existing #[func]s.
+	var gallery_btn := Button.new()
+	gallery_btn.text = "🗺️  Starters Gallery — scenario picker"
+	gallery_btn.tooltip_text = "Browse the saved starter library: pick a scenario, scrub its recorded timeline,\nthen Play (gen-1 = a fresh run · checkpoint = restored at gen N with its edits)."
+	gallery_btn.pressed.connect(_on_open_gallery_pressed)
+	col.add_child(gallery_btn)
 
 	col.add_child(_sep())
 
@@ -400,6 +413,13 @@ func _on_load_gem_pressed() -> void:
 ## A gem file was chosen: hand its absolute path to main.gd and dismiss the menu (mirrors _on_start's emit+free).
 func _on_gem_file_selected(path: String) -> void:
 	load_gem.emit(path)
+	queue_free()
+
+
+## "🗺️ Starters Gallery": request the scenario picker + dismiss this menu (main.gd shows the gallery, which routes
+## Play back to Start / load_session; Back reopens this menu). Mirrors _on_start's emit+free.
+func _on_open_gallery_pressed() -> void:
+	open_gallery.emit()
 	queue_free()
 
 

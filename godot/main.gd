@@ -53,6 +53,7 @@ const Brush := preload("res://brush.gd")
 const PanelChrome := preload("res://panel.gd")
 const PillRail := preload("res://pill_rail.gd")
 const MainMenu := preload("res://main_menu.gd")
+const Gallery := preload("res://gallery.gd")  # STARTERS scenario picker (gen-1 fresh run / gen-N checkpoint load)
 const DataLayerShader := preload("res://data_layer.gdshader")
 const SpeciesVisualMap := preload("res://species_visual_map.gd")
 
@@ -531,6 +532,15 @@ func _ready() -> void:
 			return
 		_configure_run_from_gem(gem_arg)  # windowed: compose + arm; the _process live loop replays it
 
+	# STARTERS GALLERY: --gallery-check drives the scenario picker headlessly (the gate — list every starter, load
+	# each kind through the proven path, assert a gen-N load carries its recorded markers) + quits; --gallery opens
+	# the picker windowed. Renderer-only (inv #2): the gallery moves inert JSON + drives existing #[func]s.
+	if _live != null and _has_flag("--gallery-check"):
+		_run_gallery_check()
+		return
+	if _live != null and _has_flag("--gallery"):
+		_show_gallery()
+
 	if shot_path != "":
 		if _live != null and _has_flag("--menu"):
 			_show_main_menu()  # capture the main-menu overlay for visual verification
@@ -607,11 +617,140 @@ func _show_main_menu() -> void:
 	menu.setup(_live, _seed, _mission_on)  # seed the mission checkbox from the --mission CLI flag (default off)
 	menu.start_run.connect(_on_menu_start)
 	menu.load_gem.connect(_on_menu_load_gem)  # LOAD-GEM-REPLAY v2: the menu's "Load Gem" FileDialog hands a gem path
+	menu.open_gallery.connect(_on_menu_open_gallery)  # STARTERS: the menu's "Starters Gallery" → the scenario picker
 	add_child(menu)
 	_menu = menu  # mark the modal open so _unhandled_input swallows sim hotkeys until Start
 	_paused = true
 	if _timer != null:
 		_timer.stop()
+
+
+## The menu's "Starters Gallery": dismiss the (self-freeing) menu and open the scenario picker. The gallery is the
+## SAME modal band as the menu (it sets _menu so sim hotkeys stay swallowed), and routes its Play back to the
+## proven menu-Start / load_session paths.
+func _on_menu_open_gallery() -> void:
+	_show_gallery()
+
+
+## Instantiate the STARTERS scenario picker, keep the sim paused behind it, and wire its Play/Back. gen-1 → the
+## proven _on_menu_start path (fresh run); gen-N checkpoint → the EXISTING load_session #[func]; Back → the new-run
+## menu. Renderer-only (inv #2): the gallery moves inert JSON + drives existing #[func]s; main.gd owns the core.
+func _show_gallery() -> void:
+	if _live == null:
+		return
+	var g := Gallery.new()
+	g.setup(_live)
+	g.play_gen1.connect(_on_gallery_play_gen1)
+	g.play_checkpoint.connect(_on_gallery_play_checkpoint)
+	g.back.connect(_on_gallery_back)
+	add_child(g)
+	_menu = g  # the gallery is modal too — swallow sim hotkeys until Play/Back
+	_paused = true
+	if _timer != null:
+		_timer.stop()
+
+
+## A gallery gen-1 Play: route the starter cfg through the proven menu Start path (set_roster/set_environment/
+## set_containment/reset) — byte-identical to composing the same roster + env in the new-run menu.
+func _on_gallery_play_gen1(cfg: Dictionary) -> void:
+	_menu = null  # the gallery freed itself after emitting → hotkeys live again
+	_on_menu_start(cfg)
+
+
+## A gallery checkpoint Play: restore the recorded session at gen N via the EXISTING load_session #[func], then set
+## the gallery-parsed recorded markers on the live timeline (the cdylib exposes no journal_actions export, so the
+## renderer's own journal→marker projection is authoritative — the SAME projection the gallery preview scrubbed).
+func _on_gallery_play_checkpoint(slug: String, markers: Array) -> void:
+	_menu = null  # the gallery freed itself after emitting → hotkeys live again
+	if not _load_checkpoint_session(slug):
+		push_warning("Starters: failed to load checkpoint session %s" % slug)
+		return
+	_injections = markers.duplicate()  # the recorded-edit projection (renderer-side; inv #2)
+	if _timeline != null:
+		_timeline.set_markers(_injections)
+
+
+## Back from the gallery → reopen the new-run main menu.
+func _on_gallery_back() -> void:
+	_menu = null
+	_show_main_menu()
+
+
+## Load a gen-N checkpoint STARTER session via the EXISTING LiveSim.load_session #[func]: the staged
+## res://data/presets/starters/<slug>/ dir (seed.json + actions.ndjson). The core rebuilds the FULL run
+## composition + replays the journal deterministically (inv #3), restoring the run to gen N. Renderer-only (inv
+## #2): GDScript only globalizes the staged path + drives load_session + resyncs the view. has_method-guarded so
+## an older cdylib / file replay degrades with a clear message. Returns false on a missing export or a load error.
+func _load_checkpoint_session(slug: String) -> bool:
+	if _live == null or not _live.has_method("load_session"):
+		push_warning("Starters: LiveSim.load_session unavailable in this build — cannot restore the checkpoint.")
+		return false
+	var dir := ProjectSettings.globalize_path("res://data/presets/starters/%s" % slug)
+	if not DirAccess.dir_exists_absolute(dir):
+		push_warning("Starters: checkpoint session dir not found at %s (was data/presets staged into res://?)" % dir)
+		return false
+	var r: Dictionary = _live.load_session(dir)
+	if not bool(r.get("ok", false)):
+		push_warning("Starters: load_session failed for %s: %s" % [slug, str(r.get("detail", "?"))])
+		return false
+	_resync_to_live()  # clears _injections; the caller sets the recorded markers next
+	print("STARTER CHECKPOINT loaded — %s · gen %d · %d actions" % [slug, int(r.get("generation", 0)), int(r.get("actions", 0))])
+	return true
+
+
+## HEADLESS GALLERY GATE (--gallery-check, inv #4): instantiate the scenario picker, list every starter, exercise
+## BOTH Play paths through the real handlers (gen-1 → _on_menu_start fresh run; gen-N → load_session), and assert a
+## checkpoint load carries its recorded edit markers. Prints a greppable `GALLERY OK …` line + quits (non-zero on a
+## broken gallery — empty index, a checkpoint with no markers, or a failed load). Renderer-only (inv #2).
+func _run_gallery_check() -> void:
+	var probe := Gallery.new()
+	probe.setup(_live)
+	add_child(probe)
+	var s: Dictionary = probe.check_headless()
+	probe.queue_free()
+	var count := int(s.get("count", 0))
+	if count <= 0:
+		print("GALLERY FAIL — no starters listed (index missing/empty at res://data/presets/starters/index.json)")
+		get_tree().quit(1)
+		return
+
+	# gen-1 Play: route the first gen-1 starter through the proven menu Start path (resets the live core).
+	var gen1_loaded := false
+	var first_gen1 := int(s.get("first_gen1", -1))
+	if first_gen1 >= 0:
+		var g1 := Gallery.new()
+		g1.setup(_live)
+		g1.play_gen1.connect(_on_gallery_play_gen1)
+		add_child(g1)
+		g1.select_entry(first_gen1)
+		g1.play_selected()  # emits play_gen1 → _on_menu_start → a fresh deterministic run
+		gen1_loaded = _live.observe() != null
+
+	# gen-N Play: load the first checkpoint via the EXISTING load_session #[func]; the recorded markers must land.
+	var checkpoint_markers := 0
+	var checkpoint_loaded := false
+	var first_ckpt := int(s.get("first_checkpoint", -1))
+	if first_ckpt >= 0:
+		var g2 := Gallery.new()
+		g2.setup(_live)
+		g2.play_checkpoint.connect(_on_gallery_play_checkpoint)
+		add_child(g2)
+		g2.select_entry(first_ckpt)
+		g2.play_selected()  # emits play_checkpoint → load_session + sets _injections to the recorded markers
+		checkpoint_markers = _injections.size()
+		checkpoint_loaded = checkpoint_markers > 0
+
+	print("GALLERY OK — listed=%d gen1=%d checkpoint=%d gen1_loaded=%s checkpoint_loaded=%s checkpoint_markers=%d" % [
+		count, int(s.get("gen1", 0)), int(s.get("checkpoint", 0)),
+		gen1_loaded, checkpoint_loaded, checkpoint_markers])
+
+	# A listed checkpoint that loads with ZERO recorded markers is a broken gen-N path (the journal projection
+	# failed) → RED. A library with only gen-1 starters passes on the listing + gen-1 load alone.
+	if first_ckpt >= 0 and not checkpoint_loaded:
+		print("GALLERY FAIL — checkpoint %d loaded but showed no recorded markers" % first_ckpt)
+		get_tree().quit(1)
+		return
+	get_tree().quit()
 
 
 ## The menu's Start: apply seed/entity/climate to the LiveSim, reseed the world in place (no relaunch — the same

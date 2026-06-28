@@ -1,0 +1,42 @@
+{
+  "name": "Coexistence",
+  "caption": "coexistence · 4 spp · takeovers",
+  "dynamics": "coexistence",
+  "source_hash": "c73cd965d3631252",
+  "source_seed": 18021835060145944617,
+  "config": {
+    "roster": [
+      [
+        "default",
+        0
+      ],
+      [
+        "ecoli",
+        474
+      ],
+      [
+        "bacillus",
+        355
+      ],
+      [
+        "pseudomonas",
+        463
+      ],
+      [
+        "staph",
+        0
+      ],
+      [
+        "aspergillus-niger",
+        0
+      ],
+      [
+        "bdellovibrio",
+        260
+      ]
+    ],
+    "containment_level": 3,
+    "temp_q": 815,
+    "season": 3
+  }
+}

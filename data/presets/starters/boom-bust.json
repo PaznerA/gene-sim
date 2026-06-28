@@ -1,0 +1,42 @@
+{
+  "name": "Boom Bust",
+  "caption": "boom-bust · 5 spp · crashes",
+  "dynamics": "boom-bust",
+  "source_hash": "50b32df22e73a13b",
+  "source_seed": 16862755984272895524,
+  "config": {
+    "roster": [
+      [
+        "default",
+        439
+      ],
+      [
+        "ecoli",
+        302
+      ],
+      [
+        "bacillus",
+        0
+      ],
+      [
+        "pseudomonas",
+        397
+      ],
+      [
+        "staph",
+        436
+      ],
+      [
+        "aspergillus-niger",
+        116
+      ],
+      [
+        "bdellovibrio",
+        0
+      ]
+    ],
+    "containment_level": 1,
+    "temp_q": 654,
+    "season": 1
+  }
+}

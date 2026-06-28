@@ -1,0 +1,42 @@
+{
+  "name": "Eventful",
+  "caption": "eventful · 4 spp · takeovers",
+  "dynamics": "eventful",
+  "source_hash": "9b6660475a238018",
+  "source_seed": 9313418225334606798,
+  "config": {
+    "roster": [
+      [
+        "default",
+        969
+      ],
+      [
+        "ecoli",
+        752
+      ],
+      [
+        "bacillus",
+        590
+      ],
+      [
+        "pseudomonas",
+        0
+      ],
+      [
+        "staph",
+        0
+      ],
+      [
+        "aspergillus-niger",
+        0
+      ],
+      [
+        "bdellovibrio",
+        161
+      ]
+    ],
+    "containment_level": 0,
+    "temp_q": 822,
+    "season": 2
+  }
+}

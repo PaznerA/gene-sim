@@ -76,6 +76,20 @@ OPTIONS:
     --save-evals          Also write EVERY evaluated (config → ScoreVec) to data/runs/evals/<search_seed>.jsonl
                           (one JSON per line, in evaluation order — the D3-A surrogate training data). OFF-HASH:
                           read-only over already-computed gem fields; the pinned sim literal is untouched.
+    --promote-gem <PATH>  STARTER-MAP PROMOTE: turn a verified gem JSON into a committed starter under
+                          data/presets/starters/ and rebuild the gallery index.json. Requires --starter-name
+                          <slug>. Default = a GEN-1 pristine fresh-config starter (<slug>.json); with
+                          --checkpoint-gen N = a GEN-N checkpoint SESSION (<slug>/seed.json + actions.ndjson,
+                          the gem's edits interleaved up to gen N), round-trip-verified before writing. Each
+                          starter carries the source gem's recorded_hash (provenance). --starter-title sets the
+                          gallery name (default: derived from the slug).
+    --starter-name <slug> Slug for --promote-gem (the <slug>.json file / <slug>/ session dir + index key).
+    --starter-title <s>   Human-readable gallery name for --promote-gem (default: title-cased slug).
+    --checkpoint-gen <N>  Make --promote-gem record a GEN-N checkpoint session up to generation N (default: a
+                          pristine GEN-1 fresh-config starter, no edits, nothing replayed).
+    --promote-default-set Promote a default set of GEN-1 starters from data/runs/gems/ — one per distinct
+                          dynamics shape (best by score/novelty), capped at --starter-max (default 8).
+    --starter-max <N>     Cap for --promote-default-set (default: 8).
     --campaign <FILE>     Grade a JSON campaign manifest (scenarios = world + region objective + budget):
                           replay one journal subdir per scenario from --journals <DIR>/<index>/ and print each
                           Won/Lost + score + the total. Win/score rules live in the core (inv #2), not GDScript.
@@ -331,6 +345,31 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
             .position(|a| a == flag)
             .and_then(|i| argv.get(i + 1).cloned())
     };
+
+    // STARTER-MAP PROMOTE — turn a verified gem into a committed starter (gen-1 fresh config or gen-N checkpoint
+    // session) under data/presets/starters/, then rebuild the gallery index. Meta-level only: gen-1 copies the
+    // gem's fresh config + provenance, gen-N replays the gem's journal through the SAME record/replay contract —
+    // the sim runs stay pure functions of their configs, so the pinned literal 0x47a0_3c8f_6701_f240 is untouched.
+    if let Some(gem_path) = val("--promote-gem") {
+        let Some(slug) = val("--starter-name") else {
+            eprintln!("error: --promote-gem requires --starter-name <slug>");
+            return Some(ExitCode::from(2));
+        };
+        let title = val("--starter-title");
+        let checkpoint = val("--checkpoint-gen").and_then(|s| s.parse::<u32>().ok());
+        return Some(run_promote_gem(
+            &gem_path,
+            &slug,
+            title.as_deref(),
+            checkpoint,
+        ));
+    }
+    if argv.iter().any(|a| a == "--promote-default-set") {
+        let max: usize = val("--starter-max")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        return Some(run_promote_default_set(max));
+    }
 
     if let Some(manifest) = val("--campaign") {
         // Grade a campaign (let-loose/campaign-grader): load the JSON manifest, replay one journal subdir per
@@ -726,6 +765,96 @@ fn run_discover_from_gem(
         }
         Err(e) => {
             eprintln!("from-gem error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// STARTER-MAP PROMOTE one gem (`--promote-gem <path> --starter-name <slug>`): a GEN-1 fresh-config starter by
+/// default, or a GEN-N checkpoint session when `--checkpoint-gen N` is given. Writes into
+/// `data/presets/starters/` and rebuilds the gallery index. The `data/species` root is resolved relative to the
+/// binary's manifest dir (the byte-mover boundary). Meta-level only — the pinned sim literal is untouched.
+fn run_promote_gem(
+    gem_path: &str,
+    slug: &str,
+    title: Option<&str>,
+    checkpoint: Option<u32>,
+) -> ExitCode {
+    let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
+    let starters_dir = PathBuf::from("data/presets/starters");
+
+    let gem: discovery::search::Gem = match std::fs::read_to_string(gem_path)
+        .map_err(|e| format!("read {gem_path}: {e}"))
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| format!("parse {gem_path}: {e}")))
+    {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("promote error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let name = title.map_or_else(|| harness::promote::title_from_slug(slug), str::to_string);
+
+    let outcome = match checkpoint {
+        Some(n) => {
+            harness::promote::promote_checkpoint(&gem, slug, &name, n, &species_dir, &starters_dir)
+                .map(|p| (p, format!("checkpoint @gen {n}")))
+        }
+        None => harness::promote::promote_gen1(&gem, slug, &name, &starters_dir)
+            .map(|p| (p, "gen-1".to_string())),
+    };
+    match outcome {
+        Ok((path, kind)) => match harness::promote::rebuild_index(&starters_dir) {
+            Ok(idx) => {
+                println!(
+                    "promoted {kind} starter {slug:?} ({name:?}) → {}\n  rebuilt {}",
+                    path.display(),
+                    idx.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("promote error: rebuild index: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("promote error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// STARTER-MAP PROMOTE the default set (`--promote-default-set`): scan `data/runs/gems/` and promote ONE GEN-1
+/// starter per distinct dynamics shape (best by score/novelty, capped at `--starter-max`), then rebuild the
+/// index. A missing/empty gems dir yields no starters (the index is still rebuilt). `data/runs/gems` is
+/// gitignored; the written starters live under the committed `data/presets/starters/`.
+fn run_promote_default_set(max: usize) -> ExitCode {
+    let gems_dir = PathBuf::from("data/runs/gems");
+    let starters_dir = PathBuf::from("data/presets/starters");
+    println!(
+        "gene-sim promote (DEFAULT SET) · gems={} · starters={} · max={max}",
+        gems_dir.display(),
+        starters_dir.display()
+    );
+    match harness::promote::promote_default_set(&gems_dir, &starters_dir, max) {
+        Ok(slugs) => {
+            if slugs.is_empty() {
+                println!(
+                    "  no gems found in {} — wrote an empty index",
+                    gems_dir.display()
+                );
+            } else {
+                println!(
+                    "  promoted {} gen-1 starter(s): {}",
+                    slugs.len(),
+                    slugs.join(", ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("promote error: {e}");
             ExitCode::from(1)
         }
     }

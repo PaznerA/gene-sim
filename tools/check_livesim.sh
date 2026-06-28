@@ -48,10 +48,26 @@ printf 'res://gene_sim.gdextension\n' > "$TMP/.godot/extension_list.cfg"
 cp crates/godot-sim/godot/livesim_smoke.gd "$TMP/livesim_smoke.gd"
 
 OUT="$(godot --headless --path "$TMP" --script livesim_smoke.gd 2>&1)"
-if printf '%s' "$OUT" | grep -q "LIVESIM_SMOKE_OK"; then
-  echo "LIVESIM OK — $(printf '%s' "$OUT" | grep -E 'Initialize godot-rust' | head -1)"
+if ! printf '%s' "$OUT" | grep -q "LIVESIM_SMOKE_OK"; then
+  echo "FAIL — LiveSim smoke did not print LIVESIM_SMOKE_OK. Full output:"
+  printf '%s\n' "$OUT" | tail -20
+  exit 1
+fi
+echo "LIVESIM OK — $(printf '%s' "$OUT" | grep -E 'Initialize godot-rust' | head -1)"
+
+# STARTERS GALLERY headless gate (renderer-only, inv #2/#4): with the cdylib just built, drive the scenario picker
+# in the MAIN godot/ project — list every promoted starter, exercise BOTH Play paths (gen-1 → the proven menu Start
+# reset; gen-N → the EXISTING load_session #[func]), and assert a checkpoint load carries its recorded edit markers.
+# Stage the inert data the renderer reads via res:// (the same copy run.sh / the snapshot gate do), then grep for
+# `GALLERY OK`. The runtime extension loader in main.gd::_setup_live picks up the dylib we just built above.
+mkdir -p godot/data/species && cp data/species/*.json godot/data/species/ 2>/dev/null || true
+mkdir -p godot/data/codex && cp data/codex/*.json godot/data/codex/ 2>/dev/null || true
+mkdir -p godot/data/presets && cp -R data/presets/. godot/data/presets/ 2>/dev/null || true
+GALLERY_OUT="$(timeout "${GODOT_TIMEOUT:-180}" godot --headless --path godot -- --live --gallery-check 2>&1)"
+if printf '%s' "$GALLERY_OUT" | grep -q "GALLERY OK"; then
+  echo "GALLERY OK — $(printf '%s' "$GALLERY_OUT" | grep 'GALLERY OK')"
   exit 0
 fi
-echo "FAIL — LiveSim smoke did not print LIVESIM_SMOKE_OK. Full output:"
-printf '%s\n' "$OUT" | tail -20
+echo "FAIL — Starters gallery check did not print 'GALLERY OK'. Full output:"
+printf '%s\n' "$GALLERY_OUT" | tail -25
 exit 1

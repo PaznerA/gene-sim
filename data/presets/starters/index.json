@@ -1,0 +1,58 @@
+[
+  {
+    "slug": "boom-bust",
+    "name": "Boom Bust",
+    "kind": "gen1",
+    "caption": "boom-bust · 5 spp · crashes",
+    "dynamics": "boom-bust",
+    "source_hash": "50b32df22e73a13b"
+  },
+  {
+    "slug": "branch-point",
+    "name": "Branch Point",
+    "kind": "checkpoint",
+    "caption": "boom-bust · 6 spp · crashes",
+    "dynamics": "boom-bust",
+    "source_hash": "16f3b8cb2519f527"
+  },
+  {
+    "slug": "coexistence",
+    "name": "Coexistence",
+    "kind": "gen1",
+    "caption": "coexistence · 4 spp · takeovers",
+    "dynamics": "coexistence",
+    "source_hash": "c73cd965d3631252"
+  },
+  {
+    "slug": "drift",
+    "name": "Drift",
+    "kind": "gen1",
+    "caption": "drift · 3 spp · steady",
+    "dynamics": "drift",
+    "source_hash": "518347049d204604"
+  },
+  {
+    "slug": "eventful",
+    "name": "Eventful",
+    "kind": "gen1",
+    "caption": "eventful · 4 spp · takeovers",
+    "dynamics": "eventful",
+    "source_hash": "9b6660475a238018"
+  },
+  {
+    "slug": "flat",
+    "name": "Flat",
+    "kind": "gen1",
+    "caption": "flat · 1 spp · steady",
+    "dynamics": "flat",
+    "source_hash": "0a39d722c4ab6800"
+  },
+  {
+    "slug": "limit-cycle",
+    "name": "Limit Cycle",
+    "kind": "gen1",
+    "caption": "limit-cycle · 4 spp · takeovers",
+    "dynamics": "limit-cycle",
+    "source_hash": "4b497fe2f8d4553c"
+  }
+]

@@ -39,6 +39,7 @@ pub mod capture;
 pub mod discover;
 pub mod firewall;
 pub mod oversight;
+pub mod promote;
 pub mod replay;
 pub mod species;
 
