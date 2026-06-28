@@ -25,11 +25,31 @@
 | 2 | `[ ]` | **discovery-continue-from-gem-impl** | workflow | A runner that LOADS a saved gem → seeds a fresh evolutionary search FROM it (branch + keep evolving/editing the discovered community); every continued gem round-trips — **the "continuation after -X gens" ask** | ✅ | gems exist · discovery infra (done) |
 | 3 | `[ ]` | **discovery-load-gem-replay-impl** | workflow | Renderer reads a saved `data/runs/gems/*.json` → configures a live run (reset/roster/env/containment) + schedules the gem edits via `apply_edit` → the player WATCHES the discovered scenario; renderer-only, reuses existing `#[func]`s | ✅ | gems exist · Variant Lab D (done) |
 | 4 | `[ ]` | **starter-map-library-impl** | workflow | Promote the curated gems (`proposals/starter-candidates.json`) into 5–10 named, committed starter maps: **gen-1** (fresh config) + **gen-N checkpoints** (replayed so the edits are RECORDED in the scrub-back timeline) + a renderer "Starters" gallery (gen-1 via Load Starter, gen-N via `load_session`) | ✅ | #2 continue-from-gem + #3 load-gem-replay |
-| 5 | `[ ]` | **oversight-ui-polish** | slice | The ADR-028 #3-verify follow-ups (renderer-only): default the "growth ratio q" knob to `1000` (wild-type) not `0` (lethal KO); align the timeline "due epoch" marker label with the immediate-commit semantics; re-enable oversight in `load_session` | ✅ | OVERSIGHT UI (done) |
+| 5 | `[ ]` | **scenario-gif-preview-impl** | workflow | Auto-GIF of a scenario's KEY EVENTS (booms/crashes/takeovers + edit gens, from the off-hash D1 trace) → headless macOS-safe frame capture → an animated GIF (MIT `gif` crate / external subprocess) at `data/presets/starters/<slug>.gif` for the RCT selector's right-panel animation | ✅ | #4 starter-map-library |
 
-**Queue depth (forward READY, non-done): 5** — 4 discovery/auto-research workflows (`scenarios` → `continue-from-gem`
-→ `load-gem-replay` → `starter-map-library`, a precisely-sequenced arc) + `oversight-ui-polish`. ≥5 ✅. All ✅
-hash-neutral. Grounded in the wave-1+2 research (`proposals/starter-map-research.md` + `starter-candidates.json`).
+**Queue depth (forward READY, non-done): 5** — the **scenarios arc** (`scenarios` → `continue-from-gem` →
+`load-gem-replay` → `starter-map-library` [RCT-style selector] → `scenario-gif-preview`). ≥5 ✅. All ✅ hash-neutral.
+Grounded in the wave-1+2 research (`proposals/starter-map-research.md` + `starter-candidates.json`). **Right after this
+arc → the VISUAL-POLISH epic below** (the user: the screen is "spammed"/cluttered — declutter it).
+
+---
+
+## ▶ VISUAL-POLISH EPIC — leads right after the scenarios arc (the screen is cluttered)
+
+> User brief (2026-06-28): the play screen is "zaspamovaná" (per-organism dot spam) + unreadable. Develop **COLONIES**
+> (map polygons that layer better than individual organisms + unify a species/variant; a CRISPR brush edit creates a NEW
+> colony — Cities-Skylines DISTRICTS); each zoom scope "pops" a selected colony open to individual organisms by organism
+> size; **plants** always-visible + most-realistic, in ≥1 colony. Colonies are an OFF-HASH render aggregation (a per-cell
+> variant/colony channel on the snapshot, like `dominant_species_id`) → inv #2/#3, `0x47a0` untouched. Also the LOD lever
+> for bigger maps (`[[perf-bigger-maps-needs-structural-change]]`).
+
+- `[ ]` **visual-declutter-colony-design** (`workflow`, DESIGN) — 3-lens panel (render-arch / data-determinism / ux-lod)
+  → judge → `proposals/visual-declutter-colony-draft.md` (ADR-029 draft + slice plan). **Leads the epic.** ✅ hash-neutral
+  (a doc). Any hash-touching part is flagged 🛑 STOP-THE-LINE for sign-off.
+- `[def]` **colony impl slices** (queued from the draft after sign-off): `colony-snapshot-channel-impl` (the off-hash
+  per-cell variant/colony channel, GSS bump — ✅ hash-neutral, model on `dominant_species_id`) → `colony-polygon-render-impl`
+  (derive + draw colony footprints) → `lod-pop-impl` (zoom×size pop colony↔organisms) → `brush-colony-binding-impl`
+  (ApplyEditRegion creates a district/colony) → `plant-realism-impl` (always-visible realistic plants in ≥1 colony).
 
 ---
 
@@ -50,7 +70,8 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 - `[def]` **unsafe-policy-adr** (`direct`) — ADR documenting the `forbid(unsafe_code)` rule + the one `godot-sim` `unsafe impl` exception.
 - `[def]` **docs-housekeeping** (`direct`) — delete the stale untracked `docs/llm/weakspots.md` (hallucinates a non-existent Python project) + triage `docs/llm/glmTakeover/`; add `ADR-INDEX.md`.
 
-**Sandbox QoL:**
+**Polish & QoL:**
+- `[def]` **oversight-ui-polish** (`slice`) — the ADR-028 #3-verify follow-ups (renderer-only): default the "growth ratio q" knob to `1000` (wild-type) not `0` (lethal KO); align the timeline "due epoch" marker label with the immediate-commit semantics; re-enable oversight in `load_session`.
 - `[def]` **live-session-sparkline-impl** — `save_session`/`load_session` already exist; add a per-gen effect sparkline on the injection/timeline markers (P4/P6 follow-up). Minor.
 
 **Flagged for human sign-off (do NOT auto-run):**
@@ -61,6 +82,7 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 
 ## ▶ LOG (append per item: date · item · PASS/RED · merge sha · note)
 
+- 2026-06-28 — **User brief folded in (scenarios + GIF + RCT selector + visual-polish/colony epic).** Refined `starter-map-library` gallery → RCT-style scenario selector (left list / big right desc + animation + thick scrub slider). Authored `scenario-gif-preview-impl` (auto-GIF of key events; off-hash + macOS-safe + GPL-clean) → active #5. Authored `visual-declutter-colony-design` (DESIGN: colonies as off-hash render aggregation, brush-creates-colony à la Cities-Skylines districts, LOD pop by zoom×size, plants always-visible/realistic; ADR-029 draft) → leads the new VISUAL-POLISH epic right after the scenarios arc. `oversight-ui-polish` → Polish pipeline.
 - 2026-06-28 — **Research waves 1+2 + starter-map capstone queued.** Ran 60 evolutionary runs (8 640 configs, 572 verified gems) over the default space. Findings (`proposals/starter-map-research.md`): decomposer keystone (Δqual +303k), a sustainability cliff on long horizons (boom-bust 16%→38%; sustainable core = plant+ecoli), predator regulates not oscillates, edits +quality, M3/M5 discriminate (validates dramaweights). Curated 11 starter candidates → `proposals/starter-candidates.json`. Authored `starter-map-library-impl` (gen-1 + gen-N-checkpoint maps with recorded-intervention timelines) → queued #4 (dep on #2 continue-from-gem + #3 load-gem-replay). `beta-contributing-md` → pipeline.
 - 2026-06-28 — **Re-plan #2 @ `main` b865644 → discovery/auto-research lead.** First brute-force batch validated the pipeline (21 verified gems, ~60s/run, edit axis produced the #1 gem, 19/21 distinct shapes, M1 saturates). Authored 3 discovery-research workflows (`discovery-scenarios-impl`, `discovery-continue-from-gem-impl`, `discovery-load-gem-replay-impl`) → READY; active queue rebuilt (5 READY: 3 research + `oversight-ui-polish` + `beta-contributing-md`). `discovery-dramaweights-impl` flagged next-to-promote (M1-saturation-validated). The 5 completed gameplay items are in the entries below.
 - 2026-06-28 — **#5 `sandbox-load-starter-impl` ALREADY SHIPPED** (no new merge). The feature landed earlier in `597a8d4` (`main_menu.gd:295-365`). Workflow VERIFIED the as-committed impl: gate GREEN; verify 4/4 at 3/3; `data/presets` res:// staged + byte-gated; `0x47a0` unmoved.
