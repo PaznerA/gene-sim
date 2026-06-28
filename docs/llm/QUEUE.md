@@ -24,9 +24,11 @@
 | 2 | `[x]` | **variant-lab-autoresearch-edits** | workflow | Variant Lab D: give the brute-force auto-research the CRISPR-edit action — a scheduled-edits axis on `SearchConfig` (serde-default, default-OFF via `edit_budget`) threaded as the EXISTING `Action::ApplyEdit` into `capture_trace` + the verify journal; edited gems round-trip | ✅ | A (done) + discovery D2a/D2b/D3-A (done) |
 | 3 | `[x]` | **oversight-ingame-ui-impl** | workflow | In-game OVERSIGHT panel: render the earned-credit ledger, request → preview (FBA KO) → commit an E. coli edit rippling via the F4 loop; drives the existing `RequestEcoliEdit`/`CommitEcoliImpact` journal | ✅ | — |
 | 4 | `[x]` | **codex-browse-panel-impl** | workflow | Browsable CODEX panel (SP-4 §2.3 follow-up): a scrollable species/gene/role/flow browser over `res://data/codex/codex.json`, reusing the staged+gated `godot/codex.gd` loader (the SP-4 res:// blocker is RESOLVED) | ✅ | codex staging (done) |
-| 5 | `[ ]` | **sandbox-load-starter-impl** | workflow | Wire "Load Starter" into the SP-2 composer: read `res://data/presets/primordial.json` → pre-fill roster + env + containment (the onboarding ramp); ensure `data/presets` is res:// staged + byte-gated | ✅ | SP-2 (done) |
+| 5 | `[x]` | **sandbox-load-starter-impl** | workflow | Wire "Load Starter" into the SP-2 composer: read `res://data/presets/primordial.json` → pre-fill roster + env + containment (the onboarding ramp); ensure `data/presets` is res:// staged + byte-gated | ✅ | SP-2 (done) |
 
-**Queue depth (forward READY, non-done): 5** — 2 pre-authored + 3 newly-authored this pass (`variant-lab-autoresearch-edits`, `codex-browse-panel-impl`, `sandbox-load-starter-impl`). ≥5 ✅. All ✅ hash-neutral.
+**Queue depth (forward READY, non-done): 0** — all 5 active items DONE (2026-06-28 `/roadmap-iterate` run). The
+NEXT PIPELINE below is DEFINED-only (`.js` not yet authored). **→ run `/roadmap-plan` to refill before the next
+`/roadmap-iterate`.**
 
 ---
 
@@ -63,6 +65,7 @@ largely orthogonal; only a future spatial-index re-pin touches an invariant and 
 ## ▶ LOG (append per item: date · item · PASS/RED · merge sha · note)
 
 - 2026-06-27 — QUEUE seeded (gameplay/sandbox lead). `beta-license-dual` done in the same commit. `variant-lab-save-reseed.js` + `oversight-ingame-ui-impl.js` authored → READY. 4 DEFINED + the discovery/beta pipeline behind them.
+- 2026-06-28 — **#5 `sandbox-load-starter-impl` ALREADY SHIPPED** (no new merge). The feature landed earlier in `597a8d4` (`main_menu.gd:295-365`, the pre-run SP-2 composer menu — the roadmap-plan frontier check grepped `main.gd` + missed `main_menu.gd`). Workflow VERIFIED the as-committed impl: gate GREEN; 3-skeptic verify CONFIRMED, 4/4 at 3/3; `data/presets` res:// staged + byte-gated (sha256-identical); `0x47a0` unmoved. Item closed verified-only. **Active queue now drained (5/5) → `/roadmap-plan` to refill.** (Minor cosmetic notes on the existing impl: unknown-season defaults to Spring silently; preset `containment.consortium` informational only — not tracked, trivial.)
 - 2026-06-28 — **#4 `codex-browse-panel-impl` PASS** (gate GREEN, `CODEX MIRROR/INSPECT OK`; 3-skeptic verify CONFIRMED, 4/4 claims at 3/3; ZERO Rust — pinned literal `0x47a0_3c8f_6701_f240` byte-identical; reuses `codex.gd`, res:// byte-gate intact; no ADR needed). Merged `--no-ff` to `main`. Next ready: #5 `sandbox-load-starter-impl` (the last active-queue item).
 - 2026-06-28 — **#3 `oversight-ingame-ui-impl` PASS** (gate GREEN; 3-skeptic verify CONFIRMED, 5/5 claims at 3/3; pinned literal `0x47a0_3c8f_6701_f240` UNMOVED on no-commit, a committed edit moves it deliberately + replays byte-equal; no economy/biology in GDScript; no wall-clock leak). **ADR-028** appended (the renderer immediate-commit path + the honest divergence from the headless `due_epoch` firewall). Merged `--no-ff` to `main`. NON-BLOCKING UX follow-ups tracked as `oversight-ui-polish`. Next ready: #4 `codex-browse-panel-impl`.
 - 2026-06-28 — **#2 `variant-lab-autoresearch-edits` PASS** (Variant Lab D; gate GREEN; 3-skeptic verify CONFIRMED, 5/5 claims at 3/3; pinned literal `0x47a0_3c8f_6701_f240` UNMOVED — `edit_budget` default-0 + disjoint `EDIT_SALT` stream; edited gems round-trip). **ADR-027** appended. Merged `--no-ff` to `main`. Next ready: #3 `oversight-ingame-ui-impl`.
