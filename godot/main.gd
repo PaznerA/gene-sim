@@ -302,6 +302,17 @@ var _containment_radius: int = 5         # schedule inoculation disc radius (cel
 var _containment_endow: SpinBox          # per-immigrant J for the scheduled events
 var _containment_horizon: int = 400      # generations the schedule spans
 var _containment_panel: Control
+# OVERSIGHT earned-credit loop (ADR-017 S4–S6): the in-game earn→preview→spend surface over the harness ledger.
+# Renderer-only (inv #2): GDScript moves only ints (species id, growth_ratio_q permille) + reads the VarDictionary
+# the LiveSim oversight #[func]s marshal; the credit economy / FBA→factor map / spend gate all stay in the core.
+# Every handler is has_method-guarded so an older cdylib / file replay degrades gracefully (no oversight #[func]s).
+var _oversight_panel: Control
+var _oversight_species: OptionButton     # which species the deep edit targets (E. coli + any editable species)
+var _oversight_ratio: SpinBox            # growth_ratio_q permille (1000 = wild-type / no-op, 0 = growth-lethal KO)
+var _oversight_credit_label: Label       # credit / cost / accrual ledger readout (refreshed live from oversight_state)
+var _oversight_preview_label: Label      # predicted vs current demand factor + affordability (Preview output)
+var _oversight_status: Label             # commit verdict line
+var _oversight_commit_button: Button     # enabled only when credit suffices (affordable)
 # Gamification (ADR-011 S-G2): a mission to SUPPRESS allele frequency in a target zone under a budget +
 # deadline (the brush lowers allele, selection raises it → a tug-of-war). Renderer-side game rules over the
 # core-exported snapshot (inv #2 — no biology computed here); not part of the determinism hash.
@@ -853,6 +864,7 @@ func _publish_frame() -> void:
 		_timeline.setup(gens)
 		_timeline.set_markers(_injections)
 	_show(_snaps.size() - 1)
+	_refresh_oversight_panel()  # OVERSIGHT credit accrues as mineralization earns it — keep the ledger readout live
 	_poll_population_alerts()  # Item (c): per-species extinction/boom flash vs the prior render frame (--live)
 	if _view_mode == VIEW_RELATIONS:
 		_refresh_relations()  # the FlowMatrix is per-generation — repaint the heatmap each render tick in Relations
@@ -1071,6 +1083,187 @@ func _build_contamination_ui(ui: CanvasLayer) -> void:
 	_containment_panel = PanelChrome.new()
 	_containment_panel.setup("🦠 CONTAMINATION", body, ui, Vector2(maxf(240.0, fs.x - 290.0), 380.0), _pill_rail)  # below the lowered INTERVENE panel
 	_containment_panel.set_active(_live != null)
+
+
+## The OVERSIGHT panel (ADR-017 S4–S6): the in-game earn→PREVIEW→SPEND surface over the harness CreditLedger. The
+## player picks a target species + a growth_ratio_q (the FBA-predicted growth permille of the edited strain), PREVIEWS
+## the demand factor it would map to WITHOUT spending (preview_ecoli_edit — read-only, zero SimRng, off-hash), then
+## COMMITS when credit suffices (commit_ecoli_edit — the core runs the spend gate, journals the Request/Commit pair,
+## and applies the per-species factor; an Applied marker lands on the timeline). The ledger readout (credit/cost/
+## accrual) refreshes live from oversight_state() as mineralization earns credit. Renderer-only (inv #2): GDScript
+## moves only ints + reads the marshaled VarDictionary — the economy/FBA/spend gate live in the harness/core. Every
+## #[func] is has_method-guarded so an older cdylib / file replay degrades gracefully (the panel stays inactive and
+## the handlers no-op with a message). Hash-neutral: preview/state draw zero RNG; a commit journals the SAME pair the
+## headless OversightEpisode emits, so a saved session replays the deep edit bit-identically (inv #3).
+func _build_oversight_ui(ui: CanvasLayer) -> void:
+	var body := _dark_panel(0.55)
+	body.custom_minimum_size = Vector2(272, 0)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 5)
+	body.add_child(col)
+
+	# Ledger readout (credit / cost / accrued / per-gen cap / committed count). Refreshed live by
+	# _refresh_oversight_panel() from oversight_state() — credit accrues as the FlowMatrix mineralizes (S4 economy).
+	_oversight_credit_label = _dim_label("")
+	_oversight_credit_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_oversight_credit_label.custom_minimum_size = Vector2(258, 0)
+	col.add_child(_oversight_credit_label)
+
+	# Target species (E. coli + any editable species), SpeciesId-ordered (inv #3); item metadata = the raw SpeciesId
+	# ordinal the core resolves (the same u16-scaffold convention the CRISPR/PCR pickers use).
+	var sp_row := HBoxContainer.new()
+	sp_row.add_child(_dim_label("Species:"))
+	_oversight_species = OptionButton.new()
+	for row in _panel_species_list():
+		var d: Dictionary = row
+		_oversight_species.add_item(str(d.get("name", "species")))
+		_oversight_species.set_item_metadata(_oversight_species.item_count - 1, int(d.get("species_id", 0)))
+	sp_row.add_child(_oversight_species)
+	col.add_child(sp_row)
+
+	# growth_ratio_q control: the FBA growth-ratio PERMILLE (1000 = wild-type / no-op, 0 = growth-lethal knockout).
+	# Lower = stronger loss-of-function → a smaller demand factor (toward 0.5×). Just an int — biology stays in core.
+	var q_row := HBoxContainer.new()
+	q_row.add_child(_dim_label("Growth ratio q:"))
+	_oversight_ratio = _make_spin(0, 1000, 10, 0)
+	_oversight_ratio.tooltip_text = "FBA growth-ratio permille: 1000 = wild-type (no-op), 0 = growth-lethal knockout.\nLower = stronger loss-of-function → a smaller demand factor (toward 0.5×). The core maps it (inv #2)."
+	q_row.add_child(_oversight_ratio)
+	col.add_child(q_row)
+
+	# PREVIEW (read-only, spends nothing): the predicted vs current demand factor + whether the spend gate can afford it.
+	var preview_btn := Button.new()
+	preview_btn.text = "🔎 Preview"
+	preview_btn.tooltip_text = "Show the demand factor this growth_ratio_q WOULD map to — without spending credit (the core computes it, inv #2)."
+	preview_btn.pressed.connect(_on_oversight_preview_pressed)
+	col.add_child(preview_btn)
+	_oversight_preview_label = _dim_label("Preview to see the predicted outcome before spending.")
+	_oversight_preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_oversight_preview_label.custom_minimum_size = Vector2(258, 0)
+	col.add_child(_oversight_preview_label)
+
+	# COMMIT (spends one edit's credit): the core runs the spend gate, journals the Request/Commit pair, and applies
+	# the per-species factor; an Applied marker lands on the timeline. Enabled only while `affordable` (set in refresh).
+	_oversight_commit_button = Button.new()
+	_oversight_commit_button.text = "💳 Commit edit"
+	_oversight_commit_button.tooltip_text = "Spend one edit's credit + commit the deep edit (the core runs the spend gate + journals it), then mark it on the timeline."
+	_oversight_commit_button.pressed.connect(_on_oversight_commit_pressed)
+	col.add_child(_oversight_commit_button)
+
+	_oversight_status = _dim_label("")
+	_oversight_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_oversight_status.custom_minimum_size = Vector2(258, 0)
+	col.add_child(_oversight_status)
+
+	var fs := _field_screen_size()
+	_oversight_panel = PanelChrome.new()
+	_oversight_panel.setup("⚖ OVERSIGHT", body, ui, Vector2(maxf(220.0, fs.x - 580.0), 176.0), _pill_rail)  # left of INTERVENE
+	# has_method-guarded (inv #2): an older cdylib / file replay lacks the oversight #[func]s → the panel stays
+	# inactive and its handlers no-op with a graceful message rather than erroring.
+	_oversight_panel.set_active(_live != null and _live.has_method("oversight_state"))
+	_refresh_oversight_panel()  # seed the ledger readout + the Commit-enabled state
+
+
+## Pull the OVERSIGHT ledger (oversight_state()) into the credit readout + gate the Commit button on `affordable`.
+## Called on build, every live render tick (credit accrues as mineralization earns it), and after a commit (to reflect
+## the spend). Read-only marshalling (inv #2): a Dictionary of ints the core marshaled — zero biology in GDScript.
+## Degrades gracefully when the oversight #[func]s are absent (older cdylib / file replay): a one-line note + a
+## disabled Commit button.
+func _refresh_oversight_panel() -> void:
+	if _oversight_credit_label == null:
+		return
+	if _live == null or not _live.has_method("oversight_state"):
+		_oversight_credit_label.text = "Credit ledger unavailable (file replay / older build)"
+		_oversight_credit_label.add_theme_color_override("font_color", Color(0.7, 0.72, 0.7))
+		if _oversight_commit_button != null:
+			_oversight_commit_button.disabled = true
+		return
+	var s: Dictionary = _live.oversight_state()
+	var credit := int(s.get("credit", 0))
+	var cost := int(s.get("edit_cost", 0))
+	var accrued := int(s.get("accrued_total", 0))
+	var cap := int(s.get("per_gen_cap", 0))
+	var affordable := bool(s.get("affordable", false))
+	var committed: Array = s.get("committed", [])
+	_oversight_credit_label.text = "Credit %d / cost %d   ·   accrued %d   ·   +%d/gen   ·   %d committed" % [
+		credit, cost, accrued, cap, committed.size()]
+	_oversight_credit_label.add_theme_color_override(
+		"font_color", Color(0.6, 0.9, 0.62) if affordable else Color(0.86, 0.8, 0.5))
+	if _oversight_commit_button != null:
+		_oversight_commit_button.disabled = not affordable
+
+
+## PREVIEW the deep edit without spending (ADR-017 S6): map the picked growth_ratio_q to its demand factor + show
+## the current factor + affordability. Read-only (inv #2): preview_ecoli_edit draws zero SimRng and never mutates.
+func _on_oversight_preview_pressed() -> void:
+	if _oversight_preview_label == null:
+		return
+	if _live == null or not _live.has_method("preview_ecoli_edit"):
+		_oversight_preview_label.text = "Preview unavailable (file replay / older build)"
+		_oversight_preview_label.add_theme_color_override("font_color", Color(0.86, 0.8, 0.5))
+		return
+	var sid := _picker_species_id(_oversight_species)
+	var q := int(_oversight_ratio.value) if _oversight_ratio != null else 1000
+	var p: Dictionary = _live.preview_ecoli_edit(sid, q)
+	var predicted := int(p.get("predicted_factor_q", 1000))
+	var current := int(p.get("current_factor_q", 1000))
+	var affordable := bool(p.get("affordable", false))
+	# Factors are permille (1000 = 1.0×); /1000 surfaces the human-readable demand multiplier in [0.5×, 1.5×].
+	_oversight_preview_label.text = "q=%d → demand factor %.3f× (now %.3f×)%s" % [
+		q, float(predicted) / 1000.0, float(current) / 1000.0,
+		"" if affordable else "   · NOT affordable yet"]
+	_oversight_preview_label.add_theme_color_override(
+		"font_color", Color(0.7, 0.86, 0.95) if affordable else Color(0.86, 0.8, 0.5))
+
+
+## COMMIT the deep edit (ADR-017 S6 — the load-bearing OVERSIGHT wire): the core runs the spend gate, journals the
+## Request/Commit pair, and applies the per-species factor; on accept we drop an Applied timeline marker and reflect
+## the spent credit. due_epoch 0 → the core Tick-counts the earliest legal commit epoch (epoch_of(gen)+lead); never
+## wall-clock (inv #3). Renderer requests, core decides (inv #2): GDScript reads only the marshaled verdict ints.
+func _on_oversight_commit_pressed() -> void:
+	if _live == null or not _live.has_method("commit_ecoli_edit"):
+		_set_oversight_status("✗ Commit unavailable (file replay / older build)", false)
+		return
+	var sid := _picker_species_id(_oversight_species)
+	var q := int(_oversight_ratio.value) if _oversight_ratio != null else 1000
+	var outcome: Dictionary = _live.commit_ecoli_edit(sid, q, 0)
+	var applied := bool(outcome.get("applied", false))
+	if applied:
+		var factor := int(outcome.get("factor_q", 1000))
+		var due_epoch := int(outcome.get("due_epoch", 0))
+		var req_id := int(outcome.get("req_id", 0))
+		# Mark it where the player committed (the journaled Request/Commit pair lands here); the Tick-counted
+		# due_epoch the edit takes effect at is surfaced in the marker label (the timeline axis is per-generation).
+		var gen := int(_live.observe().get("generation", 0)) if _live.has_method("observe") else 0
+		_record_oversight_marker(
+			gen, "OVERSIGHT q=%d → %.3f× · due epoch %d · req %d" % [q, float(factor) / 1000.0, due_epoch, req_id])
+		_set_oversight_status(
+			"✓ committed q=%d → %.3f× (req %d, due epoch %d)" % [q, float(factor) / 1000.0, req_id, due_epoch], true)
+	else:
+		_set_oversight_status("✗ %s" % str(outcome.get("reason", "rejected")), false)
+	_refresh_oversight_panel()  # reflect the spent credit + re-gate the Commit button immediately
+
+
+## Drop an Applied OVERSIGHT marker on the timeline (tool tag "oversight" → its own colour/glyph in timeline.gd;
+## an older timeline falls back to the CRISPR look). Mirrors _record_tool_outcome's marker shape but stays off the
+## 6-palette TOOL_KEYS index (OVERSIGHT is not a brush tool). Read-only (inv #2): a projection of the core's verdict.
+func _record_oversight_marker(generation: int, label: String) -> void:
+	_injections.append({
+		"generation": generation,
+		"tool": "oversight",
+		"applied": true,
+		"label": label,
+	})
+	if _timeline != null:
+		_timeline.set_markers(_injections)
+
+
+## Show an OVERSIGHT verdict in its own status line (green ok / red fail). Separate from the INTERVENE status so the
+## two panels never clobber each other's last message.
+func _set_oversight_status(text: String, ok: bool) -> void:
+	if _oversight_status != null:
+		_oversight_status.text = text
+		_oversight_status.add_theme_color_override(
+			"font_color", Color(0.5, 0.92, 0.52) if ok else Color(0.96, 0.55, 0.5))
 
 
 ## The ContainmentLevel selector hook: store the level (0 Sealed · 1 Clean · 2 Lab · 3 Open). The schedule is only
@@ -2014,6 +2207,7 @@ func _build_scene() -> void:
 	_build_timeline(ui)
 	_build_intervention_ui(ui)
 	_build_contamination_ui(ui)
+	_build_oversight_ui(ui)
 	_build_mission_ui(ui)
 	_build_alert_ui(ui)
 	# --live was requested but the LiveSim cdylib failed to load → show why (we fell back to file replay).
@@ -2780,6 +2974,10 @@ func _set_view_mode(m: int) -> void:
 		# CONTAMINATION is an ecosystem-mode control (consortium schedule); gate it to the field view like the
 		# intervention panel, so its (tall) body never overlaps the SPECIMEN / RELATIONS panels (both top-right).
 		_containment_panel.set_active(_live != null and m == VIEW_ECOSYSTEM)
+	if _oversight_panel != null:
+		# OVERSIGHT is an ecosystem-mode economy control; gate it to the field view (like INTERVENE/CONTAMINATION)
+		# and only when the oversight #[func]s exist (older cdylib / file replay → stays inactive, inv #2).
+		_oversight_panel.set_active(_live != null and _live.has_method("oversight_state") and m == VIEW_ECOSYSTEM)
 	if m == VIEW_SPECIMEN:
 		# The specimen view now renders a GENUINE per-species body: a Microbe rod glyph for E. coli, the L-system
 		# plant for the abstract species (branched in _render_specimens). No placeholder.

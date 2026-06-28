@@ -37,6 +37,9 @@ unsafe impl ExtensionLibrary for GodotSimExtension {}
 const DEFAULT_ENTITY_COUNT: u32 = 1000;
 /// Generations advanced per `step(0)` / used to clamp negative inputs to a sane, deterministic value.
 const NO_NEGATIVE: i64 = 0;
+/// The neutral per-species demand factor permille (`1000` = `1.0×`, an unedited/no-op species). The guarded
+/// before-`reset` preview/commit returns marshal this (mirrors `harness`'s `NEUTRAL_FACTOR_Q`).
+const NEUTRAL_FACTOR_Q: i64 = 1000;
 
 /// Resolve a species file `name` to an existing path, trying the process working dir first (dev / `run.sh`,
 /// which runs from the repo root) then the directory beside the executable (shipped builds stage
@@ -305,6 +308,13 @@ impl LiveSim {
         if let Some((level, config)) = &self.containment {
             env.set_containment(*level, config.clone());
         }
+        // ADR-017 S4–S6: ENABLE the earned-credit OVERSIGHT economy so the renderer's run accrues credit the
+        // earn→spend loop (`oversight_state` / `preview_ecoli_edit` / `commit_ecoli_edit`) drives. Hash-neutral:
+        // accrual is a pure OFF-hash integer fold over RNG-free read-only projections (the `edits_used`
+        // precedent), so the pinned literal `0x47a0_3c8f_6701_f240` is untouched (inv #3) — only a COMMITTED deep
+        // edit moves the hash, and that crosses inline through the journaled `CommitEcoliImpact`. The per-run
+        // ledger inits inside `env.reset` (below), so this must precede it. Default policy = pure game-design tuning.
+        env.enable_oversight(harness::oversight::CreditPolicy::default());
         // `seed` is the master seed; reinterpret the i64 bits as u64 so the full 64-bit space is usable
         // from GDScript (which has no native u64) without changing the deterministic stream.
         let obs = env.reset(seed as u64);
@@ -954,6 +964,125 @@ impl LiveSim {
             self.journal.push(action); // record for save/load
         }
         n
+    }
+
+    // ── OVERSIGHT earned-credit loop (ADR-017 S4–S6) — the renderer-driven earn→spend surface ──────────────────
+    // THIN marshalling only (inv #2): every economy/biology decision lives in `harness::GeneSimEnv` (the spend
+    // gate, the `req_id` allocator, the FBA→factor map, the journaled Request/Commit pair); these `#[func]`s just
+    // pour its returns into `VarDictionary`s. Read-only `oversight_state`/`preview_ecoli_edit` draw zero SimRng
+    // (off-hash, inv #3); only `commit_ecoli_edit` mutates — and it journals the SAME pair `OversightEpisode`
+    // produces so a saved session replays the deep edit bit-identically. Each is guarded before `reset` like the
+    // other `#[func]`s (a zero ledger / neutral preview / `applied:false` instead of a panic).
+
+    /// Read the OVERSIGHT earned-credit ledger (ADR-017 S4 — the renderer's INSPECT panel): `{credit,
+    /// accrued_total, per_gen_cap, edit_cost, affordable, pending, committed: [{species, req_id, due_epoch,
+    /// growth_ratio_q, factor_q}, …]}`. Pure read-only marshalling of [`harness::GeneSimEnv::oversight_status`] —
+    /// no RNG, no mutation, off-hash (inv #2/#3). Guarded: a zero ledger before `reset`.
+    #[func]
+    fn oversight_state(&self) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        let Some(env) = self.env.as_ref() else {
+            godot_error!("LiveSim::oversight_state called before reset()");
+            d.set("credit", 0_i64);
+            d.set("accrued_total", 0_i64);
+            d.set("per_gen_cap", 0_i64);
+            d.set("edit_cost", 0_i64);
+            d.set("affordable", false);
+            d.set("pending", 0_i64);
+            d.set("committed", &VarArray::new().to_variant());
+            return d;
+        };
+        let s = env.oversight_status();
+        d.set("credit", s.credit as i64);
+        d.set("accrued_total", s.accrued_total as i64);
+        d.set("per_gen_cap", s.per_gen_cap as i64);
+        d.set("edit_cost", s.edit_cost as i64);
+        d.set("affordable", s.affordable);
+        d.set("pending", i64::from(s.pending));
+        let mut committed = VarArray::new();
+        for c in &s.committed {
+            let mut cd = VarDictionary::new();
+            cd.set("species", i64::from(c.species));
+            cd.set("req_id", i64::from(c.req_id));
+            cd.set("due_epoch", i64::from(c.due_epoch));
+            cd.set("growth_ratio_q", i64::from(c.growth_ratio_q));
+            cd.set("factor_q", i64::from(c.factor_q));
+            committed.push(&cd.to_variant());
+        }
+        d.set("committed", &committed.to_variant());
+        d
+    }
+
+    /// PREVIEW a deep edit WITHOUT committing (ADR-017 S6): `{growth_ratio_q, predicted_factor_q,
+    /// current_factor_q, affordable}` — the strictly-positive `[500,1500]` permille demand factor the quantized
+    /// FBA `growth_ratio_q` WOULD map to (via the core's loss-of-function map), the factor currently in effect for
+    /// `species`, and whether the spend gate can afford it. Delegates to [`harness::GeneSimEnv::preview_ecoli_edit`]
+    /// — READ-ONLY: zero SimRng, no mutation, never folded into the hash (modeled on `observe_species`, inv #3).
+    /// `species`/`growth_ratio_q` are clamped to `u16` at the boundary. Guarded: a neutral preview before `reset`.
+    #[func]
+    fn preview_ecoli_edit(&self, species: i64, growth_ratio_q: i64) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        let Some(env) = self.env.as_ref() else {
+            godot_error!("LiveSim::preview_ecoli_edit called before reset()");
+            d.set(
+                "growth_ratio_q",
+                growth_ratio_q.clamp(0, i64::from(u16::MAX)),
+            );
+            d.set("predicted_factor_q", NEUTRAL_FACTOR_Q);
+            d.set("current_factor_q", NEUTRAL_FACTOR_Q);
+            d.set("affordable", false);
+            return d;
+        };
+        let sp = species.clamp(0, i64::from(u16::MAX)) as u16;
+        let q = growth_ratio_q.clamp(0, i64::from(u16::MAX)) as u16;
+        let p = env.preview_ecoli_edit(sp, q);
+        d.set("growth_ratio_q", i64::from(p.growth_ratio_q));
+        d.set("predicted_factor_q", i64::from(p.predicted_factor_q));
+        d.set("current_factor_q", i64::from(p.current_factor_q));
+        d.set("affordable", p.affordable);
+        d
+    }
+
+    /// COMMIT a deep edit (ADR-017 S6 — the load-bearing OVERSIGHT wire): runs the credit SPEND gate and, on
+    /// accept, journals the `RequestEcoliEdit`/`CommitEcoliImpact` pair (the SAME stream `OversightEpisode`
+    /// produces) and applies the committed quantized `growth_ratio_q` through the existing `step` path. Returns
+    /// `{applied, reason, due_epoch, req_id, factor_q}`. Delegates to [`harness::GeneSimEnv::commit_ecoli_edit`]
+    /// (the spend gate / `req_id` allocator / FBA→factor map all live there, inv #2); the binding only RECORDS the
+    /// returned pair into the session journal so save/load replays the edit bit-identically (inv #3). The commit
+    /// epoch is Tick-counted (`max(due_epoch, …)`), never wall-clock. `species`/`growth_ratio_q`/`due_epoch` are
+    /// clamped at the boundary. Guarded: `applied:false`/`"not reset"` before `reset` (the journal is untouched).
+    #[func]
+    fn commit_ecoli_edit(
+        &mut self,
+        species: i64,
+        growth_ratio_q: i64,
+        due_epoch: i64,
+    ) -> VarDictionary {
+        let mut d = VarDictionary::new();
+        let Some(env) = self.env.as_mut() else {
+            godot_error!("LiveSim::commit_ecoli_edit called before reset()");
+            d.set("applied", false);
+            d.set("reason", "not reset");
+            d.set("due_epoch", 0_i64);
+            d.set("req_id", 0_i64);
+            d.set("factor_q", NEUTRAL_FACTOR_Q);
+            return d;
+        };
+        let sp = species.clamp(0, i64::from(u16::MAX)) as u16;
+        let q = growth_ratio_q.clamp(0, i64::from(u16::MAX)) as u16;
+        let epoch = due_epoch.clamp(0, i64::from(u32::MAX)) as u32;
+        let outcome = env.commit_ecoli_edit(sp, q, epoch);
+        // Record the committed Request/Commit pair (empty when REJECTED) for save/load — the same journaled stream
+        // the headless `OversightEpisode` emits, so a saved session replays the deep edit byte-identically (inv #3).
+        for action in &outcome.journaled {
+            self.journal.push(action.clone());
+        }
+        d.set("applied", outcome.applied);
+        d.set("reason", outcome.reason);
+        d.set("due_epoch", i64::from(outcome.due_epoch));
+        d.set("req_id", i64::from(outcome.req_id));
+        d.set("factor_q", i64::from(outcome.factor_q));
+        d
     }
 
     /// The Cas-variant table as `[{id, name}, ...]` so the intervention UI can offer real choices (ids +

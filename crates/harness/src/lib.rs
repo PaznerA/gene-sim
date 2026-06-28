@@ -353,6 +353,136 @@ pub struct GeneSimEnv {
     /// Cumulative generations advanced since `reset` (the Tick clock the schedule fires against). The env
     /// advances via `Action::Advance`, so this mirrors the core's generation counter for schedule timing.
     generation: u64,
+    /// The OVERSIGHT earned-credit economy state (ADR-017 S4–S6 — the renderer-driven earn→spend loop the
+    /// godot-sim oversight `#[func]`s marshal). Off-hash by construction (the `edits_used` / `CreditLedger`
+    /// precedent): accrual is a pure integer fold over RNG-free read-only projections, so it adds 0 bytes to
+    /// `hash_world` and the pinned literal `0x47a0_3c8f_6701_f240` is untouched. DISABLED by default → the
+    /// existing headless callers (discovery / campaign / `OversightEpisode`) pay zero overhead and step
+    /// byte-AND-perf-identically; [`LiveSim`](../../godot-sim) enables it at `reset` so the renderer's run accrues.
+    oversight: OversightState,
+}
+
+/// A single committed deep-edit (ADR-017 S6 — the renderer's INSPECT row). Mirrors the journaled
+/// [`Action::CommitEcoliImpact`] payload that crossed the firewall: the target species, its `req_id`, the epoch
+/// it committed at, the quantized growth ratio, and the strictly-positive `[0.5,1.5]` demand factor it mapped to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedEdit {
+    /// Target species ordinal (operator/species granularity — inv #6).
+    pub species: u16,
+    /// The deterministic monotonic occurrence index of the committed request.
+    pub req_id: u32,
+    /// The epoch the impact committed at (Tick-counted, never wall-clock).
+    pub due_epoch: u32,
+    /// The committed quantized growth-ratio permille (`1000` = wild-type).
+    pub growth_ratio_q: u16,
+    /// The strictly-positive `[500,1500]` permille demand factor the ratio mapped to via [`sim_core::edit_factor_q`].
+    pub factor_q: u16,
+}
+
+/// A read-only snapshot of the OVERSIGHT ledger for the renderer's INSPECT view (ADR-017 S4). Pure data — drawn
+/// without touching the sim RNG, never folded into the determinism hash (inv #3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversightStatus {
+    /// Spendable credit currently held.
+    pub credit: u64,
+    /// Total credit ever accrued (monotonic).
+    pub accrued_total: u64,
+    /// The per-generation accrual cap (the economy's accrual-rate ceiling).
+    pub per_gen_cap: u64,
+    /// The cost of one deep edit (the spend gate).
+    pub edit_cost: u64,
+    /// Whether a deep edit can be afforded right now (`credit >= edit_cost`).
+    pub affordable: bool,
+    /// Requests buffered but not yet committed (always `0` in the immediate-commit renderer path; kept for the
+    /// firewall-buffered future).
+    pub pending: u32,
+    /// Every deep edit committed so far this run, in commit order.
+    pub committed: Vec<CommittedEdit>,
+}
+
+/// A read-only PREVIEW of a deep edit (ADR-017 S6) — the predicted KO/growth outcome WITHOUT committing. Drawn
+/// with zero `SimRng` and no mutation (modeled on [`GeneSimEnv::observe_all`]), so previewing never perturbs the
+/// run or the hash (inv #3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OversightPreview {
+    /// The quantized growth-ratio permille being previewed (`1000` = wild-type).
+    pub growth_ratio_q: u16,
+    /// The strictly-positive `[500,1500]` permille demand factor the ratio WOULD map to (loss-of-function map).
+    pub predicted_factor_q: u16,
+    /// The factor currently in effect for that species (`1000` = unedited/neutral).
+    pub current_factor_q: u16,
+    /// Whether a deep edit can be afforded right now.
+    pub affordable: bool,
+}
+
+/// The outcome of a renderer-driven [`GeneSimEnv::commit_ecoli_edit`]: whether the spend gate accepted, the epoch
+/// the impact committed at, and the `RequestEcoliEdit`/`CommitEcoliImpact` pair to append to the renderer journal
+/// (empty when REJECTED). The pair is the SAME journaled action stream `OversightEpisode` produces, so a saved
+/// session replays the committed edit bit-identically from `actions.ndjson` (inv #3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversightCommit {
+    /// `true` if the spend gate accepted and the impact was committed; `false` if refused (insufficient credit).
+    pub applied: bool,
+    /// A short human-readable reason (`"applied"` / `"rejected: insufficient credit"` / `"not reset"`).
+    pub reason: &'static str,
+    /// The epoch the impact committed at (Tick-counted; `0` when rejected).
+    pub due_epoch: u32,
+    /// The committed request's `req_id` (`0` when rejected).
+    pub req_id: u32,
+    /// The strictly-positive `[500,1500]` permille demand factor applied (`1000` neutral when rejected/none).
+    pub factor_q: u16,
+    /// The journaled `[RequestEcoliEdit, CommitEcoliImpact]` pair to record for save/load (empty when rejected).
+    pub journaled: Vec<Action>,
+}
+
+/// The neutral per-species demand factor permille (`1000` = `1.0×`, an unedited/no-op species). Mirrors
+/// sim-core's crate-private `EDIT_FACTOR_NEUTRAL_Q`; a committed wild-type ratio maps here (hash-neutral).
+const NEUTRAL_FACTOR_Q: u16 = 1000;
+
+/// The default OBJECTIVE region the credit Term A reads — a whole-world disc over the `RESOURCE_DIMS` grid (the
+/// same zone the `firewall_determinism` economy tests read). Pure config, off-hash.
+const DEFAULT_OVERSIGHT_REGION: sim_core::Region = sim_core::Region {
+    cx: 16,
+    cy: 16,
+    radius: 64,
+};
+
+/// The OVERSIGHT earned-credit economy state held on [`GeneSimEnv`] (ADR-017 S4–S6). Off-hash: the harness-layer
+/// `CreditLedger` + `EditFirewall` (the `edits_used` precedent) add 0 bytes to `hash_world`. Disabled by default.
+#[derive(Debug)]
+struct OversightState {
+    /// Whether accrual runs at all (set by [`GeneSimEnv::enable_oversight`]). Off by default → zero overhead and
+    /// byte-AND-perf-identical stepping for the headless callers that never enable it.
+    enabled: bool,
+    /// The earned-credit ledger (S4) — recomputed deterministically from the per-advance stats fold.
+    ledger: oversight::CreditLedger,
+    /// The credit-economy tuning (S4).
+    policy: oversight::CreditPolicy,
+    /// The firewall `req_id` allocator (S5) — a deterministic monotonic occurrence index, reset per episode.
+    firewall: firewall::EditFirewall,
+    /// Every committed deep edit this run, in commit order (the INSPECT view).
+    committed: Vec<CommittedEdit>,
+    /// The objective region the credit Term A reads, and the grid it is read on. Set by `enable_oversight`.
+    region: sim_core::Region,
+    grid: (u32, u32),
+    /// The previous advance's stats sample (for the quantize-each-then-difference accrual fold). `None` until the
+    /// gen-0 baseline is taken at `reset`.
+    prev_sample: Option<oversight::GenSample>,
+}
+
+impl Default for OversightState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ledger: oversight::CreditLedger::new(),
+            policy: oversight::CreditPolicy::default(),
+            firewall: firewall::EditFirewall::new(),
+            committed: Vec::new(),
+            region: DEFAULT_OVERSIGHT_REGION,
+            grid: sim_core::resource::RESOURCE_DIMS,
+            prev_sample: None,
+        }
+    }
 }
 
 impl GeneSimEnv {
@@ -379,6 +509,7 @@ impl GeneSimEnv {
             schedule: Vec::new(),
             schedule_cursor: 0,
             generation: 0,
+            oversight: OversightState::default(),
         }
     }
 
@@ -657,6 +788,173 @@ impl GeneSimEnv {
             );
     }
 
+    // ── OVERSIGHT earned-credit loop (ADR-017 S4–S6) — the renderer-driven earn→spend surface ──────────────────
+    // All of the economy/biology lives HERE in the harness (inv #2); the godot-sim `#[func]`s only marshal these
+    // returns into `VarDictionary`s. Accrual is a pure integer fold over RNG-free read-only projections, so the
+    // whole surface is OFF-hash — the pinned literal `0x47a0_3c8f_6701_f240` is never moved by it.
+
+    /// ENABLE the OVERSIGHT earned-credit economy for subsequent runs under `policy` (ADR-017 S4). Off by default
+    /// so the headless callers (discovery / campaign / `OversightEpisode`) stay byte-AND-perf-identical; the
+    /// renderer's binding calls this before `reset`. The objective region the credit Term A reads is the
+    /// whole-world disc over `RESOURCE_DIMS`. The per-run ledger / firewall / committed list are (re)initialized at
+    /// the next [`reset`](Env::reset). Does not disturb a run already in progress.
+    pub fn enable_oversight(&mut self, policy: oversight::CreditPolicy) {
+        self.oversight.enabled = true;
+        self.oversight.policy = policy;
+        self.oversight.region = DEFAULT_OVERSIGHT_REGION;
+        self.oversight.grid = sim_core::resource::RESOURCE_DIMS;
+    }
+
+    /// Read the OVERSIGHT ledger (ADR-017 S4) — balance + accrual cap + the committed deep edits. Pure read-only
+    /// (no RNG, no mutation, off-hash). The renderer's INSPECT panel marshals this; returns the zero ledger before
+    /// any run.
+    #[must_use]
+    pub fn oversight_status(&self) -> OversightStatus {
+        let o = &self.oversight;
+        OversightStatus {
+            credit: o.ledger.credit,
+            accrued_total: o.ledger.accrued_total,
+            per_gen_cap: o.policy.per_gen_cap,
+            edit_cost: o.policy.ecoli_edit_cost,
+            affordable: o.ledger.can_afford(&o.policy),
+            // Immediate-commit renderer path never buffers, so nothing is pending; `is_empty()` confirms it.
+            pending: u32::from(!o.firewall.is_empty()),
+            committed: o.committed.clone(),
+        }
+    }
+
+    /// PREVIEW a deep edit (ADR-017 S6) — the predicted KO/growth outcome WITHOUT committing. Maps the
+    /// already-quantized FBA `growth_ratio_q` to the strictly-positive `[0.5,1.5]` demand factor via the SAME
+    /// core [`sim_core::edit_factor_q`] the commit path applies (loss-of-function direction), reports the factor
+    /// currently in effect for `species`, and whether the spend gate can afford it. READ-ONLY: zero `SimRng`, no
+    /// mutation, never folded into the hash (inv #3 — modeled on [`observe_all`](Self::observe_all)). Returns the
+    /// neutral preview before `reset`.
+    #[must_use]
+    pub fn preview_ecoli_edit(&self, species: u16, growth_ratio_q: u16) -> OversightPreview {
+        let predicted_factor_q =
+            sim_core::edit_factor_q(growth_ratio_q, sim_core::EditEffect::Knockout);
+        let current_factor_q = self
+            .sim
+            .as_ref()
+            .map(|s| s.species_edit_factor_q(sim_core::SpeciesId::new(species)))
+            .unwrap_or(NEUTRAL_FACTOR_Q);
+        OversightPreview {
+            growth_ratio_q,
+            predicted_factor_q,
+            current_factor_q,
+            affordable: self.oversight.ledger.can_afford(&self.oversight.policy),
+        }
+    }
+
+    /// COMMIT a deep edit (ADR-017 S6 — the load-bearing OVERSIGHT wire). Runs the credit SPEND gate; on accept it
+    /// allocates the deterministic `req_id`, journals the `RequestEcoliEdit` + `CommitEcoliImpact` pair (the SAME
+    /// stream `OversightEpisode` produces), and applies the committed quantized `growth_ratio_q` through the
+    /// existing [`Action::CommitEcoliImpact`] `step` arm (which sets the per-species `[0.5,1.5]` demand factor the
+    /// NEXT `Advance` consumes). The pair is RETURNED for the renderer to append to its journal so a saved session
+    /// replays the edit bit-identically (inv #3); a REFUSED request journals nothing and applies nothing (the
+    /// hash-neutral baseline). The commit epoch is Tick-counted (`max(due_epoch, epoch_of(gen) + EPOCH_LEAD)`),
+    /// never wall-clock. `growth_ratio_q` is the already-quantized FBA answer the off-thread oracle produced (the
+    /// firewall's one-way integer crossing — floats never reach here). Rejected (not reset) before `reset`.
+    pub fn commit_ecoli_edit(
+        &mut self,
+        species: u16,
+        growth_ratio_q: u16,
+        due_epoch: u32,
+    ) -> OversightCommit {
+        if self.sim.is_none() {
+            return OversightCommit {
+                applied: false,
+                reason: "not reset",
+                due_epoch: 0,
+                req_id: 0,
+                factor_q: NEUTRAL_FACTOR_Q,
+                journaled: Vec::new(),
+            };
+        }
+        // Spend gate (the two-tier rule): a borderline credit accepts-or-refuses HERE; the decision is journaled
+        // (a refused request emits no action) so replay never re-decides on a recomputed credit.
+        let policy = self.oversight.policy;
+        if !self.oversight.ledger.try_spend(&policy) {
+            return OversightCommit {
+                applied: false,
+                reason: "rejected: insufficient credit",
+                due_epoch: 0,
+                req_id: 0,
+                factor_q: NEUTRAL_FACTOR_Q,
+                journaled: Vec::new(),
+            };
+        }
+        let req_id = self.oversight.firewall.alloc_req_id();
+        // The commit epoch is decided by epoch-counting off the Tick stream (never wall-clock); honour a caller's
+        // later request but never earlier than the lead window.
+        let commit_epoch =
+            due_epoch.max(oversight::epoch_of(self.generation) + oversight::EPOCH_LEAD);
+        // Build the firewall payload + its content hash over the quantized bytes (the same binding replay checks).
+        let impact = firewall::EcoliImpact {
+            growth_ratio_q,
+            exchange_deltas: Vec::new(),
+        };
+        let content_hash = impact.content_hash();
+        let request = Action::RequestEcoliEdit {
+            species,
+            locus: LocusId(0),
+            edit_kind: crispr::EditKind::Knockout,
+            due_epoch: commit_epoch,
+            req_id,
+        };
+        let commit = Action::CommitEcoliImpact {
+            species,
+            req_id,
+            due_epoch: commit_epoch,
+            slipped_from: None,
+            content_hash,
+            growth_ratio_q,
+            exchange_deltas: Vec::new(),
+        };
+        // Apply through the existing step arms: the request is inert (no RNG), the commit sets the per-species
+        // demand factor (no RNG — the integer is read straight from the action, exactly as replay reads it).
+        let _ = self.step(request.clone());
+        let _ = self.step(commit.clone());
+        let factor_q = sim_core::edit_factor_q(growth_ratio_q, sim_core::EditEffect::Knockout);
+        self.oversight.committed.push(CommittedEdit {
+            species,
+            req_id,
+            due_epoch: commit_epoch,
+            growth_ratio_q,
+            factor_q,
+        });
+        OversightCommit {
+            applied: true,
+            reason: "applied",
+            due_epoch: commit_epoch,
+            req_id,
+            factor_q,
+            journaled: vec![request, commit],
+        }
+    }
+
+    /// Accrue ONE advance's earned credit (ADR-017 S4): sample the RNG-free objective region + FlowMatrix-health
+    /// projections, quantize-each-then-difference against the previous sample, and fold the improvement into the
+    /// ledger. Called after each `Advance` when oversight is enabled. Pure read-only sampling → off-hash (inv #3).
+    fn accrue_oversight(&mut self) {
+        let now = self.sample_oversight();
+        if let Some(prev) = self.oversight.prev_sample {
+            let policy = self.oversight.policy;
+            self.oversight.ledger.accrue_gen(&prev, &now, &policy);
+        }
+        self.oversight.prev_sample = Some(now);
+    }
+
+    /// Read the RNG-free OVERSIGHT credit sample at the current env state (a pure read-only projection — no RNG, no
+    /// mutation). Mirrors `oversight::sample_now`.
+    fn sample_oversight(&mut self) -> oversight::GenSample {
+        let region = self.oversight.region;
+        let (gw, gh) = self.oversight.grid;
+        let readout = self.region_allele(region, gw, gh);
+        let (s, flat) = self.flow_matrix();
+        oversight::GenSample::from_projections(&readout, s, &flat)
+    }
+
     /// Apply a journaled [`Action::RegionInoculate`] (ADR-019 S1): resolve the contaminant `species_key` to a
     /// registered [`BuiltSpecies`], register it into the running roster (idempotent — no duplicate), then spawn
     /// `count` orgs RNG-FREE into the region disc with J minted from the `immigration` tap. An UNRESOLVED key
@@ -795,6 +1093,15 @@ impl Env for GeneSimEnv {
         );
         self.schedule_cursor = 0;
         self.generation = 0;
+        // ADR-017 S4: (re)initialize the OVERSIGHT per-run ledger / firewall / committed list and take the gen-0
+        // credit baseline (a pure read-only sample). Skipped entirely when oversight is disabled (the default), so
+        // a non-renderer reset is byte-AND-perf-identical. Off-hash: the sample draws no `SimRng`.
+        if self.oversight.enabled {
+            self.oversight.ledger = oversight::CreditLedger::new();
+            self.oversight.firewall = firewall::EditFirewall::new();
+            self.oversight.committed.clear();
+            self.oversight.prev_sample = Some(self.sample_oversight());
+        }
         obs
     }
 
@@ -979,6 +1286,12 @@ impl Env for GeneSimEnv {
         // Advance the schedule's Tick clock after the `sim` borrow ends (ADR-019 S2 — `advance_by` is 0 for a
         // non-Advance action). The schedule itself is drained by the driver via `drain_due_inoculations`.
         self.generation += advance_by;
+        // ADR-017 S4: fold this advance's earned credit into the OVERSIGHT ledger (off-hash — a pure integer fold
+        // over RNG-free read-only projections). Only when enabled (the renderer path) and only for an actual
+        // advance; the `sim` borrow above has ended, so `accrue_oversight` can re-borrow self.
+        if self.oversight.enabled && advance_by > 0 {
+            self.accrue_oversight();
+        }
         StepResult {
             obs,
             reward,

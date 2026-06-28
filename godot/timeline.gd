@@ -20,6 +20,7 @@ const TOOL_STYLE := {
 	"nutrient": {"color": Color(0.95, 0.78, 0.32), "glyph": "🌱"}, # amber
 	"toxin": {"color": Color(0.74, 0.46, 0.95), "glyph": "☣"},    # violet
 	"inoculate": {"color": Color(0.62, 0.85, 0.38), "glyph": "🦠"}, # biohazard-lime (ADR-019 immigration / contamination)
+	"oversight": {"color": Color(0.95, 0.85, 0.42), "glyph": "⚖"}, # gold (ADR-017 OVERSIGHT earned-credit deep edit)
 }
 
 var _count: int = 0

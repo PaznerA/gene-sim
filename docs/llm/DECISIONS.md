@@ -1197,3 +1197,50 @@ species })`).
 pinned config has no edits). The search is a strict superset: `edit_budget 0` ≡ the prior D2a/D2b behaviour
 byte-for-byte; `edit_budget > 0` discovers reproducible edited gems. The D3 surrogate (steered loop) can later
 steer this axis once it lands. Gate GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3).
+
+---
+
+## ADR-028 — OVERSIGHT in-game UI: the renderer immediate-commit path (ADR-017 S4/S5/S6 surface, hash-neutral)
+
+**Status:** Accepted (2026-06-28). The renderer SURFACE of the ADR-017 layered-E. coli OVERSIGHT earned-edit loop
+(economy core landed in prior slices — the harness `CreditLedger`, the `due_epoch` multi-fidelity firewall, the
+`EcoliEditModifier` ripple via the F4 decomposer loop, the `oracle-fba` KO table accepted under ADR-018). This is
+the first DECISIONS block for the loop's player-facing layer; the economy itself is designed in
+`docs/llm/proposals/ecoli-oversight-gameloop-draft.md`.
+
+**Context.** The OVERSIGHT economy existed only headless. This slice lets the player, in `--live`, EARN credit
+(RNG-free accrual), REQUEST → PREVIEW (the FBA knockout result, read-only) → COMMIT an E. coli edit that ripples
+through the F4 loop.
+
+**Decision.**
+- `godot-sim` gains thin marshalling `#[func]`s only — `oversight_state(&self)`, `preview_ecoli_edit(&self, …)`
+  (read-only), `commit_ecoli_edit(&mut self, …)` — every economy/biology decision stays in the harness/core
+  (inv #2): `edit_factor_q` / `commit_species_edit` (integer, no RNG, sim-core), `can_afford` / `try_spend`
+  (harness `oversight`). GDScript moves only ints + the marshaled `VarDictionary` (the sole arithmetic is permille
+  `/1000.0` display formatting).
+- A COMMIT goes through `harness::commit_ecoli_edit`: `try_spend` (RNG-free credit check) → `alloc_req_id` →
+  journal `RequestEcoliEdit` + `CommitEcoliImpact`. This pair is recorded into the same journal `save_session` /
+  replay persist, so the loop is fully replay-reproducible.
+
+**Why hash-neutral / replay-equal (inv #3).** `RequestEcoliEdit` draws ZERO `SimRng` (inert arm);
+`CommitEcoliImpact` reads a COMMITTED integer (no oracle call on the hot path); credit accrual is RNG-free + is
+never folded into `hash_world` (off-hash); `due_epoch` is a GENERATION COUNT (`epoch_of(gen)+EPOCH_LEAD` — no
+`SystemTime`/`Instant` anywhere, so no wall-clock leak). The pinned literal `0x47a0_3c8f_6701_f240` is UNMOVED on
+a no-commit run (`oversight_plumbing_is_hash_neutral`); a COMMITTED edit moves the hash DELIBERATELY (the player
+acted) and replays byte-equal on a fresh oversight-less env (`renderer_committed_edit_is_replay_equal`) — exactly
+like `apply_edit`/`inoculate`.
+
+**Load-bearing divergence (recorded honestly; flagged for a follow-up).** The renderer applies the commit
+IMMEDIATELY at the current generation (effect lands on the next `Advance`), whereas the headless
+`OversightEpisode` buffers + splices the commit at the future `due_epoch` boundary. BOTH are internally
+deterministic + replay-equal, but the same player intent yields different ecosystem TIMING across the two paths,
+and the UI "due epoch N" marker label currently implies a deferral the renderer path does not perform. Accepted
+for this slice (both paths are deterministic, hash-neutral); a follow-up should EITHER defer the renderer commit
+to `due_epoch` OR relabel the UI to immediate-commit semantics. Related off-hash cosmetic note: credit-accrual
+sampling granularity differs (renderer per `step(n)`, headless per-gen) — no determinism/replay impact.
+
+**Consequences.** The player can earn → preview → commit E. coli edits in-game; hash-neutral to `0x47a0`. Gate
+GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3). **Follow-up UX (tracked in QUEUE `oversight-ui-polish`):**
+default the "growth ratio q" knob to `1000` (wild-type/no-op) instead of `0` (growth-lethal); align the
+due-epoch marker label with the immediate-commit semantics; re-enable oversight in `load_session` so the ledger
+resumes after a loaded session.
