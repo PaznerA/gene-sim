@@ -1,0 +1,8 @@
+{
+  "name": "Branch Point",
+  "caption": "boom-bust · 6 spp · crashes",
+  "dynamics": "boom-bust",
+  "checkpoint_gen": 200,
+  "source_hash": "16f3b8cb2519f527",
+  "source_seed": 2360360069078774214
+}

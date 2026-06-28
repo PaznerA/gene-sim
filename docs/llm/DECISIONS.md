@@ -1279,3 +1279,37 @@ replay reads `res://data/species` — byte-identical via the staged mirror (gate
 divergence between the two roots would desync the replay. Follow-up: wire a gated headless `--gem` smoke (asserting
 `applied==total>0` on a gem WITH edits) so edit fidelity is covered by CI, not only the manual smoke + the 3 core
 tests. Gate GREEN; 3-skeptic verify CONFIRMED (4/4 at 3/3).
+
+---
+
+## ADR-031 — Starter-map library: committed gen-1 + gen-N-checkpoint content from the auto-research
+
+**Status:** Accepted (2026-06-29). The capstone of the auto-research → playable-content loop (curated gems →
+`proposals/starter-candidates.json` → committed starters). (ADR-029 reserved for the colony epic.)
+
+**Context.** The discovery search produces round-trip-verified gems (config + scheduled edits). To make them
+playable + browsable, a `promote` tool (`crates/harness/src/promote.rs`) turns a curated gem into a **committed**
+starter under `data/presets/starters/`, surfaced by an RCT-style selector (`godot/gallery.gd`).
+
+**Decision — two reproducibility tiers:**
+1. **GEN-1 (`<slug>.json`)** — a fresh config (roster + env + containment) + provenance (`source_hash`, `source_seed`).
+   The gem's edits are **dropped** (a gen-1 starter is pristine — the player starts the discovered *community*, not a
+   mid-run edited state). Inert data; loaded via the Load Starter path.
+2. **GEN-N CHECKPOINT (`<slug>/`)** — the gem replayed to gen N via the EXISTING `record_episode` so the scheduled
+   edits are RECORDED in the session journal (`seed.json` + `actions.ndjson`) — a developed state with the
+   interventions on the scrub-back timeline; loaded via `load_session`. Round-trip-verified (`record == replay`)
+   BEFORE writing.
+
+**Hash-neutral.** The promote tool is meta-level (pure config + the existing `record_episode`/`replay`/`save_journal`,
+no `SimRng`/`HashMap`); the committed data is inert; the gallery is renderer-only (inv #2). Pinned literal
+`0x47a0_3c8f_6701_f240` unmoved (sim-core 184/184). New on-disk format under `data/presets/starters/` + `index.json`,
+staged into `res://` (recursive `run.sh` + byte-gated).
+
+**Known trap (tracked → `starter-promote-hardening`).** `promote_gen1` copies `source_hash = gem.recorded_hash` but
+drops the gem's edits **without enforcing the source gem is edit-free**. This is correct **today only because CRISPR
+edits are currently hash-neutral** (identity-gated — `committed_neutral_edit_does_not_move_the_run_hash`); the 6
+shipped gen-1 starters are all edit-free / no-op-edit (verified: each replays to its `source_hash`). **When edits
+become hash-active, a gen-1 starter promoted from an edited gem would silently stop replaying to its `source_hash`.**
+The fix (queued): reject firing-edit gems in `promote_gen1`, OR recompute the gen-1 `source_hash` from an edit-free
+replay; also store `gens` (+ an edit flag) in the gen-1 doc so it is self-contained re-verifiable. Gate GREEN;
+3-skeptic verify CONFIRMED (5/5 at 3/3); committed library empirically replay-verified.

@@ -47,7 +47,10 @@ echo "CODEX MIRROR OK — godot/data/codex == data/codex ($(ls data/codex | wc -
 # Item 3 res:// presets mirror — the SAME discipline as the species/codex mirrors. data/presets/ is the committed
 # source of truth (the "Load Starter" presets main_menu.gd reads via FileAccess); godot/data/presets/ is the
 # generated, gitignored mirror. Stage it + assert byte-equality (RED on drift) so a preset can never silently rot.
-mkdir -p godot/data/presets && cp data/presets/*.json godot/data/presets/
+# STARTER-MAP PROMOTE adds data/presets/starters/ (gen-1 starter docs + index.json + gen-N checkpoint session
+# subdirs), so stage the WHOLE tree recursively (cp -R …/.) and let `diff -rq` recurse — the starter library +
+# index are byte-gated against the canonical dir exactly like the top-level presets.
+mkdir -p godot/data/presets && cp -R data/presets/. godot/data/presets/
 if ! diff -rq data/presets godot/data/presets >/dev/null 2>&1; then
   echo "FAIL — godot/data/presets is not byte-equal to data/presets (Item 3 mirror drift):"
   diff -rq data/presets godot/data/presets || true

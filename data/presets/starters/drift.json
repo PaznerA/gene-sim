@@ -1,0 +1,42 @@
+{
+  "name": "Drift",
+  "caption": "drift · 3 spp · steady",
+  "dynamics": "drift",
+  "source_hash": "518347049d204604",
+  "source_seed": 16777275962096678196,
+  "config": {
+    "roster": [
+      [
+        "default",
+        1227
+      ],
+      [
+        "ecoli",
+        110
+      ],
+      [
+        "bacillus",
+        0
+      ],
+      [
+        "pseudomonas",
+        0
+      ],
+      [
+        "staph",
+        0
+      ],
+      [
+        "aspergillus-niger",
+        0
+      ],
+      [
+        "bdellovibrio",
+        52
+      ]
+    ],
+    "containment_level": 0,
+    "temp_q": 617,
+    "season": 1
+  }
+}

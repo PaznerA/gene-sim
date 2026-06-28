@@ -1,0 +1,42 @@
+{
+  "name": "Limit Cycle",
+  "caption": "limit-cycle · 4 spp · takeovers",
+  "dynamics": "limit-cycle",
+  "source_hash": "4b497fe2f8d4553c",
+  "source_seed": 10562790716582683927,
+  "config": {
+    "roster": [
+      [
+        "default",
+        0
+      ],
+      [
+        "ecoli",
+        343
+      ],
+      [
+        "bacillus",
+        0
+      ],
+      [
+        "pseudomonas",
+        254
+      ],
+      [
+        "staph",
+        0
+      ],
+      [
+        "aspergillus-niger",
+        281
+      ],
+      [
+        "bdellovibrio",
+        44
+      ]
+    ],
+    "containment_level": 3,
+    "temp_q": 752,
+    "season": 1
+  }
+}

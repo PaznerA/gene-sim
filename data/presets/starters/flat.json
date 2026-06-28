@@ -1,0 +1,42 @@
+{
+  "name": "Flat",
+  "caption": "flat · 1 spp · steady",
+  "dynamics": "flat",
+  "source_hash": "0a39d722c4ab6800",
+  "source_seed": 13370497035361816416,
+  "config": {
+    "roster": [
+      [
+        "default",
+        1181
+      ],
+      [
+        "ecoli",
+        0
+      ],
+      [
+        "bacillus",
+        0
+      ],
+      [
+        "pseudomonas",
+        0
+      ],
+      [
+        "staph",
+        0
+      ],
+      [
+        "aspergillus-niger",
+        0
+      ],
+      [
+        "bdellovibrio",
+        0
+      ]
+    ],
+    "containment_level": 2,
+    "temp_q": 226,
+    "season": 1
+  }
+}

@@ -4,6 +4,19 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Starter-map library — committed gen-1 + gen-N starters from the auto-research + an RCT selector — HASH-NEUTRAL
+The capstone of the discovery → playable-content loop (ADR-031). A `promote` tool (`crates/harness/src/promote.rs` +
+`--promote-gem`/`--promote-default-set` CLI) turns a curated gem into a **committed** starter under
+`data/presets/starters/`: **gen-1** (`<slug>.json`, a fresh config + `source_hash` provenance, edits dropped) or
+**gen-N checkpoint** (`<slug>/`, the gem replayed to gen N via `record_episode` so the scheduled edits sit in the
+session journal — a developed state scrubbable BACK through its interventions, loaded via `load_session`;
+round-trip-verified before write). 7 starters shipped (6 gen-1 across the dynamics taxonomy + 1 `branch-point`
+checkpoint). An RCT-style scenario selector (`godot/gallery.gd`): a left list + a big right description + an animation
+preview (the GIF if present, else a live replay) + a thick scrub slider. Meta-level promote + renderer-only gallery →
+pinned literal `0x47a0_3c8f_6701_f240` unmoved. Gate GREEN; 3-skeptic verify CONFIRMED (5/5 at 3/3). QUEUE item #4.
+*(Follow-up tracked `starter-promote-hardening`: enforce edit-free gen-1 promotion / recompute its source_hash + store
+`gens` — the gen-1-drops-edits provenance is safe today only because edits are hash-neutral.)*
+
 ### Discovery load-gem-replay — watch a discovered scenario live (renderer + read-only core resolver) — HASH-NEUTRAL
 A "💎 Load Gem" picker reconstructs + plays a saved gem live: `reset(master_seed)` + roster keys → `set_roster` (via
 `res://data/species`, the Load Starter path) + `temp_q`/season → `set_environment` + containment → `set_containment`,
