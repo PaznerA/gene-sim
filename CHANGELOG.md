@@ -4,6 +4,16 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Discovery continue-from-gem — branch the search from a discovered gem (harness) — HASH-NEUTRAL
+`discover_from_gem(gem_path, …)` + a `--from-gem <path>` CLI flag: load a saved gem JSON → pre-seed a fresh
+evolutionary `GemLibrary` from its config (the gem becomes the gen-0 elite the mutate/crossover pool branches off,
+optionally with new edits via `edit_budget`) so the auto-research keeps developing the discovered community — the
+"continuation after -X gens" ask. Every continued gem is round-trip-verified (`record_episode → replay ==
+recorded_hash`) by the unchanged `verify_and_write_library`; a stale source gem (build_id mismatch) is logged + used
+as an anchor but dropped at write time, so no irreproducible gem reaches disk. Meta-level (std/serde + splitmix
+meta-RNG, no SimRng) → pinned literal `0x47a0_3c8f_6701_f240` unmoved. Gate GREEN; 3-skeptic verify CONFIRMED (4/4 at
+3/3). QUEUE item #2 (scenarios arc).
+
 ### Discovery scenario starters — named `SearchSpace` presets + `--space` CLI (discovery + harness) — HASH-NEUTRAL
 Six named `SearchSpace` scenario presets (predator-prey / decomposer / contamination-open / spore-resilience /
 edit-rescue / extreme-climate) that bias the brute-force search toward a drama type (per-species `include_bp` + count

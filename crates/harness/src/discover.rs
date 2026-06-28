@@ -590,7 +590,56 @@ pub fn discover_evolved_in_space(
     out_dir: &Path,
     evals_path: Option<&Path>,
 ) -> io::Result<GemLibrary> {
-    let mut lib = GemLibrary::new(keep);
+    // The COLD start: a fresh (empty) library and NO gen-0 anchor — generation 0 is all random proposals. This
+    // is the byte-identical historical behaviour (the [`discover_evolved_core`] explorer cut + step coordinates
+    // are unchanged for `anchor_gen0 == false` over an empty pool).
+    discover_evolved_core(
+        space,
+        search_seed,
+        pop_size,
+        generations,
+        keep,
+        gens,
+        species_dir,
+        out_dir,
+        evals_path,
+        GemLibrary::new(keep),
+        false,
+    )
+}
+
+/// The shared EVOLUTIONARY loop body behind [`discover_evolved_in_space`] (COLD start) and [`discover_from_gem`]
+/// (CONTINUE-FROM-GEM). It runs `generations + 1` generations of propose → capture → score → consider over the
+/// running `lib`, then round-trip-verifies + writes the kept gems via the UNCHANGED [`verify_and_write_library`].
+///
+/// `lib` is the INITIAL library: empty for a cold start, or PRE-SEEDED with the anchor gem (the elite gen-0
+/// parent) for a continue-from-gem run. `anchor_gen0` selects gen-0's behaviour:
+/// - `false` (cold) → generation 0 is ALL fresh random [`propose`] (the historical D2b base case). With an empty
+///   `lib` this reproduces [`discover_evolved_in_space`]'s exact byte stream.
+/// - `true` (anchored) → generation 0's EXPLOIT fraction (`i >= explore`) draws [`propose_evolved`] off the
+///   pre-seeded pool (mutate/crossover of the anchor), so the search branches OFF the gem from the very first
+///   generation instead of a cold random start; only the leading `explore` cut stays fresh exploration.
+///
+/// ## Determinism (inv #3)
+/// Every proposal/operator draw is the META-RNG over `(search_seed, step, field)`; `step = generation*pop_size+i`
+/// is a fixed function of `(generation, individual)`. The pre-seeded anchor + `anchor_gen0` only change WHICH
+/// proposal function each gen-0 individual calls (both fed the SAME `step`) and the initial parent pool — never
+/// the sim path. The sim runs stay pure functions of their configs, so the pinned literal `0x47a0_3c8f_6701_f240`
+/// is untouched.
+#[allow(clippy::too_many_arguments)] // independent run parameters; grouping would obscure the call sites
+fn discover_evolved_core(
+    space: &SearchSpace,
+    search_seed: u64,
+    pop_size: u64,
+    generations: u64,
+    keep: usize,
+    gens: u32,
+    species_dir: &Path,
+    out_dir: &Path,
+    evals_path: Option<&Path>,
+    mut lib: GemLibrary,
+    anchor_gen0: bool,
+) -> io::Result<GemLibrary> {
     let total_evals = pop_size.saturating_mul(generations + 1);
     let mut evals: Vec<EvalRecord> = Vec::with_capacity(usize::try_from(total_evals).unwrap_or(0));
 
@@ -599,20 +648,26 @@ pub fn discover_evolved_in_space(
     // injects fresh blood); never more than the whole population.
     let explore = ((pop_size * EVOLVE_EXPLORE_BP / BP_SCALE).max(1)).min(pop_size);
 
-    // The total number of individuals (== meta-RNG steps) is `pop_size * (generations + 1)`: one random
-    // generation 0 plus `generations` evolved generations. `step` is monotonic across the whole run so no two
-    // individuals share a proposal stream coordinate.
+    // The total number of individuals (== meta-RNG steps) is `pop_size * (generations + 1)`: one (random or
+    // anchored) generation 0 plus `generations` evolved generations. `step` is monotonic across the whole run so
+    // no two individuals share a proposal stream coordinate.
     let total_generations = generations + 1;
     for generation in 0..total_generations {
         // The PARENTS for this generation are the CURRENTLY-kept gems' configs (the elites). Snapshotted before
-        // proposing this generation's children so the pool is stable within the generation (deterministic).
+        // proposing this generation's children so the pool is stable within the generation (deterministic). For a
+        // continue-from-gem run the pre-seeded anchor is already in `lib`, so it is the gen-0 parent.
         let parents: Vec<SearchConfig> = lib.gems.iter().map(|g| g.config.clone()).collect();
 
         for i in 0..pop_size {
             // A globally-monotonic meta-RNG step so every individual draws an independent proposal stream.
             let step = generation * pop_size + i;
-            let cfg = if generation == 0 || i < explore {
-                // GENERATION 0 (cold start) + the per-generation EXPLORE fraction → fresh random proposal.
+            // COLD generation 0 (no anchor) → all fresh random. ANCHORED generation 0 → the leading `explore`
+            // cut stays fresh, the rest branch off the pre-seeded pool. Every later generation: explore cut fresh,
+            // the rest evolved. `i < explore || (generation == 0 && !anchor_gen0)` collapses to the historical
+            // `generation == 0 || i < explore` when `anchor_gen0 == false` (byte-identical cold path).
+            let cold = i < explore || (generation == 0 && !anchor_gen0);
+            let cfg = if cold {
+                // Fresh random proposal (cold start / the per-generation EXPLORE fraction).
                 propose(search_seed, step, space)
             } else {
                 // The EXPLOIT fraction → mutate/crossover of the current elite pool (empty pool → cold propose,
@@ -637,6 +692,152 @@ pub fn discover_evolved_in_space(
     }
 
     verify_and_write_library(&lib, keep, gens, species_dir, out_dir)
+}
+
+/// CONTINUE-FROM-GEM (the auto-research lead): branch the EVOLUTIONARY search OFF a saved gem instead of a cold
+/// random start. Reads + serde-parses the [`Gem`] at `gem_path`, PRE-SEEDS the [`GemLibrary`] with its
+/// [`SearchConfig`] as the gen-0 ANCHOR/elite, then runs the SAME [`discover_evolved_core`] machinery with
+/// `anchor_gen0 = true` so generation 0's exploit fraction is already [`propose_evolved`] (mutate/crossover) of
+/// the gem's roster + env + edits. The kept gems (the anchor + its branched descendants) are round-trip-verified
+/// and written by the UNCHANGED [`verify_and_write_library`] contract — a gem that fails `record_episode →
+/// replay == recorded_hash` is DROPPED, never written.
+///
+/// The SOURCE gem is re-verified on the CURRENT build before the search ([`verify_source_gem`]): a `build_id`
+/// mismatch or a round-trip mismatch is LOGGED as stale/incompatible but does NOT abort — its config still
+/// anchors the branching (a stale anchor is simply dropped at write time while its fresh-hashed children are
+/// written). The gem's [`SearchSpace`] is kept consistent: `space` when `Some`, else the widened
+/// [`SearchSpace::default`] with `edit_budget` set to the anchor's edit count (so the operators can reproduce the
+/// gem's mid-run-edit axis when it carries edits).
+///
+/// ## Determinism (inv #3)
+/// The proposal is the META-RNG and the sim runs are pure functions of their configs, so a fixed `(gem,
+/// search_seed, pop_size, generations, keep, gens, space, species_dir)` produces a byte-identical set of saved
+/// gems. This runner is std/serde meta-level only — the pinned literal `0x47a0_3c8f_6701_f240` is untouched.
+///
+/// # Errors
+/// Returns an [`io::Error`] for a failure to READ/PARSE the gem file, to create `out_dir`, or to write a gem
+/// file / the eval log. A stale/unreproducible SOURCE gem is logged (not an error); a per-child round-trip
+/// failure is handled internally (dropped + logged) by [`verify_and_write_library`].
+#[allow(clippy::too_many_arguments)] // independent run parameters; grouping would obscure the CLI mapping
+pub fn discover_from_gem(
+    gem_path: &Path,
+    space: Option<&SearchSpace>,
+    search_seed: u64,
+    pop_size: u64,
+    generations: u64,
+    keep: usize,
+    gens: u32,
+    species_dir: &Path,
+    out_dir: &Path,
+    evals_path: Option<&Path>,
+) -> io::Result<GemLibrary> {
+    // (a) READ + serde-parse the saved gem (std/serde meta-level — no sim run touched).
+    let text = std::fs::read_to_string(gem_path)?;
+    let gem: Gem = serde_json::from_str(&text).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse gem {}: {e}", gem_path.display()),
+        )
+    })?;
+
+    // Resolve the search space consistent with the anchor: an explicit `space`, else the widened default with the
+    // gem's edit budget folded in (so mutate/propose can reproduce the anchor's mid-run-edit axis when present).
+    let owned_default;
+    let space: &SearchSpace = match space {
+        Some(s) => s,
+        None => {
+            let edit_budget = u8::try_from(gem.config.edits.len()).unwrap_or(u8::MAX);
+            owned_default = SearchSpace {
+                edit_budget,
+                ..SearchSpace::default()
+            };
+            &owned_default
+        }
+    };
+
+    // Re-verify the SOURCE gem on this build (the gem reproducibility contract) — logs stale/incompatible but
+    // never aborts; the config still anchors the branching. `out_dir` hosts the throwaway stage subdir, so make
+    // sure it exists first (verify_and_write_library also creates it — idempotent).
+    std::fs::create_dir_all(out_dir)?;
+    verify_source_gem(&gem, gens, species_dir, out_dir);
+
+    // (b) PRE-SEED the library with the gem as the gen-0 ANCHOR/elite (an empty library's first candidate is
+    // always kept: novelty_l1 over an empty set is SCALE == dedup_min, not < it), then run the evolutionary
+    // generations with `anchor_gen0 = true` so propose_evolved branches off the gem from generation 0.
+    let mut lib = GemLibrary::new(keep);
+    lib.consider(gem);
+
+    discover_evolved_core(
+        space,
+        search_seed,
+        pop_size,
+        generations,
+        keep,
+        gens,
+        species_dir,
+        out_dir,
+        evals_path,
+        lib,
+        true,
+    )
+}
+
+/// Re-verify a SOURCE gem on the CURRENT build before continuing from it (the gem reproducibility contract,
+/// inv #3/#7). LOGS a clear note for each of: a `build_id` mismatch (stale/incompatible build), a roster that no
+/// longer resolves, a record/replay failure, or a round-trip hash mismatch — but NEVER aborts: a stale anchor is
+/// still a valid branching point (its descendants get fresh, reproducible hashes; the stale anchor itself is
+/// dropped at write time by [`verify_and_write_library`]). Off-hash meta-level only (record/replay into a
+/// throwaway `out_dir/.verify-source` stage that is removed) — the pinned literal is untouched.
+fn verify_source_gem(gem: &Gem, gens: u32, species_dir: &Path, out_dir: &Path) {
+    let seed = gem.config.master_seed;
+    if gem.build_id != BUILD_ID {
+        eprintln!(
+            "discover: source gem (seed {seed:016x}) build_id {:?} != current {BUILD_ID:?} — stale/incompatible; branching anyway (its score is recomputed by replay; a stale anchor is dropped at write time)",
+            gem.build_id
+        );
+    }
+
+    let (env_config, skipped) = env_config_for(&gem.config, species_dir);
+    for (key, err) in &skipped {
+        eprintln!("discover: source gem (seed {seed:016x}): skipped species {key:?} ({err})");
+    }
+    let Some(env_config) = env_config else {
+        eprintln!(
+            "discover: source gem (seed {seed:016x}): roster no longer resolves — branching off the raw config"
+        );
+        return;
+    };
+
+    // Mirror verify_and_write_library's journal exactly (so a re-verify here matches the write-time check).
+    let actions = edits_to_actions(&gem.config, &env_config.roster, gens);
+    let journal: Vec<Action> = build_journal(&actions, gem.gens);
+
+    let stage = out_dir.join(".verify-source");
+    let _ = std::fs::remove_dir_all(&stage);
+    let outcome = record_episode(&env_config, seed, &journal, &stage)
+        .and_then(|recorded| replay(&recorded.dir).map(|replayed| (recorded.hash, replayed)));
+    let _ = std::fs::remove_dir_all(&stage);
+
+    match outcome {
+        Ok((recorded_hash, replayed))
+            if replayed == recorded_hash && recorded_hash == gem.recorded_hash =>
+        {
+            eprintln!(
+                "discover: source gem (seed {seed:016x}) re-verified on this build (hash {recorded_hash:016x}) — anchoring"
+            );
+        }
+        Ok((recorded_hash, replayed)) => {
+            eprintln!(
+                "discover: source gem (seed {seed:016x}) does NOT reproduce on this build (recorded {recorded_hash:016x}, replay {replayed:016x}, gem {:016x}) — stale; branching off the config anyway",
+                gem.recorded_hash
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "discover: source gem (seed {seed:016x}) record/replay failed ({e}) — branching off the config anyway"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1174,225 @@ mod tests {
         assert_eq!(
             replayed, recorded.hash,
             "record → replay is bit-identical (inv #3) for an edited gem"
+        );
+    }
+
+    // ---- CONTINUE-FROM-GEM (discover_from_gem) ----
+
+    /// Build a tiny but REAL gem (scored on THIS build → a real `recorded_hash` that re-verifies) and write it
+    /// to `dir/<name>`, returning its path. Self-contained fixture — no dependency on `data/runs/gems`.
+    fn write_fixture_gem(
+        dir: &std::path::Path,
+        cfg: &SearchConfig,
+        gens: u32,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let (env_config, skipped) = env_config_for(cfg, &species_dir());
+        assert!(skipped.is_empty(), "fixture roster resolves: {skipped:?}");
+        let env_config = env_config.expect("fixture roster resolves");
+        let gem = score_config(cfg, &env_config, gens, &[]);
+        let path = dir.join(name);
+        let json = serde_json::to_string_pretty(&gem).expect("serialize fixture gem");
+        std::fs::write(&path, format!("{json}\n")).expect("write fixture gem");
+        path
+    }
+
+    /// Every saved gem JSON in `dir` as `(file_name, bytes)`, name-sorted (the throwaway `.verify-*` stage dirs
+    /// are filtered out — only real `*.json` files). The deterministic on-disk artifact set the runner writes.
+    fn saved_gems(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read out_dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().expect("file type").is_file() && name.ends_with(".json") {
+                out.push((name, std::fs::read(entry.path()).expect("read saved gem")));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn discover_from_gem_is_byte_reproducible() {
+        // (a) DETERMINISM: the SAME (gem, search_seed, pop, gens) into two temp dirs → byte-identical saved gems
+        // (inv #3). The proposal is the meta-RNG and the sim runs are pure functions of their configs.
+        let tmp = TempDir::new("from-gem-determinism");
+        let gens = 40u32;
+        let cfg = tiny_config(0x6E4D_0001);
+        let gem_path = write_fixture_gem(tmp.path(), &cfg, gens, "fixture.json");
+
+        let out_a = tmp.path().join("out_a");
+        let out_b = tmp.path().join("out_b");
+
+        let lib_a = discover_from_gem(
+            &gem_path,
+            None,
+            11,
+            4,
+            1,
+            8,
+            gens,
+            &species_dir(),
+            &out_a,
+            None,
+        )
+        .expect("from-gem A");
+        let lib_b = discover_from_gem(
+            &gem_path,
+            None,
+            11,
+            4,
+            1,
+            8,
+            gens,
+            &species_dir(),
+            &out_b,
+            None,
+        )
+        .expect("from-gem B");
+
+        assert_eq!(
+            lib_a, lib_b,
+            "same (gem, seed, pop, gens) → identical returned library"
+        );
+        let gems_a = saved_gems(&out_a);
+        let gems_b = saved_gems(&out_b);
+        assert!(
+            !gems_a.is_empty(),
+            "the continued search writes at least one verified gem"
+        );
+        assert_eq!(
+            gems_a, gems_b,
+            "byte-identical saved gems across two runs (inv #3)"
+        );
+    }
+
+    #[test]
+    fn discover_from_gem_children_round_trip() {
+        // (b) ROUND-TRIP: every continued/branched gem the runner writes replays to its recorded_hash (the gem
+        // reproducibility contract — verify_and_write_library enforces it before writing; we re-prove it here).
+        let tmp = TempDir::new("from-gem-roundtrip");
+        let gens = 40u32;
+        let cfg = tiny_config(0x9A71_0002);
+        let gem_path = write_fixture_gem(tmp.path(), &cfg, gens, "fixture.json");
+        let out = tmp.path().join("out");
+
+        let lib = discover_from_gem(
+            &gem_path,
+            None,
+            5,
+            4,
+            1,
+            8,
+            gens,
+            &species_dir(),
+            &out,
+            None,
+        )
+        .expect("from-gem");
+        assert!(
+            !lib.is_empty(),
+            "the continued search keeps at least one gem"
+        );
+
+        let saved = saved_gems(&out);
+        assert!(!saved.is_empty(), "at least one verified gem is written");
+        for (name, bytes) in &saved {
+            let gem: Gem = serde_json::from_slice(bytes).expect("parse saved gem");
+            let (env_config, _) = env_config_for(&gem.config, &species_dir());
+            let env_config = env_config.expect("saved gem roster resolves");
+            let actions = edits_to_actions(&gem.config, &env_config.roster, gens);
+            let journal = build_journal(&actions, gem.gens);
+            let stage = out.join(format!(".rt-{name}"));
+            let _ = std::fs::remove_dir_all(&stage);
+            let recorded = record_episode(&env_config, gem.config.master_seed, &journal, &stage)
+                .expect("record saved gem");
+            let replayed = replay(&recorded.dir).expect("replay saved gem");
+            let _ = std::fs::remove_dir_all(&stage);
+            assert_eq!(replayed, recorded.hash, "record == replay (inv #3)");
+            assert_eq!(
+                recorded.hash, gem.recorded_hash,
+                "saved gem {name} replays to its recorded_hash"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_from_gem_anchors_gen0_on_the_loaded_gem() {
+        // (c) ANCHORING: the gen-0 pool genuinely derives from the loaded gem (NOT a cold random start).
+        let tmp = TempDir::new("from-gem-anchor");
+        let gens = 40u32;
+        let cfg = tiny_config(0xA0C0_0003);
+        let gem_path = write_fixture_gem(tmp.path(), &cfg, gens, "fixture.json");
+
+        let search_seed = 21u64;
+        let pop_size = 4u64;
+        let generations = 1u64;
+        let keep = 16usize; // large enough that the keep-cut never evicts the pre-seeded anchor
+
+        // CONTINUE-FROM-GEM run: the anchor is pre-seeded + branched off from generation 0.
+        let out = tmp.path().join("out");
+        let anchored = discover_from_gem(
+            &gem_path,
+            None,
+            search_seed,
+            pop_size,
+            generations,
+            keep,
+            gens,
+            &species_dir(),
+            &out,
+            None,
+        )
+        .expect("from-gem");
+
+        // RUNNER-LEVEL proof: the anchor's exact config survives into the continued library (it was pre-seeded as
+        // the gen-0 elite, re-verified on this build, and carried forward) — the search KNEW the gem.
+        assert!(
+            anchored.gems.iter().any(|g| g.config == cfg),
+            "the continued library must contain the loaded gem's config (the gen-0 anchor)"
+        );
+
+        // CONTRAST: a COLD evolutionary run over the SAME (seed, pop, gens, keep, space) never saw the gem, so its
+        // library does NOT contain the anchor's config — the difference is exactly the anchoring.
+        let cold_out = tmp.path().join("cold");
+        let space = SearchSpace::default();
+        let cold = discover_evolved_in_space(
+            &space,
+            search_seed,
+            pop_size,
+            generations,
+            keep,
+            gens,
+            &species_dir(),
+            &cold_out,
+            None,
+        )
+        .expect("cold evolved");
+        assert!(
+            !cold.gems.iter().any(|g| g.config == cfg),
+            "a cold start must NOT contain the gem's config (anchoring is load-bearing)"
+        );
+        assert_ne!(
+            anchored, cold,
+            "anchoring the gen-0 pool on the gem changes the discovered library vs a cold start"
+        );
+
+        // OPERATOR-LEVEL proof: the gen-0 EXPLOIT individual the runner proposes is a mutate (a genuine branch)
+        // of the gem — NOT an unrelated cold propose. The runner uses `propose_evolved(&[anchor], seed, step)`
+        // for `i >= explore`; with one parent that delegates to `mutate`, which preserves the parent's roster.
+        let explore = ((pop_size * EVOLVE_EXPLORE_BP / BP_SCALE).max(1)).min(pop_size);
+        let step = explore; // generation 0, first exploit individual (i == explore)
+        let branched = propose_evolved(std::slice::from_ref(&cfg), search_seed, step, &space);
+        let mutated = discovery::search::mutate(&cfg, search_seed, step, &space);
+        assert_eq!(
+            branched, mutated,
+            "the gen-0 exploit child is a mutate of the gem (a genuine branch off the anchor)"
+        );
+        assert_ne!(
+            branched,
+            propose(search_seed, step, &space),
+            "the gen-0 exploit child is NOT an unrelated cold propose"
         );
     }
 }
