@@ -28,8 +28,10 @@
 use std::io;
 use std::path::Path;
 
+use crispr::{default_cas_variants, GuideSequence};
 use discovery::search::{
     caption, propose, propose_evolved, EvalRecord, Gem, GemLibrary, SearchConfig, SearchSpace,
+    EDIT_GEN_Q16_DEN,
 };
 use discovery::{final_score, DefaultScorer};
 use genome::spec::BuiltSpecies;
@@ -38,7 +40,7 @@ use sim_core::{ConsortiumConfig, ContainmentLevel, EnvParams};
 use crate::capture::capture_trace;
 use crate::replay::{record_episode, replay, EnvConfig};
 use crate::species::load_species_file;
-use crate::Action;
+use crate::{Action, EditAction};
 
 /// The pinned-build fingerprint stored on every gem (inv #7). Anchored to the determinism literal so a re-pin
 /// (which moves the literal) self-invalidates stored scores — a gem carrying an OLD `build_id` must be
@@ -126,10 +128,111 @@ pub fn env_config_for(
     (Some(env_config), skipped)
 }
 
+/// Map a [`SearchConfig`]'s mid-run edit schedule (Variant Lab D) to the harness `(gen, Action::ApplyEdit)`
+/// POINT actions [`capture_trace`] consumes — the STAGE-2 wire from the std+serde [`discovery::search::EditGene`]
+/// DESCRIPTIONS (inv #1/#5) onto the real `crispr` action surface. Inv #2 holds: the genotype→phenotype gate
+/// runs in sim-core; the harness only SCHEDULES the already-existing [`Action::ApplyEdit`].
+///
+/// Each `EditGene` becomes one `(gen_abs, ApplyEdit)`:
+/// - `gen_abs = edit.gen * gens / EDIT_GEN_Q16_DEN` — the q16 run-fraction mapped to an ABSOLUTE generation in
+///   `[0, gens)`. Computed from the SAME `gens` on BOTH the capture (score) and the verify (replay) side, so the
+///   two stay byte-identical even when a run early-stops at `gem.gens < gens` (an edit beyond `gem.gens` simply
+///   never fires on either side). A `gen_abs == 0` edit never fires (the capture loop is `1..=gens`) — a no-op
+///   on both sides, so it is round-trip-safe.
+/// - `species` resolves `edit.species_index` (an index into the FULL proposed `cfg.roster`, incl. zero-count
+///   axes) to the [`sim_core::SpeciesId`] ordinal the env uses. [`env_config_for`] builds the resolved roster as
+///   a POSITIONAL, order-preserving filter of `cfg.roster` (it drops zero-count / unresolvable entries), and
+///   `reset_with_roster` assigns ids `0..n` in that order — so the SpeciesId is the COUNT of non-zero entries
+///   strictly before `species_index` (resolution is POSITIONAL, never by key: a roster key is a file stem, e.g.
+///   `ecoli`, while the built species' `key` is the JSON id, e.g. `ecoli-core`). An edit aimed at an absent
+///   (zero-count) or out-of-range species is SKIPPED — identically on the capture + verify side, so even an
+///   imperfect resolution is round-trip-safe (both sides derive the SAME action list from the SAME inputs).
+/// - `target` indexes the chosen species' ACTUAL loci (`edit.target mod loci_len` → that locus' real `LocusId`),
+///   so the bare genome-agnostic search locus always resolves to a real locus (inv #2/#5).
+/// - `cas` is the build's first seed Cas variant (an `EditGene` carries no Cas — the canonical default).
+///
+/// An EMPTY schedule (the default `edit_budget == 0`) yields an EMPTY `Vec`, so `capture_trace(.., &[])` is
+/// recovered byte-for-byte and the pinned literal `0x47a0_3c8f_6701_f240` is untouched.
+fn edits_to_actions(
+    cfg: &SearchConfig,
+    roster: &[(BuiltSpecies, u32)],
+    gens: u32,
+) -> Vec<(u32, Action)> {
+    if cfg.edits.is_empty() {
+        return Vec::new(); // hash-neutral: the default search (edit_budget 0) recovers capture_trace(.., &[]).
+    }
+    // The default Cas (the seed table's first variant) — an EditGene names no Cas, so the engine picks the
+    // canonical default deterministically. An empty table (impossible by construction) → no edits.
+    let Some(cas) = default_cas_variants().first().map(|v| v.id) else {
+        return Vec::new();
+    };
+    let mut actions: Vec<(u32, Action)> = Vec::with_capacity(cfg.edits.len());
+    for edit in &cfg.edits {
+        // species_index (into the FULL proposed roster) → the SpeciesId the env uses, resolved POSITIONALLY: the
+        // resolved roster is cfg.roster's non-zero entries in order, so the id is the count of non-zero entries
+        // strictly before species_index — valid only when species_index itself is present (non-zero).
+        let idx = edit.species_index as usize;
+        let Some((_, count)) = cfg.roster.get(idx) else {
+            continue; // index past the proposed roster (defensive) — skip.
+        };
+        if *count == 0 {
+            continue; // the targeted species is absent (zero-count) — no-op, both sides.
+        }
+        let sid = cfg.roster[..idx].iter().filter(|(_, c)| *c > 0).count();
+        let Some((built, _)) = roster.get(sid) else {
+            continue; // the position fell outside the resolved roster (a load-failed earlier entry) — skip.
+        };
+        // Clamp the bare search locus onto a REAL locus of the chosen species' genome (always resolves).
+        let loci = &built.genome.loci;
+        if loci.is_empty() {
+            continue;
+        }
+        let target = loci[edit.target as usize % loci.len()].id;
+        // Rebuild the guide (draw_guide only emits ACGT → always valid; a corrupt config is skipped, not panicked).
+        let Ok(guide) = GuideSequence::new(edit.guide.clone().into_bytes()) else {
+            continue;
+        };
+        // q16 run-fraction → absolute generation (SAME `gens` on capture + verify; always < gens for gens >= 1).
+        let gen_abs =
+            ((u64::from(edit.gen) * u64::from(gens)) / u64::from(EDIT_GEN_Q16_DEN)) as u32;
+        actions.push((
+            gen_abs,
+            Action::ApplyEdit(EditAction {
+                cas,
+                target,
+                guide,
+                species: sid as u16,
+            }),
+        ));
+    }
+    actions
+}
+
+/// Build the round-trip JOURNAL that reproduces a captured run BYTE-IDENTICALLY: it mirrors [`capture_trace`]'s
+/// interleave EXACTLY — for `gen` in `1..=gens`, push every POINT action scheduled at that `gen` (in list order,
+/// skipping any `Advance` — the loop owns time), then one [`Action::Advance`]`(1)`. With NO scheduled edits this
+/// collapses to `Advance(1)*gens`, which is byte-identical (in `run_stats().hash`) to the historical single
+/// `Advance(gens)` — proven by `tests/trace_capture.rs::capture_is_hash_neutral_on_a_real_multi_species_run`
+/// (one seeded stream, no re-seed) — so an UNEDITED gem's round-trip is unchanged. `gens` here is the CAPTURED
+/// `gem.gens` (the capture early-stops at it), so an edit scheduled past it is naturally excluded.
+fn build_journal(actions: &[(u32, Action)], gens: u32) -> Vec<Action> {
+    let mut journal: Vec<Action> = Vec::with_capacity(gens as usize + actions.len());
+    for gen in 1..=gens {
+        for (g, a) in actions {
+            if *g == gen && !matches!(a, Action::Advance(_)) {
+                journal.push(a.clone());
+            }
+        }
+        journal.push(Action::Advance(1));
+    }
+    journal
+}
+
 /// Capture + score one [`SearchConfig`] into a [`Gem`] (the per-trial scoring step). Runs the off-hash
-/// [`capture_trace`] over `gens` generations of the freshly-built env (NO journaled actions — the search probes
-/// the INITIAL-CONFIG space; mid-run edits are a later axis), scores it vs the already-kept fingerprints, and
-/// packages the full integer signal set + the reproducible config into a gem.
+/// [`capture_trace`] over `gens` generations of the freshly-built env, threading the config's mid-run CRISPR
+/// edit schedule ([`edits_to_actions`] — EMPTY for the default `edit_budget == 0`, so byte-identical to the
+/// pre-edit search), scores the trace vs the already-kept fingerprints, and packages the full integer signal
+/// set + the reproducible config into a gem.
 fn score_config(
     cfg: &SearchConfig,
     env_config: &EnvConfig,
@@ -147,8 +250,11 @@ fn score_config(
         env.set_containment(*level, config.clone());
     }
 
-    // Off-hash capture of the pure-config run, then the D0 score + the save-time novelty multiplier vs the kept set.
-    let trace = capture_trace(&mut env, cfg.master_seed, gens, &[]);
+    // Off-hash capture of the config's run (with its scheduled mid-run edits), then the D0 score + the save-time
+    // novelty multiplier vs the kept set. The actions resolve against the SAME resolved roster the verify side
+    // rebuilds, so the captured `recorded_hash` round-trips through `record_episode → replay`.
+    let actions = edits_to_actions(cfg, &env_config.roster, gens);
+    let trace = capture_trace(&mut env, cfg.master_seed, gens, &actions);
     let scorer = DefaultScorer::default();
     let scored = final_score(&scorer, &trace, saved_fps);
     let sv = scored.score;
@@ -208,13 +314,44 @@ pub fn discover(
     out_dir: &Path,
     evals_path: Option<&Path>,
 ) -> io::Result<GemLibrary> {
-    let space = SearchSpace::default();
+    // The Primordial anchor with NO mid-run-edit axis (edit_budget 0) — byte-identical to the pre-Variant-Lab-D
+    // search. A caller that wants the edit axis ON calls [`discover_in_space`] with a raised `edit_budget`.
+    discover_in_space(
+        &SearchSpace::default(),
+        search_seed,
+        trials,
+        keep,
+        gens,
+        species_dir,
+        out_dir,
+        evals_path,
+    )
+}
+
+/// [`discover`] over an EXPLICIT [`SearchSpace`] — the Variant-Lab-D opt-in seam. The space's
+/// [`SearchSpace::edit_budget`] turns the mid-run CRISPR edit axis ON (`> 0`) or OFF (`0`, the
+/// [`SearchSpace::default`] — byte-identical to [`discover`]). Everything else matches [`discover`]: a fixed
+/// `(space, search_seed, trials, keep, gens, species_dir)` produces a byte-identical set of saved gems (the
+/// proposal is the meta-RNG; the sim runs are pure functions of their configs — the pinned literal is untouched,
+/// and a config with an empty schedule schedules no actions, so its run + round-trip are byte-for-byte the old
+/// behaviour).
+#[allow(clippy::too_many_arguments)] // independent run parameters; grouping would obscure the CLI mapping
+pub fn discover_in_space(
+    space: &SearchSpace,
+    search_seed: u64,
+    trials: u64,
+    keep: usize,
+    gens: u32,
+    species_dir: &Path,
+    out_dir: &Path,
+    evals_path: Option<&Path>,
+) -> io::Result<GemLibrary> {
     let mut lib = GemLibrary::new(keep);
     let mut evals: Vec<EvalRecord> = Vec::with_capacity(usize::try_from(trials).unwrap_or(0));
 
     // --- SEARCH: propose → build → capture → score → consider, in trial order (deterministic) ---
     for trial in 0..trials {
-        let cfg = propose(search_seed, trial, &space);
+        let cfg = propose(search_seed, trial, space);
         capture_and_consider(
             &cfg,
             species_dir,
@@ -232,7 +369,7 @@ pub fn discover(
         write_eval_log(path, &evals)?;
     }
 
-    verify_and_write_library(&lib, keep, species_dir, out_dir)
+    verify_and_write_library(&lib, keep, gens, species_dir, out_dir)
 }
 
 /// Build, capture, score, and CONSIDER one [`SearchConfig`] into `lib` — the shared per-config step both the
@@ -301,10 +438,13 @@ fn write_eval_log(path: &Path, evals: &[EvalRecord]) -> io::Result<()> {
 /// VERIFY + WRITE the kept gems: each must round-trip (`record_episode → replay == recorded_hash`) before it is
 /// written, so the on-disk library only ever holds reproducible gems; a gem that fails is DROPPED (logged),
 /// never written. Returns the [`GemLibrary`] of the gems that PASSED and were written. Shared by [`discover`]
-/// and [`discover_evolved`] so the round-trip contract has ONE implementation.
+/// and [`discover_evolved`] so the round-trip contract has ONE implementation. `gens` is the REQUESTED horizon
+/// (used to map each gem's q16 edit schedule to the SAME absolute generations the capture used — see
+/// [`edits_to_actions`]).
 fn verify_and_write_library(
     lib: &GemLibrary,
     keep: usize,
+    gens: u32,
     species_dir: &Path,
     out_dir: &Path,
 ) -> io::Result<GemLibrary> {
@@ -319,11 +459,14 @@ fn verify_and_write_library(
             );
             continue;
         };
-        // The gem's journal is a SINGLE Advance over the generations the capture actually ran (the search probes
-        // the INITIAL-CONFIG space — no mid-run edits this slice). `capture_trace` drives `Advance(1)*g` which is
-        // byte-identical to one `Advance(g)` (one seeded stream, no re-seed — proven in tests/trace_capture.rs),
-        // and the capture EARLY-STOPS at `gem.gens` (== `trace.g`), so this reproduces the captured run exactly.
-        let journal: Vec<Action> = vec![Action::Advance(u64::from(gem.gens))];
+        // The gem's journal MIRRORS the capture's interleave (Variant Lab D): per generation `1..=gem.gens`, the
+        // edits scheduled at that gen (in list order) then one `Advance(1)`. With NO edits this collapses to
+        // `Advance(1)*gem.gens`, byte-identical to one `Advance(gem.gens)` (one seeded stream, no re-seed — proven
+        // in tests/trace_capture.rs), so an UNEDITED gem's round-trip is unchanged. The edit actions resolve
+        // against the SAME resolved roster + the SAME requested `gens` the capture used (so the absolute edit
+        // generations match), and the capture EARLY-STOPS at `gem.gens` (== `trace.g`) — reproducing it exactly.
+        let actions = edits_to_actions(&gem.config, &env_config.roster, gens);
+        let journal: Vec<Action> = build_journal(&actions, gem.gens);
 
         // Round-trip the gem through the on-disk record/replay contract into a TEMP subdir, then compare.
         let stage = out_dir.join(format!(".verify-{:016x}", gem.config.master_seed));
@@ -415,7 +558,38 @@ pub fn discover_evolved(
     out_dir: &Path,
     evals_path: Option<&Path>,
 ) -> io::Result<GemLibrary> {
-    let space = SearchSpace::default();
+    // The widened Primordial anchor with NO mid-run-edit axis (edit_budget 0) — byte-identical to pre-Variant-
+    // Lab-D. A caller wanting the edit axis ON calls [`discover_evolved_in_space`] with a raised `edit_budget`.
+    discover_evolved_in_space(
+        &SearchSpace::default(),
+        search_seed,
+        pop_size,
+        generations,
+        keep,
+        gens,
+        species_dir,
+        out_dir,
+        evals_path,
+    )
+}
+
+/// [`discover_evolved`] over an EXPLICIT [`SearchSpace`] — the Variant-Lab-D opt-in seam (mirrors
+/// [`discover_in_space`]). The space's [`SearchSpace::edit_budget`] turns the mid-run CRISPR edit axis ON
+/// (`> 0`) or OFF (`0`, the [`SearchSpace::default`] — byte-identical to [`discover_evolved`]); every proposal
+/// AND every evolutionary operator child draws its edit schedule from the same space, so a raised budget threads
+/// edits through the whole generational loop. Determinism + the round-trip contract are unchanged.
+#[allow(clippy::too_many_arguments)] // independent run parameters; grouping would obscure the CLI mapping
+pub fn discover_evolved_in_space(
+    space: &SearchSpace,
+    search_seed: u64,
+    pop_size: u64,
+    generations: u64,
+    keep: usize,
+    gens: u32,
+    species_dir: &Path,
+    out_dir: &Path,
+    evals_path: Option<&Path>,
+) -> io::Result<GemLibrary> {
     let mut lib = GemLibrary::new(keep);
     let total_evals = pop_size.saturating_mul(generations + 1);
     let mut evals: Vec<EvalRecord> = Vec::with_capacity(usize::try_from(total_evals).unwrap_or(0));
@@ -439,11 +613,11 @@ pub fn discover_evolved(
             let step = generation * pop_size + i;
             let cfg = if generation == 0 || i < explore {
                 // GENERATION 0 (cold start) + the per-generation EXPLORE fraction → fresh random proposal.
-                propose(search_seed, step, &space)
+                propose(search_seed, step, space)
             } else {
                 // The EXPLOIT fraction → mutate/crossover of the current elite pool (empty pool → cold propose,
                 // handled inside propose_evolved). Drawn off the evolve stream salt (disjoint from propose).
-                propose_evolved(&parents, search_seed, step, &space)
+                propose_evolved(&parents, search_seed, step, space)
             };
             capture_and_consider(
                 &cfg,
@@ -462,7 +636,7 @@ pub fn discover_evolved(
         write_eval_log(path, &evals)?;
     }
 
-    verify_and_write_library(&lib, keep, species_dir, out_dir)
+    verify_and_write_library(&lib, keep, gens, species_dir, out_dir)
 }
 
 #[cfg(test)]
@@ -483,6 +657,7 @@ mod tests {
             containment_level: 2, // Lab → a (level, config) pair, Mode-A consortium pre-loaded
             temp_q: 600,
             season: 1,
+            edits: Vec::new(),
         };
         let (env_config, skipped) = env_config_for(&cfg, &species_dir());
         let env_config = env_config.expect("roster resolves");
@@ -523,6 +698,7 @@ mod tests {
             containment_level: 0, // Sealed → hash-neutral default
             temp_q: 500,
             season: 0,
+            edits: Vec::new(),
         }
     }
 
@@ -700,6 +876,103 @@ mod tests {
         assert!(
             !stray.exists(),
             "no eval log should be written when evals_path is None"
+        );
+    }
+
+    // ---- Variant Lab D (STAGE 2): the mid-run edit wire ----
+
+    /// A config carrying a real mid-run edit schedule: two edits at distinct relative points, two present
+    /// species. Maps to two `ApplyEdit` actions at gens ~18 and ~36 over a 60-gen run.
+    fn edited_config(seed: u64) -> SearchConfig {
+        use discovery::search::EditGene;
+        SearchConfig {
+            master_seed: seed,
+            roster: vec![("default".to_string(), 600), ("ecoli".to_string(), 300)],
+            containment_level: 0,
+            temp_q: 500,
+            season: 0,
+            edits: vec![
+                // ~0.30 of the run, species 0 (default), locus index 0.
+                EditGene {
+                    gen: 20_000,
+                    species_index: 0,
+                    target: 0,
+                    guide: "ACGTACGTACGTACGTACGT".to_string(),
+                },
+                // ~0.61 of the run, species 1 (ecoli), locus index 3.
+                EditGene {
+                    gen: 40_000,
+                    species_index: 1,
+                    target: 3,
+                    guide: "TTTTGGGGCCCCAAAATTTT".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn no_edits_yields_empty_actions_and_an_unedited_journal() {
+        // (a) edit_budget 0 (empty schedule) recovers EXACTLY the old behaviour: no scheduled actions, and the
+        // journal is `Advance(1)*gens` — byte-identical-in-hash to the historical single Advance(gens).
+        let cfg = tiny_config(0x55); // edits: Vec::new()
+        let (env_config, _) = env_config_for(&cfg, &species_dir());
+        let env_config = env_config.expect("roster resolves");
+        let actions = edits_to_actions(&cfg, &env_config.roster, 40);
+        assert!(actions.is_empty(), "an empty schedule schedules no actions");
+        let journal = build_journal(&actions, 7);
+        assert_eq!(
+            journal,
+            vec![Action::Advance(1); 7],
+            "no edits → Advance(1)*gens"
+        );
+    }
+
+    #[test]
+    fn edited_config_round_trips_and_genuinely_edits() {
+        // (b) THE LOAD-BEARING PROOF: a config carrying mid-run edits captures a recorded_hash that ROUND-TRIPS
+        // through the on-disk record_episode → replay contract (inv #3), AND the edits genuinely change the run
+        // (a different hash than the SAME config with NO edits — the wire is load-bearing, not a silent no-op).
+        let gens = 60u32;
+        let cfg = edited_config(0xED17);
+        let (env_config, skipped) = env_config_for(&cfg, &species_dir());
+        assert!(skipped.is_empty(), "roster resolves: {skipped:?}");
+        let env_config = env_config.expect("roster resolves");
+
+        // The two edits resolve to two real ApplyEdit actions at distinct in-range generations.
+        let actions = edits_to_actions(&cfg, &env_config.roster, gens);
+        assert_eq!(actions.len(), 2, "both edits map to actions");
+        assert!(actions
+            .iter()
+            .all(|(g, a)| *g >= 1 && *g < gens && matches!(a, Action::ApplyEdit(_))));
+
+        // Score the EDITED config (capture WITH the edits) → its recorded_hash.
+        let gem = score_config(&cfg, &env_config, gens, &[]);
+
+        // The EDITS GENUINELY CHANGE THE RUN: the same config with NO edits captures a different hash.
+        let unedited = SearchConfig {
+            edits: Vec::new(),
+            ..cfg.clone()
+        };
+        let unedited_gem = score_config(&unedited, &env_config, gens, &[]);
+        assert_ne!(
+            gem.recorded_hash, unedited_gem.recorded_hash,
+            "the mid-run edits must genuinely change the run (the wire is load-bearing)"
+        );
+
+        // ROUND-TRIP: build the verify journal exactly as verify_and_write_library does, record + replay it,
+        // and assert it reproduces the captured hash bit-for-bit.
+        let journal = build_journal(&actions, gem.gens);
+        let tmp = TempDir::new("edited_rt");
+        let recorded =
+            record_episode(&env_config, cfg.master_seed, &journal, tmp.path()).expect("record");
+        let replayed = replay(&recorded.dir).expect("replay");
+        assert_eq!(
+            recorded.hash, gem.recorded_hash,
+            "the verify journal reproduces the captured recorded_hash"
+        );
+        assert_eq!(
+            replayed, recorded.hash,
+            "record → replay is bit-identical (inv #3) for an edited gem"
         );
     }
 }

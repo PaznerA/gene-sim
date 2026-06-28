@@ -39,6 +39,44 @@ pub struct SearchConfig {
     pub temp_q: u16,
     /// Season ordinal (`0..=3`: Spring/Summer/Autumn/Winter).
     pub season: u8,
+    /// The mid-run CRISPR edit schedule (Variant Lab D) — a list of [`EditGene`] DESCRIPTIONS the replay
+    /// engine fires during the run. `#[serde(default, skip_serializing_if)]` makes this field HASH-NEUTRAL:
+    /// - an OLD gem/config written WITHOUT the field deserializes to an EMPTY schedule (no migration), and
+    /// - an EMPTY schedule serializes to NO `edits` key at all (skip-if-empty), so the [`EvalRecord`]/[`Gem`]
+    ///   JSONL bytes are BYTE-IDENTICAL to pre-D logs.
+    ///
+    /// EMPTY whenever [`SearchSpace::edit_budget`] is `0` (the default search): [`propose`]/[`mutate`] draw
+    /// ZERO edit fields, so the entire config — and the eval log — is byte-identical to before this slice.
+    /// Edits enter ONLY when a caller raises `edit_budget`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<EditGene>,
+}
+
+/// One scheduled mid-run CRISPR edit — a SERIALIZABLE DESCRIPTION of a single edit, carrying NO
+/// `sim-core`/`harness`/`genome`/`crispr` type so it stays on the clean std+serde side of the seam, EXACTLY
+/// like [`SearchConfig`] (inv #1/#5). The Variant-Lab-E replay engine maps each gene onto a
+/// `harness::Action::ApplyEdit(EditAction { target: genome::LocusId(target), guide, species })` — the fields
+/// here are the bare integer / string reprs of that `EditAction` so this crate needs no biology dep (inv #2).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EditGene {
+    /// WHEN the edit fires, as a q16 FRACTION of the run: the absolute generation is
+    /// `gen * gens / `[`EDIT_GEN_Q16_DEN`]` (`gen ∈ [0, EDIT_GEN_Q16_DEN)` ↔ `0.0..<1.0`). SPAN-INDEPENDENT —
+    /// the gem replays at the same RELATIVE point regardless of the configured run length, and (crucially)
+    /// [`propose`]/[`mutate`] never need the run length, so their 3-arg signatures (and every existing draw)
+    /// are unchanged. The mapped generation is always `< gens` for `gens ≥ 1`.
+    pub gen: u32,
+    /// WHICH species' genome to edit: an index into the proposed [`SearchConfig::roster`] (operator/species
+    /// granularity, inv #6 — never a per-organism handle). The replay engine resolves it against the run's
+    /// species (`< roster.len()` by construction).
+    pub species_index: u16,
+    /// The genome locus to target — the bare [`genome::LocusId`] integer (a plain `u32` so this crate carries
+    /// NO genome dep). Drawn in `[0, `[`EDIT_TARGET_LOCI`]`)`; the engine resolves/clamps it against the chosen
+    /// species' ACTUAL loci count at replay (genomes range from a few to ~136 loci — this crate is
+    /// genome-agnostic, inv #2/#5).
+    pub target: u32,
+    /// The guide (spacer) as a validated-ACGT string ([`EDIT_GUIDE_LEN`] bases) — the engine rebuilds it into a
+    /// `crispr::GuideSequence` (which would reject a non-ACGT base, but [`draw_guide`] only emits `A/C/G/T`).
+    pub guide: String,
 }
 
 /// One species axis of the search: its key/stem, the inclusive `[lo, hi]` starting-count range to draw from
@@ -77,6 +115,12 @@ pub struct SearchSpace {
     pub season_lo: u8,
     /// Inclusive season-ordinal upper bound.
     pub season_hi: u8,
+    /// MAX number of mid-run edits a proposed config may schedule (Variant Lab D). THE HASH-NEUTRALITY KNOB:
+    /// `0` (the [`Default`]) → [`propose`]/[`mutate`] draw ZERO edit fields and emit `edits: vec![]`, so the
+    /// default search — and every existing eval-log byte — is unchanged. A caller raising this above `0` turns
+    /// the mid-run-edit axis ON; each proposal then draws `[0, edit_budget]` [`EditGene`]s from field words
+    /// allocated AFTER the env knobs (so the count/presence/env draws never shift).
+    pub edit_budget: u8,
 }
 
 impl Default for SearchSpace {
@@ -144,6 +188,9 @@ impl Default for SearchSpace {
             // all four seasons.
             season_lo: 0,
             season_hi: 3,
+            // NO mid-run edits by default — the hash-neutral knob. propose/mutate emit `edits: vec![]`, so the
+            // default search + every existing eval-log byte is byte-identical to pre-Variant-Lab-D.
+            edit_budget: 0,
         }
     }
 }
@@ -190,6 +237,15 @@ fn in_range_u64(r: u64, lo: u64, hi: u64) -> u64 {
 //   1 + 2*N        → containment
 //   2 + 2*N        → temp
 //   3 + 2*N        → season
+//   4 + 2*N        → edit COUNT          (Variant Lab D — drawn on the EDIT_SALT stream only)
+//   5 + 2*N + 4*k  → edit k gen
+//   6 + 2*N + 4*k  → edit k species_index
+//   7 + 2*N + 4*k  → edit k target
+//   8 + 2*N + 4*k  → edit k guide-seed
+//
+// The edit words live AFTER season + are drawn on a DISTINCT EDIT_SALT stream, so adding the mid-run-edit axis
+// shifts NO existing draw: with `edit_budget == 0` the edit fields are never touched and the rest of the config
+// (master_seed / roster / env) is byte-identical to pre-D.
 //
 // The evolutionary operators ([`mutate`]) reuse the SAME per-field stream coordinates (offset by a per-operator
 // base so a mutation step is independent of a propose at the same index) — kept in these helpers so the count /
@@ -219,6 +275,88 @@ fn fi_temp(n: usize) -> u64 {
 #[inline]
 fn fi_season(n: usize) -> u64 {
     3 + 2 * n as u64
+}
+
+// ── Mid-run edit axis (Variant Lab D) ─────────────────────────────────────────────────────────────────────────
+//
+// The edit schedule is drawn on a stream SALTED by `EDIT_SALT` (XORed into the operator salt) so it is disjoint
+// from the count/presence/env draws AND from the other operators — adding the axis perturbs nothing. With
+// `edit_budget == 0` (the default) NO edit field is drawn and the schedule is empty (hash-neutral).
+
+/// Stream salt for the edit-schedule draws — XORed into the operator salt so the edit words are disjoint from
+/// the count/presence/env words and from each operator's main stream.
+const EDIT_SALT: u64 = 0x4564_6974_5363_0004;
+/// Stream words consumed per [`EditGene`] (gen, species_index, target, guide-seed).
+const EDIT_FIELDS_PER_GENE: u64 = 4;
+/// q16 denominator for [`EditGene::gen`]: the fraction is `gen / EDIT_GEN_Q16_DEN` of the run. `gen` is drawn in
+/// `[0, EDIT_GEN_Q16_DEN)`, so the mapped generation `gen * gens / EDIT_GEN_Q16_DEN` is always `< gens`.
+pub const EDIT_GEN_Q16_DEN: u32 = 1 << 16;
+/// Search resolution for [`EditGene::target`]: the bare `LocusId` is drawn in `[0, EDIT_TARGET_LOCI)`. The
+/// replay engine resolves/clamps it against the chosen species' ACTUAL loci count (this crate is
+/// genome-agnostic, inv #2/#5), so this is a fixed search granularity, not a hard genome bound.
+pub const EDIT_TARGET_LOCI: u32 = 32;
+/// Length (nt) of a drawn [`EditGene::guide`] — the standard SpCas9 spacer length.
+pub const EDIT_GUIDE_LEN: usize = 20;
+
+/// Field word base for edit gene `k`, AFTER the edit COUNT word (`4 + 2*N`). Gene `k` occupies the four words
+/// `[base, base+3]` (gen / species_index / target / guide-seed).
+#[inline]
+fn fi_edit_gene(n: usize, k: usize) -> u64 {
+    5 + 2 * n as u64 + k as u64 * EDIT_FIELDS_PER_GENE
+}
+
+/// Derive a fixed-length validated-ACGT guide string from one scrambled word: 2 bits per base
+/// (`0→A,1→C,2→G,3→T`), re-mixing the word every 32 bases so longer guides keep avalanching. The default
+/// [`EDIT_GUIDE_LEN`] (20) needs 40 bits — one word suffices. Always returns `EDIT_GUIDE_LEN` upper-case ACGT
+/// bytes, i.e. a string the engine can always rebuild into a `crispr::GuideSequence`.
+fn draw_guide(seed: u64) -> String {
+    const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    let mut s = String::with_capacity(EDIT_GUIDE_LEN);
+    let mut w = seed;
+    for i in 0..EDIT_GUIDE_LEN {
+        if i > 0 && i % 32 == 0 {
+            w = mix64(w);
+        }
+        let sym = (w >> ((i as u64 % 32) * 2)) & 0b11;
+        s.push(BASES[sym as usize] as char);
+    }
+    s
+}
+
+/// Draw the mid-run edit schedule for a proposal/mutation. `edit_draw(field) -> u64` is the operator's
+/// EDIT-stream draw (`op_draw(op_salt ^ EDIT_SALT, ..)`), disjoint from the count/presence/env draws. Returns
+/// at most `space.edit_budget` genes; an EMPTY `Vec` (drawing NO edit field at all) when the budget is `0` — the
+/// hash-neutral default. `roster_len` bounds `species_index`. Every gene is in range: `gen < EDIT_GEN_Q16_DEN`,
+/// `species_index < roster_len`, `target < EDIT_TARGET_LOCI`, guide is valid ACGT.
+fn draw_edits(
+    n: usize,
+    roster_len: usize,
+    space: &SearchSpace,
+    edit_draw: impl Fn(u64) -> u64,
+) -> Vec<EditGene> {
+    let budget = space.edit_budget as u64;
+    if budget == 0 {
+        return Vec::new(); // hash-neutral: NO edit field is drawn.
+    }
+    // edit count in [0, budget] from the dedicated COUNT word (`4 + 2*N`).
+    let count_field = 4 + 2 * n as u64;
+    let m = in_range_u64(edit_draw(count_field), 0, budget) as usize;
+    let roster_len = roster_len.max(1) as u64;
+    let mut edits = Vec::with_capacity(m);
+    for k in 0..m {
+        let base = fi_edit_gene(n, k);
+        let gen = in_range_u64(edit_draw(base), 0, u64::from(EDIT_GEN_Q16_DEN - 1)) as u32;
+        let species_index = (edit_draw(base + 1) % roster_len) as u16;
+        let target = (edit_draw(base + 2) % u64::from(EDIT_TARGET_LOCI)) as u32;
+        let guide = draw_guide(edit_draw(base + 3));
+        edits.push(EditGene {
+            gen,
+            species_index,
+            target,
+            guide,
+        });
+    }
+    edits
 }
 
 /// The per-species count when PRESENT, drawn uniformly from `[count_lo, count_hi]`.
@@ -287,12 +425,19 @@ pub fn propose(search_seed: u64, trial: u64, space: &SearchSpace) -> SearchConfi
         u64::from(space.season_hi),
     ) as u8;
 
+    // Mid-run edit schedule (Variant Lab D) — drawn on the EDIT_SALT stream (op_salt = 0 for `propose`), so it
+    // never perturbs the count/presence/env draws above. EMPTY when `edit_budget == 0` (the default).
+    let edits = draw_edits(n, roster.len(), space, |field| {
+        op_draw(EDIT_SALT, search_seed, trial, field)
+    });
+
     SearchConfig {
         master_seed,
         roster,
         containment_level,
         temp_q,
         season,
+        edits,
     }
 }
 
@@ -434,12 +579,21 @@ pub fn mutate(
         u64::from(space.season_hi),
     ) as u8;
 
+    // Mid-run edit schedule (Variant Lab D) — drawn on the `MUTATE_SALT ^ EDIT_SALT` stream so it is disjoint
+    // from both mutate's main draws AND propose's edit draws. Span-independent; EMPTY when `edit_budget == 0`.
+    // (The child draws a FRESH schedule rather than perturbing the parent's — like its freshly-drawn master_seed,
+    // a mutated config is a new run.)
+    let edits = draw_edits(n, roster.len(), space, |field| {
+        op_draw(MUTATE_SALT ^ EDIT_SALT, search_seed, step, field)
+    });
+
     SearchConfig {
         master_seed,
         roster,
         containment_level,
         temp_q,
         season,
+        edits,
     }
 }
 
@@ -516,6 +670,9 @@ pub fn crossover(a: &SearchConfig, b: &SearchConfig, search_seed: u64, step: u64
         containment_level,
         temp_q,
         season,
+        // Edit recombination is a later slice; a crossover child carries no mid-run edits (hash-neutral — an
+        // empty schedule serializes to no `edits` key). Edits ride only via `propose`/`mutate`.
+        edits: Vec::new(),
     }
 }
 
@@ -769,6 +926,7 @@ mod tests {
                 containment_level: 0,
                 temp_q: 500,
                 season: 0,
+                edits: Vec::new(),
             },
             score,
             quality: score,
@@ -907,6 +1065,7 @@ mod tests {
             containment_level: 0,
             temp_q: 500,
             season: 0,
+            edits: Vec::new(),
         };
         // limit-cycle: high m3 + high m1; takeover-dominated fingerprint (dim 10).
         let mut fp = [0u16; FP_DIMS];
@@ -937,6 +1096,7 @@ mod tests {
             containment_level: 0,
             temp_q: 500,
             season: 0,
+            edits: Vec::new(),
         };
         let c = caption(&scorevec([6000, 6000, 1000, 0, 0, 100], [0; FP_DIMS]), &cfg);
         assert!(c.contains("2 spp"), "got: {c}");
@@ -1028,6 +1188,7 @@ mod tests {
             containment_level: 1,
             temp_q: 500,
             season: 1,
+            edits: Vec::new(),
         }
     }
 
@@ -1046,6 +1207,7 @@ mod tests {
             containment_level: 3,
             temp_q: 700,
             season: 2,
+            edits: Vec::new(),
         }
     }
 
@@ -1339,6 +1501,7 @@ mod tests {
                 containment_level: 0,
                 temp_q: 500,
                 season: 0,
+                edits: Vec::new(),
             },
             quality,
             breakdown: [1, 2, 3, 4, 5, 6],
@@ -1371,6 +1534,221 @@ mod tests {
         assert!(
             json.starts_with(expected_prefix),
             "unexpected JSON shape: {json}"
+        );
+    }
+
+    // ---- Variant Lab D: mid-run edit axis (edit_budget / EditGene) ----
+
+    /// The default space widened with a mid-run-edit budget (everything else unchanged).
+    fn space_with_budget(budget: u8) -> SearchSpace {
+        SearchSpace {
+            edit_budget: budget,
+            ..SearchSpace::default()
+        }
+    }
+
+    #[test]
+    fn default_space_has_zero_edit_budget() {
+        // The hash-neutral knob: the default search schedules NO mid-run edits.
+        assert_eq!(SearchSpace::default().edit_budget, 0);
+    }
+
+    #[test]
+    fn default_space_proposes_no_edits_and_omits_the_key() {
+        // edit_budget == 0 → propose/mutate draw ZERO edit fields → empty schedule, and an empty schedule
+        // serializes with NO `edits` key (so eval-log bytes are byte-identical to pre-Variant-Lab-D).
+        let space = SearchSpace::default();
+        for trial in 0..64u64 {
+            let cfg = propose(42, trial, &space);
+            assert!(cfg.edits.is_empty(), "default propose schedules no edits");
+            let json = serde_json::to_string(&cfg).expect("serialize");
+            assert!(
+                !json.contains("edits"),
+                "an empty schedule must not serialize an `edits` key: {json}"
+            );
+        }
+        let child = mutate(&parent_a(), 7, 3, &space);
+        assert!(child.edits.is_empty(), "default mutate schedules no edits");
+    }
+
+    #[test]
+    fn raising_budget_does_not_perturb_roster_or_env() {
+        // THE byte-identity guarantee: adding the edit axis shifts NO existing draw. For the SAME (seed, trial)
+        // the non-edit fields of a budget>0 proposal are byte-identical to the budget==0 default — only `edits`
+        // is appended. (The edit words live at NEW field indices on a DISTINCT salt, so the count/presence/env
+        // draws never move — every existing propose/mutate test passes unchanged.)
+        let base = SearchSpace::default();
+        let withb = space_with_budget(5);
+        for trial in 0..128u64 {
+            let a = propose(99, trial, &base);
+            let b = propose(99, trial, &withb);
+            assert_eq!(a.master_seed, b.master_seed);
+            assert_eq!(a.roster, b.roster, "roster draws must be unperturbed");
+            assert_eq!(a.containment_level, b.containment_level);
+            assert_eq!(a.temp_q, b.temp_q);
+            assert_eq!(a.season, b.season);
+            assert!(
+                a.edits.is_empty(),
+                "the budget==0 config still has no edits"
+            );
+        }
+        let p = parent_a();
+        for step in 0..128u64 {
+            let a = mutate(&p, 5, step, &base);
+            let b = mutate(&p, 5, step, &withb);
+            assert_eq!(
+                a.roster, b.roster,
+                "mutate roster draws must be unperturbed"
+            );
+            assert_eq!(a.containment_level, b.containment_level);
+            assert_eq!(a.temp_q, b.temp_q);
+            assert_eq!(a.season, b.season);
+        }
+    }
+
+    /// Assert one drawn schedule is deterministic-bounds-valid against `space` (`len <= budget`, every gene in
+    /// range, guide a fixed-length ACGT string).
+    fn assert_edits_in_bounds(cfg: &SearchConfig, space: &SearchSpace) {
+        assert!(
+            cfg.edits.len() <= space.edit_budget as usize,
+            "schedule length {} exceeds budget {}",
+            cfg.edits.len(),
+            space.edit_budget
+        );
+        for e in &cfg.edits {
+            assert!(e.gen < EDIT_GEN_Q16_DEN, "gen {} not a q16 fraction", e.gen);
+            assert!(
+                (e.species_index as usize) < cfg.roster.len(),
+                "species_index {} out of roster (len {})",
+                e.species_index,
+                cfg.roster.len()
+            );
+            assert!(
+                e.target < EDIT_TARGET_LOCI,
+                "target {} out of locus search range",
+                e.target
+            );
+            assert_eq!(
+                e.guide.len(),
+                EDIT_GUIDE_LEN,
+                "guide is the fixed spacer length"
+            );
+            assert!(
+                e.guide
+                    .bytes()
+                    .all(|c| matches!(c, b'A' | b'C' | b'G' | b'T')),
+                "guide {} is not valid ACGT",
+                e.guide
+            );
+        }
+    }
+
+    #[test]
+    fn budgeted_propose_is_deterministic_and_in_bounds() {
+        let space = space_with_budget(4);
+        for trial in 0..256u64 {
+            let a = propose(7, trial, &space);
+            let b = propose(7, trial, &space);
+            assert_eq!(a, b, "same (seed,trial) → byte-identical config + edits");
+            assert_edits_in_bounds(&a, &space);
+        }
+        // The axis is LIVE: a positive budget schedules edits on a good fraction of trials, but not all (the
+        // count draws [0, budget], so some proposals still schedule zero).
+        let scheduled = (0..256u64)
+            .filter(|&t| !propose(7, t, &space).edits.is_empty())
+            .count();
+        assert!(scheduled > 0, "a positive budget must schedule edits");
+        assert!(scheduled < 256, "the count draw should sometimes be zero");
+    }
+
+    #[test]
+    fn budgeted_mutate_is_deterministic_and_in_bounds() {
+        let space = space_with_budget(3);
+        let p = parent_a();
+        for step in 0..256u64 {
+            let a = mutate(&p, 11, step, &space);
+            let b = mutate(&p, 11, step, &space);
+            assert_eq!(a, b, "same (seed,step) → byte-identical config + edits");
+            assert_edits_in_bounds(&a, &space);
+        }
+        let scheduled = (0..256u64)
+            .filter(|&s| !mutate(&p, 11, s, &space).edits.is_empty())
+            .count();
+        assert!(
+            scheduled > 0,
+            "a positive budget must schedule edits in mutate"
+        );
+    }
+
+    #[test]
+    fn propose_and_mutate_edit_streams_are_disjoint() {
+        // The edit schedules of a propose at trial s and a mutate at step s (same seed) draw from DISTINCT salts,
+        // so they do not collide — a sanity check that the EDIT_SALT layering keeps the operators independent.
+        let space = space_with_budget(4);
+        let mut differ = 0;
+        for s in 0..128u64 {
+            let pe = propose(3, s, &space).edits;
+            let me = mutate(&parent_a(), 3, s, &space).edits;
+            if pe != me {
+                differ += 1;
+            }
+        }
+        assert!(
+            differ > 100,
+            "propose vs mutate edit schedules should rarely coincide, got {differ}/128 differing"
+        );
+    }
+
+    #[test]
+    fn search_config_with_edits_round_trips_and_serde_defaults() {
+        // (1) a config WITH a schedule round-trips byte-stably and serializes the `edits` key.
+        let cfg = SearchConfig {
+            master_seed: 9,
+            roster: vec![("default".to_string(), 100), ("ecoli".to_string(), 50)],
+            containment_level: 1,
+            temp_q: 400,
+            season: 2,
+            edits: vec![
+                EditGene {
+                    gen: 1234,
+                    species_index: 1,
+                    target: 3,
+                    guide: "ACGTACGTACGTACGTACGT".to_string(),
+                },
+                EditGene {
+                    gen: 60_000,
+                    species_index: 0,
+                    target: 7,
+                    guide: "TTTTAAAACCCCGGGGACGT".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(
+            json.contains(r#""edits""#),
+            "a non-empty schedule serializes the key: {json}"
+        );
+        let back: SearchConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, back, "round-trip must preserve the schedule");
+
+        // (2) an OLD config written WITHOUT the `edits` field deserializes to an empty schedule (serde default),
+        // byte-identically — no migration needed.
+        let legacy = r#"{"master_seed":9,"roster":[["default",100]],"containment_level":0,"temp_q":500,"season":0}"#;
+        let parsed: SearchConfig = serde_json::from_str(legacy).expect("legacy deserialize");
+        assert!(
+            parsed.edits.is_empty(),
+            "a missing `edits` field → empty schedule"
+        );
+
+        // (3) an EMPTY schedule serializes to NO `edits` key (eval-log byte-identity with pre-D).
+        let empty = SearchConfig {
+            edits: Vec::new(),
+            ..cfg.clone()
+        };
+        let ejson = serde_json::to_string(&empty).expect("serialize");
+        assert!(
+            !ejson.contains("edits"),
+            "an empty schedule must omit the key: {ejson}"
         );
     }
 }

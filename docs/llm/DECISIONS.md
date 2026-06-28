@@ -1155,3 +1155,45 @@ p < 0.05 — the BTreeMap per-node heap-alloc + pointer-chase was a large fracti
 ### Historical — Stage 0 (slice S0): empty deterministic loop (no selection)
 | 1 000 × 50 → **302.6 µs** · 5 000 × 50 → **1.438 ms** · 10 000 × 50 → **2.856 ms** (~175 M updates/s). |
 | Superseded by the Stage 1 row above once real selection landed; kept for the record. |
+
+---
+
+## ADR-027 — Variant Lab D: the mid-run-EDIT search axis (auto-research gets the CRISPR-edit action, hash-neutral)
+
+**Status:** Accepted (2026-06-28). Extends ADR-024 (D2a random search) + ADR-025 (D2b evolutionary proposer);
+sits inside their envelope (ADR-025 already foreshadowed "scheduled mid-run edits within the widened search").
+
+**Context.** The discovery search (D2a/D2b) probed only the INITIAL-CONFIG space — `score_config` ran
+`capture_trace(.., &[])` with no journaled actions. The user's Variant Lab vision requires the brute-force
+auto-research to ALSO wield the CRISPR-edit action: explore the (init-config + MID-RUN-EDIT) space so an
+interesting *edited* lineage can be discovered + saved as a replayable gem, exactly like a player editing a
+species. The per-species edit primitive already exists (Slice A: `Action::ApplyEdit(EditAction{ target, guide,
+species })`).
+
+**Decision.** A scheduled-edits axis on `SearchConfig`, threaded through the existing capture/replay seam:
+- `SearchConfig.edits: Vec<EditGene>` — the LAST field, `#[serde(default, skip_serializing_if = "Vec::is_empty")]`
+  → legacy/no-edit gems serialize + deserialize byte-identically (the surrogate eval-log JSON-prefix contract is
+  intact). `EditGene { gen, species_index, target, guide }` is bare ints + an ACGT `String` (std+serde, inv #1/#5;
+  no sim-core/genome dep).
+- An `edit_budget: u8` knob on `SearchSpace`, **default 0**. When `edit_budget == 0`, `draw_edits` returns
+  `Vec::new()` BEFORE drawing any word — so the default search, every existing discovery test, and the eval-log
+  bytes are byte-identical, and edits enter ONLY when a caller opts in (`--edit-budget N`).
+- `harness::discover::edits_to_actions` maps each `EditGene` onto the EXISTING `Action::ApplyEdit` (resolving
+  `species_index` positionally against the same `env_config.roster` on both the capture and the verify side) —
+  **no new sim Action**; the genotype→phenotype gate stays in sim-core (inv #2/#6). `verify_and_write_library`
+  rebuilds the round-trip journal to MATCH `capture_trace`'s interleave (per gen: the scheduled `ApplyEdit`s, then
+  `Advance(1)`), so an edited gem round-trips (`replay == recorded == gem.recorded_hash`) or is dropped.
+
+**Two load-bearing determinism choices (the reason this is reproducible + hash-neutral):**
+1. **q16 span-independent gen encoding** (`EDIT_GEN_Q16_DEN`): an edit's firing generation is drawn as a q16
+   fraction of the run, not an absolute gen, so the schedule is stable + meaningful regardless of the `gens` the
+   trial runs; `gen_abs` is recomputed by integer mul/div in `edits_to_actions` (no float).
+2. **`EDIT_SALT` XOR stream-layering**: the edit draws use NEW field indices (`5 + 2N + 4k`) on a salt
+   `EDIT_SALT = 0x4564_6974_5363_0004`, disjoint from the four existing operator salts (propose `0` / `MUTATE`
+   `…0001` / `CROSS` `…0002` / `EVOLVE` `…0003`); the mutate-edit stream is `MUTATE_SALT ^ EDIT_SALT`. Adding the
+   axis therefore perturbs NO existing count/presence/env draw — proven by `raising_budget_does_not_perturb_roster_or_env`.
+
+**Consequences.** The pinned literal `0x47a0_3c8f_6701_f240` is UNMOVED (sim-core untouched; the single-plant
+pinned config has no edits). The search is a strict superset: `edit_budget 0` ≡ the prior D2a/D2b behaviour
+byte-for-byte; `edit_budget > 0` discovers reproducible edited gems. The D3 surrogate (steered loop) can later
+steer this axis once it lands. Gate GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3).

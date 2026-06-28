@@ -191,6 +191,7 @@ mod tests {
             containment_level: 1,
             temp_q: 500,
             season: 1,
+            edits: Vec::new(),
         }
     }
 
@@ -210,6 +211,7 @@ mod tests {
             containment_level: 0,
             temp_q: 500,
             season: 0,
+            edits: Vec::new(),
         }
     }
 
@@ -374,6 +376,7 @@ mod tests {
             containment_level: 0,
             temp_q: 500,
             season: 0,
+            edits: Vec::new(),
         };
         let f = encode(&cfg, &space);
         // predator present but no prey → prey_count = 0 → prey_share = 0.
