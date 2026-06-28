@@ -4,6 +4,18 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Discovery load-gem-replay — watch a discovered scenario live (renderer + read-only core resolver) — HASH-NEUTRAL
+A "💎 Load Gem" picker reconstructs + plays a saved gem live: `reset(master_seed)` + roster keys → `set_roster` (via
+`res://data/species`, the Load Starter path) + `temp_q`/season → `set_environment` + containment → `set_containment`,
+then fires the gem's CRISPR edits at their generations so the discovered (possibly edited) scenario plays out
+(ADR-030). The edit resolution lives in CORE — a read-only `godot-sim` `gem_edit_schedule(gem_json)` `#[func]` that
+**reuses `edits_to_actions`** (`loci[edit.target % loci.len()].id`, `gen_abs = edit.gen * gens_requested / 65536`,
+`species_index → SpeciesId`) — so the renderer replays byte-faithfully to what the search scored; no biology in
+GDScript (inv #2). `Gem.gens_requested` is serialized off-hash (`#[serde(default)]`) so early-stopped gems use the
+search horizon; old gems fall back to `gem.gens`. Pinned literal `0x47a0_3c8f_6701_f240` unmoved. (The first
+renderer-only attempt was RED — it resolved edits in GDScript and diverged from `edits_to_actions` [81/147 edits
+failed]; the 3-skeptic verify caught it, the v2 core-resolver fix is CONFIRMED 4/4 at 3/3.) QUEUE item #3.
+
 ### Discovery continue-from-gem — branch the search from a discovered gem (harness) — HASH-NEUTRAL
 `discover_from_gem(gem_path, …)` + a `--from-gem <path>` CLI flag: load a saved gem JSON → pre-seed a fresh
 evolutionary `GemLibrary` from its config (the gem becomes the gen-0 elite the mutate/crossover pool branches off,

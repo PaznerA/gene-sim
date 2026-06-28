@@ -109,6 +109,10 @@ const LIVE_GRID := Vector2i(32, 32)  # snapshot grid pulled from LiveSim each ti
 # a render cell maps 1:1 to a world cell — the selective brush picks world cells directly, ADR-011 S-F)
 const LIVE_STEP := 1  # generations advanced per tick (a FIXED integer — deterministic cadence, inv #3)
 const LIVE_HISTORY := 150  # rolling snapshot buffer kept for the timeline / scrubbing
+# LOAD-GEM-REPLAY v2: the entity_count a loaded gem's run resets under — mirrors the harness DISCOVER_ENTITY_COUNT
+# (the per-species roster counts drive the actual spawn; this only feeds the metadata fold, so it must match for
+# the closest reproduction of the captured run).
+const GEM_ENTITY_COUNT := 1000
 const SAVE_DIR := "user://saves/slot1"  # default save slot (the journal: seed.json + actions.ndjson)
 
 var _snaps: Array = []  # parsed snapshot.gd instances, ordered by generation
@@ -185,6 +189,12 @@ var _frame_seconds: float = FRAME_SECONDS  # runtime FILE-replay interval (the s
 var _steps_per_second: float = STEPS_PER_SECOND_BASE  # live step-rate target (scaled by the speed slider)
 var _step_carry: float = 0.0  # fractional generations owed this frame (accumulator)
 var _render_carry: float = 0.0  # seconds since the last snapshot/redraw (throttles to RENDER_HZ)
+# LOAD-GEM-REPLAY v2: a loaded gem's RESOLVED mid-run CRISPR edit schedule (from the CORE resolver
+# LiveSim.gem_edit_schedule — inv #2, NO target/gen math in GDScript). Each row is {gen_abs, cas, target, guide,
+# species}, kept gen_abs >= 1 and stable-sorted by gen_abs (ties keep list order) so a single forward pointer
+# (_gem_schedule_idx) fires them in the SAME order the harness journal does. Empty = no gem loaded (hash-neutral).
+var _gem_schedule: Array = []
+var _gem_schedule_idx: int = 0
 var _syncing: bool = false  # re-entrancy guard so programmatic widget updates don't recurse via signals
 var _timeline: Control  # full-width bottom generation timeline (timeline.gd)
 var _tooltip: PanelContainer
@@ -509,6 +519,18 @@ func _ready() -> void:
 		get_tree().quit()
 		return
 
+	# LOAD-GEM-REPLAY v2: --gem <path> loads a saved emergent-run gem (an ABSOLUTE filesystem path — data/runs is
+	# gitignored, NOT under res://) and replays it INCLUDING its mid-run CRISPR edit schedule, which the CORE
+	# (LiveSim.gem_edit_schedule) resolves — GDScript computes NO target/gen (inv #2). Headless → drive the
+	# deterministic edit-schedule SMOKE (report APPLIED edits) + quit; windowed → configure the run, arm the
+	# schedule, and fall through to the live play loop (which fires each edit at the top of its gen's step).
+	var gem_arg := _arg_value("--gem")
+	if _live != null and gem_arg != "":
+		if DisplayServer.get_name() == "headless":
+			_run_gem_smoke(gem_arg)
+			return
+		_configure_run_from_gem(gem_arg)  # windowed: compose + arm; the _process live loop replays it
+
 	if shot_path != "":
 		if _live != null and _has_flag("--menu"):
 			_show_main_menu()  # capture the main-menu overlay for visual verification
@@ -575,6 +597,7 @@ func _should_show_menu() -> bool:
 		and not _has_flag("--check")
 		and not _has_flag("--inject")
 		and not _has_flag("--brush")
+		and _arg_value("--gem") == ""  # --gem composed the run from a saved gem → skip the new-run menu
 	)
 
 
@@ -583,6 +606,7 @@ func _show_main_menu() -> void:
 	var menu := MainMenu.new()
 	menu.setup(_live, _seed, _mission_on)  # seed the mission checkbox from the --mission CLI flag (default off)
 	menu.start_run.connect(_on_menu_start)
+	menu.load_gem.connect(_on_menu_load_gem)  # LOAD-GEM-REPLAY v2: the menu's "Load Gem" FileDialog hands a gem path
 	add_child(menu)
 	_menu = menu  # mark the modal open so _unhandled_input swallows sim hotkeys until Start
 	_paused = true
@@ -843,6 +867,7 @@ func _process(delta: float) -> void:
 		steps = MAX_STEPS_PER_FRAME
 		_step_carry = 0.0  # drop the backlog rather than chase it
 	for _i in steps:
+		_fire_due_gem_edits()  # LOAD-GEM-REPLAY v2: fire a loaded gem's edits at the TOP of this gen's step (BEFORE the advance)
 		_live.step(LIVE_STEP)
 		_fire_due_immigration()  # ADR-019 S3: drain the deterministic schedule's events DUE at this gen + mark them
 	# Render: throttle the heavy snapshot+parse+redraw to RENDER_HZ, decoupled from the step rate.
@@ -904,6 +929,196 @@ func _fire_due_immigration() -> void:
 		"detail": "🦠 schedule fired ×%d (gen %d)" % [fired, gen],
 		"generation": gen,
 	})
+
+
+# ──────────────────────────── LOAD-GEM-REPLAY v2: load + replay a saved gem ────────────────────────────────
+#
+# A saved gem (data/runs/gems/<…>.json — GITIGNORED, so loaded by ABSOLUTE filesystem path, NOT res://) bundles a
+# reproducible run description (master_seed + roster + env + containment) AND a mid-run CRISPR edit schedule. The
+# loader (a) composes the run through the SAME proven Load-Starter/menu path (set_roster/set_environment/
+# set_containment/reset) and (b) asks the CORE (LiveSim.gem_edit_schedule) to RESOLVE every edit to its absolute
+# generation + REAL locus + REAL species ordinal. GDScript computes NO target/gen math (inv #2) — it only moves the
+# resolved ints/strings into LiveSim.apply_edit and fires each at the TOP of its gen's step, matching the harness
+# capture/verify interleave (apply at loop gen == gen_abs, BEFORE that gen's Advance — fixes the prior off-by-one).
+
+
+## Read a gem JSON file and configure the live run from it (the windowed "Load Gem" + the headless --gem smoke share
+## this). Composes the run via the existing menu Start path (_on_menu_start → set_roster/set_environment/
+## set_containment/_do_reset) then arms the CORE-resolved edit schedule. Returns false on a missing/malformed gem.
+func _configure_run_from_gem(path: String) -> bool:
+	if _live == null:
+		return false
+	var gem_json := _read_text_file(path)
+	if gem_json == "":
+		push_warning("Load Gem: cannot read %s" % path)
+		return false
+	var cfg := _gem_cfg_from_text(gem_json, path)
+	if cfg.is_empty():
+		return false
+	# Compose + reseed the run via the SAME proven path the menu Start uses (roster keys → set_roster, temp_q/season
+	# → set_environment, containment → set_containment, master_seed → reset). Mission off (a gem is a sandbox replay).
+	_on_menu_start(cfg)
+	# Resolve the gem's mid-run edit schedule in the CORE (NOT here — inv #2) and arm it for the live loop.
+	var n := _load_gem_schedule(gem_json)
+	print("LOAD GEM — %s · roster %d spp · %d scheduled edit(s)" % [path.get_file(), int((cfg.get("roster", []) as Array).size()), n])
+	return true
+
+
+## Build the run-config Dictionary _on_menu_start consumes from a gem's JSON TEXT. The renderer only moves inert
+## strings + ints (inv #2): roster stems, the q16 temp/season knobs, the containment ordinal, the master seed. The
+## roster DROPS zero-count (absent) species so the set_roster order == the harness RESOLVED-roster order — the
+## SpeciesId ordinals the CORE schedule resolver returns are POSITIONAL over the non-zero entries, so they line up
+## 1:1 with set_roster. NOTE on the seed: Godot's JSON reads a u64 master_seed exactly when it fits i64, else as a
+## double (lossy) — fine for a renderer REPLAY (the per-species edit GATE is genome-based, not seed-driven).
+func _gem_cfg_from_text(gem_json: String, src: String) -> Dictionary:
+	var parsed: Variant = JSON.parse_string(gem_json)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		push_warning("Load Gem: malformed gem JSON in %s" % src)
+		return {}
+	var gem: Dictionary = parsed
+	var config_v: Variant = gem.get("config", null)
+	if typeof(config_v) != TYPE_DICTIONARY or (config_v as Dictionary).is_empty():
+		push_warning("Load Gem: gem %s has no 'config'" % src)
+		return {}
+	var config: Dictionary = config_v
+	# config.roster is [[stem, count], …] (serde tuple → JSON 2-array). Keep order; drop zero-count (absent) species.
+	var roster: Array = []
+	for entry in config.get("roster", []):
+		if typeof(entry) == TYPE_ARRAY and (entry as Array).size() >= 2:
+			var count := int(entry[1])
+			if count > 0:
+				roster.append({"stem": String(entry[0]), "count": count})
+	var temp_q := int(config.get("temp_q", 500))
+	var active_stem := String((roster[0] as Dictionary).get("stem", "default")) if not roster.is_empty() else "default"
+	return {
+		"seed": int(config.get("master_seed", _seed)),
+		"lat": 0.0,
+		"lon": 0.0,
+		"temp": clampf(float(temp_q) / 1000.0, 0.0, 1.0),
+		"season": int(config.get("season", 0)),
+		"entities": GEM_ENTITY_COUNT,
+		"mission": false,
+		"species": active_stem,
+		"roster": roster,
+		"containment": int(config.get("containment_level", 0)),
+	}
+
+
+## Resolve a gem's mid-run CRISPR edit schedule via the CORE (LiveSim.gem_edit_schedule → harness::gem_edit_schedule,
+## the SAME edits_to_actions resolver the capture/verify path uses — the target/gen math is NOT reimplemented here,
+## inv #2) and arm it on _gem_schedule for the live loop. Keeps only gen_abs >= 1 (a gen_abs==0 edit never fires —
+## the capture loop is 1..=gens — so dropping it is exactly faithful to the harness build_journal) and stable-sorts
+## by gen_abs (ties keep list order). Returns the count armed. has_method-guards the resolver: an OLDER cdylib
+## without it degrades with a clear message (no edits replayed) rather than erroring. Returns 0 on any degrade.
+func _load_gem_schedule(gem_json: String) -> int:
+	_gem_schedule = []
+	_gem_schedule_idx = 0
+	if _live == null:
+		return 0
+	if not _live.has_method("gem_edit_schedule"):
+		push_warning("LiveSim.gem_edit_schedule unavailable in this build (older cdylib) — the gem's mid-run edits will NOT replay. Rebuild crates/godot-sim to enable LOAD-GEM-REPLAY v2.")
+		return 0
+	var sched: Array = _live.gem_edit_schedule(gem_json)
+	var rows: Array = []
+	for i in sched.size():
+		var e: Variant = sched[i]
+		if typeof(e) == TYPE_DICTIONARY and int((e as Dictionary).get("gen_abs", 0)) >= 1:
+			var d: Dictionary = (e as Dictionary).duplicate()
+			d["_ord"] = i  # original index → a stable tie-break so a single forward pointer fires the harness order
+			rows.append(d)
+	rows.sort_custom(func(a, b):
+		var ga := int((a as Dictionary).get("gen_abs", 0))
+		var gb := int((b as Dictionary).get("gen_abs", 0))
+		if ga != gb:
+			return ga < gb
+		return int((a as Dictionary).get("_ord", 0)) < int((b as Dictionary).get("_ord", 0)))
+	_gem_schedule = rows
+	return _gem_schedule.size()
+
+
+## Fire every armed gem edit DUE at the top of the upcoming step — the harness interleave (apply at loop gen ==
+## gen_abs, BEFORE that gen's Advance). env.generation == G now; this tick advances to G + LIVE_STEP, so fire each
+## pending edit whose gen_abs is in (G, G+LIVE_STEP] (with LIVE_STEP==1: gen_abs == G+1). The schedule is gen_abs-
+## sorted, so a single forward pointer suffices. No-op (and no observe()) when no gem is armed — hash-neutral.
+func _fire_due_gem_edits() -> void:
+	if _live == null or _gem_schedule_idx >= _gem_schedule.size():
+		return
+	var due := int(_live.observe().get("generation", 0)) + LIVE_STEP
+	while _gem_schedule_idx < _gem_schedule.size():
+		var e: Dictionary = _gem_schedule[_gem_schedule_idx]
+		if int(e.get("gen_abs", 0)) > due:
+			break
+		_fire_one_gem_edit(e)
+		_gem_schedule_idx += 1
+
+
+## Apply ONE resolved gem edit through the unchanged LiveSim.apply_edit surface (inv #2 — the renderer only moves
+## the CORE-resolved ids + guide string; the authoritative PAM/score/gate stays in crispr) and drop a timeline
+## marker. Returns the core's outcome Dictionary {applied, detail, generation}.
+func _fire_one_gem_edit(e: Dictionary) -> Dictionary:
+	var outcome: Dictionary = _live.apply_edit(
+		int(e.get("cas", 0)), int(e.get("target", 0)), str(e.get("guide", "")), int(e.get("species", 0)))
+	_record_edit_outcome(outcome)
+	return outcome
+
+
+## The menu's "Load Gem" → compose + replay the chosen gem (the windowed entry; _configure_run_from_gem resumes the
+## live loop via _on_menu_start). The menu frees itself after emitting load_gem.
+func _on_menu_load_gem(path: String) -> void:
+	if _live == null:
+		return
+	if not _configure_run_from_gem(path):
+		push_warning("Load Gem: failed to load %s" % path)
+
+
+## HEADLESS --gem smoke (LOAD-GEM-REPLAY v2 fidelity gate): load a gem, drive the run gen-by-gen firing each CORE-
+## resolved edit at the TOP of its gen's step (env at gen-1, BEFORE the advance — the harness build_journal
+## interleave), and report APPLIED edits (apply_edit's outcome.applied == true), NOT merely dispatched, so the
+## gate can SEE edit fidelity. Prints a greppable `GEM_SMOKE …` line + a human summary, then quits.
+func _run_gem_smoke(path: String) -> void:
+	if not _configure_run_from_gem(path):
+		print("GEM_SMOKE FAIL — could not configure the run from %s" % path)
+		get_tree().quit(1)
+		return
+	var total := _gem_schedule.size()
+	var horizon := 0
+	for e in _gem_schedule:
+		horizon = maxi(horizon, int((e as Dictionary).get("gen_abs", 0)))
+	var fired := 0
+	var applied := 0
+	# Drive gen-by-gen. At loop gen `g` env.generation == g-1; fire the edits scheduled at gen_abs == g BEFORE the
+	# step to g — exactly the harness capture/verify interleave (which the unedited round-trip already proves).
+	for g in range(1, horizon + 1):
+		while _gem_schedule_idx < _gem_schedule.size() and int((_gem_schedule[_gem_schedule_idx] as Dictionary).get("gen_abs", 0)) == g:
+			var e: Dictionary = _gem_schedule[_gem_schedule_idx]
+			var outcome := _fire_one_gem_edit(e)
+			fired += 1
+			if bool(outcome.get("applied", false)):
+				applied += 1
+			else:
+				print("GEM_SMOKE — edit NOT applied at gen %d (target %d, species %d): %s" % [
+					g, int(e.get("target", 0)), int(e.get("species", 0)), str(outcome.get("detail", ""))])
+			_gem_schedule_idx += 1
+		_live.step(1)
+	print("GEM_SMOKE fired=%d applied=%d total=%d horizon=%d" % [fired, applied, total, horizon])
+	if total > 0 and applied == total:
+		print("GEM SMOKE OK — every scheduled edit APPLIED at its resolved generation (%d/%d)" % [applied, total])
+	elif total == 0:
+		print("GEM SMOKE OK — gem carries no mid-run edits (nothing to replay)")
+	else:
+		print("GEM SMOKE PARTIAL — %d/%d scheduled edits applied (see lines above)" % [applied, total])
+	get_tree().quit()
+
+
+## Read a whole text file from an ABSOLUTE filesystem path (a gem lives in gitignored data/runs, outside res://).
+## Returns "" when the file cannot be opened.
+func _read_text_file(path: String) -> String:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return ""
+	var text := f.get_as_text()  # FileAccess (RefCounted) closes on free
+	f.close()
+	return text
 
 
 ## Live-mode CRISPR intervention UI (P6): pick a Cas variant / locus / guide and Inject. The renderer only

@@ -8,6 +8,10 @@ extends CanvasLayer
 ##   const MainMenu := preload("res://main_menu.gd")
 
 signal start_run(cfg)  # { seed, lat, lon, temp, season, entities, mission, species, roster:[{stem,count}], containment }
+# LOAD-GEM-REPLAY v2: the player picks a saved emergent-run gem (data/runs/gems/<…>.json — GITIGNORED, so an
+# ABSOLUTE filesystem path, NOT res://) to replay. main.gd reads + composes the run from the gem's config and asks
+# the CORE to resolve its mid-run CRISPR edit schedule (no biology here — inv #2; the menu only hands the path).
+signal load_gem(path)  # absolute path to a gem .json the player chose in the Load-Gem FileDialog
 
 const SEASONS := ["Spring", "Summer", "Autumn", "Winter"]
 # SP-2: the multi-species ROSTER master list. [label, file stem under data/species/]. Each stem is the FILE name
@@ -129,6 +133,16 @@ func _build() -> void:
 	starter.tooltip_text = "Fill the form below with the bundled starter preset:\na producer-heavy 4-species soil community (plant · E. coli · Bacillus · Bdellovibrio)."
 	starter.pressed.connect(_on_load_starter)
 	col.add_child(starter)
+
+	# LOAD-GEM-REPLAY v2: replay a saved emergent-run gem (the discovery harness writes them to the GITIGNORED
+	# data/runs/gems/). The button opens a FILESYSTEM FileDialog (absolute path — gems are NOT under res://); on a
+	# pick the menu emits `load_gem(path)` and main.gd composes the run + replays the gem's mid-run CRISPR edit
+	# schedule (resolved by the CORE, inv #2). The menu only moves the chosen file path.
+	var load_gem_btn := Button.new()
+	load_gem_btn.text = "💎  Load Gem — replay a saved discovery"
+	load_gem_btn.tooltip_text = "Open a saved emergent-run gem (data/runs/gems/*.json) and replay it,\nincluding its mid-run CRISPR edit schedule (resolved by the core)."
+	load_gem_btn.pressed.connect(_on_load_gem_pressed)
+	col.add_child(load_gem_btn)
 
 	col.add_child(_sep())
 
@@ -353,6 +367,40 @@ func _on_load_starter() -> void:
 
 	_refresh_values()
 	_update_preview()
+
+
+# ──────────────────────────── LOAD-GEM-REPLAY v2: the "Load Gem" FileDialog ────────────────────────────────
+
+
+## "💎 Load Gem": open a FILESYSTEM FileDialog over the gitignored data/runs/gems/ (gems are NOT under res://, so
+## ACCESS_FILESYSTEM + an absolute current_dir). On a pick the dialog emits file_selected → we re-emit `load_gem`
+## with the absolute path and free the menu (main.gd composes + replays the gem). Renderer-only (inv #2): the menu
+## only moves the file path; the CORE parses the gem + resolves its biology.
+func _on_load_gem_pressed() -> void:
+	var dlg := FileDialog.new()
+	dlg.access = FileDialog.ACCESS_FILESYSTEM
+	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	dlg.title = "Load Gem — data/runs/gems/*.json"
+	dlg.use_native_dialog = false
+	dlg.add_filter("*.json", "Gem JSON")
+	# Best-effort default dir: the gitignored data/runs/gems beside the project (dev) — res:// is godot/, so
+	# res://../data/runs/gems globalizes to <repo>/data/runs/gems. Fall back up the tree if it isn't there yet.
+	for candidate in ["res://../data/runs/gems", "res://../data/runs", "res://.."]:
+		var abs := ProjectSettings.globalize_path(candidate)
+		if DirAccess.dir_exists_absolute(abs):
+			dlg.current_dir = abs
+			break
+	dlg.size = Vector2i(760, 500)
+	dlg.file_selected.connect(_on_gem_file_selected)
+	dlg.canceled.connect(dlg.queue_free)
+	add_child(dlg)
+	dlg.popup_centered()
+
+
+## A gem file was chosen: hand its absolute path to main.gd and dismiss the menu (mirrors _on_start's emit+free).
+func _on_gem_file_selected(path: String) -> void:
+	load_gem.emit(path)
+	queue_free()
 
 
 ## ALL_SPECIES index for a file stem (preset roster key → composer row selection). Unknown stem → 0 (the abstract

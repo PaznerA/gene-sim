@@ -55,6 +55,20 @@ fn resolve_species_path(name: &str) -> Option<std::path::PathBuf> {
     beside.is_file().then_some(beside)
 }
 
+/// Resolve the `data/species` DIRECTORY (the roster-key resolution root a loaded gem's edit schedule resolves
+/// against), trying the process working dir first (dev / `run.sh`) then beside the executable (shipped builds
+/// stage `data/species/` next to the binary). Mirrors [`resolve_species_path`] but for the directory the
+/// harness `gem_edit_schedule` resolver joins `<key>.json` onto. Returns `None` if neither exists.
+fn resolve_species_dir() -> Option<std::path::PathBuf> {
+    let rel = "data/species";
+    let cwd = std::path::PathBuf::from(rel);
+    if cwd.is_dir() {
+        return Some(cwd);
+    }
+    let beside = std::env::current_exe().ok()?.parent()?.join(rel);
+    beside.is_dir().then_some(beside)
+}
+
 /// `LiveSim` — the one Godot node the live-sim feature exposes (ADR-010).
 ///
 /// A thin `RefCounted` wrapper over [`harness::GeneSimEnv`]. GDScript drives it with
@@ -1129,6 +1143,54 @@ impl LiveSim {
                 go.push(&i64::from(g.0).to_variant());
             }
             d.set("go_refs", &go.to_variant());
+            arr.push(&d.to_variant());
+        }
+        arr
+    }
+
+    /// RESOLVE a saved gem's mid-run CRISPR edit schedule for a READ-ONLY preview (LOAD-GEM-REPLAY v2 fidelity).
+    /// `gem_json` is the saved gem file's TEXT (the renderer reads `data/runs/gems/<…>.json` and passes the
+    /// string); the CORE parses it + resolves every [`discovery::search::EditGene`] EXACTLY as the capture/verify
+    /// path does (`harness::discover::gem_edit_schedule` → the SAME `edits_to_actions` resolver — the math is NOT
+    /// reimplemented here, inv #2), and the schedule is returned as an ordered `Array` of Dictionaries, one per
+    /// resolved edit in fire order:
+    /// * `gen_abs` (int) — the ABSOLUTE generation the edit fires at (`gen * gens_requested / 65536`, mapped
+    ///   against the gem's REQUESTED horizon `gens_requested`, falling back to `gens` for a pre-fix gem);
+    /// * `cas` (int) — the default Cas-variant id;
+    /// * `target` (int) — the REAL resolved genome [`genome::LocusId`];
+    /// * `guide` (String) — the ACGT guide;
+    /// * `species` (int) — the resolved [`sim_core::SpeciesId`] ordinal.
+    ///
+    /// READ-ONLY (inv #2/#3): it draws ZERO `SimRng`, mutates NOTHING (no `env` needed — it resolves an external
+    /// gem off the `data/species` boundary), and is never folded into the determinism hash. A garbled/invalid gem
+    /// JSON, or a missing `data/species` dir, yields an EMPTY array + a `godot_error!` (guarded like the other
+    /// `#[func]`s); a gem with no edits / an unresolvable roster yields an empty array (not an error).
+    #[func]
+    fn gem_edit_schedule(&self, gem_json: GString) -> VarArray {
+        let mut arr = VarArray::new();
+        let Some(species_dir) = resolve_species_dir() else {
+            godot_error!(
+                "LiveSim::gem_edit_schedule: data/species not found (looked in the working dir and beside the executable)"
+            );
+            return arr;
+        };
+        let resolved = match harness::discover::gem_edit_schedule_from_json(
+            &gem_json.to_string(),
+            &species_dir,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                godot_error!("LiveSim::gem_edit_schedule: invalid gem JSON: {e}");
+                return arr;
+            }
+        };
+        for edit in resolved {
+            let mut d = VarDictionary::new();
+            d.set("gen_abs", i64::from(edit.gen_abs));
+            d.set("cas", i64::from(edit.cas));
+            d.set("target", i64::from(edit.target));
+            d.set("guide", edit.guide.as_str());
+            d.set("species", i64::from(edit.species));
             arr.push(&d.to_variant());
         }
         arr

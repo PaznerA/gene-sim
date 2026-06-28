@@ -904,8 +904,21 @@ pub struct Gem {
     pub build_id: String,
     /// Auto one-liner from the integer breakdown (no biology) — see [`caption`].
     pub caption: String,
-    /// Generations the run actually executed.
+    /// Generations the run actually executed (the EARLY-STOPPED count, `trace.g`).
     pub gens: u32,
+    /// The REQUESTED search horizon `gens` the capture mapped the q16 mid-run-edit fractions against to derive
+    /// each edit's ABSOLUTE generation (`gen * gens_requested / `[`EDIT_GEN_Q16_DEN`](crate::search::EDIT_GEN_Q16_DEN)).
+    /// THE LOAD-GEM-REPLAY v2 fidelity field: a run that EARLY-STOPS captures `gens < gens_requested`, so a loader
+    /// that resolved the schedule against [`gens`](Self::gens) would place the edits at the WRONG absolute
+    /// generations — only `gens_requested` reproduces the capture/verify mapping exactly.
+    ///
+    /// OFF-HASH metadata (the gem lives in gitignored `data/runs`, so an additive `#[serde(default)]` field is
+    /// safe): an OLD gem written WITHOUT this field deserializes to `0`, and a loader falls back to
+    /// [`gens`](Self::gens) for such a pre-fix gem (a DOCUMENTED divergence — the early-stopped count is the best
+    /// available horizon for a gem that predates this field). The field is appended LAST so the JSON prefix of
+    /// every earlier field is unchanged.
+    #[serde(default)]
+    pub gens_requested: u32,
 }
 
 /// One `(config → ScoreVec)` evaluation record — the raw training row the D3 surrogate trains on. Mirrors
@@ -1110,6 +1123,7 @@ mod tests {
             build_id: "test-build".to_string(),
             caption: "x".to_string(),
             gens: 200,
+            gens_requested: 200,
         }
     }
 
