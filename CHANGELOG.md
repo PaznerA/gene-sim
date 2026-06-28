@@ -4,6 +4,19 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### OVERSIGHT in-game UI — earn → preview → commit E. coli edits (godot-sim + renderer) — HASH-NEUTRAL
+The player-agency payoff (ADR-017 S4/S5/S6 surface, ADR-028): surfaces the earned-credit OVERSIGHT loop in `--live`.
+- `godot-sim` thin marshalling `#[func]`s — `oversight_state` / `preview_ecoli_edit` (read-only) / `commit_ecoli_edit`;
+  the economy/biology stays in harness/core (inv #2: GDScript moves only ints + a `VarDictionary`).
+- A commit journals `RequestEcoliEdit` (zero SimRng) + `CommitEcoliImpact` (reads a committed int) — replay-reproducible;
+  `due_epoch` is a generation count (no wall-clock leak). Pinned literal `0x47a0_3c8f_6701_f240` unmoved on a no-commit
+  run (`oversight_plumbing_is_hash_neutral`); a committed edit moves the hash DELIBERATELY + replays byte-equal
+  (`renderer_committed_edit_is_replay_equal`).
+- Renderer panel (modelled on the CRISPR intervention panel): the credit ledger + request/preview(FBA-KO)/commit +
+  timeline markers. The renderer applies the commit immediately (vs the headless firewall's `due_epoch` deferral —
+  both deterministic + replay-equal; the divergence is recorded in ADR-028 + a `oversight-ui-polish` follow-up).
+- Gate GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3). ADR-028. QUEUE item #3 (gameplay/sandbox lead).
+
 ### Variant Lab D — the auto-research mid-run-EDIT search axis (discovery + harness) — HASH-NEUTRAL
 The brute-force discovery search can now propose mid-run CRISPR edits, not just initial configs (ADR-027) — so an
 edited lineage can be discovered + saved as a replayable gem (the user: the auto-research must ALSO get the edit action).
