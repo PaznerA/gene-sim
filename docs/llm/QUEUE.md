@@ -10,51 +10,46 @@
 > `[~]` in progress · `[x]` done · `RED` failed gate/verify (left for human) · 🛑 needs human sign-off.
 > **Driver:** `workflow` = run the named `.js` · `slice` = one implementer+gate+reviewer pass · `direct` = trivial inline edit.
 >
-> **Lead thrust (chosen 2026-06-27): Gameplay / sandbox-first** (`[[gameplay-sandbox-first]]`). The Variant Lab
-> epic (edit→save→reseed for player AND auto-research) leads; the discovery/ML chain + beta-hardening remainder
-> are the next pipeline. **Frontier: `main` @ `8415199`** — re-planned 2026-06-28.
+> **Lead thrust (chosen 2026-06-28): Discovery / auto-research.** The first brute-force batch validated the whole
+> pipeline (21 verified gems in ~60s/run; the Variant Lab D edit axis produced the #1 gem; 19/21 distinct community
+> shapes; M1 saturates → validates the drama-weighted target). Next: make the search SCENARIO-targeted over multiple
+> starters, branch from discovered gems, and let the player WATCH a gem replay. **Frontier: `main` @ `b865644`.**
 
 ---
 
-## ▶ ACTIVE QUEUE (gameplay/sandbox + Variant Lab)
+## ▶ ACTIVE QUEUE (discovery / auto-research)
 
 | # | Status | Item | Driver | Goal | Hash | Deps |
 |---|--------|------|--------|------|------|------|
-| 1 | `[x]` | **variant-lab-save-reseed** | workflow | Variant Lab B+C: read-only `export_species_json` of a species' post-edit genome+niche; specimen-view "💾 Save variant" + a "Saved variants" reseed section reusing the contaminant/inoculate path | ✅ | A (done) |
-| 2 | `[x]` | **variant-lab-autoresearch-edits** | workflow | Variant Lab D: give the brute-force auto-research the CRISPR-edit action — a scheduled-edits axis on `SearchConfig` (serde-default, default-OFF via `edit_budget`) threaded as the EXISTING `Action::ApplyEdit` into `capture_trace` + the verify journal; edited gems round-trip | ✅ | A (done) + discovery D2a/D2b/D3-A (done) |
-| 3 | `[x]` | **oversight-ingame-ui-impl** | workflow | In-game OVERSIGHT panel: render the earned-credit ledger, request → preview (FBA KO) → commit an E. coli edit rippling via the F4 loop; drives the existing `RequestEcoliEdit`/`CommitEcoliImpact` journal | ✅ | — |
-| 4 | `[x]` | **codex-browse-panel-impl** | workflow | Browsable CODEX panel (SP-4 §2.3 follow-up): a scrollable species/gene/role/flow browser over `res://data/codex/codex.json`, reusing the staged+gated `godot/codex.gd` loader (the SP-4 res:// blocker is RESOLVED) | ✅ | codex staging (done) |
-| 5 | `[x]` | **sandbox-load-starter-impl** | workflow | Wire "Load Starter" into the SP-2 composer: read `res://data/presets/primordial.json` → pre-fill roster + env + containment (the onboarding ramp); ensure `data/presets` is res:// staged + byte-gated | ✅ | SP-2 (done) |
+| 1 | `[ ]` | **discovery-scenarios-impl** | workflow | Named `SearchSpace` SCENARIO presets (predator-prey / decomposer / contamination-open / spore-resilience / edit-rescue / extreme-climate) biasing species set + count/containment/temp ranges + `edit_budget`, + a `--space <name>` CLI flag + a multi-starter batch — **the "more starters" ask** | ✅ | discovery D2a/D2b + Variant Lab D (done) |
+| 2 | `[ ]` | **discovery-continue-from-gem-impl** | workflow | A runner that LOADS a saved gem → seeds a fresh evolutionary search FROM it (branch + keep evolving/editing the discovered community); every continued gem round-trips — **the "continuation after -X gens" ask** | ✅ | gems exist · discovery infra (done) |
+| 3 | `[ ]` | **discovery-load-gem-replay-impl** | workflow | Renderer reads a saved `data/runs/gems/*.json` → configures a live run (reset/roster/env/containment) + schedules the gem edits via `apply_edit` → the player WATCHES the discovered scenario; renderer-only, reuses existing `#[func]`s | ✅ | gems exist · Variant Lab D (done) |
+| 4 | `[ ]` | **oversight-ui-polish** | slice | The ADR-028 #3-verify follow-ups (renderer-only): default the "growth ratio q" knob to `1000` (wild-type) not `0` (lethal KO); align the timeline "due epoch" marker label with the immediate-commit semantics; re-enable oversight in `load_session` | ✅ | OVERSIGHT UI (done) |
+| 5 | `[ ]` | **beta-contributing-md** | slice | `CONTRIBUTING.md`: the branch workflow + `tools/gate.sh` + the ADR process + the commit/trailer format (beta prep; from the `glmTakeover/` audit B0) | ✅ | — |
 
-**Queue depth (forward READY, non-done): 0** — all 5 active items DONE (2026-06-28 `/roadmap-iterate` run). The
-NEXT PIPELINE below is DEFINED-only (`.js` not yet authored). **→ run `/roadmap-plan` to refill before the next
-`/roadmap-iterate`.**
+**Queue depth (forward READY, non-done): 5** — 3 newly-authored discovery workflows + 2 slice-driver items. ≥5 ✅.
+All ✅ hash-neutral.
 
 ---
 
 ## ▶ NEXT PIPELINE (defined; promote when the active queue drains)
 
 **Discovery / ML chain** (precisely-sequenced; `surrogate-model-spec.md`; all ✅ hash-neutral, `crates/discovery`).
-**D3-A (eval log) + D3-B.1 (feature encoder) DONE** (`3ad7b9e` / `370d888`). Remaining:
+**D3-A (eval log) + D3-B.1 (feature encoder) DONE** (`3ad7b9e` / `370d888`). The first batch's **M1 saturation**
+empirically validates the drama-weighted target → `discovery-dramaweights-impl` is the **next to promote**:
 - `[def]` **discovery-dramaweights-impl** — D3-B.2: the drama-weighted target `D` (M3+M5 dominant) + reweighted scorer.
 - `[def]` **discovery-ridgeint-impl** — D3-B.3: integer ridge regressor (fixed-point GD, no f64, row-order-independent, `build_id` anchor). *dep: dramaweights.*
-- `[def]` **discovery-steered-loop-impl** — D3-B.4: wire RidgeInt into D2b (oversample→predict→select, explore floor), retrain per gen. *dep: ridgeint.* **Composes with item #2** — the steered loop can also steer the new mid-run-EDIT axis once both land.
-- `[def]` **discovery-batch-showcase** — D4: night-cron batch + gem-index sidecar + curated showcase gallery. *dep: steered-loop; ADR on the steering target (drama-weighted vs raw Q).*
+- `[def]` **discovery-steered-loop-impl** — D3-B.4: wire RidgeInt into D2b (oversample→predict→select, explore floor), retrain per gen. *dep: ridgeint.* Composes with the Variant Lab D edit axis + the named scenario spaces.
+- `[def]` **discovery-batch-showcase** — D4: night-cron batch (over the named scenario spaces) + a gem-index sidecar + a curated, committed showcase gallery (the replayable gems the player browses). *dep: steered-loop + scenarios; ADR on the steering target.*
 
-**Beta-hardening remainder** (`glmTakeover/` audit folded in; mostly ✅ infra/docs — NOT blocking the Variant Lab,
-largely orthogonal; only a future spatial-index re-pin touches an invariant and is flagged below):
-- `[def]` **beta-contributing-md** (`slice`) — `CONTRIBUTING.md`: branch workflow + `tools/gate.sh` + ADR process + commit format.
+**Beta-hardening remainder** (`glmTakeover/` audit folded in; ✅ infra/docs):
 - `[def]` **slim-hermeticity-impl** — `env_clear()` + `LC_ALL=C` on the SLiM subprocess (oracle golden-file robustness, inv #1-adjacent).
 - `[def]` **replay-error-handling-impl** — `seed.json`/`actions.ndjson` corruption → `ReplayError` enum (not panic) + a corrupted-input proptest.
 - `[def]` **unsafe-policy-adr** (`direct`) — ADR documenting the `forbid(unsafe_code)` rule + the one `godot-sim` `unsafe impl` exception.
-- `[def]` **docs-housekeeping** (`direct`) — delete the stale untracked `docs/llm/weakspots.md` (hallucinates a non-existent Python project) + triage `docs/llm/glmTakeover/` (keep as an audit snapshot or archive); add `ADR-INDEX.md`.
+- `[def]` **docs-housekeeping** (`direct`) — delete the stale untracked `docs/llm/weakspots.md` (hallucinates a non-existent Python project) + triage `docs/llm/glmTakeover/`; add `ADR-INDEX.md`.
 
-**Sandbox QoL (re-scoped — partly already shipped):**
-- `[def]` **oversight-ui-polish** (`slice`) — the ADR-028 follow-ups flagged by the #3 verify (all renderer-only,
-  hash-neutral): default the "growth ratio q" knob to `1000` (wild-type/no-op) instead of `0` (growth-lethal KO);
-  align the timeline "due epoch" marker label with the renderer's immediate-commit semantics; re-enable oversight in
-  `load_session` so the credit ledger resumes after a loaded session.
-- `[def]` **live-session-sparkline-impl** — `save_session`/`load_session` ALREADY EXIST (`main.gd:2503/2511` + `journal_actions`); the remaining piece is a per-gen effect sparkline on the injection/timeline markers (P4/P6 follow-up). Minor — deprioritized below the discovery chain.
+**Sandbox QoL:**
+- `[def]` **live-session-sparkline-impl** — `save_session`/`load_session` already exist; add a per-gen effect sparkline on the injection/timeline markers (P4/P6 follow-up). Minor.
 
 **Flagged for human sign-off (do NOT auto-run):**
 - 🛑 **R3-F3 resource coupling** — per-cell local Wright-Fisher selection rewrite; blocked on the R1.2/R1.3 spatial-`Cell` design collision (a re-pin + an ADR-005 change). Needs a design workflow + sign-off first.
@@ -64,10 +59,10 @@ largely orthogonal; only a future spatial-index re-pin touches an invariant and 
 
 ## ▶ LOG (append per item: date · item · PASS/RED · merge sha · note)
 
-- 2026-06-27 — QUEUE seeded (gameplay/sandbox lead). `beta-license-dual` done in the same commit. `variant-lab-save-reseed.js` + `oversight-ingame-ui-impl.js` authored → READY. 4 DEFINED + the discovery/beta pipeline behind them.
-- 2026-06-28 — **#5 `sandbox-load-starter-impl` ALREADY SHIPPED** (no new merge). The feature landed earlier in `597a8d4` (`main_menu.gd:295-365`, the pre-run SP-2 composer menu — the roadmap-plan frontier check grepped `main.gd` + missed `main_menu.gd`). Workflow VERIFIED the as-committed impl: gate GREEN; 3-skeptic verify CONFIRMED, 4/4 at 3/3; `data/presets` res:// staged + byte-gated (sha256-identical); `0x47a0` unmoved. Item closed verified-only. **Active queue now drained (5/5) → `/roadmap-plan` to refill.** (Minor cosmetic notes on the existing impl: unknown-season defaults to Spring silently; preset `containment.consortium` informational only — not tracked, trivial.)
-- 2026-06-28 — **#4 `codex-browse-panel-impl` PASS** (gate GREEN, `CODEX MIRROR/INSPECT OK`; 3-skeptic verify CONFIRMED, 4/4 claims at 3/3; ZERO Rust — pinned literal `0x47a0_3c8f_6701_f240` byte-identical; reuses `codex.gd`, res:// byte-gate intact; no ADR needed). Merged `--no-ff` to `main`. Next ready: #5 `sandbox-load-starter-impl` (the last active-queue item).
-- 2026-06-28 — **#3 `oversight-ingame-ui-impl` PASS** (gate GREEN; 3-skeptic verify CONFIRMED, 5/5 claims at 3/3; pinned literal `0x47a0_3c8f_6701_f240` UNMOVED on no-commit, a committed edit moves it deliberately + replays byte-equal; no economy/biology in GDScript; no wall-clock leak). **ADR-028** appended (the renderer immediate-commit path + the honest divergence from the headless `due_epoch` firewall). Merged `--no-ff` to `main`. NON-BLOCKING UX follow-ups tracked as `oversight-ui-polish`. Next ready: #4 `codex-browse-panel-impl`.
-- 2026-06-28 — **#2 `variant-lab-autoresearch-edits` PASS** (Variant Lab D; gate GREEN; 3-skeptic verify CONFIRMED, 5/5 claims at 3/3; pinned literal `0x47a0_3c8f_6701_f240` UNMOVED — `edit_budget` default-0 + disjoint `EDIT_SALT` stream; edited gems round-trip). **ADR-027** appended. Merged `--no-ff` to `main`. Next ready: #3 `oversight-ingame-ui-impl`.
-- 2026-06-28 — **#1 `variant-lab-save-reseed` PASS** (gate GREEN; 3-skeptic verify CONFIRMED, 5/5 claims at 3/3; pinned literal `0x47a0_3c8f_6701_f240` UNMOVED — read-only `export_species_spec` + renderer-only save/reseed UI). Merged `--no-ff` to `main`. Next ready: #2 `variant-lab-autoresearch-edits`.
-- 2026-06-28 — **Re-plan @ `main` 8415199.** Reconciled the real frontier: D3-A (`3ad7b9e`) + D3-B.1 (`370d888`) + PERF-1/2 (`ed558d7`/`81ef729`) + dual-LICENSE (`8415199`) all LANDED since the seed. Confirmed `beta-license-dual` `[x]` done; codex res:// staging + `godot/codex.gd` loader landed (SP-4 blocker RESOLVED); `save_session`/`load_session` already exist. **Authored 3 new READY workflows:** `variant-lab-autoresearch-edits` (Slice D — the user's explicit "auto-research must get the edit action" gap), `codex-browse-panel-impl`, `sandbox-load-starter-impl`. Re-scoped `live-session-save-load` → `live-session-sparkline-impl` (save/load done; only the sparkline remains) + deprioritized. glmTakeover reconciled: NOT blocking — its valid items are the beta-hardening pipeline above. Queue depth 5 READY (gameplay/sandbox) ✅.
+- 2026-06-28 — **Re-plan #2 @ `main` b865644 → discovery/auto-research lead.** First brute-force batch validated the pipeline (21 verified gems, ~60s/run, edit axis produced the #1 gem, 19/21 distinct shapes, M1 saturates). Authored 3 discovery-research workflows (`discovery-scenarios-impl`, `discovery-continue-from-gem-impl`, `discovery-load-gem-replay-impl`) → READY; active queue rebuilt (5 READY: 3 research + `oversight-ui-polish` + `beta-contributing-md`). `discovery-dramaweights-impl` flagged next-to-promote (M1-saturation-validated). The 5 completed gameplay items are in the entries below.
+- 2026-06-28 — **#5 `sandbox-load-starter-impl` ALREADY SHIPPED** (no new merge). The feature landed earlier in `597a8d4` (`main_menu.gd:295-365`). Workflow VERIFIED the as-committed impl: gate GREEN; verify 4/4 at 3/3; `data/presets` res:// staged + byte-gated; `0x47a0` unmoved.
+- 2026-06-28 — **#4 `codex-browse-panel-impl` PASS** (gate GREEN, `CODEX MIRROR/INSPECT OK`; verify 4/4 at 3/3; ZERO Rust — `0x47a0` byte-identical; reuses `codex.gd`). Merged `1ba13b8`.
+- 2026-06-28 — **#3 `oversight-ingame-ui-impl` PASS** (gate GREEN; verify 5/5 at 3/3; `0x47a0` unmoved on no-commit, a committed edit moves it deliberately + replays byte-equal). **ADR-028** appended. Merged `b4e368f`. UX follow-ups tracked as `oversight-ui-polish`.
+- 2026-06-28 — **#2 `variant-lab-autoresearch-edits` PASS** (Variant Lab D; gate GREEN; verify 5/5 at 3/3; `0x47a0` UNMOVED — `edit_budget` default-0 + disjoint `EDIT_SALT`; edited gems round-trip). **ADR-027**. Merged `7fb3150`.
+- 2026-06-28 — **#1 `variant-lab-save-reseed` PASS** (gate GREEN; verify 5/5 at 3/3; `0x47a0` UNMOVED — read-only export + renderer save/reseed). Merged `5f43c28`.
+- 2026-06-27 — QUEUE seeded (gameplay/sandbox lead). `beta-license-dual` done (`8415199`).
