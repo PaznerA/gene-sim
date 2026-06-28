@@ -228,6 +228,82 @@ fn build_journal(actions: &[(u32, Action)], gens: u32) -> Vec<Action> {
     journal
 }
 
+/// A RESOLVED mid-run edit — one entry of a loaded gem's edit schedule mapped to the bare, display-ready ids a
+/// renderer can show / replay (the LOAD-GEM-REPLAY v2 read-only surface). It is EXACTLY the `(gen_abs,
+/// ApplyEdit)` [`edits_to_actions`] produces, flattened: the ABSOLUTE generation, the default Cas id, the REAL
+/// resolved [`genome::LocusId`] integer, the ACGT guide string, and the resolved [`sim_core::SpeciesId`] ordinal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedEdit {
+    /// ABSOLUTE generation the edit fires at (`gen * gens_requested / EDIT_GEN_Q16_DEN`).
+    pub gen_abs: u32,
+    /// The Cas-variant id — the build's default (an `EditGene` names no Cas).
+    pub cas: u16,
+    /// The REAL target locus id (`edit.target mod loci_len` resolved to the chosen species' actual `LocusId`).
+    pub target: u32,
+    /// The ACGT guide string.
+    pub guide: String,
+    /// The resolved species ordinal (`SpeciesId`) the edit targets.
+    pub species: u16,
+}
+
+/// Resolve a loaded [`Gem`]'s mid-run edit schedule to its ABSOLUTE-generation, REAL-locus, REAL-species form —
+/// EXACTLY as the capture/verify path ([`edits_to_actions`]) does, for the renderer's READ-ONLY gem-replay
+/// preview (LOAD-GEM-REPLAY v2). Resolves the gem's roster through `species_dir` ([`env_config_for`]) and maps
+/// the q16 edit fractions against the gem's REQUESTED horizon ([`Gem::gens_requested`], falling back to
+/// [`Gem::gens`] for a pre-fix gem where it is `0` — a documented divergence). The result is the SAME ordered
+/// schedule [`build_journal`] fires, so a renderer shows precisely the edits the run replays.
+///
+/// READ-ONLY (inv #2/#3): draws NO `SimRng`, mutates nothing, never folded into the determinism hash — the
+/// resolution math lives HERE in the core/harness boundary (NOT in the renderer) and is the ONE definition
+/// shared with [`edits_to_actions`]. An empty/unresolvable roster (or a gem with no edits) yields an empty `Vec`.
+#[must_use]
+pub fn gem_edit_schedule(gem: &Gem, species_dir: &Path) -> Vec<ResolvedEdit> {
+    let (env_config, _skipped) = env_config_for(&gem.config, species_dir);
+    let Some(env_config) = env_config else {
+        return Vec::new(); // the roster no longer resolves — nothing to schedule (guarded, like the verify path).
+    };
+    // The horizon the capture mapped the q16 fractions against: `gens_requested` for a v2 gem; `gem.gens` (the
+    // early-stopped count) for a pre-fix gem whose `gens_requested` defaulted to 0 (the documented divergence).
+    let horizon = if gem.gens_requested == 0 {
+        gem.gens
+    } else {
+        gem.gens_requested
+    };
+    edits_to_actions(&gem.config, &env_config.roster, horizon)
+        .into_iter()
+        .filter_map(|(gen_abs, action)| match action {
+            Action::ApplyEdit(EditAction {
+                cas,
+                target,
+                guide,
+                species,
+            }) => Some(ResolvedEdit {
+                gen_abs,
+                cas: cas.0,
+                target: target.0,
+                // draw_guide only emits ACGT, so the bytes are valid UTF-8 (lossy is a defensive no-op).
+                guide: String::from_utf8_lossy(guide.bases()).into_owned(),
+                species,
+            }),
+            // edits_to_actions only ever yields ApplyEdit POINT actions — any other variant is unreachable.
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`gem_edit_schedule`] from a gem's JSON TEXT — the renderer/CLI boundary entry (the binding hands the gem
+/// file bytes; the core does the parse + resolution so NO biology/resolution math leaks into GDScript, inv #2).
+///
+/// # Errors
+/// Returns a [`serde_json::Error`] if `gem_json` is not a valid serialized [`Gem`].
+pub fn gem_edit_schedule_from_json(
+    gem_json: &str,
+    species_dir: &Path,
+) -> serde_json::Result<Vec<ResolvedEdit>> {
+    let gem: Gem = serde_json::from_str(gem_json)?;
+    Ok(gem_edit_schedule(&gem, species_dir))
+}
+
 /// Capture + score one [`SearchConfig`] into a [`Gem`] (the per-trial scoring step). Runs the off-hash
 /// [`capture_trace`] over `gens` generations of the freshly-built env, threading the config's mid-run CRISPR
 /// edit schedule ([`edits_to_actions`] — EMPTY for the default `edit_budget == 0`, so byte-identical to the
@@ -270,6 +346,10 @@ fn score_config(
         build_id: BUILD_ID.to_string(),
         caption: caption(&sv, cfg),
         gens: trace.g,
+        // LOAD-GEM-REPLAY v2: stamp the REQUESTED horizon (the SAME `gens` `edits_to_actions` mapped the q16 edit
+        // fractions against) so a loaded gem resolves its mid-run-edit schedule to the IDENTICAL absolute
+        // generations — even when the run early-stopped (`trace.g < gens`). Off-hash metadata (inv #3).
+        gens_requested: gens,
     }
 }
 
@@ -1174,6 +1254,223 @@ mod tests {
         assert_eq!(
             replayed, recorded.hash,
             "record → replay is bit-identical (inv #3) for an edited gem"
+        );
+    }
+
+    // ---- LOAD-GEM-REPLAY v2: gem_edit_schedule fidelity (gens_requested) ----
+
+    /// A config with mid-run edits on the LOW-LOCI `default` species (4 loci) AND on `ecoli` (136 loci), with
+    /// target indices that exercise the `target mod loci_len` resolution (target 5 on a 4-loci genome → locus 1).
+    fn low_loci_edited_config(seed: u64) -> SearchConfig {
+        use discovery::search::EditGene;
+        SearchConfig {
+            master_seed: seed,
+            roster: vec![("default".to_string(), 500), ("ecoli".to_string(), 200)],
+            containment_level: 0,
+            temp_q: 500,
+            season: 0,
+            edits: vec![
+                // default species (4 loci): target 0 → real LocusId 0.
+                EditGene {
+                    gen: 10_000,
+                    species_index: 0,
+                    target: 0,
+                    guide: "ACGTACGTACGTACGTACGT".to_string(),
+                },
+                // default species (4 loci): target 5 → 5 % 4 = 1 → real LocusId 1 (exercises the low-loci modulo).
+                EditGene {
+                    gen: 30_000,
+                    species_index: 0,
+                    target: 5,
+                    guide: "TTTTGGGGCCCCAAAATTTT".to_string(),
+                },
+                // ecoli species (136 loci): target 7 → real LocusId 7.
+                EditGene {
+                    gen: 50_000,
+                    species_index: 1,
+                    target: 7,
+                    guide: "GGGGCCCCAAAATTTTGGGG".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// A hand-built [`Gem`] over `cfg` with explicit `(gens, gens_requested)` — to exercise the horizon
+    /// fallback/fidelity branches without forcing a real early-stop (the score fields are inert here).
+    fn gem_from(cfg: &SearchConfig, gens: u32, gens_requested: u32) -> Gem {
+        Gem {
+            config: cfg.clone(),
+            score: 0,
+            quality: 0,
+            novelty: 0,
+            breakdown: [0; 6],
+            fingerprint: [0; discovery::FP_DIMS],
+            recorded_hash: 0,
+            build_id: BUILD_ID.to_string(),
+            caption: String::new(),
+            gens,
+            gens_requested,
+        }
+    }
+
+    /// The expected schedule as comparable tuples, straight from [`edits_to_actions`] at `horizon` (the
+    /// canonical resolver gem_edit_schedule must reproduce).
+    fn expected_schedule(
+        cfg: &SearchConfig,
+        roster: &[(BuiltSpecies, u32)],
+        horizon: u32,
+    ) -> Vec<(u32, u16, u32, String, u16)> {
+        edits_to_actions(cfg, roster, horizon)
+            .into_iter()
+            .filter_map(|(g, a)| match a {
+                Action::ApplyEdit(EditAction {
+                    cas,
+                    target,
+                    guide,
+                    species,
+                }) => Some((
+                    g,
+                    cas.0,
+                    target.0,
+                    String::from_utf8_lossy(guide.bases()).into_owned(),
+                    species,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// gem_edit_schedule's output as the same comparable tuples.
+    fn actual_schedule(gem: &Gem) -> Vec<(u32, u16, u32, String, u16)> {
+        gem_edit_schedule(gem, &species_dir())
+            .into_iter()
+            .map(|e| (e.gen_abs, e.cas, e.target, e.guide, e.species))
+            .collect()
+    }
+
+    #[test]
+    fn gem_edit_schedule_matches_edits_to_actions() {
+        // A REAL v2 gem (score_config stamps gens_requested = gens): the resolver reproduces edits_to_actions
+        // field-for-field (gen_abs + resolved LocusId + species + cas + guide), incl. the low-loci modulo and
+        // through the JSON-text boundary the renderer uses.
+        let gens = 80u32;
+        let cfg = low_loci_edited_config(0x5CED_0001);
+        let (env_config, skipped) = env_config_for(&cfg, &species_dir());
+        assert!(skipped.is_empty(), "roster resolves: {skipped:?}");
+        let env_config = env_config.expect("roster resolves");
+
+        let gem = score_config(&cfg, &env_config, gens, &[]);
+        assert_eq!(
+            gem.gens_requested, gens,
+            "score_config stamps the requested horizon"
+        );
+
+        let expected = expected_schedule(&cfg, &env_config.roster, gem.gens_requested);
+        let actual = actual_schedule(&gem);
+        assert_eq!(
+            actual, expected,
+            "gem_edit_schedule must match edits_to_actions exactly"
+        );
+
+        // The low-loci modulo resolved correctly: default has 4 loci, so target 5 → real LocusId 1.
+        assert_eq!(actual.len(), 3, "all three edits resolve");
+        assert_eq!(
+            actual[1].2, 1,
+            "default target 5 mod 4 loci → real LocusId 1"
+        );
+        // species ordinals: default → SpeciesId 0, ecoli → SpeciesId 1 (positional resolution).
+        assert_eq!((actual[0].4, actual[2].4), (0, 1), "resolved SpeciesIds");
+
+        // build_journal fires the SAME resolved edits at their gen_abs (the schedule the verify path replays).
+        let journal = build_journal(
+            &edits_to_actions(&cfg, &env_config.roster, gem.gens),
+            gem.gens,
+        );
+        for (gen_abs, _, _, _, _) in &actual {
+            assert!(*gen_abs < gem.gens, "every edit fires within the run");
+        }
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|a| matches!(a, Action::ApplyEdit(_)))
+                .count(),
+            actual.len(),
+            "the journal carries one ApplyEdit per resolved edit"
+        );
+
+        // The JSON-text boundary (the godot path) yields the identical schedule.
+        let json = serde_json::to_string(&gem).expect("serialize gem");
+        let via_json: Vec<_> = gem_edit_schedule_from_json(&json, &species_dir())
+            .expect("parse")
+            .into_iter()
+            .map(|e| (e.gen_abs, e.cas, e.target, e.guide, e.species))
+            .collect();
+        assert_eq!(via_json, expected, "the JSON-text resolver matches too");
+    }
+
+    #[test]
+    fn gem_edit_schedule_uses_requested_horizon_not_early_stop() {
+        // THE FIDELITY FIX: an EARLY-STOPPED gem (gem.gens < gens_requested) resolves its schedule against the
+        // REQUESTED horizon (what the capture/verify path used), NOT the early-stopped count — else the edits
+        // land at the WRONG absolute generations.
+        let requested = 200u32;
+        let early_stop = 50u32;
+        let cfg = low_loci_edited_config(0x5CED_0002);
+        let (env_config, _) = env_config_for(&cfg, &species_dir());
+        let env_config = env_config.expect("roster resolves");
+
+        let gem = gem_from(&cfg, early_stop, requested);
+        let actual = actual_schedule(&gem);
+
+        // Matches edits_to_actions against the REQUESTED horizon (the verify path's mapping).
+        let expected_requested = expected_schedule(&cfg, &env_config.roster, requested);
+        assert_eq!(
+            actual, expected_requested,
+            "resolves against gens_requested (the verify path's horizon)"
+        );
+        // ...and is NOT the (wrong) early-stop mapping — proving the fidelity fix is load-bearing.
+        let wrong_early = expected_schedule(&cfg, &env_config.roster, early_stop);
+        assert_ne!(
+            actual, wrong_early,
+            "must NOT resolve against the early-stopped gem.gens (the v1 bug)"
+        );
+    }
+
+    #[test]
+    fn gem_edit_schedule_falls_back_to_gens_for_pre_fix_gem() {
+        // A PRE-FIX gem (written before this slice) carries no gens_requested → it deserializes to 0; the resolver
+        // falls back to gem.gens (the documented divergence — the best available horizon for an old gem).
+        let cfg = low_loci_edited_config(0x5CED_0003);
+        let (env_config, _) = env_config_for(&cfg, &species_dir());
+        let env_config = env_config.expect("roster resolves");
+
+        let gem = gem_from(&cfg, 60, 0); // gens_requested == 0 → pre-fix gem
+        let actual = actual_schedule(&gem);
+        let expected = expected_schedule(&cfg, &env_config.roster, gem.gens); // fallback horizon = gem.gens
+        assert_eq!(
+            actual, expected,
+            "a pre-fix gem (gens_requested 0) resolves against gem.gens"
+        );
+
+        // An OLD gem JSON with NO gens_requested key deserializes to 0 (serde-default) + resolves the same way.
+        let mut value = serde_json::to_value(&gem).expect("to value");
+        value
+            .as_object_mut()
+            .expect("gem is a JSON object")
+            .remove("gens_requested");
+        let old_json = serde_json::to_string(&value).expect("old json");
+        assert!(
+            !old_json.contains("gens_requested"),
+            "the simulated old gem JSON omits the field"
+        );
+        let via_json: Vec<_> = gem_edit_schedule_from_json(&old_json, &species_dir())
+            .expect("parse old gem")
+            .into_iter()
+            .map(|e| (e.gen_abs, e.cas, e.target, e.guide, e.species))
+            .collect();
+        assert_eq!(
+            via_json, expected,
+            "an old gem JSON (no field) deserializes to 0 and falls back to gem.gens"
         );
     }
 

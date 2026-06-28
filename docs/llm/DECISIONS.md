@@ -1244,3 +1244,38 @@ GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3). **Follow-up UX (tracked i
 default the "growth ratio q" knob to `1000` (wild-type/no-op) instead of `0` (growth-lethal); align the
 due-epoch marker label with the immediate-commit semantics; re-enable oversight in `load_session` so the ledger
 resumes after a loaded session.
+
+---
+
+## ADR-030 — Gem replay fidelity: resolution stays in core (`gem_edit_schedule`) + off-hash `Gem.gens_requested`
+
+**Status:** Accepted (2026-06-28). (ADR-029 is reserved for the colony epic — pasted when its S1 channel slice lands.)
+
+**Context.** Load-gem-replay lets the renderer reconstruct + play a discovered gem (config + scheduled CRISPR
+edits) so the player WATCHES the scenario. The first attempt resolved the mid-run edits IN GDSCRIPT and diverged
+from the search's `edits_to_actions`: it passed the bare search `target` instead of `loci[edit.target % loci.len()].id`
+(81/147 gem edits failed `UnknownTargetLocus` — silent no-ops the gem had scored as *applied*), and it computed
+`gen_abs` from `gem.gens` (the early-stop trace length) instead of the search horizon `gens_requested` (which was
+never serialized). The renderer-only gate missed it (the `--gem` smoke reported *dispatched*, not *applied*); the
+3-skeptic adversarial verify caught it (`replays_gem_config_and_edits` 0/3 → RED).
+
+**Decision.**
+1. The edit RESOLUTION lives in CORE, never re-derived in GDScript: a read-only `godot-sim`
+   `gem_edit_schedule(gem_json) -> [{gen_abs, cas, target, guide, species}]` `#[func]` that **reuses
+   `harness::edits_to_actions`** (the SAME `loci[edit.target % loci.len()].id` target, the SAME
+   `gen_abs = edit.gen * gens_requested / 65536`, the SAME `species_index → SpeciesId`). The renderer only moves the
+   resolved ints/strings into the existing `apply_edit` and fires each at its `gen_abs` (before that gen's `Advance`,
+   matching `capture_trace`/`build_journal`). Keeps biology/resolution in core (inv #2); the v1 GDScript divergence
+   cannot recur.
+2. `Gem.gens_requested: u32` is serialized (the LAST field, `#[serde(default)]`) so the replay uses the search
+   horizon, not the early-stop length. OFF-HASH metadata: `Gem` lives in gitignored `data/runs`, the field is never
+   folded into the run `recorded_hash`, and old gems (no field) deserialize to `0` → the loader falls back to
+   `gem.gens` (documented divergence for pre-fix gems). The pinned literal `0x47a0_3c8f_6701_f240` is UNMOVED.
+
+**Consequences.** A discovered gem replays byte-faithfully to what the search scored (a correctly-resolved
+real-locus edit can still legitimately fail the CRISPR PAM/on-target gate — that faithfully reproduces the captured
+outcome, not a bug). Known coupling: the core resolver reads repo-root `data/species` while the renderer config
+replay reads `res://data/species` — byte-identical via the staged mirror (gated by `check_godot_snapshot.sh`); a
+divergence between the two roots would desync the replay. Follow-up: wire a gated headless `--gem` smoke (asserting
+`applied==total>0` on a gem WITH edits) so edit fidelity is covered by CI, not only the manual smoke + the 3 core
+tests. Gate GREEN; 3-skeptic verify CONFIRMED (4/4 at 3/3).
