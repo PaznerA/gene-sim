@@ -52,6 +52,12 @@ OPTIONS:
     --discover            Run the emergent-run SEARCH (D2a): propose N configs, capture+score each off-hash,
                           verify each kept gem round-trips, write the survivors to data/runs/gems/, and print a
                           ranked summary. The proposal is the meta-RNG; the pinned sim literal is untouched.
+    --from-gem <PATH>     CONTINUE-FROM-GEM: branch the EVOLUTIONARY search OFF a saved gem JSON instead of a cold
+                          random start. Pre-seeds the gem's config as the gen-0 anchor/elite so mutate/crossover
+                          branch off its roster + env + edits, then runs the evolutionary loop. Reuses --pop-size
+                          /--evolve-gens/--keep/--discover-gens/--search-seed/--edit-budget (+ optional --space).
+                          Each branched gem is round-trip-verified before writing; the source gem is re-verified
+                          (a build_id/round-trip mismatch is logged as stale but still branched from).
     --trials <u64>        Number of search trials for --discover (pure-random D2a). Default: 64
     --keep <usize>        Top-K deduped gems to keep for --discover. Default: 8
     --search-seed <u64>   Meta-RNG seed for --discover's proposal sampler. Default: 7
@@ -376,6 +382,54 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         });
     }
 
+    // CONTINUE-FROM-GEM — branch the EVOLUTIONARY search off a saved gem instead of a cold random start.
+    // `--from-gem <path>` reads the gem JSON, pre-seeds its config as the gen-0 anchor, and runs the same
+    // evolutionary loop (mutate/crossover off the gem). Reuses the discover flags. Meta-level only — the sim
+    // runs stay pure functions of their configs, so the pinned literal 0x47a0_3c8f_6701_f240 is untouched.
+    if let Some(gem_path) = val("--from-gem") {
+        let keep: usize = val("--keep").and_then(|s| s.parse().ok()).unwrap_or(8);
+        let search_seed: u64 = val("--search-seed")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7);
+        let gens: u32 = val("--discover-gens")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        let pop_size: u64 = val("--pop-size").and_then(|s| s.parse().ok()).unwrap_or(16);
+        // The number of EVOLVED generations to branch the gem over (gen 0 is the anchored generation). Defaults
+        // to 4 when --evolve-gens is absent (a from-gem run is inherently evolutionary).
+        let generations: u64 = val("--evolve-gens")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let save_evals = argv.iter().any(|a| a == "--save-evals");
+        let evals_path = save_evals
+            .then(|| PathBuf::from(format!("data/runs/evals/from-gem-{search_seed:016x}.jsonl")));
+        // SearchSpace: pass an explicit space ONLY when --space or --edit-budget was given; otherwise pass None
+        // so the runner defaults to the widened space with the GEM's own edit budget (keeps it consistent).
+        let edit_budget: u8 = val("--edit-budget")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let edit_budget_explicit = argv.iter().any(|a| a == "--edit-budget");
+        let space_name = val("--space");
+        let resolved = (space_name.is_some() || edit_budget_explicit)
+            .then(|| resolve_space(space_name.as_deref(), edit_budget, edit_budget_explicit));
+        let (space_label, space): (&str, Option<&discovery::search::SearchSpace>) = match &resolved
+        {
+            Some((label, sp)) => (label.as_str(), Some(sp)),
+            None => ("gem-default", None),
+        };
+        return Some(run_discover_from_gem(
+            &gem_path,
+            space,
+            space_label,
+            search_seed,
+            pop_size,
+            generations,
+            keep,
+            gens,
+            evals_path.as_deref(),
+        ));
+    }
+
     // D2a STAGE 2 — the emergent-run SEARCH (ADR-023). `--discover` runs N trials of propose→capture→score→
     // consider, verifies each kept gem round-trips, writes the survivors to data/runs/gems/, and prints a
     // ranked summary. The proposal is the meta-RNG (NOT the sim RNG); the sim runs are pure functions of their
@@ -617,6 +671,61 @@ fn run_discover_evolved(
         }
         Err(e) => {
             eprintln!("discover error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Run the CONTINUE-FROM-GEM EVOLUTIONARY search: branch off the saved gem at `gem_path` (pre-seeded as the
+/// gen-0 anchor) into `data/runs/gems/` and print a ranked summary of the verified saved gems. Mirrors
+/// [`run_discover_evolved`] (same `data/species` boundary + gitignored `data/runs/gems/`); `space == None` lets
+/// the runner default to the widened space with the gem's own edit budget (the `space_label` is banner-only).
+#[allow(clippy::too_many_arguments)] // independent CLI run parameters; grouping would obscure the flag mapping
+fn run_discover_from_gem(
+    gem_path: &str,
+    space: Option<&discovery::search::SearchSpace>,
+    space_label: &str,
+    search_seed: u64,
+    pop_size: u64,
+    generations: u64,
+    keep: usize,
+    gens: u32,
+    evals_path: Option<&std::path::Path>,
+) -> ExitCode {
+    let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
+    let out_dir = PathBuf::from("data/runs/gems");
+
+    println!(
+        "gene-sim discover (CONTINUE-FROM-GEM) · gem={gem_path} · space={space_label} · search_seed={search_seed} · pop_size={pop_size} · evolve_gens={generations} · keep={keep} · gens={gens}\n  branching off the loaded gem; writing verified gems to {}",
+        out_dir.display()
+    );
+    if let Some(p) = evals_path {
+        println!("  writing eval log to {}", p.display());
+    }
+    match harness::discover::discover_from_gem(
+        std::path::Path::new(gem_path),
+        space,
+        search_seed,
+        pop_size,
+        generations,
+        keep,
+        gens,
+        &species_dir,
+        &out_dir,
+        evals_path,
+    ) {
+        Ok(lib) => {
+            if let Some(p) = evals_path {
+                let count = std::fs::read_to_string(p)
+                    .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+                    .unwrap_or(0);
+                println!("  wrote {count} eval records to {}", p.display());
+            }
+            print_gem_library(&lib);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("from-gem error: {e}");
             ExitCode::from(1)
         }
     }
