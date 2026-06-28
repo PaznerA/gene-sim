@@ -43,13 +43,18 @@ arc → the VISUAL-POLISH epic below** (the user: the screen is "spammed"/clutte
 > variant/colony channel on the snapshot, like `dominant_species_id`) → inv #2/#3, `0x47a0` untouched. Also the LOD lever
 > for bigger maps (`[[perf-bigger-maps-needs-structural-change]]`).
 
-- `[ ]` **visual-declutter-colony-design** (`workflow`, DESIGN) — 3-lens panel (render-arch / data-determinism / ux-lod)
-  → judge → `proposals/visual-declutter-colony-draft.md` (ADR-029 draft + slice plan). **Leads the epic.** ✅ hash-neutral
-  (a doc). Any hash-touching part is flagged 🛑 STOP-THE-LINE for sign-off.
-- `[def]` **colony impl slices** (queued from the draft after sign-off): `colony-snapshot-channel-impl` (the off-hash
-  per-cell variant/colony channel, GSS bump — ✅ hash-neutral, model on `dominant_species_id`) → `colony-polygon-render-impl`
-  (derive + draw colony footprints) → `lod-pop-impl` (zoom×size pop colony↔organisms) → `brush-colony-binding-impl`
-  (ApplyEditRegion creates a district/colony) → `plant-realism-impl` (always-visible realistic plants in ≥1 colony).
+- `[x]` **visual-declutter-colony-design** (`workflow`, DESIGN) — DONE → `proposals/visual-declutter-colony-draft.md`
+  (470 lines: ADR-029 draft + the airtight off-hash argument — `hash_world` omits `Species`, so a heritable `Variant`
+  tag is hash-neutral the same way — + the 6-slice plan). The colony impl slices below come from §7 of the draft.
+- `[def]` **S1 `colony-snapshot-channel-impl`** 🛑 — the off-hash heritable `Variant(u16)` tag + `NextVariantId` +
+  `dominant_variant_id` GSS6 channel + brush mint/stamp in `apply_edit_region` + the `snapshot.gd`/byte-gate bump.
+  **STOP-THE-LINE: the only core/snapshot touch — designed hash-neutral (NOT a re-pin) but must PROVE `0x47a0` unmoved
+  at the gate before merge; needs human sign-off to run.** *(deps: ADR-029 sign-off.)*
+- `[def]` **S2 `colony-polygon-render-impl`** ✅ — `colonies.gd`: deterministic connected-components → contour → fill/outline/label (renderer-only). *dep: S1.*
+- `[def]` **S3 `lod-pop-impl`** ✅ — the footprint (`cell×zoom×size_scale`) pop ladder; plants pop first; no per-frame redraw. *dep: S2.*
+- `[def]` **S4 `brush-colony-binding-impl`** ✅ — render the brushed disc as a nested district (intra-species hue shift) + selected-pop. *dep: S2 (+ S1 core bind).*
+- `[def]` **S5 `plant-realism-impl`** ✅ — plant canopy hulls, always-visible floor, ≥1-colony guarantee. *dep: S2.*
+- `[def]` **S6 `colony-polish-impl`** ✅ *(optional)* — viewport-cull/sprite-budget, district inspect panel, big-map draw-count check. *dep: S3.*
 
 ---
 
@@ -82,6 +87,7 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 
 ## ▶ LOG (append per item: date · item · PASS/RED · merge sha · note)
 
+- 2026-06-28 — **(parallel b) `visual-declutter-colony-design` DONE** (ran concurrently with #3 v2). Delivered `proposals/visual-declutter-colony-draft.md` (ADR-029 draft + 6-slice plan). Headline: colonies are an off-hash heritable `Variant(u16)` tag + a `dominant_variant_id` GSS6 channel (sibling of `dominant_species_id`); the inv #3 case is airtight (`hash_world` omits `Species`, so `Variant` is hash-neutral too; single-plant config → all `Variant(0)` → `0x47a0` byte-identical, NOT a re-pin); brush = a 2-line `ApplyEditRegion` extension (Cities-Skylines districts, survives replay); renderer derives the polygon geometry (inv #2). **S1 `colony-snapshot-channel-impl` flagged 🛑 STOP-THE-LINE** (the only core/snapshot touch — needs human sign-off). Merged `--no-ff`.
 - 2026-06-28 — **#3 `discovery-load-gem-replay-impl` RED → v2 fix authored.** Gate GREEN but verify refuted `replays_gem_config_and_edits` 0/3 (config replay sound; EDIT replay diverged from `edits_to_actions`: (1) raw target vs `loci[edit.target % loci.len()].id` → 81/147 edits failed `UnknownTargetLocus`; (2) `gem.gens` vs the unserialized `gens_requested` → wrong gen on early-stopped gems). The gate missed it (the `--gem` smoke reported *dispatched*, not *applied*) — the adversarial verify caught it. WIP preserved on `auto/discovery-load-gem-replay-2026-06-28` (`6e48a35`, NOT merged). **v2 authored** = renderer + a read-only core `gem_edit_schedule` #[func] (resolves via `edits_to_actions`) + off-hash `Gem.gens_requested`; hash-neutral. STOPPED the run (verify-refute) — awaiting human go to re-run v2 (a renderer→renderer+tiny-core re-scope).
 - 2026-06-28 — **#2 `discovery-continue-from-gem-impl` PASS** (gate GREEN; verify CONFIRMED, 4/4 at 3/3; `0x47a0` UNMOVED — meta-level; `discover_from_gem` pre-seeds from the gem + branches; children round-trip, stale anchors dropped at write). Merged `--no-ff`. Next ready: #3 `discovery-load-gem-replay-impl`.
 - 2026-06-28 — **#1 `discovery-scenarios-impl` PASS** (gate GREEN; 3-skeptic verify CONFIRMED, 4/4 at 3/3; pinned literal `0x47a0_3c8f_6701_f240` UNMOVED — default `--space` path golden-byte-identical; 6 named presets fixed-order/in-bounds/distinct; unknown name degrades with a note). Merged `--no-ff` to `main`. Next ready: #2 `discovery-continue-from-gem-impl`.
