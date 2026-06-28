@@ -59,6 +59,9 @@ OPTIONS:
     --evolve-gens <u64>   Run the EVOLUTIONARY discover loop (D2b) for G generations (mutate/crossover of the
                           kept gems + fresh exploration). G=0 keeps the pure-random D2a behavior. Default: 0
     --pop-size <u64>      Population proposed per evolutionary generation (and gen 0). Default: 16
+    --edit-budget <u8>    Variant Lab D: MAX mid-run CRISPR edits a proposed config may schedule. 0 (default) =
+                          the edit axis OFF → byte-identical to the no-edit search. > 0 turns it ON; each
+                          discovered gem then carries + REPRODUCES its scheduled edits (round-trip-verified).
     --save-evals          Also write EVERY evaluated (config → ScoreVec) to data/runs/evals/<search_seed>.jsonl
                           (one JSON per line, in evaluation order — the D3-A surrogate training data). OFF-HASH:
                           read-only over already-computed gem fields; the pinned sim literal is untouched.
@@ -393,6 +396,11 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
         let save_evals = argv.iter().any(|a| a == "--save-evals");
         let evals_path =
             save_evals.then(|| PathBuf::from(format!("data/runs/evals/{search_seed:016x}.jsonl")));
+        // Variant Lab D — the mid-run CRISPR edit axis. `--edit-budget N` (N > 0) opts INTO the axis (each
+        // proposed config may schedule up to N edits); `0` (the default) keeps the no-edit search byte-identical.
+        let edit_budget: u8 = val("--edit-budget")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         if evolve_gens > 0 {
             let pop_size: u64 = val("--pop-size").and_then(|s| s.parse().ok()).unwrap_or(16);
             return Some(run_discover_evolved(
@@ -401,6 +409,7 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
                 evolve_gens,
                 keep,
                 gens,
+                edit_budget,
                 evals_path.as_deref(),
             ));
         }
@@ -409,6 +418,7 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
             trials,
             keep,
             gens,
+            edit_budget,
             evals_path.as_deref(),
         ));
     }
@@ -441,19 +451,26 @@ fn run_discover(
     trials: u64,
     keep: usize,
     gens: u32,
+    edit_budget: u8,
     evals_path: Option<&std::path::Path>,
 ) -> ExitCode {
     let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let out_dir = PathBuf::from("data/runs/gems");
+    // Variant Lab D: a raised edit_budget turns the mid-run-edit axis ON; 0 is byte-identical to discover().
+    let space = discovery::search::SearchSpace {
+        edit_budget,
+        ..discovery::search::SearchSpace::default()
+    };
 
     println!(
-        "gene-sim discover · search_seed={search_seed} · trials={trials} · keep={keep} · gens={gens}\n  writing verified gems to {}",
+        "gene-sim discover · search_seed={search_seed} · trials={trials} · keep={keep} · gens={gens} · edit_budget={edit_budget}\n  writing verified gems to {}",
         out_dir.display()
     );
     if let Some(p) = evals_path {
         println!("  writing eval log to {}", p.display());
     }
-    match harness::discover::discover(
+    match harness::discover::discover_in_space(
+        &space,
         search_seed,
         trials,
         keep,
@@ -483,19 +500,26 @@ fn run_discover(
 /// the DISTINCT-gem count (the diversity win the evolutionary loop targets). `gen 0` proposes `pop_size`
 /// random configs; each later generation mutates/crosses the kept gems plus a fresh-exploration fraction.
 /// Defaults mirror [`run_discover`] (same `data/species` boundary + gitignored `data/runs/gems/`).
+#[allow(clippy::too_many_arguments)] // independent CLI run parameters; grouping would obscure the flag mapping
 fn run_discover_evolved(
     search_seed: u64,
     pop_size: u64,
     evolve_gens: u64,
     keep: usize,
     gens: u32,
+    edit_budget: u8,
     evals_path: Option<&std::path::Path>,
 ) -> ExitCode {
     let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let out_dir = PathBuf::from("data/runs/gems");
+    // Variant Lab D: a raised edit_budget turns the mid-run-edit axis ON; 0 is byte-identical to discover_evolved().
+    let space = discovery::search::SearchSpace {
+        edit_budget,
+        ..discovery::search::SearchSpace::default()
+    };
 
     println!(
-        "gene-sim discover (EVOLUTIONARY) · search_seed={search_seed} · pop_size={pop_size} · evolve_gens={evolve_gens} · keep={keep} · gens={gens}\n  evaluated {} configs over {} generations; writing verified gems to {}",
+        "gene-sim discover (EVOLUTIONARY) · search_seed={search_seed} · pop_size={pop_size} · evolve_gens={evolve_gens} · keep={keep} · gens={gens} · edit_budget={edit_budget}\n  evaluated {} configs over {} generations; writing verified gems to {}",
         pop_size * (evolve_gens + 1),
         evolve_gens + 1,
         out_dir.display()
@@ -503,7 +527,8 @@ fn run_discover_evolved(
     if let Some(p) = evals_path {
         println!("  writing eval log to {}", p.display());
     }
-    match harness::discover::discover_evolved(
+    match harness::discover::discover_evolved_in_space(
+        &space,
         search_seed,
         pop_size,
         evolve_gens,

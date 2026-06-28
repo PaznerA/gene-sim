@@ -4,6 +4,20 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Variant Lab D — the auto-research mid-run-EDIT search axis (discovery + harness) — HASH-NEUTRAL
+The brute-force discovery search can now propose mid-run CRISPR edits, not just initial configs (ADR-027) — so an
+edited lineage can be discovered + saved as a replayable gem (the user: the auto-research must ALSO get the edit action).
+- `SearchConfig.edits: Vec<EditGene>` (LAST field, `#[serde(default, skip_serializing_if = "Vec::is_empty")]`) + an
+  `edit_budget` SearchSpace knob **defaulting to 0**; `draw_edits` returns empty BEFORE drawing when budget==0, so the
+  default search + every existing discovery test + the eval-log bytes stay byte-identical (the edit draws use a disjoint
+  `EDIT_SALT` stream at field indices after season; q16 span-independent gen encoding).
+- `harness::discover::edits_to_actions` maps each `EditGene` onto the EXISTING `Action::ApplyEdit` (no new sim action;
+  genotype→phenotype stays in core, inv #2/#6); `verify_and_write_library` rebuilds the journal to MATCH
+  `capture_trace`'s per-gen interleave so an edited gem round-trips (`replay==recorded==gem.recorded_hash`) or is dropped.
+  `--edit-budget N` CLI flag opts the axis in.
+- Pinned literal `0x47a0_3c8f_6701_f240` unmoved (`edit_budget_zero_is_byte_identical_to_the_no_edit_search`). Gate
+  GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3). ADR-027. QUEUE item #2 (Variant Lab epic, gameplay/sandbox lead).
+
 ### Variant Lab B+C — save→name→reseed loop (renderer + read-only core export) — HASH-NEUTRAL
 The player can save a roster species' CURRENT (post-edit) genome as a named variant and reseed it like a contaminant.
 - **Slice B (save):** read-only `Simulation::export_species_spec(sid) -> SpeciesSpec` (`&self`, zero SimRng, never
