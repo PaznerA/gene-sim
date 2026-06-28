@@ -19,10 +19,11 @@ extends Node2D
 ##                         cargo build --manifest-path crates/godot-sim/Cargo.toml). Space pauses, ▶ steps.
 ##   --view specimen       Open the L-system specimen view (instead of the ecosystem view) for --shot.
 ##   --view relations      Open the Relations FlowMatrix heatmap view for --shot.
+##   --view codex          Open the browsable CODEX encyclopedia view for --shot.
 ##   --focus <i>           With --view specimen: focus specimen i (0 baseline, 1.. edits) for --shot.
 ## With no args and a display, auto-discovers the newest data/runs/<id>/ that holds snap_*.bin.
 ##
-## Keys (windowed): Space pause · V cycle ecosystem→specimen→relations · Tab cycle specimen · D cycle layer ·
+## Keys (windowed): Space pause · V cycle ecosystem→specimen→relations→codex · Tab cycle specimen · D cycle layer ·
 ##   S toggle plant sprites/dots · B toggle selective edit brush (live) · [ / ] brush radius ·
 ##   ,/. step · 1/2/3 zoom scope · wheel zoom (brush: wheel = radius) · arrows pan.
 ## Brush (live, ADR-011 / SP-3.6): with B on, hover paints a disc on the map; click/drag applies the ACTIVE
@@ -68,11 +69,12 @@ const OVERLAY_LEGENDS := {
 # View modes (Rel-UI.0): the top toggle cycles Ecosystem → Specimen → Relations. The Relations view renders the
 # emergent S×S FlowMatrix (core-measured inter-species joule flows) as a heatmap; it is renderer-only VIEW state
 # (a third _view_mode value) and degrades gracefully until the F4 core wires the matrix (see _flow_matrix_or_empty).
-const VIEW_NAMES := ["Ecosystem", "Specimen", "Relations"]
-const VIEW_COUNT := 3
+const VIEW_NAMES := ["Ecosystem", "Specimen", "Relations", "Codex"]
+const VIEW_COUNT := 4
 const VIEW_ECOSYSTEM := 0
 const VIEW_SPECIMEN := 1
 const VIEW_RELATIONS := 2
+const VIEW_CODEX := 3  # SP-4 browsable encyclopedia (renderer-only static content via codex.gd; inv #2)
 # The species-genome traits, in canonical order (matches the core's Trait::ALL). Iterate THIS, never the
 # specimens.json Dictionary's keys, so the readout order is stable (inv #3 hygiene, even in UI).
 const TRAIT_KEYS := [
@@ -161,6 +163,14 @@ var _relations_matrix_btn: Button
 var _relations_banner: Label  # degrade-state banner (State 1/2/4 text; hidden in State 3)
 var _relations_flowsum: Label  # plain-language "who's eating whom" top-N flow summary (parsed from the FlowMatrix)
 var _relations_nearest: Label  # ADR-014 nearest-species strip (view-only/advisory; hidden when no overlay)
+# Codex view (SP-4): a FULL-WINDOW browsable encyclopedia (modelled on _relations_full) — a left entry list +
+# filter, a right scrollable detail pane. Renderer-only (inv #2): every field is a static codex.gd lookup; no
+# biology is computed. Degrades to a "codex unavailable" note when codex.gd did not load (older build / unstaged).
+var _codex_full: Control  # full-window container (visible only in the Codex view, like _relations_full)
+var _codex_list: ItemList  # left list of entries (species / roles / genes / flows, declared order, inv #3)
+var _codex_filter: LineEdit  # case-insensitive substring filter over the list labels/ids
+var _codex_detail_box: VBoxContainer  # right scrollable detail pane for the selected entry
+var _codex_entries: Array = []  # parallel to _codex_list rows: [{kind, id}] for the selected-row lookup
 # Per-species panel vitals (Rel-UI.1): 3-up Population / Allele / Fitness, value + ▲▼ trend per row.
 var _species_vital_rows: Array = []  # [{key:String, fmt:String, value:Label}] one per vitals row
 var _species_vital_note: Label  # "pending core export" note, shown only when a stat reads "—"
@@ -456,6 +466,8 @@ func _ready() -> void:
 		_apply_active_tool()
 	if _arg_value("--view") == "relations":  # optional: open the Relations FlowMatrix heatmap for --shot
 		_set_view_mode(VIEW_RELATIONS)
+	if _arg_value("--view") == "codex":  # optional: open the browsable CODEX encyclopedia for --shot
+		_set_view_mode(VIEW_CODEX)
 	if _arg_value("--view") == "specimen":  # optional: open the L-system specimen view for --shot
 		_set_view_mode(VIEW_SPECIMEN)
 		var focus_arg := _arg_value("--focus")  # optional: focus a specific specimen (0=baseline, 1..=edits)
@@ -481,6 +493,9 @@ func _ready() -> void:
 		_render_specimens()  # exercise the L-system build path headlessly (catches GDScript errors)
 		_update_trait_readout()  # exercise the per-species vitals + trait readout build path (Rel-UI.1)
 		_refresh_relations()  # exercise the relations heatmap refresh + degrade path (Rel-UI.0, State 1 in replay)
+		_refresh_codex()  # SP-4: exercise the browsable CODEX list build + detail render headlessly (inv #4)
+		for _e in _codex_entries:  # render EVERY entry once so a typo in any kind branch (species/role/gene/flow) goes RED
+			_render_codex_detail(_e)
 		_fill_detail("(check)", ["density 0.0"])  # exercise the detail/ontology rendering path
 		# SP-4 headless guards (inv #4 — every path built before any GPU): (a) BUILD every baked species' glyph via
 		# the key-led factory so a parse error / malformed polygon in ANY morphotype body goes RED; (b) load the
@@ -2200,6 +2215,7 @@ func _build_scene() -> void:
 	_build_hud(ui, field_screen)
 	_build_vitals_ui(ui)
 	_build_controls(ui, field_screen)
+	_build_codex_ui(ui, field_screen)  # full-window browsable encyclopedia; built BEFORE the viewscope so the always-on VIEW switcher draws on top of it (the codex panel must never cover its own escape hatch)
 	_build_viewscope_ui(ui)  # the always-on top-right VIEW + SCOPE switcher (built after _build_controls owns _scope_buttons)
 	_build_specimen_ui(ui, field_screen)
 	_build_relations_ui(ui, field_screen)
@@ -2946,6 +2962,8 @@ func _set_view_mode(m: int) -> void:
 		_relations_root.visible = (m == VIEW_RELATIONS)
 	if _relations_full != null:
 		_relations_full.visible = (m == VIEW_RELATIONS)  # the full-window graph/heatmap content (like _specimen_root)
+	if _codex_full != null:
+		_codex_full.visible = (m == VIEW_CODEX)  # the full-window browsable encyclopedia (renderer-only, inv #2)
 	if _vignette != null:
 		_vignette.visible = (m == VIEW_ECOSYSTEM)  # screen-space edge darkening only suits the field view
 	if _detail_panel != null:
@@ -2992,6 +3010,8 @@ func _set_view_mode(m: int) -> void:
 	elif m == VIEW_RELATIONS:
 		_refresh_relations()  # pull species names + the flat FlowMatrix, feed the heatmap (degrades gracefully)
 		_frame_world()  # the relations graph/heatmap are full-window Controls (screen-space) — keep the world camera neutral
+	elif m == VIEW_CODEX:
+		_refresh_codex()  # (re)build the browsable entry list from codex.gd; degrades to an "unavailable" note
 	else:
 		_frame_world()
 	_sync_controls()  # enable/disable scrubber + step for the new mode
@@ -3726,6 +3746,244 @@ func _build_relations_ui(ui: CanvasLayer, field_px: Vector2) -> void:
 	_relations_panel = PanelChrome.new()
 	_relations_panel.setup("🔗 RELATIONS", body, ui, Vector2(maxf(220.0, field_px.x - 320.0), 176.0), _pill_rail)  # y=176 clears the always-on VIEW+SCOPE panel
 	_relations_panel.set_active(false)
+
+
+# ──────────────────────────── browsable CODEX view (SP-4) ────────────────────────────
+
+## Build the CODEX view chrome: a FULL-WINDOW panel (modelled on _relations_full + the specimen full-rect) holding a
+## left entry list + filter and a right scrollable detail pane. Renderer-only (inv #2): every field rendered is a
+## STATIC codex.gd lookup keyed on a core-exported id — no genotype→phenotype, no biology. The list is populated in
+## _refresh_codex (on view-entry) and degrades to a clear "codex unavailable" note when codex.gd did not load.
+func _build_codex_ui(ui: CanvasLayer, _field_px: Vector2) -> void:
+	# Full-window container, same offsets the Relations full view uses (under the title bar, above the controls deck).
+	_codex_full = Control.new()
+	_codex_full.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_codex_full.offset_top = 44.0       # clear the full-width title bar
+	_codex_full.offset_bottom = -58.0   # clear the bottom controls/timeline band
+	_codex_full.offset_left = 8.0
+	_codex_full.offset_right = -8.0
+	_codex_full.mouse_filter = Control.MOUSE_FILTER_IGNORE  # the interactive widgets below own their own input
+	_codex_full.visible = false
+	# Same `ui` CanvasLayer as the other views; added before the viewscope (see _build_scene) so the VIEW switcher
+	# draws on top and never gets covered by the codex card.
+	ui.add_child(_codex_full)
+
+	# Dark card backdrop filling the container (reuses the panel idiom of the other full views).
+	var card := PanelContainer.new()
+	card.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.04, 0.06, 0.05, 0.86)
+	sb.set_corner_radius_all(8)
+	sb.set_border_width_all(1)
+	sb.border_color = Color(0.2, 0.46, 0.32, 0.6)
+	sb.set_content_margin_all(12)
+	card.add_theme_stylebox_override("panel", sb)
+	_codex_full.add_child(card)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 14)
+	card.add_child(row)
+
+	# ── Left column: title + filter + the browsable entry list ──
+	var left := VBoxContainer.new()
+	left.add_theme_constant_override("separation", 6)
+	left.custom_minimum_size = Vector2(300, 0)
+	left.size_flags_vertical = Control.SIZE_FILL
+	row.add_child(left)
+
+	var title := Label.new()
+	title.text = "📖 CODEX — browsable encyclopedia"
+	title.add_theme_font_size_override("font_size", 14)
+	title.add_theme_color_override("font_color", Color(0.86, 0.92, 0.84))
+	left.add_child(title)
+
+	_codex_filter = LineEdit.new()
+	_codex_filter.placeholder_text = "filter (species / gene / role)…"
+	_codex_filter.clear_button_enabled = true
+	_codex_filter.text_changed.connect(_on_codex_filter_changed)
+	left.add_child(_codex_filter)
+
+	_codex_list = ItemList.new()
+	_codex_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_codex_list.size_flags_horizontal = Control.SIZE_FILL
+	_codex_list.auto_height = false
+	_codex_list.item_selected.connect(_on_codex_item_selected)
+	left.add_child(_codex_list)
+
+	# ── Right column: a scrollable detail pane (vertical scroll only → labels autowrap to the pane width) ──
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	row.add_child(scroll)
+
+	_codex_detail_box = VBoxContainer.new()
+	_codex_detail_box.add_theme_constant_override("separation", 5)
+	_codex_detail_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(_codex_detail_box)
+
+
+## (Re)build the browsable codex list from codex.gd, honouring the current filter. Selects + renders the first match.
+## Degrades to a "codex unavailable" note when codex.gd did not load (older build / unstaged mirror) — guarded like
+## the other views. Renderer-only (inv #2): reads static codex entries; computes no biology.
+func _refresh_codex() -> void:
+	if _codex_list == null:
+		return
+	_rebuild_codex_list(_codex_filter.text if _codex_filter != null else "")
+
+
+func _on_codex_filter_changed(text: String) -> void:
+	_rebuild_codex_list(text)
+
+
+func _on_codex_item_selected(idx: int) -> void:
+	if idx >= 0 and idx < _codex_entries.size():
+		_render_codex_detail(_codex_entries[idx])
+
+
+## Rebuild the left list from the ORDERED codex arrays (species → roles → genes → flows, inv #3), filtered by a
+## case-insensitive substring over each row's label/id. Each accepted row appends a {kind,id} to _codex_entries so a
+## selection maps straight back to a codex.gd lookup. Empty codex → the unavailable note; no matches → a "no match" note.
+func _rebuild_codex_list(filter: String) -> void:
+	_codex_list.clear()
+	_codex_entries = []
+	if not _codex.is_loaded():
+		_show_codex_message("Codex unavailable",
+			"res://data/codex/codex.json did not load (older build, or the data/codex → godot/data/codex mirror was not staged). Run ./run.sh or tools/check_godot_snapshot.sh to stage it, then reopen the Codex view.")
+		return
+	var f := filter.strip_edges().to_lower()
+	for key in _codex.species_keys():
+		var sp := _codex.species_for(key)
+		var label := "%s  %s" % [str(sp.get("emoji", "🔬")), str(sp.get("display_name", key))]
+		_maybe_add_codex_entry("species", str(key), label, "%s %s %s" % [label, key, str(sp.get("headline", ""))], f)
+	for rid in _codex.role_ids():
+		var r := _codex.role_for(rid)
+		var label := "◆ %s" % str(r.get("title", rid))
+		_maybe_add_codex_entry("role", str(rid), label, "%s %s %s" % [label, rid, str(r.get("one_line", ""))], f)
+	for sym in _codex.gene_symbols():
+		var g := _codex.gene_for_symbol(sym)
+		var label := "🧬 %s — %s" % [str(sym), str(g.get("one_line", g.get("go_label", "")))]
+		_maybe_add_codex_entry("gene", str(sym), label, "%s %s %s" % [label, sym, str(g.get("go_label", ""))], f)
+	for fk in _codex.flow_keys():
+		var parts := str(fk).split("|")
+		var fl: Dictionary = _codex.flow_for(parts[0], parts[1]) if parts.size() == 2 else {}
+		var label := "→ %s" % str(fl.get("title", fk))
+		_maybe_add_codex_entry("flow", str(fk), label, "%s %s" % [label, fk], f)
+	if _codex_entries.is_empty():
+		_show_codex_message("No matches", "No codex entries match \"%s\"." % filter.strip_edges())
+		return
+	_codex_list.select(0)
+	_render_codex_detail(_codex_entries[0])
+
+
+## Append one list row + its {kind,id} when it passes the (already-lowercased) substring filter. `searchable` is the
+## haystack (label + id + a gloss); an empty filter accepts everything. Keeps the list and _codex_entries in lockstep.
+func _maybe_add_codex_entry(kind: String, id: String, label: String, searchable: String, f: String) -> void:
+	if f != "" and not searchable.to_lower().contains(f):
+		return
+	_codex_list.add_item(label)
+	_codex_entries.append({"kind": kind, "id": id})
+
+
+## Render the detail pane for a selected {kind,id} entry. Pure presentation (inv #2): each branch is a static
+## codex.gd lookup formatted into section labels; no biology is derived.
+func _render_codex_detail(entry: Dictionary) -> void:
+	for c in _codex_detail_box.get_children():
+		c.queue_free()
+	match str(entry.get("kind", "")):
+		"species": _render_codex_species(str(entry.get("id", "")))
+		"role": _render_codex_role(str(entry.get("id", "")))
+		"gene": _render_codex_gene(str(entry.get("id", "")))
+		"flow": _render_codex_flow(str(entry.get("id", "")))
+
+
+func _render_codex_species(key: String) -> void:
+	var sp := _codex.species_for(key)
+	if sp.is_empty():
+		_codex_detail_box.add_child(_detail_label("(no codex entry for %s)" % key, 13, Color(0.85, 0.74, 0.6)))
+		return
+	_codex_detail_box.add_child(_detail_label(
+		"%s  %s" % [str(sp.get("emoji", "")), str(sp.get("display_name", key))], 18, Color(0.97, 0.99, 0.96)))
+	if sp.has("headline"):
+		_codex_detail_box.add_child(_detail_label(str(sp["headline"]), 13, Color(0.86, 0.92, 0.88)))
+	_codex_section("Taxonomy", str(sp.get("taxonomy", "")))
+	_codex_section("Ontology", str(sp.get("ontology", "")))
+	_codex_section("Phenology", str(sp.get("phenology", "")))
+	_codex_section("Famous fact", str(sp.get("famous_fact", "")))
+	_codex_section("Sim role", str(sp.get("sim_role", "")))
+	var anchors: Array = sp.get("anchor_genes", [])
+	if not anchors.is_empty():
+		_codex_section("Anchor genes", "  ·  ".join(PackedStringArray(anchors)))
+	_codex_sources(sp.get("sources", []))
+
+
+func _render_codex_gene(sym: String) -> void:
+	var g := _codex.gene_for_symbol(sym)
+	if g.is_empty():
+		_codex_detail_box.add_child(_detail_label("(no codex entry for %s)" % sym, 13, Color(0.85, 0.74, 0.6)))
+		return
+	_codex_detail_box.add_child(_detail_label(
+		"🧬 %s — %s" % [sym, str(g.get("go_label", ""))], 18, Color(0.95, 0.92, 0.7)))
+	if g.has("one_line"):
+		_codex_detail_box.add_child(_detail_label(str(g["one_line"]), 13, Color(0.86, 0.92, 0.88)))
+	_codex_section("Identifiers", "GO:%s · SO:%s · trait: %s · species: %s" % [
+		str(g.get("go", "—")), str(g.get("so", "—")), str(g.get("trait", "—")), str(g.get("species_key", "—"))])
+	_codex_section("Ontology", str(g.get("ontology", "")))
+	_codex_section("Famous fact", str(g.get("famous_fact", "")))
+	_codex_section("Knockdown", str(g.get("knockdown", "")))
+	_codex_sources(g.get("sources", []))
+
+
+func _render_codex_role(rid: String) -> void:
+	var r := _codex.role_for(rid)
+	if r.is_empty():
+		_codex_detail_box.add_child(_detail_label("(no codex entry for %s)" % rid, 13, Color(0.85, 0.74, 0.6)))
+		return
+	_codex_detail_box.add_child(_detail_label("◆ %s" % str(r.get("title", rid)), 18, Color(0.84, 0.92, 0.96)))
+	if r.has("one_line"):
+		_codex_detail_box.add_child(_detail_label(str(r["one_line"]), 13, Color(0.86, 0.92, 0.88)))
+	_codex_section("Description", str(r.get("body", "")))
+	_codex_section("Trophic position", "typically prey" if bool(r.get("is_prey", false)) else "not typically prey")
+	_codex_sources(r.get("sources", []))
+
+
+func _render_codex_flow(fk: String) -> void:
+	var parts := fk.split("|")
+	var fl: Dictionary = _codex.flow_for(parts[0], parts[1]) if parts.size() == 2 else {}
+	if fl.is_empty():
+		_codex_detail_box.add_child(_detail_label("(no codex entry for %s)" % fk, 13, Color(0.85, 0.74, 0.6)))
+		return
+	_codex_detail_box.add_child(_detail_label("→ %s" % str(fl.get("title", fk)), 18, Color(0.9, 0.88, 0.7)))
+	_codex_detail_box.add_child(_detail_label(
+		"%s → %s" % [str(fl.get("from_role", "")), str(fl.get("to_role", ""))], 12, Color(0.78, 0.84, 0.78)))
+	_codex_section("Phenology", str(fl.get("phenology", "")))
+	_codex_section("Description", str(fl.get("body", "")))
+	_codex_sources(fl.get("sources", []))
+
+
+## A titled section (dim header + wrapped body) appended to the detail pane; skipped when the body is empty (graceful).
+func _codex_section(title: String, body: String) -> void:
+	if body.strip_edges() == "":
+		return
+	_codex_detail_box.add_child(_detail_label(title, 12, Color(0.66, 0.78, 0.7)))
+	_codex_detail_box.add_child(_detail_label(body, 12, Color(0.88, 0.92, 0.88)))
+
+
+## The "Sources" tail: a dim header + one bullet per URL (graceful when none).
+func _codex_sources(sources: Array) -> void:
+	if sources.is_empty():
+		return
+	_codex_detail_box.add_child(_detail_label("Sources", 11, Color(0.6, 0.7, 0.66)))
+	for s in sources:
+		_codex_detail_box.add_child(_detail_label("• %s" % str(s), 10, Color(0.56, 0.66, 0.78)))
+
+
+## Replace the detail pane with a single titled message (the unavailable / no-match degrade states).
+func _show_codex_message(title: String, body: String) -> void:
+	for c in _codex_detail_box.get_children():
+		c.queue_free()
+	_codex_detail_box.add_child(_detail_label(title, 16, Color(0.95, 0.8, 0.5)))
+	_codex_detail_box.add_child(_detail_label(body, 12, Color(0.82, 0.86, 0.8)))
 
 
 ## Item 4: select the relations representation (Graph vs Matrix) + swap which node is visible. The legend / flow

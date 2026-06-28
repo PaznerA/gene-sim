@@ -30,6 +30,7 @@ var _flows: Dictionary = {}  # "from|to" -> flow entry dict
 var _species_order: Array = []
 var _gene_order: Array = []
 var _role_order: Array = []
+var _flow_order: Array = []  # "from|to" keys, in declared order (for the browsable CODEX list)
 
 
 func _init() -> void:
@@ -48,6 +49,7 @@ func load_codex() -> bool:
 	_species_order = []
 	_gene_order = []
 	_role_order = []
+	_flow_order = []
 	if not FileAccess.file_exists(CODEX_PATH):
 		push_warning("codex.gd: %s not found (staging?) — INSPECT/tooltips degrade to bare ids" % CODEX_PATH)
 		return false
@@ -96,6 +98,7 @@ func load_codex() -> bool:
 		var fd: Dictionary = fl
 		var fk := "%s|%s" % [str(fd.get("from_role", "")), str(fd.get("to_role", ""))]
 		_flows[fk] = fd
+		_flow_order.append(fk)
 	_ok = true
 	return true
 
@@ -149,3 +152,18 @@ func gene_for_trait(trait_key: String, species_key: String) -> Dictionary:
 ## Ordered species keys (declared order, inv #3) — for any browsable list.
 func species_keys() -> Array:
 	return _species_order.duplicate()
+
+
+## Ordered gene symbols (declared order, inv #3) — for the browsable CODEX list.
+func gene_symbols() -> Array:
+	return _gene_order.duplicate()
+
+
+## Ordered role ids (declared order, inv #3) — for the browsable CODEX list.
+func role_ids() -> Array:
+	return _role_order.duplicate()
+
+
+## Ordered flow keys ("from_role|to_role", declared order, inv #3) — split + pass to flow_for() to read the entry.
+func flow_keys() -> Array:
+	return _flow_order.duplicate()

@@ -4,6 +4,15 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Codex browse panel — scrollable in-game species/gene/role/flow browser (renderer) — HASH-NEUTRAL
+A 4th "Codex" VIEW (full-window, modelled on the relations/specimen views) over `res://data/codex/codex.json` via the
+EXISTING `godot/codex.gd` loader (no inline JSON parse) — a left `ItemList` (declared order) + a case-insensitive
+filter + a right scrollable detail pane (taxonomy / ontology / GO-SO ids / trophic role / traits + flow descriptions).
+Reachable via the top-right VIEW switcher, the `V` cycle, and `--view codex`. Renderer-only (inv #2: static
+`codex.gd` lookups, zero biology in GDScript); zero Rust → pinned literal `0x47a0_3c8f_6701_f240` unmoved. Degrade
+guarded ("Codex unavailable" / "No matches"). Gate GREEN (`CODEX MIRROR OK` / `CODEX INSPECT OK`); 3-skeptic verify
+CONFIRMED (4/4 claims at 3/3). QUEUE item #4 (gameplay/sandbox lead).
+
 ### OVERSIGHT in-game UI — earn → preview → commit E. coli edits (godot-sim + renderer) — HASH-NEUTRAL
 The player-agency payoff (ADR-017 S4/S5/S6 surface, ADR-028): surfaces the earned-credit OVERSIGHT loop in `--live`.
 - `godot-sim` thin marshalling `#[func]`s — `oversight_state` / `preview_ecoli_edit` (read-only) / `commit_ecoli_edit`;
