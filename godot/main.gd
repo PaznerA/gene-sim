@@ -38,6 +38,7 @@ extends Node2D
 ## import pass, so a bare identifier is unresolved under a fresh `--headless` run. `preload` needs no cache.
 const SnapshotReader := preload("res://snapshot.gd")
 const Organisms := preload("res://organisms.gd")
+const Colonies := preload("res://colonies.gd")  # ADR-029 S2: Field-scope district-polygon de-spam layer
 const Lsystem := preload("res://lsystem.gd")
 const Microbe := preload("res://microbe.gd")
 const Mold := preload("res://mold.gd")
@@ -143,6 +144,7 @@ var _controls_panel: Control  # the wrapped control deck (Phase U)
 var _terrain: TileMapLayer
 var _overlay: Sprite2D
 var _organisms: Node2D
+var _colonies: Node2D  # ADR-029 S2: colony polygon layer (shown at Field scope; organisms at closer scopes)
 var _cam: Camera2D
 var _hud: Label
 var _legend_label: Label
@@ -2544,6 +2546,13 @@ func _build_scene() -> void:
 	_organisms = Organisms.new()
 	_organisms.set_iso(_iso)
 	_world.add_child(_organisms)
+
+	# ADR-029 S2: colony polygon layer, a sibling drawn just above organisms in _world. At Field scope it
+	# replaces the per-cell dot spam with O(#colonies) district polygons (the de-spam); _update_scope_layers
+	# swaps which of the two layers is visible by zoom. Pure presentation geometry (inv #2).
+	_colonies = Colonies.new()
+	_colonies.set_iso(_iso)
+	_world.add_child(_colonies)
 
 	# Selective-edit brush overlay (drawn above organisms, in world space). Only used in --live mode.
 	_brush = Brush.new()
@@ -5399,10 +5408,17 @@ func _show(i: int) -> void:
 	# (plant LARGE … symbiont tiny) instead of one shared density radius. Pure presentation (inv #2): the core
 	# decided which species dominates each cell; this only maps id → pixels. Empty table (file-replay / older
 	# cdylib) → the default plant visual (graceful).
+	var vis_table := SpeciesVisualMap.build_table(_species_id_meta())
 	if _organisms.has_method("set_dominant_species_ids"):
 		var dom: PackedFloat32Array = snap.dominant_species_id if "dominant_species_id" in snap else PackedFloat32Array()
-		_organisms.set_dominant_species_ids(dom, SpeciesVisualMap.build_table(_species_id_meta()))
+		_organisms.set_dominant_species_ids(dom, vis_table)
 	_organisms.set_snapshot(snap, _cell)
+	# ADR-029 S2: feed the colony layer the two off-hash identity planes (dominant_species_id +
+	# dominant_variant_id) + the same species visual table; it derives the district polygons. Guarded so an
+	# older (pre-GSS6) snapshot lacking dominant_variant_id never crashes (colonies.gd treats it as all-0).
+	if _colonies != null and _colonies.has_method("set_snapshot"):
+		_colonies.set_snapshot(snap, _cell, vis_table)
+	_update_scope_layers()
 	if _iso_ground != null:
 		_iso_ground.set_snapshot(snap, _overlay_mode)  # iso draws ground + data overlay as diamonds
 	_update_overlay(snap)
@@ -5475,6 +5491,19 @@ func _set_zoom(z: float) -> void:
 	_cam.zoom = Vector2(zc, zc)
 	_refresh_hud()
 	_sync_scope_buttons()
+	_update_scope_layers()
+
+
+## ADR-029 S2: pick which population layer is visible by zoom scope. At the Field scope (zoomed out) the colony
+## DISTRICT polygons replace the per-cell dot spam (the de-spam); at the closer Patch/Cells scopes the existing
+## organisms.gd morph sprites show individuals. (S3 will replace this hard swap with a footprint crossfade.)
+## Pure presentation visibility (inv #2): no biology, no determinism exposure.
+func _update_scope_layers() -> void:
+	if _organisms == null or _colonies == null or _cam == null:
+		return
+	var field_scope := _cam.zoom.x < 1.8  # matches _scope_label's field/patch boundary
+	_colonies.visible = field_scope
+	_organisms.visible = not field_scope
 
 
 ## Jump to a named zoom scope preset (keys 1/2/3).
