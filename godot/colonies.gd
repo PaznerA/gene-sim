@@ -39,6 +39,18 @@ const POP_HI_PX := 8.0             # crossfade band end: district fully POPPED �
 const GHOST_FILL_FACTOR := 0.15    # fully-popped fill-alpha factor (the district frame survives as a faint ghost)
 const STIPPLE_MAX_ALPHA := 0.5     # peak per-cell density-stipple alpha across the mid band
 
+# ADR-029 S5 — PLANT REALISM (renderer-only, inv #2 presentation). A PLANT colony (is_plant from the core species
+# table) is the always-visible, most-realistic aggregate: it never decays into background haze and reads as a soft
+# vegetation CANOPY mass rather than an abstract hard-edged zone. These knobs branch the plant path from the microbe
+# path; microbe behaviour is byte-for-byte unchanged. All are presentation constants — no biology (the canopy SHAPE
+# driver, branchiness/reflectance, already came from the core species traits via organisms.gd's template).
+const PLANT_GHOST_FILL_FACTOR := 0.40  # plant popped-fill floor — ABOVE the microbe GHOST_FILL_FACTOR (0.15) so the canopy frame stays visible at EVERY zoom
+const PLANT_CHAIKIN_PASSES := 2        # the plant contour gets EXTRA corner-cutting → a rounder, organic canopy hull (microbe = 1 hard pass)
+const PLANT_MIN_OUTLINE_WIDTH := 2.0   # plant outline width FLOOR — the always-visible SIZE floor (the canopy frame never thins to nothing)
+const PLANT_CANOPY_CORE_LIGHTEN := 0.18  # canopy gradient: lighten toward the dense centroid core
+const PLANT_CANOPY_RIM_DARKEN := 0.22    # canopy gradient: darken toward the soft rim
+const PLANT_CANOPY_RIM_ALPHA := 0.72     # canopy gradient: the rim fades a touch → a soft mass, not a flat zone
+
 # Per-cell identity ordinals the core exported (row-major, w*h), the two INERT integers the polygons group by.
 var _w: int = 0
 var _h: int = 0
@@ -247,12 +259,19 @@ func _rebuild_colonies() -> void:
 		var meta: Dictionary = _species_table.get(sid, {})
 		var base_col: Color = meta.get("color", SpeciesVisualMap.COLOR_DEFAULT)
 		var morph := str(meta.get("morph", "plant"))
+		# ADR-029 S5: is this colony a PLANT (the core species table's is_plant flag)? Plants get the always-visible
+		# district floor (no haze speck) + the soft canopy hull + the higher ghost-fill floor; microbes keep the
+		# hard district. Branch on this one read — the biology decision (autotroph vs microbe) was made in the core.
+		var is_plant := bool(meta.get("is_plant", false))
 		# S3: the district's species SIZE multiplier (plant 2.2 … symbiont 0.34) — the §4.1 footprint term carried
 		# into the draw entry so plant districts cross the pop threshold FIRST (do NOT clamp it away).
 		var size_scale := float(meta.get("size", SpeciesVisualMap.SIZE_DEFAULT))
 		var key := sid * VARIANT_KEY_BASE + vid
-		if count < MIN_COLONY_CELLS:
-			# Tiny speck → a soft haze blob, not a full district (anti-flicker; the brief's risk #2).
+		# ADR-029 S5 always-visible FLOOR: a PLANT colony is NEVER a haze speck — it always renders as a full
+		# district (fill + outline) even at 1-2 cells, so it can never decay into background haze (the brief's
+		# "plants always visible"). MICROBES keep the sub-MIN_COLONY_CELLS haze speck (anti-flicker; risk #2) —
+		# microbe behaviour is unchanged.
+		if count < MIN_COLONY_CELLS and not is_plant:
 			_colony_draw.append({"haze": true, "centroid": centroid, "color": base_col, "count": count})
 			continue
 		# ADR-029 S4 — trace ALL boundary loops: loops[0] = the outer hull, loops[1..] = interior HOLES. A brushed
@@ -266,7 +285,16 @@ func _rebuild_colonies() -> void:
 		var loops: Array = []
 		for rl in raw_loops:
 			var s := _simplify_closed(rl, SIMPLIFY_EPS)
-			s = _chaikin_once(s)
+			if is_plant:
+				# ADR-029 S5 soft CANOPY HULL: never let over-simplification collapse a tiny plant loop below a
+				# triangle (it must stay a DISTRICT, not haze — the always-visible floor), THEN give it EXTRA
+				# Chaikin passes so the boundary reads as a rounder, organic canopy mass rather than a hard edge.
+				if s.size() < 3:
+					s = rl
+				for _pass in PLANT_CHAIKIN_PASSES:
+					s = _chaikin_once(s)
+			else:
+				s = _chaikin_once(s)  # microbe: ONE pass → the clean hard-edged Cities-Skylines district (unchanged)
 			if s.size() >= 3:
 				loops.append(s)
 		if loops.is_empty():
@@ -291,7 +319,7 @@ func _rebuild_colonies() -> void:
 			"label": label, "centroid": centroid, "depth": centroid.x + centroid.y, "seq": cid,
 			# S3 LOD ladder + S4 selection: the species size term, the colony id/bbox (for the bounded row-major
 			# stipple + hole-cut cell-quad fill), and the packed (species,variant) key the selected-pop matches on.
-			"cid": cid, "key": key, "size_scale": size_scale,
+			"cid": cid, "key": key, "size_scale": size_scale, "is_plant": is_plant,
 			"minx": agg_minx[cid], "miny": agg_miny[cid], "maxx": agg_maxx[cid], "maxy": agg_maxy[cid],
 		})
 
@@ -543,13 +571,18 @@ func _draw() -> void:
 		# 1.0 → GHOST_FILL_FACTOR across the POP_LO..POP_HI crossfade band while organisms.gd ramps its per-cell
 		# sprites 0 → 1 over the SAME band; the outline + label always draw so the district frame survives the pop.
 		var size_scale: float = float(c.get("size_scale", 1.0))
+		var is_plant: bool = bool(c.get("is_plant", false))
 		var foot := _cell * _zoom * size_scale
 		var pop_t := clampf((foot - POP_LO_PX) / (POP_HI_PX - POP_LO_PX), 0.0, 1.0)
 		# S4 selected-pop: a clicked district forces FULL pop (fill → ghost) regardless of zoom, so organisms.gd
 		# explodes it to members while neighbours keep their footprint-driven rung. Pure key match (inv #2/#3).
 		if _selected_key >= 0 and int(c.get("key", -1)) == _selected_key:
 			pop_t = 1.0
-		var fill_factor := lerpf(1.0, GHOST_FILL_FACTOR, pop_t)  # 1.0 full district → 0.15 popped (thin ghost + outline)
+		# ADR-029 S5 always-visible FLOOR: a PLANT district's popped ghost fill floors at PLANT_GHOST_FILL_FACTOR
+		# (> the microbe GHOST_FILL_FACTOR) so the canopy frame stays visible at EVERY zoom — it never fades into
+		# background haze the way a fully-popped microbe district does. The microbe ghost factor is unchanged.
+		var ghost: float = PLANT_GHOST_FILL_FACTOR if is_plant else GHOST_FILL_FACTOR
+		var fill_factor := lerpf(1.0, ghost, pop_t)  # 1.0 full district → ghost floor when popped (thin ghost + outline)
 		# Project the OUTER grid-corner contour into world space (ortho or iso).
 		var pts := PackedVector2Array()
 		var grid: PackedVector2Array = c["points"]
@@ -564,25 +597,31 @@ func _draw() -> void:
 				# of the parent fill so the parent reads as a FRAME around the child (the child draws its own
 				# family-tinted fill in the hole). Bridge+triangulate for one hole; cell-quad masked fill for many.
 				_draw_holed_fill(c, fill)
+			elif is_plant:
+				# ADR-029 S5: a plant aggregate is a SOFT CANOPY MASS, not a flat zone — fill with a green radial
+				# gradient (brighter/denser at the centroid core, softening to the rim) so it reads as vegetation.
+				_draw_canopy_fill(pts, _grid_to_world(c["centroid"].x, c["centroid"].y), fill)
 			else:
-				draw_colored_polygon(pts, fill)
+				draw_colored_polygon(pts, fill)  # microbe: a flat hard-edged district (unchanged)
 			# Mid-band internal heat: a per-cell density stipple that grows across [STIPPLE_MIN..POP_LO] and fades as
 			# the colony pops [POP_LO..POP_HI] (organisms.gd's sprites take over). Pure function of footprint.
 			var stipple_a := clampf((foot - STIPPLE_MIN_PX) / (POP_LO_PX - STIPPLE_MIN_PX), 0.0, 1.0) * (1.0 - pop_t)
 			if stipple_a > 0.01:
 				_draw_density_stipple(c, stipple_a)
 			# Outline: the outer hull always; for a holed parent, ALSO each hole loop so the inner frame edge
-			# around the child reads as a clean district boundary.
+			# around the child reads as a clean district boundary. ADR-029 S5: a PLANT outline width floors at
+			# PLANT_MIN_OUTLINE_WIDTH (the always-visible SIZE floor) so the canopy frame never thins to nothing.
+			var ow: float = maxf(float(c["width"]), PLANT_MIN_OUTLINE_WIDTH) if is_plant else float(c["width"])
 			if has_holes:
 				for lp in c.get("loops", []):
 					var wl := _project_loop(lp)
 					if wl.size() >= 2:
 						wl.append(wl[0])
-						draw_polyline(wl, c["outline"], float(c["width"]), true)
+						draw_polyline(wl, c["outline"], ow, true)
 			else:
 				var outline := pts
 				outline.append(pts[0])
-				draw_polyline(outline, c["outline"], float(c["width"]), true)
+				draw_polyline(outline, c["outline"], ow, true)
 		# Centred district label: registry family name (or species glyph) + variant tag + cell-footprint count.
 		if font != null:
 			var lp := _grid_to_world(c["centroid"].x, c["centroid"].y)
@@ -668,6 +707,32 @@ func _draw_cell_quads(c: Dictionary, fill: Color) -> void:
 			draw_colored_polygon(PackedVector2Array([
 				_grid_to_world(float(x), float(y)), _grid_to_world(float(x + 1), float(y)),
 				_grid_to_world(float(x + 1), float(y + 1)), _grid_to_world(float(x), float(y + 1))]), fill)
+
+
+## ADR-029 S5 plant CANOPY fill — a SOFT canopy mass (vs the microbe district's flat zone). Fills the hull with a
+## green radial gradient: brighter/denser at the colony centroid core, softening (darker + a touch more translucent)
+## toward the rim, so a plant aggregate reads as vegetation rather than an abstract zone. The mean-fitness/density
+## value is already baked into `fill` (the species canopy palette via _fill_color); this adds the centroid→rim
+## falloff. PURE PRESENTATION (inv #2 — a per-vertex Color lerp, no biology). DETERMINISTIC (inv #3): a closed-form
+## distance lerp in row order, no randf()/time. draw_polygon takes per-vertex colours (same triangulation path as
+## the flat draw_colored_polygon the microbe districts use, so concave hulls render identically).
+func _draw_canopy_fill(pts: PackedVector2Array, center: Vector2, fill: Color) -> void:
+	var n := pts.size()
+	if n < 3:
+		return
+	var core := fill.lightened(PLANT_CANOPY_CORE_LIGHTEN)
+	core.a = fill.a
+	var rim := fill.darkened(PLANT_CANOPY_RIM_DARKEN)
+	rim.a = fill.a * PLANT_CANOPY_RIM_ALPHA
+	var maxd := 0.0001
+	for p in pts:
+		maxd = maxf(maxd, p.distance_to(center))
+	var colors := PackedColorArray()
+	colors.resize(n)
+	for i in n:
+		var t := clampf(pts[i].distance_to(center) / maxd, 0.0, 1.0)
+		colors[i] = core.lerp(rim, t)
+	draw_polygon(pts, colors)
 
 
 ## Signed area of a closed polygon (shoelace; this y-down convention: >0 = clockwise on screen). Pure geometry.

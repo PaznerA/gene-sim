@@ -4,6 +4,30 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Colonies S5 — plant realism (always-visible canopy hulls + ≥1-colony guarantee) — RENDERER-ONLY, zero Rust (ADR-029)
+Completes the visual-declutter epic. Plant colonies are now **always-visible** and **most-realistic**.
+(1) **Always-visible floor** — a plant colony skips the sub-`MIN_COLONY_CELLS` haze-speck path
+(`if count < MIN_COLONY_CELLS and not is_plant`), so it renders as a full district even at 1–2 cells, and never
+collapses below fill+outline at any zoom: the plant full-pop ghost fill floors at `PLANT_GHOST_FILL_FACTOR=0.40`
+(vs the microbe `GHOST_FILL_FACTOR=0.15`) with a `PLANT_MIN_OUTLINE_WIDTH=2.0` floor — the plant district frame
+always reads. (2) **Canopy hull vs hard district** — plant colonies draw as a soft canopy hull: extra Chaikin
+smoothing (`PLANT_CHAIKIN_PASSES=2`, with a triangle-collapse guard) + a radial green gradient fill
+(`_draw_canopy_fill`, a pure per-vertex `Color.lerp`); microbe colonies keep the hard-edged single-Chaikin
+Cities-Skylines district (`draw_colored_polygon`). No plant morphology is duplicated — `organisms.gd._draw_plant`
+(the L-system canopy) is reused untouched for the popped trees; `colonies.gd` owns only the aggregate hull.
+(3) **≥1-colony guarantee** — every non-empty plant cell lands in exactly one connected-component colony
+(structural: the row-major union-find labels every non-empty cell). A new headless proof `godot/colony_s5_test.gd`
+(wired into the snapshot gate) asserts FLOOR / CANOPY / COLONY_GUARANTEE / GHOST_FLOOR (verified locally:
+`COLONY S5 OK`, plant_cells=37/0 unlabeled, plant 20 pts > microbe 10 pts, ghost 0.40>0.15). (4) Plants pop first to
+L-system trees (already true via `SIZE_PLANT 2.2` in the S3 footprint). inv #2: `is_plant` is a keyed read of the
+core species table — no genotype→phenotype in GDScript. inv #3: ordered passes only (no hash-order iteration), no
+`randf`/`randi`/`Time`/`OS`, no `_process`/Timer. **Zero Rust diff** → pinned literal `0x47a0_3c8f_6701_f240`
+byte-identical by construction; snapshot stays GSS6/channels=14. Gate GREEN (sim-core 187/187, determinism OK, the
+full godot snapshot gate green incl. COLONY S4/S5). Verify 3/3 on the three feature booleans; the renderer-only
+boolean's only open conjunct was "test committed" (resolved by staging `colony_s5_test.gd` — re-verified green on the
+committed tree). (Deferred cosmetic: a brushed plant *parent* with holes takes the S4 frame path, skipping the canopy
+gradient for that case — floor still holds.)
+
 ### Colonies S4 — brush→district render surface (nested family district + select-pop) — RENDERER-ONLY, zero Rust (ADR-029)
 The CRISPR brush now reads as the Cities-Skylines "create district" verb (the core brush→`Variant` bind shipped in
 S1; this is its render surface). (1) **Nested district** — closes the S2 hole-cut deferral: `_trace_boundaries`
