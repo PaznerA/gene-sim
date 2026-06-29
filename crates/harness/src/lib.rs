@@ -38,6 +38,8 @@ pub mod campaign;
 pub mod capture;
 pub mod discover;
 pub mod firewall;
+pub mod gifenc;
+pub mod keyframe;
 pub mod oversight;
 pub mod promote;
 pub mod replay;

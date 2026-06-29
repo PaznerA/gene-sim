@@ -4,6 +4,23 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Scenario GIF preview — CAPTURE + ASSEMBLE on the off-hash key-event schedule — HASH-NEUTRAL
+The renderer-side half of the scenario preview (the schedule itself is `harness::keyframe`, ADR-032). `--keyframes
+<gem>` prints the off-hash KEY generations to snapshot (boom/crash/takeover/edit/immigrate + start/context/final
+anchors). `tools/make_starter_gif.sh` REPLAYS the gem (the discovery-load-gem-replay loader, incl. its mid-run
+edits) and shoots ONE renderer `--shot` PNG per key gen — **macOS-safe** (timeout + FILE capture, never a `$(godot…)`
+pipe that hangs; WINDOWED since `--shot` needs a GPU; SKIPs cleanly on a no-display box). A minimal renderer hook
+(`--gem --shot --steps N` advances the loaded gem N gens firing due edits before the shot — renderer-only, no biology
+in GDScript). `--assemble-gif` then encodes the frames into a looping animated GIF with the **in-process MIT `gif`
+encoder** (`crates/harness/src/gifenc.rs`; `png` decode + `color_quant` quantize; pinned `gif = 0.13`, `png = 0.17`
+— GPL stays at the process boundary, inv #1) at `data/presets/starters/<slug>.gif`, next to the starter so
+`gallery.gd` shows it (it already reads `res://data/presets/starters/<slug>.gif`); staged by the existing recursive
+`cp -R data/presets/.` + byte-gate. The `.gif` is a generated artifact (gitignored, never committed). Off-hash
+(`--keyframes` runs only the hash-neutral trace capture; the encoder is inert PNG post-processing) → pinned literal
+`0x47a0_3c8f_6701_f240` unmoved (sim-core 184/184, harness 101/101 + 5 new `gifenc` tests). Headless smoke asserts a
+valid >1-frame GIF without a GPU; the full pipeline was run end-to-end (6 real `--shot` frames → a 480×404 looping
+GIF). Gate GREEN.
+
 ### Starter-map library — committed gen-1 + gen-N starters from the auto-research + an RCT selector — HASH-NEUTRAL
 The capstone of the discovery → playable-content loop (ADR-031). A `promote` tool (`crates/harness/src/promote.rs` +
 `--promote-gem`/`--promote-default-set` CLI) turns a curated gem into a **committed** starter under

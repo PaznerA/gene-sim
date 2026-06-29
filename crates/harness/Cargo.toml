@@ -16,6 +16,8 @@ crispr = { workspace = true }   # Cas-variant table + apply_edit — the species
 discovery = { path = "../discovery" }  # D1 PerGenTrace schema + D0 scorer — the off-hash capture seam (D1, inv #1/#5)
 serde = { workspace = true }       # derive(Serialize/Deserialize) for Action/EditAction + replay schemas (S3.2)
 serde_json = { workspace = true }  # seed.json + actions.ndjson replay logs (SPEC §5)
+gif = { workspace = true }         # MIT/Apache — in-process animated-GIF encoder for the scenario preview (ADR-032, inv #1)
+png = { workspace = true }         # MIT/Apache — PNG decoder for the captured --shot keyframes (ADR-032, inv #1)
 
 [lib]
 name = "harness"

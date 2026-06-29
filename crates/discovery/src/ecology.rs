@@ -273,14 +273,46 @@ struct Events {
     raw: u64,
 }
 
-/// M5 — Emergent events over the FULL captured run (booms/crashes/takeovers from `pop`, immigrations from the
-/// journal). `event_raw = Σ mags`; `m5 = min(SCALE, event_raw*SCALE/event_sat)`.
-fn metric_m5(p: &ScoreParams, t: &PerGenTrace, s: usize) -> (u64, Events) {
-    let mut ev = Events::default();
+/// The KIND of an emergent population event detected by [`detect_events`] — the boom/crash/takeover families M5
+/// rewards (immigration is journal-derived, not a `pop`-series event, so it is NOT a [`DetectedEvent`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    /// A species' population jumped `≥ boom_k×` over the previous gen (from a base `≥ pop_floor`).
+    Boom,
+    /// A species' population fell `≤ 1/crash_k×` of the previous gen (from a base `≥ crash_from`).
+    Crash,
+    /// The rank-1 (most-populous) species changed between two consecutive gens (a dominance flip).
+    Takeover,
+}
+
+/// One detected emergent event on the per-gen population series — the unit BOTH the M5 metric and the GIF-preview
+/// key-frame detector consume (the SINGLE source of "what happened" in a run, so the score and the preview can
+/// never disagree). `gen` is the generation the event was detected AT (the later of the two consecutive gens);
+/// `species` is the affected species index (the NEW dominant for a [`EventKind::Takeover`]); `mag` is the event's
+/// magnitude in bp (the M5 saturating-numerator term: an octave-log ratio for boom/crash, `SCALE` for a takeover).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DetectedEvent {
+    /// The generation the event was detected at (`GenRow::gen` of the later consecutive row).
+    pub gen: u32,
+    /// What kind of event.
+    pub kind: EventKind,
+    /// The affected species index (the new dominant for a takeover).
+    pub species: u16,
+    /// Magnitude in bp (octave-log ratio for boom/crash; `SCALE` for a takeover).
+    pub mag: u64,
+}
+
+/// Detect every BOOM / CRASH / TAKEOVER on a trace's per-gen population series, using the SAME pinned
+/// [`ScoreParams`] thresholds M5 rewards — so a consumer keys off exactly the events that make a run score. Pure,
+/// integer, RNG-free; events are emitted in `(gen, species)` order (per gen: each species' boom/crash, then the
+/// gen's takeover), the SAME order M5 historically accumulated them, so [`metric_m5`]'s `ev.raw` is byte-identical.
+/// Immigration is journal-derived (not a `pop`-series event) and is NOT included here.
+#[must_use]
+pub fn detect_events(p: &ScoreParams, t: &PerGenTrace) -> Vec<DetectedEvent> {
+    let s = t.s as usize;
     let rows = &t.rows;
     let g = rows.len();
-
-    // BOOM / CRASH per (g, i) on consecutive captured gens.
+    let mut out: Vec<DetectedEvent> = Vec::new();
     for gi in 1..g {
         let cur = &rows[gi];
         let prev = &rows[gi - 1];
@@ -289,30 +321,58 @@ fn metric_m5(p: &ScoreParams, t: &PerGenTrace, s: usize) -> (u64, Events) {
             let pv = u64::from(prev.pop.get(i).copied().unwrap_or(0));
             // BOOM: c ≥ pv*boom_k ∧ pv ≥ pop_floor.
             if pv >= p.pop_floor && c >= pv.saturating_mul(p.boom_k) {
-                let mag = octave_log_bp(c / pv.max(1));
-                ev.booms += 1;
-                ev.raw = ev.raw.saturating_add(mag);
+                out.push(DetectedEvent {
+                    gen: cur.gen,
+                    kind: EventKind::Boom,
+                    species: i as u16,
+                    mag: octave_log_bp(c / pv.max(1)),
+                });
             }
             // CRASH: pv ≥ crash_from ∧ c ≤ pv/crash_k.
             if pv >= p.crash_from && c <= pv / p.crash_k {
-                let mag = octave_log_bp(pv / c.max(1));
-                ev.crashes += 1;
-                ev.raw = ev.raw.saturating_add(mag);
+                out.push(DetectedEvent {
+                    gen: cur.gen,
+                    kind: EventKind::Crash,
+                    species: i as u16,
+                    mag: octave_log_bp(pv / c.max(1)),
+                });
             }
         }
         // TAKEOVER: rank-1 argmax flips between prev and cur (ties → lower SpeciesId), both N>0.
-        let r_prev = rank1(prev, s);
-        let r_cur = rank1(cur, s);
-        if let (Some(a), Some(b)) = (r_prev, r_cur) {
+        if let (Some(a), Some(b)) = (rank1(prev, s), rank1(cur, s)) {
             if a != b {
-                ev.takeovers += 1;
-                ev.raw = ev.raw.saturating_add(SCALE);
+                out.push(DetectedEvent {
+                    gen: cur.gen,
+                    kind: EventKind::Takeover,
+                    species: b as u16,
+                    mag: SCALE,
+                });
             }
         }
     }
+    out
+}
+
+/// M5 — Emergent events over the FULL captured run (booms/crashes/takeovers from `pop`, immigrations from the
+/// journal). `event_raw = Σ mags`; `m5 = min(SCALE, event_raw*SCALE/event_sat)`. The boom/crash/takeover tallies
+/// come from the SHARED [`detect_events`] pass — the SAME events the GIF-preview key-frame detector keys off — so
+/// the score and the preview can never disagree about what happened in a run.
+fn metric_m5(p: &ScoreParams, t: &PerGenTrace, s: usize) -> (u64, Events) {
+    let mut ev = Events::default();
+
+    // BOOM / CRASH / TAKEOVER from the shared per-gen detector (same `(gen, species)` order M5 used inline, so
+    // `ev.raw`'s saturating accumulation is byte-identical to the pre-extraction code).
+    for e in detect_events(p, t) {
+        match e.kind {
+            EventKind::Boom => ev.booms += 1,
+            EventKind::Crash => ev.crashes += 1,
+            EventKind::Takeover => ev.takeovers += 1,
+        }
+        ev.raw = ev.raw.saturating_add(e.mag);
+    }
 
     // IMMIGRATE_ESTABLISHED: per InocRec, the species is alive at the LAST captured gen (G-1).
-    if let Some(last) = rows.last() {
+    if let Some(last) = t.rows.last() {
         for inoc in &t.inoculations {
             let i = inoc.species_id as usize;
             if i < s && u64::from(last.pop.get(i).copied().unwrap_or(0)) > 0 {

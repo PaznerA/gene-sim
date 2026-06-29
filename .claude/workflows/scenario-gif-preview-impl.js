@@ -46,7 +46,7 @@ const VSCHEMA = {
 }
 const skeptics = (await parallel([0, 1, 2].map((i) => () =>
   agent(
-    `Adversarially verify the scenario-GIF preview slice (gene-sim). Read \`git diff\` + CLAUDE.md inv #1/#2/#3/#7. Skeptic #${i} — default each boolean FALSE unless confirmed. Hunt: a MOVED pinned literal 0x47a0_3c8f_6701_f240 or any sim-path change (must be off-hash render/tooling); a $(godot…) PIPE capture (hangs on macOS — must be timeout+file); a GPL crate linked for GIF encoding (inv #1 — must be MIT/Apache `gif` or an external subprocess) or an unpinned new crate (inv #7); biology computed in the GIF pipeline; key-event gens NOT derived from the off-hash trace. Report the structured verdict with file:line. Do NOT edit.`,
+    `Adversarially verify the scenario-GIF preview slice (gene-sim). Read \`git diff\` + CLAUDE.md inv #1/#2/#3/#7. Skeptic #${i} — default each boolean FALSE unless confirmed. Hunt: a MOVED pinned literal 0x47a0_3c8f_6701_f240 or any sim-path change (must be off-hash render/tooling); a $(godot…) PIPE capture (hangs on macOS — must be timeout+file); a GPL crate linked for GIF encoding (inv #1 — must be the MIT/Apache gif crate or an external subprocess) or an unpinned new crate (inv #7); biology computed in the GIF pipeline; key-event gens NOT derived from the off-hash trace. Report the structured verdict with file:line. Do NOT edit.`,
     { label: `verify:skeptic${i}`, phase: 'Verify', schema: VSCHEMA, agentType: 'reviewer' },
   ),
 ))).filter(Boolean)

@@ -90,6 +90,15 @@ OPTIONS:
     --promote-default-set Promote a default set of GEN-1 starters from data/runs/gems/ — one per distinct
                           dynamics shape (best by score/novelty), capped at --starter-max (default 8).
     --starter-max <N>     Cap for --promote-default-set (default: 8).
+    --keyframes <PATH>    SCENARIO GIF PREVIEW (capture driver): print the off-hash KEY-EVENT schedule for a saved
+                          gem JSON — one `<gen> <why>` per line (boom/crash/takeover/edit/immigrate + start/context/
+                          final anchors), gen-sorted, capped. tools/make_starter_gif.sh reads the gens and shoots
+                          one renderer --shot frame per gen. Off-hash (inv #3): only the hash-neutral trace capture.
+    --assemble-gif <OUT>  SCENARIO GIF PREVIEW (assemble): encode the captured `frame_*.png` in --frames <DIR> into a
+                          looping animated GIF at <OUT> (in-process MIT `gif` encoder — inv #1, no GPL subprocess).
+    --frames <DIR>        Frame dir for --assemble-gif (default: current dir). Reads `frame_*.png` in name order.
+    --gif-delay <CS>      Per-frame delay in centiseconds for --assemble-gif (default: 30 → ~3.6s/12-frame loop).
+    --gif-max-dim <PX>    Cap the longest side of each preview frame for --assemble-gif (default: 480; 0 = no resize).
     --campaign <FILE>     Grade a JSON campaign manifest (scenarios = world + region objective + budget):
                           replay one journal subdir per scenario from --journals <DIR>/<index>/ and print each
                           Won/Lost + score + the total. Win/score rules live in the core (inv #2), not GDScript.
@@ -405,6 +414,29 @@ fn handle_replay_subcommands() -> Option<ExitCode> {
                 ExitCode::from(1)
             }
         });
+    }
+
+    // SCENARIO GIF PREVIEW — the off-hash KEY-EVENT schedule (the CAPTURE driver). `--keyframes <gem.json>` reads a
+    // saved gem and prints the KEY generations to snapshot (one `<gen> <why>` per line), resolved by the SHARED
+    // `harness::keyframe` detector (the SAME ecology event logic the D0 scorer's M5 rewards). The capture script
+    // (tools/make_starter_gif.sh) reads the gens + shoots one --shot frame per gen. Off-hash (inv #3): the only sim
+    // work is the proven hash-neutral trace capture.
+    if let Some(gem_path) = val("--keyframes") {
+        return Some(run_keyframes(&gem_path));
+    }
+
+    // SCENARIO GIF PREVIEW — the ASSEMBLE step. `--assemble-gif <out.gif> --frames <dir>` encodes the captured
+    // `frame_*.png` (one per key gen) into a looping animated GIF via the in-process MIT `gif` encoder (inv #1 — no
+    // GPL subprocess). Optional `--gif-delay <cs>` / `--gif-max-dim <px>` tune the loop speed + thumbnail size.
+    if let Some(out_gif) = val("--assemble-gif") {
+        let frames_dir = val("--frames").unwrap_or_else(|| ".".to_string());
+        let delay_cs: u16 = val("--gif-delay")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(harness::gifenc::DEFAULT_DELAY_CS);
+        let max_dim: u32 = val("--gif-max-dim")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(harness::gifenc::DEFAULT_MAX_DIM);
+        return Some(run_assemble_gif(&out_gif, &frames_dir, delay_cs, max_dim));
     }
 
     if let Some(dir) = val("--replay") {
@@ -855,6 +887,65 @@ fn run_promote_default_set(max: usize) -> ExitCode {
         }
         Err(e) => {
             eprintln!("promote error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// SCENARIO GIF PREVIEW — the CAPTURE driver. Read the gem JSON at `gem_path` and print the off-hash KEY-EVENT
+/// schedule (one `<gen> <why>` line per [`harness::keyframe::FrameKey`], gen-sorted) the capture script shoots a
+/// `--shot` frame for. The roster resolves through the `data/species/<key>.json` boundary (the binary's manifest
+/// dir, like the other subcommands); an unresolvable roster prints an empty schedule (a clean no-op). Off-hash
+/// (inv #3): the only sim work is the proven hash-neutral [`harness::capture`] trace.
+fn run_keyframes(gem_path: &str) -> ExitCode {
+    let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
+    let text = match std::fs::read_to_string(gem_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("keyframes error: read {gem_path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match harness::keyframe::gem_keyframes_from_json(&text, &species_dir) {
+        Ok(frames) => {
+            // One `<gen> <why>` per line — the capture script reads the gen (field 1); the tag is for humans/logs.
+            for f in &frames {
+                println!("{} {}", f.gen, f.label.name());
+            }
+            // A summary on stderr so stdout stays a clean machine-readable gen list.
+            eprintln!("keyframes: {} frame(s) from {gem_path}", frames.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("keyframes error: parse {gem_path}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// SCENARIO GIF PREVIEW — the ASSEMBLE step. Collect the captured `frame_*.png` from `frames_dir` (name order ==
+/// gen order) and encode them into a looping animated GIF at `out_gif` (in-process MIT `gif` encoder — inv #1).
+/// Prints the assembled frame count + final screen size. An empty/garbled frame dir is a clear error (never a
+/// silently-broken preview).
+fn run_assemble_gif(out_gif: &str, frames_dir: &str, delay_cs: u16, max_dim: u32) -> ExitCode {
+    let dir = std::path::Path::new(frames_dir);
+    let frames = match harness::gifenc::collect_frames(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("assemble-gif error: read frames {frames_dir}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match harness::gifenc::encode_gif(&frames, std::path::Path::new(out_gif), delay_cs, max_dim) {
+        Ok(report) => {
+            println!(
+                "assembled {} ({} frames, {}x{}, {}cs/frame)",
+                out_gif, report.frames, report.width, report.height, delay_cs
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("assemble-gif error: {e}");
             ExitCode::from(1)
         }
     }

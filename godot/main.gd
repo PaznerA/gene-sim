@@ -450,7 +450,9 @@ func _ready() -> void:
 	# populations establish (varied node sizes on the map + relations graph) and the FlowMatrix accumulates the
 	# measured trophic flows the relations graph draws as edges. Pure stepping of the deterministic core (inv #3).
 	var steps_arg := _arg_value("--steps")
-	if _live != null and steps_arg != "" and steps_arg.is_valid_int():
+	# Skip the generic pre-gem advance when a gem is being loaded: the gem reconfigure (below) RESETS the sim, so
+	# stepping here would advance a soon-discarded default sim. The --gem capture path re-advances WITH edit firing.
+	if _live != null and steps_arg != "" and steps_arg.is_valid_int() and _arg_value("--gem") == "":
 		_live.step(maxi(0, int(steps_arg)))
 		_publish_frame()
 	if _live != null and _has_flag("--inject"):  # optional: fire one demo injection for --shot verification
@@ -531,6 +533,12 @@ func _ready() -> void:
 			_run_gem_smoke(gem_arg)
 			return
 		_configure_run_from_gem(gem_arg)  # windowed: compose + arm; the _process live loop replays it
+		# SCENARIO GIF PREVIEW capture (tools/make_starter_gif.sh): with --shot --steps N, advance the freshly-loaded
+		# gem N generations HERE — firing each due CORE-resolved edit + scheduled immigration at the top of every
+		# gen's step (the SAME interleave the live _process loop uses) — so a per-keyframe --shot lands on a DEVELOPED
+		# frame incl. the gem's edits. Renderer-only (inv #2): it only drives existing core surfaces; no biology here.
+		if shot_path != "" and steps_arg != "" and steps_arg.is_valid_int():
+			_advance_gem_for_shot(maxi(0, int(steps_arg)))
 
 	# STARTERS GALLERY: --gallery-check drives the scenario picker headlessly (the gate — list every starter, load
 	# each kind through the proven path, assert a gen-N load carries its recorded markers) + quits; --gallery opens
@@ -1199,6 +1207,22 @@ func _fire_one_gem_edit(e: Dictionary) -> Dictionary:
 		int(e.get("cas", 0)), int(e.get("target", 0)), str(e.get("guide", "")), int(e.get("species", 0)))
 	_record_edit_outcome(outcome)
 	return outcome
+
+
+## SCENARIO GIF PREVIEW capture helper (tools/make_starter_gif.sh): advance a freshly-loaded gem `n` generations,
+## firing each due CORE-resolved edit + scheduled immigration at the top of every gen's step — the SAME interleave
+## the live _process loop runs (see _process) — then publish one frame so the following --shot captures a DEVELOPED
+## state incl. the gem's edits. Renderer-only (inv #2): it only drives existing core surfaces (_live.step +
+## _fire_due_gem_edits + _fire_due_immigration); no genotype→phenotype/biology is computed in GDScript. Each capture
+## is a separate godot process replaying the gem to gen N, so the frame is a deterministic pure function of (gem, N).
+func _advance_gem_for_shot(n: int) -> void:
+	if _live == null:
+		return
+	for _i in n:
+		_fire_due_gem_edits()      # fire a loaded gem's edits BEFORE this gen's advance (the harness interleave)
+		_live.step(LIVE_STEP)
+		_fire_due_immigration()    # drain the deterministic immigration schedule's events due at this gen
+	_publish_frame()
 
 
 ## The menu's "Load Gem" → compose + replay the chosen gem (the windowed entry; _configure_run_from_gem resumes the

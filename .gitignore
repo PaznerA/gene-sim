@@ -14,6 +14,12 @@
 /data/runs/*
 !/data/runs/.gitkeep
 
+# Generated scenario GIF previews (tools/make_starter_gif.sh) — animated previews assembled from renderer --shot
+# captures of a discovered gem (ADR-032). They sit next to the committed starter docs so the RCT selector can show
+# them + are staged into res:// by the recursive cp in run.sh / the byte-gate, but are GENERATED artifacts, never
+# committed (re-buildable from the gem; binary churn). The starter *.json docs ARE committed (above this rule).
+/data/presets/starters/*.gif
+
 # Criterion bench raw output (baselines are recorded in docs, not committed)
 /target/criterion
 
