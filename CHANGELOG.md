@@ -4,6 +4,25 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Colonies S2 — `colonies.gd` district polygons (the visible de-spam) — RENDERER-ONLY, zero Rust (ADR-029)
+The first VISIBLE colony slice: a new `godot/colonies.gd` (a `Node2D` colony layer) turns the spammed dot map into
+readable district polygons at Field scope. Deterministic connected-components (4-connectivity, two-pass union-find
+over a single row-major `width*height` `PackedInt32Array` — **no Dictionary/hash-order iteration**, inv #3 in the
+renderer; union-by-smaller-root so labelling is order-independent) over the per-cell key
+`species_id*65536 + variant_id` from the GSS6 snapshot (`dominant_species_id` + `dominant_variant_id`). Per colony:
+marching-squares boundary trace → Douglas-Peucker simplify → one Chaikin smoothing → `draw_colored_polygon` fill
+(species color via `SpeciesVisualMap.color_for`, brightness by mean fitness, bounded intra-species hue shift per
+variant) + `draw_polyline` outline (width by cell_count) + a centered glyph+population label; a `MIN_COLONY_CELLS`
+haze floor for specks (anti-flicker). `main.gd._update_scope_layers` swaps layers by zoom: at Field scope
+(`zoom.x < 1.8`) it shows the colony layer and HIDES the per-organism dot layer (the `MAX_DOTS_PER_CELL` spam); the
+closer scopes keep `organisms.gd` (S3 adds the LOD pop crossfade). Guards a pre-GSS6 snapshot (treats variant as
+all-0) so nothing crashes. **Zero Rust diff** → pinned literal `0x47a0_3c8f_6701_f240` byte-identical by
+construction; snapshot format stays GSS6/channels=14 (S1, unchanged). inv #2: geometry only — reads the two off-hash
+identity channels + the visual table, computes no genotype→phenotype. Gate GREEN (sim-core 187/187, determinism OK);
+de-spam proven both ways (a Field-scope `--shot` renders one district polygon, Patch-scope shows individual sprites =
+layer swap works; + a green headless render-scene smoke over a real 14-channel snapshot). 3-skeptic verify 3/3 on all
+four invariant booleans. (Deferred to S4: hole-cutting for nested districts; a brushed-disc `--shot`.)
+
 ### Colonies S1 — off-hash `Variant` tag + `dominant_variant_id` GSS6 channel + the brush→district bind — HASH-NEUTRAL (ADR-029)
 The single core/snapshot slice of the colony epic (the 🛑 STOP-THE-LINE slice, human-signed-off; S2–S6 are
 renderer-only and build on it). `crates/sim-core`: a heritable, spawn-assigned `Variant(u16)` component (default 0 =

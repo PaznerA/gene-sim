@@ -50,8 +50,8 @@ arc → the VISUAL-POLISH epic below** (the user: the screen is "spammed"/clutte
   `NextVariantId` + `dominant_variant_id` GSS6 channel + brush mint/stamp in `apply_edit_region` + the `snapshot.gd`/byte-gate
   bump (channels 13→14). **Gate GREEN; `0x47a0_3c8f_6701_f240` BYTE-IDENTICAL (NOT a re-pin); 3-skeptic verify 3/3 on all
   five invariant booleans; 187/187 sim-core tests.** Merged `--no-ff`. ADR-029 + CHANGELOG written.
-- `[ ]` **S2 `colony-polygon-render-impl`** ✅ — `colonies.gd`: deterministic connected-components → contour → fill/outline/label (renderer-only). *dep: S1 ✓ — READY NEXT.*
-- `[def]` **S3 `lod-pop-impl`** ✅ — the footprint (`cell×zoom×size_scale`) pop ladder; plants pop first; no per-frame redraw. *dep: S2.*
+- `[x]` **S2 `colony-polygon-render-impl`** ✅ — **DONE (2026-06-29)** — `godot/colonies.gd`: deterministic row-major union-find CC → marching-squares contour → DP+Chaikin → fill/outline/label; `main.gd` scope-layer swap (Field=polygons, hides dot-spam). **Gate GREEN; zero Rust (literal byte-identical); verify 3/3.** Merged `--no-ff`. *(deferred to S4: hole-cut nested districts; brushed `--shot`.)*
+- `[ ]` **S3 `lod-pop-impl`** ✅ — the footprint (`cell×zoom×size_scale`) pop ladder; plants pop first; no per-frame redraw. *dep: S2 ✓ — READY NEXT.*
 - `[def]` **S4 `brush-colony-binding-impl`** ✅ — render the brushed disc as a nested district (intra-species hue shift) + selected-pop. *dep: S2 (+ S1 core bind).*
 - `[def]` **S5 `plant-realism-impl`** ✅ — plant canopy hulls, always-visible floor, ≥1-colony guarantee. *dep: S2.*
 - `[def]` **S6 `colony-polish-impl`** ✅ *(optional)* — viewport-cull/sprite-budget, district inspect panel, big-map draw-count check. *dep: S3.*
