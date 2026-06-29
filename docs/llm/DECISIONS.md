@@ -1476,3 +1476,59 @@ surfaced to the human before D4 generates the committed showcase. Pinning the co
 (the empirical motivation). Replacing `Q` with `D` for curation too: REJECTED — curation wants the
 coexistence/quality criterion; conflating steer + curate loses the "hunt drama, keep a quality library" property.
 A float target / matrix-inversion fit: REJECTED — cross-platform non-determinism (inv #3); integer GD lands in D3-B.3.
+
+---
+
+## ADR-034 — Discovery surrogate model: `RidgeInt` (integer ridge regression, fixed-point GD) + the pluggable `Surrogate` trait (D3-B.3)
+
+**Status:** Accepted (2026-06-30). The model the steered loop (D3-B.4) fits on the eval log to predict the
+drama target `D` (ADR-033). Off-hash, pure-integer (`crates/discovery/src/surrogate.rs`); the pinned literal
+`0x47a0_3c8f_6701_f240` is byte-identical and `cargo tree -p discovery` stays `std`+`serde` only (inv #5).
+
+**Context.** The discovery regime is **tens-to-hundreds of evals over 28 features** → variance-bound, so the
+lowest-variance model (a linear regressor) wins; the hand-crafted interaction features (predator×prey,
+temp-extremity) supply the only nonlinearity drama needs. A float fit (matrix inversion / float GD) is
+cross-platform non-deterministic (inv #3), so the model + its training must be **pure integer**.
+
+**Decision.**
+1. **`Surrogate` trait (inv #5 seam)** — `fn fit(&mut self, x:&[FeatureVec], y:&[u64], seed:u64)` ·
+   `fn predict(&self, &FeatureVec)->u64` · `fn id(&self)->&'static str` · `fn min_samples(&self)->usize`.
+   Object-safe; impls are swappable without touching the search. **`NullSurrogate`** = the base case (`fit` no-op,
+   `predict` constant 0, `min_samples()==usize::MAX` so a steered run COLD-STARTS to passthrough = byte-identical
+   to `discover_evolved`). **`RidgeInt`** = the default. The **`BoostStumpInt`** upgrade (when the log exceeds
+   ~300 rows) and any heavy ML (XGBoost/LightGBM at a **subprocess boundary** crate, never linked — inv #1) stay
+   behind the same trait, deferred.
+2. **`RidgeInt`** — integer ridge LINEAR regression. `θ` (length `FEAT_DIMS=28`) is `i64` on **`THETA_SHIFT=16`**;
+   predict is a pure-integer dot product `(θ·x) >> THETA_SHIFT` clamped to `[0, SCALE]`. fit: **sort the rows once**
+   by `(y, features)` (→ row-order-independent: the batch gradient sums are commutative integer sums), then run a
+   **PINNED `N_ITERS=2000`** fixed loop (no float early-stop) of fixed-point gradient descent on the ridge MSE —
+   every dot-product / gradient sum uses **i128 accumulators** (overflow-safe), the per-iteration data step is
+   `Σ rⱼ·xⱼᵢ / (n · 2^LR_SHIFT)` with **`LR_SHIFT=11`**, plus a decoupled L2 decay `θᵢ −= θᵢ / 2^RIDGE_LAMBDA_SHIFT`
+   (`RIDGE_LAMBDA_SHIFT=8`, non-bias). **Zero f64** on train or predict. Serde, with `RIDGE_MIN_SAMPLES=FEAT_DIMS`
+   and a **`RIDGE_BUILD_ID = "ridgeint-v1@dims28-shift16-iters2000"`** self-invalidation anchor (travels with a
+   serialized model; a re-pin bumps the id so a stale model self-detects — like `ENCODER_ID` /
+   `DramaWeights.version`).
+
+**Invariant audit.** inv #3 — off-hash, pure-integer, deterministic + row-order-independent (sort-once + i128
+commutative sums; no f64/RNG/HashMap); the pinned literal is byte-identical (`discovery` has no `sim-core` dep; the
+diff touches only `surrogate.rs` + the `lib.rs` re-export). inv #5 — the science is behind the `Surrogate` trait;
+`discovery` adds no dependency (no `ndarray`/`nalgebra`/`linfa`/`smartcore`/heavy-ML/GPL — those reach `harness` only
+via `bio→crispr`, never `discovery`). inv #7 — the GD constants are pinned + the `RIDGE_BUILD_ID` anchor records them.
+
+**Scope / sequencing.** This slice **DEFINES** the model — it changes **no search behaviour** and is **not wired
+into the loop** (`discover_evolved` untouched; `search.rs` not in the diff). The steered sibling lands in D3-B.4;
+per ADR-033, the behavioural model-choice + steering-target sign-off (spec open-questions) is surfaced to the human
+before D4 generates the committed showcase. The model is fully reversible behind the trait.
+
+**Known provisional / follow-ups (non-blocking).** `LR_SHIFT=11` is a single global learning-rate shift that learns
+heterogeneous binary/one-hot features slowly (spec open-question #4) — acceptable here because the planted-signal
+test converges and `RIDGE_BUILD_ID` self-invalidates a stale model on any re-pin; a real-eval-log convergence pass
+(possibly a per-feature scale or more iters) is a D3-B.4-adjacent retune. The final `θ` write-back narrows
+`i128→i64` by a deterministic two's-complement cast (the accumulators are i128-guarded and `θ` stays within range
+under the pinned dynamics); a `saturating` cast / `debug_assert` is a cheap future hardening.
+
+**Alternatives considered.** Float GD / closed-form matrix inversion: REJECTED — cross-platform non-determinism
+(inv #3). A nonlinear model now (GBT / NN): REJECTED for the variance-bound small-N regime — deferred behind the
+trait as `BoostStumpInt`, with heavy ML kept at a subprocess boundary (inv #1). Linking a Rust ML crate
+(`linfa`/`smartcore`): REJECTED — drags a heavy dep tree into the in-process `discovery` crate (inv #5); the
+hand-rolled integer regressor is ~200 lines and determinism-exact.

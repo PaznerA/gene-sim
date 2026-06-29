@@ -4,6 +4,27 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Discovery D3-B.3 — `RidgeInt` integer ridge regressor + pluggable `Surrogate` trait — HASH-NEUTRAL, zero f64 (ADR-034)
+The surrogate model the steered loop (D3-B.4) will fit on the eval log to predict the drama target `D` (ADR-033).
+Off-hash, pure-integer (`crates/discovery/src/surrogate.rs`). (1) **`Surrogate` trait** (inv #5 seam) — `fit(&mut,
+x:&[FeatureVec], y:&[u64], seed)` / `predict(&FeatureVec)->u64` / `id()` / `min_samples()`, object-safe; impls swap
+without touching search. (2) **`NullSurrogate`** — base case (`predict` 0, `min_samples()==usize::MAX` so a steered
+run cold-starts to passthrough = byte-identical to `discover_evolved`). (3) **`RidgeInt`** — integer ridge LINEAR
+regression: `θ` is `i64` on `THETA_SHIFT=16`, predict = pure-integer `(θ·x) >> THETA_SHIFT` clamped to `[0,SCALE]`;
+fit **sorts the rows once** (`(y,features)` → row-order-independent via commutative i128 batch sums) then runs a
+**pinned `N_ITERS=2000`** fixed loop of fixed-point gradient descent on the ridge MSE (i128 accumulators, data step
+`/2^LR_SHIFT` `LR_SHIFT=11`, decoupled L2 decay `/2^RIDGE_LAMBDA_SHIFT` `RIDGE_LAMBDA_SHIFT=8`). **Zero f64** on train
+or predict. Serde + `RIDGE_BUILD_ID="ridgeint-v1@dims28-shift16-iters2000"` self-invalidation anchor. Tests
+(verified): deterministic + **row-order-independent** (reverse + coprime-stride permutations → identical θ),
+**recovers a planted signal** (`D = a·predator×prey + b·temp-extremity + noise` → θ[16]/θ[27] within 20% of ideal,
+held-out err<500), serde round-trip + build-id mismatch detection, NullSurrogate passthrough. **Not wired into the
+search** (`discover_evolved`/`search.rs` untouched — that's D3-B.4). Hash-neutral: pinned literal
+`0x47a0_3c8f_6701_f240` byte-identical (sim-core 187/187); `cargo tree -p discovery` stays `std`+`serde` (no
+`ndarray`/`nalgebra`/`linfa`/heavy-ML; inv #5). Gate GREEN; 3-skeptic verify 3/3 on all four invariant booleans. The
+upgrade path (`BoostStumpInt`, heavy ML at a subprocess boundary) stays behind the trait, deferred. **ADR-034.**
+(Provisional, self-invalidating: `LR_SHIFT` global rate, spec open-question #4 — a real-eval-log convergence retune
+is D3-B.4-adjacent.)
+
 ### Discovery D3-B.2 — the drama-weighted steering target `D` — HASH-NEUTRAL, off-hash integer (ADR-033)
 The first brute-force batch showed **M1 (coexistence) saturates** → raw quality `Q` (≈46% weight on M1/M2) stops
 separating *dramatic* runs from *placid* ones. New off-hash, pure-integer steering target the surrogate (D3-B.3/B.4)
