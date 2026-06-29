@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Colonies S3 — LOD pop ladder (zoom→footprint, plants pop first) — RENDERER-ONLY, zero Rust (ADR-029)
+Replaces the binary scope-layer swap (Field=colonies XOR closer=organisms) with a per-colony LOD ladder keyed on the
+**on-screen organism footprint** `footprint_px = _cell * cam.zoom.x * size_scale(species)` (§4.1 — fixes the wiring
+bug where `organisms.gd` keyed its LOD on the raw field-space `_cell`). A new `set_zoom(zoom)` on both `colonies.gd`
+and `organisms.gd` (each stores `_zoom` + `queue_redraw`, guarded by `is_equal_approx` so an unchanged zoom can't
+thrash a redraw) is threaded from `main.gd._set_zoom`/`_update_scope_layers`. Per colony the rung is a **closed-form
+pure function of footprint** (`pop_t = clampf((foot-POP_LO)/(POP_HI-POP_LO),0,1)`): `<6 px` district polygon only;
+mid-band polygon + row-major density stipple; `≥8 px` POP OPEN to per-cell morph sprites (the existing
+`organisms.gd` `_draw_plant`/`_draw_morph`, reused untouched — single source of truth for morphology) while the
+polygon crossfades to a thin outline (fill alpha `1.0→0.15`, sprite alpha `0→1` over the same 6–8 px band). Because
+`size_scale` is **in** the footprint, plant colonies (`SIZE_PLANT 2.2`) cross the pop threshold at a lower zoom than
+microbes → "by organism size, pop open" for free; un-popped microbe cells emit **zero** sprites (`if pop_t <= 0.0:
+continue`), so the de-spam holds. **No per-frame redraw**: neither layer defines `_process`/Timer; `queue_redraw`
+fires only on `set_snapshot`/`set_zoom`/`set_iso`/scope change (time-based easing stays deferred behind a future
+"allow animated redraw" decision — inv #3 renderer discipline). **Zero Rust diff** → pinned literal
+`0x47a0_3c8f_6701_f240` byte-identical by construction; snapshot stays GSS6/channels=14. inv #2: the ladder computes
+only footprint/alpha — no genotype→phenotype. Gate GREEN (sim-core 187/187, determinism OK); 3-skeptic verify 3/3 on
+all four invariant booleans; all reviewers APPROVE. (Non-blocking nits for later cleanup: dead `LOD_MIN_CELL` const;
+a degenerate-path fallback-default mismatch.)
+
 ### Colonies S2 — `colonies.gd` district polygons (the visible de-spam) — RENDERER-ONLY, zero Rust (ADR-029)
 The first VISIBLE colony slice: a new `godot/colonies.gd` (a `Node2D` colony layer) turns the spammed dot map into
 readable district polygons at Field scope. Deterministic connected-components (4-connectivity, two-pass union-find
