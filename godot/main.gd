@@ -499,6 +499,7 @@ func _ready() -> void:
 			var bvid := _dominant_variant_at(_brush_cell)
 			if bsid >= 0 and bvid >= 0:
 				_set_selected_colony(bsid * 65536 + bvid)
+				_show_colony_inspect()  # S6: the --shot also shows the brushed district's inspect card
 	if _arg_value("--view") == "relations":  # optional: open the Relations FlowMatrix heatmap for --shot
 		_set_view_mode(VIEW_RELATIONS)
 	if _arg_value("--view") == "codex":  # optional: open the browsable CODEX encyclopedia for --shot
@@ -532,6 +533,9 @@ func _ready() -> void:
 		for _e in _codex_entries:  # render EVERY entry once so a typo in any kind branch (species/role/gene/flow) goes RED
 			_render_codex_detail(_e)
 		_fill_detail("(check)", ["density 0.0"])  # exercise the detail/ontology rendering path
+		# ADR-029 S6: build the DISTRICT INSPECT card path headlessly (inv #4) so a GDScript error in _fill_colony_inspect
+		# goes RED in CI without a GPU. A stub summary mirrors a selected founding colony (registry-less, vid 0).
+		_fill_colony_inspect({"species": 0, "variant": 0, "label": "", "count": 12, "gen_created": -1, "parent": -1})
 		# SP-4 headless guards (inv #4 — every path built before any GPU): (a) BUILD every baked species' glyph via
 		# the key-led factory so a parse error / malformed polygon in ANY morphotype body goes RED; (b) load the
 		# codex + exercise the codex-enriched inspect join with a real species so a garbled codex.json or a broken
@@ -5233,8 +5237,12 @@ func _on_click() -> void:
 				var sid := int(round(snap.dominant_species_id[i]))
 				var vid := int(round(snap.dominant_variant_id[i])) if ("dominant_variant_id" in snap and i < snap.dominant_variant_id.size()) else 0
 				_set_selected_colony(sid * 65536 + vid)
+				# ADR-029 S6 DISTRICT INSPECT: replace the per-cell stat lines with the selected district's inspect
+				# card (registry fields + live cell-count). Always (re)fills so re-clicking the SAME district still
+				# shows its card (the _set_selected_colony no-op guard would otherwise leave the cell lines showing).
+				_show_colony_inspect()
 			else:
-				_set_selected_colony(-1)
+				_set_selected_colony(-1)  # empty cell → keep the per-cell stat lines _fill_detail just wrote (deselect)
 		else:
 			_detail_panel.visible = false
 			_set_selected_colony(-1)
@@ -5293,6 +5301,51 @@ func _detail_label(text: String, size: int, color: Color) -> Label:
 	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	l.custom_minimum_size = Vector2(236, 0)
 	return l
+
+
+## ADR-029 S6 DISTRICT INSPECT: fetch the selected district's summary from the colony layer (renderer-side registry
+## fields + live cell-count) and render it into the inspect card. No-op when nothing is selected or the layer is
+## absent (file-replay) — so the cell-detail / hidden panel set by the caller stands (the deselect "clear"). Pure
+## presentation routing (inv #2): a read of already-built render state, no biology.
+func _show_colony_inspect() -> void:
+	if _colonies == null or not _colonies.has_method("selected_colony_summary"):
+		return
+	var summary: Dictionary = _colonies.selected_colony_summary()
+	if summary.is_empty():
+		return
+	_fill_colony_inspect(summary)
+
+
+## ADR-029 S6 — the DISTRICT INSPECT card itself: a selected colony's registry fields {species, label, gen_created,
+## parent} joined with its live cell/pop count, rendered into the SAME inspect panel (_detail_box / _detail_label)
+## the cell-detail + saved-variant naming UI use (reuse, not a new panel). Read-only ANNOTATION (inv #2): every field
+## is a renderer-side registry entry or an inert cell-count — no genotype→phenotype is computed in GDScript. The
+## panel is cleared on deselect by the cell-detail / hide path in _on_click.
+func _fill_colony_inspect(summary: Dictionary) -> void:
+	for c in _detail_box.get_children():
+		c.queue_free()
+	var sid := int(summary.get("species", -1))
+	var vid := int(summary.get("variant", 0))
+	var sp_name := _species_name_for(sid) if sid >= 0 else "?"
+	var reg_label := str(summary.get("label", ""))
+	var title_name := reg_label if reg_label != "" else sp_name
+	var kind := "founding colony" if vid == 0 else "variant district"
+	_detail_box.add_child(_detail_label("🏘 %s — %s" % [title_name, kind], 15, Color(0.96, 0.99, 0.96)))
+	var lines: Array = [
+		"species        %d  (%s)" % [sid, sp_name],
+		"label          %s" % (reg_label if reg_label != "" else "—"),
+		"variant        %d" % vid,
+		"cells (pop)    %d" % int(summary.get("count", 0)),
+	]
+	var gen := int(summary.get("gen_created", -1))
+	if gen >= 0:
+		lines.append("gen created    %d" % gen)
+	var parent := int(summary.get("parent", -1))
+	if parent >= 0:
+		lines.append("parent variant %d" % parent)
+	for s in lines:
+		_detail_box.add_child(_detail_label(str(s), 12, Color(0.9, 0.94, 0.9)))
+	_detail_panel.visible = true
 
 
 # ──────────────────────────── SP-4 rich per-specimen INSPECT card ────────────────────────────

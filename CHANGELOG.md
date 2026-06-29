@@ -4,6 +4,29 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Colonies S6 — perf-lever verification + select-pop cull + district inspect + label declutter — RENDERER-ONLY, zero Rust (ADR-029)
+Closes the colony epic with the perf story + UX polish. (1) **Perf-lever verification** (the headline) — a new
+headless `godot/colony_s6_test.gd` builds the colony layer at Field scope on a 48² (2304 cells) and a 96² (9216
+cells) grid and asserts the district draw count is **identical and bounded** (`48²=4, 96²=4`, ≤24) — `O(#colonies)`,
+**independent of map size**: `PERF_LEVER_OK … old per-organism dots @96²=46080 → 11520× fewer draws`. This is the
+structural draw-count win [[perf-bigger-maps-needs-structural-change]] called for, now under the gate. (2)
+**Select-pop cull + budget hardening** — `organisms.gd._selected_pop_plan` caps a map-spanning selected colony at
+`SELECTED_POP_BUDGET=700` AND viewport-culls (`world_rect.has_point`), with the budget meter growing only from
+on-screen in-budget cells, so an off-screen cell never consumes budget nor re-spams (test: 9216-cell colony pops
+exactly 700; a 60×60 window pops 25 / culls 9191 / budget_capped=0). (3) **District inspect panel** —
+`_on_click → _show_colony_inspect → _fill_colony_inspect` renders `{species, label, variant, cells, gen_created,
+parent}` into the **reused** `_detail_box`/`_detail_panel` saved-variant-naming idiom (no new panel, no biology — a
+display-name lookup + inert cell count). (4) **Label declutter** — `colonies.gd._label_plan` keeps the selected +
+above-`LABEL_MIN_CELLS` districts and de-overlaps by centroid (`LABEL_MIN_SEP_CELLS`), highest-priority-first
+(deterministic total sort). inv #2: cull/inspect/declutter are presentation-only reads of built render state — no
+genotype→phenotype. inv #3: ordered total sorts throughout (`_draw_order` iso-depth/x/y; `_label_plan`
+selected/count/seq; registry keyed reads), no `randf`/`randi`/`Time`/`OS`, no `_process`/Timer. **Zero Rust diff** →
+pinned literal `0x47a0_3c8f_6701_f240` byte-identical by construction; snapshot stays GSS6/channels=14. Gate GREEN
+(sim-core 187/187, determinism OK; full godot snapshot gate green incl. COLONY S4/S5/S6, re-verified on the committed
+tree); 3-skeptic verify 3/3 on all four invariant booleans. **→ ADR-029 colony epic COMPLETE (S1–S6).** (Non-blocking
+note: the perf metric counts district entries, not the mid-zoom per-cell stipple/quad cost, which is inactive at the
+Field scope where the O(#colonies) claim lives.)
+
 ### Colonies S5 — plant realism (always-visible canopy hulls + ≥1-colony guarantee) — RENDERER-ONLY, zero Rust (ADR-029)
 Completes the visual-declutter epic. Plant colonies are now **always-visible** and **most-realistic**.
 (1) **Always-visible floor** — a plant colony skips the sub-`MIN_COLONY_CELLS` haze-speck path
