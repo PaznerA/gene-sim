@@ -20,13 +20,20 @@ extends Node2D
 
 const MAX_DOTS_PER_CELL := 5
 const DOT_RADIUS_SCALE := 0.55  # demoted "activity pip" dots under each plant render at this × the old radius
-const LOD_MIN_CELL := 5.0  # below this on-screen cell size, draw dots only (sprites would be sub-pixel clutter)
+const LOD_MIN_CELL := 5.0  # (legacy) field-space dots-only threshold — SUPERSEDED by the §4.1 per-cell footprint POP gate
 const ALLELE_HUE_SHIFT := 0.12  # allele_freq shifts the hue ±this AROUND the species base hue (within-species cline)
+# ADR-029 S3 — the per-cell POP gate keys on the EFFECTIVE on-screen footprint (§4.1: _cell * zoom * size_scale),
+# NOT the raw field-space _cell. A cell draws per-cell sprites ONLY once its colony has popped (footprint >= POP_LO);
+# below that it stays a polygon in colonies.gd (zero sprites here → the de-spam holds). The sprite alpha ramps
+# 0 → 1 across the SAME POP_LO..POP_HI band colonies.gd fades its fill over — a PURE function of footprint, no timer.
+const POP_LO_PX := 6.0
+const POP_HI_PX := 8.0
 const SpeciesVisualMap := preload("res://species_visual_map.gd")
 
 var _w: int = 0
 var _h: int = 0
 var _cell: float = 12.0
+var _zoom: float = 1.0  # live cam.zoom.x (threaded from main.gd) → per-cell footprint = _cell * zoom * size_scale (§4.1)
 var _density: PackedFloat32Array
 var _allele: PackedFloat32Array
 var _fitness: PackedFloat32Array
@@ -51,6 +58,18 @@ var _glyph_params: Dictionary = {}  # species-level visual params precomputed ON
 ## Route placement through an isometric transform (P3). null = orthographic (the default).
 func set_iso(iso) -> void:
 	_iso = iso
+	queue_redraw()
+
+
+## ADR-029 S3: thread the camera magnification (cam.zoom.x) in from main.gd so the per-cell POP gate keys on the
+## EFFECTIVE on-screen footprint (§4.1: _cell * zoom * size_scale) instead of the raw field-space _cell. main.gd
+## calls this from _set_zoom / _update_scope_layers; a wheel/scope event re-pops with a single state-change redraw.
+## inv #3: NO per-frame redraw — the crossfade is closed-form on footprint, never a timer. Guarded so an unchanged
+## zoom does not thrash a redundant redraw.
+func set_zoom(zoom: float) -> void:
+	if is_equal_approx(zoom, _zoom):
+		return
+	_zoom = zoom
 	queue_redraw()
 
 
@@ -183,7 +202,6 @@ func _draw() -> void:
 		return  # short/truncated channels (snapshot.gd should have rejected them) — degrade gracefully, no crash
 	var base_r := maxf(1.5, _cell * 0.16)
 	var rim := Color(0.03, 0.05, 0.04, 0.92)
-	var lod_dots_only := _cell < LOD_MIN_CELL
 	var base_hue: float = float(_glyph_params.get("base_hue", 0.4))
 	var is_microbe: bool = bool(_glyph_params.get("is_microbe", false))
 
@@ -208,6 +226,17 @@ func _draw() -> void:
 		# sets the radius (plant LARGE … symbiont tiny) and the base colour, so adjacent species read at their
 		# real relative scale instead of one shared density radius. Empty plane/table → the default plant visual.
 		var vis := _cell_visual(i)
+		var size_scale := float(vis.get("size", 1.0))
+		# ADR-029 S3 POP gate: this cell draws per-cell sprites ONLY once its colony has popped — i.e. its on-screen
+		# footprint (§4.1: _cell * zoom * size_scale) crosses POP_LO. Below that the cell stays a polygon in
+		# colonies.gd (we draw NOTHING here → the de-spam holds; sprites are CLIPPED to popped colonies). Because
+		# size_scale is IN the footprint, PLANT cells (2.2) pop FIRST while microbe cells (rod 0.9 … symbiont 0.34)
+		# stay aggregated as polygons — the brief's "by organism size" pop. The sprite alpha then ramps 0 → 1 across
+		# the SAME POP_LO..POP_HI band colonies.gd fades its fill over (pure function of footprint, no per-frame timer).
+		var foot := _cell * _zoom * size_scale
+		var pop_t := clampf((foot - POP_LO_PX) / (POP_HI_PX - POP_LO_PX), 0.0, 1.0)
+		if pop_t <= 0.0:
+			continue  # not popped → colonies.gd owns this cell as a district polygon (zero per-cell sprites)
 		var cell_r := base_r * float(vis.get("size", 1.0))
 		var cell_is_plant: bool = bool(vis.get("is_plant", not is_microbe))
 		# Per-cell colour: blend the SPECIES base colour (from the visual table) toward the fitness-brightened
@@ -233,23 +262,30 @@ func _draw() -> void:
 				p = base + Vector2(jx * _cell * 0.7, jy * _cell * 0.35)  # 2:1 squashed footprint
 			else:
 				p = base + Vector2(jx * _cell * 0.7, jy * _cell * 0.5)
-			if _sprites_on and not lod_dots_only:
+			# S3 crossfade: ramp the marker's alpha 0 → 1 across the POP_LO..POP_HI band (pure function of footprint
+			# via pop_t) so a popping colony's sprites fade IN exactly as colonies.gd fades its fill OUT. The _draw_*
+			# morphology routines stay the single source of truth (untouched) — only the colour we hand them carries
+			# the crossfade weight. inv #2: no biology here, just the presentation alpha.
+			var dcol := col
+			dcol.a *= pop_t
+			var drim := rim
+			drim.a *= pop_t
+			if _sprites_on:
 				# Route the per-cell draw on the cell's DOMINANT species (GSS5): a plant L-sprite for autotrophs,
 				# else a microbe rod-blob — sized by the species' real-cell SIZE multiplier (vis.size). Falls back
 				# to the run-level is_microbe flag when no dominant plane/table is present (file-replay).
-				var size_scale := float(vis.get("size", 1.0))
 				if cell_is_plant:
-					_draw_plant(p, col, fit, dens, x, y, k, size_scale)
+					_draw_plant(p, dcol, fit, dens, x, y, k, size_scale)
 				else:
 					# Item #5: route the cell to its DOMINANT species' MORPHOTYPE glyph (rod / cocci / vibrioid /
 					# pleomorph / symbiont / mold), the field-scale echo of the specimen view — so the Cells scope
 					# reads as a real microbial community, not one rod sized+coloured per species.
-					_draw_morph(str(vis.get("morph", "rod")), p, col, fit, dens, x, y, k, size_scale)
-				_draw_dot(p, col, rim, cell_r * DOT_RADIUS_SCALE)  # demoted activity pip at the foot, species-sized
+					_draw_morph(str(vis.get("morph", "rod")), p, dcol, fit, dens, x, y, k, size_scale)
+				_draw_dot(p, dcol, drim, cell_r * DOT_RADIUS_SCALE)  # demoted activity pip at the foot, species-sized
 			else:
-				# LOD / sprites-off: a TRAIT-TINTED dot at the species' real-cell radius (cell_r) — even the
-				# zoomed-out field scope is species-distinct by SIZE + palette, not one generic uniform marker.
-				_draw_dot(p, col, rim, cell_r)
+				# Sprites-off toggle (key 'S'): a TRAIT-TINTED dot at the species' real-cell radius (cell_r), still
+				# only for POPPED cells (so the de-spam holds) and faded by the same crossfade weight.
+				_draw_dot(p, dcol, drim, cell_r)
 
 
 ## One procedural plant standing at foot `p`. The SPECIES template (`_glyph_params`: stature→height, branchiness→

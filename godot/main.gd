@@ -5494,16 +5494,24 @@ func _set_zoom(z: float) -> void:
 	_update_scope_layers()
 
 
-## ADR-029 S2: pick which population layer is visible by zoom scope. At the Field scope (zoomed out) the colony
-## DISTRICT polygons replace the per-cell dot spam (the de-spam); at the closer Patch/Cells scopes the existing
-## organisms.gd morph sprites show individuals. (S3 will replace this hard swap with a footprint crossfade.)
-## Pure presentation visibility (inv #2): no biology, no determinism exposure.
+## ADR-029 S3: the per-colony LOD POP ladder — NOT a binary layer swap. BOTH layers are now visible at once; each
+## decides its own rung from ITS on-screen FOOTPRINT (§4.1: _cell * cam.zoom.x * size_scale(species)). A district
+## below its pop threshold draws as a polygon (colonies.gd) with ZERO per-cell sprites (organisms.gd skips it);
+## a district above the threshold fades its polygon to a thin ghost+outline while its cells POP to per-cell sprites
+## — both sides crossfading as a pure function of footprint over the SAME 6-8px band. Because size_scale is in the
+## footprint, PLANT districts (2.2) pop FIRST while microbe districts stay polygons. We just thread cam.zoom.x into
+## both layers; the per-frame-free crossfade lives inside each layer's _draw (inv #3: redraw only on this zoom/scope
+## change, never _process). Pure presentation visibility (inv #2): no biology, no determinism exposure.
 func _update_scope_layers() -> void:
 	if _organisms == null or _colonies == null or _cam == null:
 		return
-	var field_scope := _cam.zoom.x < 1.8  # matches _scope_label's field/patch boundary
-	_colonies.visible = field_scope
-	_organisms.visible = not field_scope
+	var z := _cam.zoom.x
+	_colonies.visible = true
+	_organisms.visible = true
+	if _colonies.has_method("set_zoom"):
+		_colonies.set_zoom(z)
+	if _organisms.has_method("set_zoom"):
+		_organisms.set_zoom(z)
 
 
 ## Jump to a named zoom scope preset (keys 1/2/3).

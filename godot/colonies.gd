@@ -31,10 +31,19 @@ const HAZE_ALPHA := 0.13           # sub-MIN_COLONY_CELLS speck haze alpha
 const VARIANT_HUE_RANGE := 0.18    # a brushed district's hue shifts up to ±half this AROUND the species base hue
 const VARIANT_KEY_BASE := 65536    # u16 ceiling: pack key = species_id * BASE + variant_id (exact, no collision)
 
+# ADR-029 S3 — the LOD POP ladder, keyed on the on-screen FOOTPRINT (§4.1: footprint_px = _cell * zoom *
+# size_scale). The rung is a PURE FUNCTION of footprint — NO per-frame timer (inv #3 renderer discipline).
+const STIPPLE_MIN_PX := 3.0        # below this footprint a district is polygon-ONLY (individuals would be sub-pixel)
+const POP_LO_PX := 6.0             # crossfade band start: the fill begins fading; organisms.gd begins fading sprites in
+const POP_HI_PX := 8.0             # crossfade band end: district fully POPPED → only a thin ghost fill + outline remain
+const GHOST_FILL_FACTOR := 0.15    # fully-popped fill-alpha factor (the district frame survives as a faint ghost)
+const STIPPLE_MAX_ALPHA := 0.5     # peak per-cell density-stipple alpha across the mid band
+
 # Per-cell identity ordinals the core exported (row-major, w*h), the two INERT integers the polygons group by.
 var _w: int = 0
 var _h: int = 0
 var _cell: float = 12.0
+var _zoom: float = 1.0                   # live cam.zoom.x (threaded from main.gd) → per-district footprint = _cell*zoom*size_scale
 var _density: PackedFloat32Array        # the non-empty test: density <= 0 → background (not in any colony)
 var _fitness: PackedFloat32Array        # per-cell fitness → district brightness (value channel) by colony mean
 var _dominant_species: PackedFloat32Array
@@ -66,6 +75,18 @@ const GLYPH_BY_MORPH := {
 ## Route the district polygons through the isometric transform (matches organisms.gd). null = orthographic.
 func set_iso(iso) -> void:
 	_iso = iso
+	queue_redraw()
+
+
+## ADR-029 S3: thread the live camera magnification (cam.zoom.x) in from main.gd so each district can pick its LOD
+## rung from its on-screen FOOTPRINT (§4.1: footprint_px = _cell * zoom * size_scale) — NOT from a per-frame timer.
+## main.gd calls this from _set_zoom / _update_scope_layers, so a wheel/scope event re-pops the whole ladder with a
+## single state-change redraw. inv #3: redraw fires only on a zoom/snapshot change, never from _process. Guarded so
+## an unchanged zoom (e.g. a same-zoom _show during live play) does not thrash a redundant redraw.
+func set_zoom(zoom: float) -> void:
+	if is_equal_approx(zoom, _zoom):
+		return
+	_zoom = zoom
 	queue_redraw()
 
 
@@ -198,6 +219,9 @@ func _rebuild_colonies() -> void:
 		var meta: Dictionary = _species_table.get(sid, {})
 		var base_col: Color = meta.get("color", SpeciesVisualMap.COLOR_DEFAULT)
 		var morph := str(meta.get("morph", "plant"))
+		# S3: the district's species SIZE multiplier (plant 2.2 … symbiont 0.34) — the §4.1 footprint term carried
+		# into the draw entry so plant districts cross the pop threshold FIRST (do NOT clamp it away).
+		var size_scale := float(meta.get("size", SpeciesVisualMap.SIZE_DEFAULT))
 		if count < MIN_COLONY_CELLS:
 			# Tiny speck → a soft haze blob, not a full district (anti-flicker; the brief's risk #2).
 			_colony_draw.append({"haze": true, "centroid": centroid, "color": base_col, "count": count})
@@ -216,6 +240,10 @@ func _rebuild_colonies() -> void:
 		_colony_draw.append({
 			"haze": false, "points": loop, "fill": fill, "outline": outline, "width": width,
 			"label": label, "centroid": centroid, "depth": centroid.x + centroid.y, "seq": cid,
+			# S3 LOD ladder: the species size term + the colony id/bbox so _draw can pick the rung from the
+			# footprint and stipple this district's own cells (bounded, row-major) without an extra label scan.
+			"cid": cid, "size_scale": size_scale,
+			"minx": agg_minx[cid], "miny": agg_miny[cid], "maxx": agg_maxx[cid], "maxy": agg_maxy[cid],
 		})
 
 	# Deterministic draw order: back-to-front by iso depth (centroid.x+centroid.y), seq tiebreak. Districts only
@@ -429,13 +457,30 @@ func _draw() -> void:
 			var hr := maxf(_cell * 0.45, _cell * 0.5 * sqrt(float(c["count"])))
 			draw_circle(hp, hr, Color(hcol.r, hcol.g, hcol.b, HAZE_ALPHA))
 			continue
+		# S3 LOD ladder — pick this district's rung from its on-screen FOOTPRINT (§4.1: _cell * zoom * size_scale).
+		# Because size_scale is IN the footprint, PLANT districts (2.2) cross the band first while microbe districts
+		# (rod 0.9 … symbiont 0.34) stay solid polygons — the brief's "by organism size, pop open", for free. The
+		# whole transition is a PURE FUNCTION of footprint (no per-frame timer — inv #3): the fill alpha ramps
+		# 1.0 → GHOST_FILL_FACTOR across the POP_LO..POP_HI crossfade band while organisms.gd ramps its per-cell
+		# sprites 0 → 1 over the SAME band; the outline + label always draw so the district frame survives the pop.
+		var size_scale: float = float(c.get("size_scale", 1.0))
+		var foot := _cell * _zoom * size_scale
+		var pop_t := clampf((foot - POP_LO_PX) / (POP_HI_PX - POP_LO_PX), 0.0, 1.0)
+		var fill_factor := lerpf(1.0, GHOST_FILL_FACTOR, pop_t)  # 1.0 full district → 0.15 popped (thin ghost + outline)
 		# Project the grid-corner contour into world space (ortho or iso) and draw fill + closed outline.
 		var pts := PackedVector2Array()
 		var grid: PackedVector2Array = c["points"]
 		for gp in grid:
 			pts.append(_grid_to_world(gp.x, gp.y))
 		if pts.size() >= 3:
-			draw_colored_polygon(pts, c["fill"])
+			var fill: Color = c["fill"]
+			fill.a *= fill_factor
+			draw_colored_polygon(pts, fill)
+			# Mid-band internal heat: a per-cell density stipple that grows across [STIPPLE_MIN..POP_LO] and fades as
+			# the colony pops [POP_LO..POP_HI] (organisms.gd's sprites take over). Pure function of footprint.
+			var stipple_a := clampf((foot - STIPPLE_MIN_PX) / (POP_LO_PX - STIPPLE_MIN_PX), 0.0, 1.0) * (1.0 - pop_t)
+			if stipple_a > 0.01:
+				_draw_density_stipple(c, stipple_a)
 			var outline := pts
 			outline.append(pts[0])
 			draw_polyline(outline, c["outline"], float(c["width"]), true)
@@ -446,3 +491,30 @@ func _draw() -> void:
 			var tw: float = font.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fsize).x
 			draw_string(font, lp - Vector2(tw * 0.5, -float(fsize) * 0.35), txt,
 				HORIZONTAL_ALIGNMENT_LEFT, -1, fsize, Color(1.0, 1.0, 1.0, 0.94))
+
+
+## S3 mid-band INTERNAL HEAT: a per-cell density stipple over district `c`'s own cells, alpha scaled by `alpha`
+## (the closed-form mid-band weight from _draw) × the per-cell density. Iterates THIS colony's bounding box in
+## ROW-MAJOR order, keyed on the member _labels image (inv #3: no hash-order iteration, no randf/time). Bounded to
+## the colony bbox and only invoked while the district sits in the ~3-7px stipple band, so it never re-spams.
+func _draw_density_stipple(c: Dictionary, alpha: float) -> void:
+	var cid: int = int(c.get("cid", -1))
+	if cid < 0 or _labels.size() != _w * _h:
+		return
+	var minx: int = int(c.get("minx", 0))
+	var miny: int = int(c.get("miny", 0))
+	var maxx: int = int(c.get("maxx", 0))
+	var maxy: int = int(c.get("maxy", 0))
+	var base: Color = c["fill"]
+	var heat := base.lightened(0.28)  # the district colour, brightened → reads as internal density heat
+	var r := maxf(0.8, _cell * 0.18)
+	for y in range(miny, maxy + 1):
+		for x in range(minx, maxx + 1):
+			var i := y * _w + x
+			if i < 0 or i >= _labels.size() or _labels[i] != cid:
+				continue
+			var d := clampf(_density[i], 0.0, 1.0) if i < _density.size() else 0.0
+			if d <= 0.0:
+				continue
+			var p := _grid_to_world(float(x) + 0.5, float(y) + 0.5)
+			draw_circle(p, r * (0.4 + 0.6 * d), Color(heat.r, heat.g, heat.b, alpha * STIPPLE_MAX_ALPHA * d))
