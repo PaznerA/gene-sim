@@ -145,6 +145,15 @@ var _terrain: TileMapLayer
 var _overlay: Sprite2D
 var _organisms: Node2D
 var _colonies: Node2D  # ADR-029 S2: colony polygon layer (shown at Field scope; organisms at closer scopes)
+# ADR-029 S4 — the SELECTED colony (packed species*65536+variant key, or -1), set on a world-click; pops the
+# clicked district open to its members regardless of zoom. Re-applied to both layers each _show so a moving colony
+# (the heritable Variant tag) stays selected. Presentation-only state (inv #2): a click → a render scope.
+var _selected_colony_id: int = -1
+# ADR-029 S4 — renderer-side COLONY REGISTRY (variant_id -> {species, label, color, gen_created, parent}) + the
+# journal of fired brush strokes still awaiting their minted child id. Assembled in ORDERED passes (no hash-order
+# iteration; inv #3) from observe_species() + the player's own ApplyEditRegion strokes. Names + colours districts.
+var _colony_registry: Dictionary = {}
+var _pending_brush: Array = []  # [{gen, species, cx, cy, r, parent, tries}] resolved against the next snapshot
 var _cam: Camera2D
 var _hud: Label
 var _legend_label: Label
@@ -479,6 +488,17 @@ func _ready() -> void:
 		_brush_radius = 6
 		_brush.set_brush(_brush_cell, _brush_radius)
 		_apply_active_tool()
+		# ADR-029 S4: publish + show the POST-edit frame so the following --shot captures what the brush did — the
+		# disc now carries its freshly-minted child Variant id, so colonies.gd renders it as a NESTED hole-cut
+		# district (the S2 deferred acceptance) and _resolve_pending_colonies names it. Renderer-only (inv #2).
+		_publish_frame()
+		_show(_snaps.size() - 1)
+		# Select the brushed colony so a --shot also demonstrates the selected-pop (the disc explodes to members).
+		if "dominant_variant_id" in _snaps[_snaps.size() - 1]:
+			var bsid := _dominant_species_at(_brush_cell)
+			var bvid := _dominant_variant_at(_brush_cell)
+			if bsid >= 0 and bvid >= 0:
+				_set_selected_colony(bsid * 65536 + bvid)
 	if _arg_value("--view") == "relations":  # optional: open the Relations FlowMatrix heatmap for --shot
 		_set_view_mode(VIEW_RELATIONS)
 	if _arg_value("--view") == "codex":  # optional: open the browsable CODEX encyclopedia for --shot
@@ -2133,6 +2153,17 @@ func _apply_brush() -> void:
 	# core's already-exported phenotype + per-cell dominant id, no biology in GDScript.
 	if bool(outcome.get("applied", false)):
 		var sid := _dominant_species_at(_brush_cell)
+		# ADR-029 S4: journal this brush stroke renderer-side — the gen, the painted species, the disc, and the
+		# PRIOR (pre-edit) dominant Variant in the disc (= the parent colony). The CORE (S1) mints the child Variant
+		# id and stamps the covered orgs; that id appears in the disc in the NEXT snapshot, where
+		# _resolve_pending_colonies binds it to this stroke → a named, family-coloured district. inv #2: we record
+		# a render scope; GDScript mints nothing. inv #3: the existing apply_edit_region #[func] is the only wire.
+		_pending_brush.append({
+			"gen": int(outcome.get("generation", 0)),
+			"species": sid if sid >= 0 else _active_species_id(),
+			"cx": _brush_cell.x, "cy": _brush_cell.y, "r": _brush_radius,
+			"parent": maxi(0, _dominant_variant_at(_brush_cell)), "tries": 0,
+		})
 		_append_edit_variant_for(sid if sid >= 0 else _active_species_id(), "region edit", int(outcome.get("generation", 0)))
 		if _view_mode == VIEW_SPECIMEN:
 			_render_specimens()
@@ -2157,6 +2188,126 @@ func _dominant_species_at(cell: Vector2i) -> int:
 	if i < 0 or i >= plane.size():
 		return -1
 	return int(round(plane[i]))
+
+
+## ADR-029 S4: the dominant Variant id at a world cell (GSS6 dominant_variant_id plane) — the sibling of
+## _dominant_species_at, used to read a brush's PARENT colony before the edit + to compose the packed selection
+## key. -1 when no snapshot / out of range / pre-GSS6. Pure read (inv #2): an index into an exported plane.
+func _dominant_variant_at(cell: Vector2i) -> int:
+	if _snaps.is_empty() or cell.x < 0 or cell.y < 0:
+		return -1
+	var snap = _snaps[_snaps.size() - 1]
+	if not ("dominant_variant_id" in snap) or cell.x >= snap.width or cell.y >= snap.height:
+		return -1
+	var plane: PackedFloat32Array = snap.dominant_variant_id
+	var w := int(snap.width)
+	var i: int = cell.y * w + cell.x
+	if i < 0 or i >= plane.size():
+		return -1
+	return int(round(plane[i]))
+
+
+## ADR-029 S4: select a colony by its packed (species*65536+variant) key (-1 = clear) and push it to both render
+## layers, which pop the clicked district open to its members regardless of zoom (capped) while neighbours stay
+## aggregated. Guarded against a no-op reselect. Pure presentation routing (inv #2): a click → a render scope.
+func _set_selected_colony(key: int) -> void:
+	if key == _selected_colony_id:
+		return
+	_selected_colony_id = key
+	if _colonies != null and _colonies.has_method("set_selected_colony"):
+		_colonies.set_selected_colony(key)
+	if _organisms != null and _organisms.has_method("set_selected_colony"):
+		_organisms.set_selected_colony(key)
+
+
+## ADR-029 S4: resolve fired-but-unminted brush strokes against the latest snapshot. For each pending stroke,
+## tally the Variant ids inside its disc (row-major) and pick the most-populous id that is NOT the recorded parent
+## — that is the freshly-minted child the CORE stamped (S1). Register it (name/colour/lineage) for the district
+## label. Bounded retries (the child may take a frame to dominate the disc). ORDERED passes only — the pending
+## list + disc are iterated in order; the tally Dict is read via SORTED keys; the registry is keyed-access only
+## (inv #3). inv #2: GDScript reads inert per-cell ordinals + observe_species names — it computes no biology.
+func _resolve_pending_colonies(snap) -> void:
+	if _pending_brush.is_empty() or not ("dominant_variant_id" in snap):
+		return
+	var plane: PackedFloat32Array = snap.dominant_variant_id
+	var w := int(snap.width)
+	var h := int(snap.height)
+	var still: Array = []
+	for stroke in _pending_brush:
+		var cx: int = int(stroke["cx"])
+		var cy: int = int(stroke["cy"])
+		var r: int = int(stroke["r"])
+		var parent: int = int(stroke["parent"])
+		var tally: Dictionary = {}  # variant_id -> count; KEYED access only (read via sorted keys below; inv #3)
+		var r2 := r * r
+		for dy in range(-r, r + 1):
+			for dx in range(-r, r + 1):
+				if dx * dx + dy * dy > r2:
+					continue
+				var x := cx + dx
+				var y := cy + dy
+				if x < 0 or y < 0 or x >= w or y >= h:
+					continue
+				var i := y * w + x
+				if i < 0 or i >= plane.size():
+					continue
+				var vid := int(round(plane[i]))
+				tally[vid] = int(tally.get(vid, 0)) + 1
+		var keys: Array = tally.keys()
+		keys.sort()  # ordinal-sorted → deterministic tiebreak (lowest id wins on a tie; inv #3)
+		var best_vid := -1
+		var best_cnt := 0
+		for vid in keys:
+			if vid == parent or vid == 0:
+				continue
+			var cnt: int = tally[vid]
+			if cnt > best_cnt:
+				best_cnt = cnt
+				best_vid = vid
+		if best_vid > 0:
+			_register_colony(best_vid, stroke)
+		else:
+			stroke["tries"] = int(stroke.get("tries", 0)) + 1
+			if int(stroke["tries"]) < 6:  # bounded retry: the child may need a frame to dominate the disc
+				still.append(stroke)
+	_pending_brush = still
+
+
+## ADR-029 S4: add a brush-minted child Variant to the registry: its species, a STABLE family colour (the species
+## base colour hue-shifted by the variant — reads as the same species, not a foreign one), the gen it was created,
+## and its parent Variant. Keyed write only; idempotent. Read-only metadata (inv #2): no biology, no hash.
+func _register_colony(vid: int, stroke: Dictionary) -> void:
+	if _colony_registry.has(vid):
+		return
+	var sid: int = int(stroke["species"])
+	var meta: Dictionary = _species_id_meta().get(sid, {})
+	var key := str(meta.get("key", "default"))
+	var role := str(meta.get("role", ""))
+	var base: Color = SpeciesVisualMap.color_for(key, role)
+	_colony_registry[vid] = {
+		"species": sid,
+		"label": _species_name_for(sid),
+		"color": _family_color(base, vid),
+		"gen_created": int(stroke.get("gen", 0)),
+		"parent": int(stroke.get("parent", 0)),
+	}
+
+
+## The display name of a species id (observe_species() rows, an ordered Array — no hash-order iteration; inv #3).
+func _species_name_for(sid: int) -> String:
+	if _live != null and _live.has_method("observe_species"):
+		for sp in _live.observe_species():
+			if int((sp as Dictionary).get("species_id", -1)) == sid:
+				return str((sp as Dictionary).get("name", "species"))
+	return "species"
+
+
+## A brushed child district's STABLE family colour: the species base colour, hue-shifted a bounded, deterministic
+## amount by the variant id (matches colonies.gd's _variant_hue_shift / VARIANT_HUE_RANGE so the two agree). A
+## Color transform only — no biology (inv #2).
+func _family_color(base: Color, vid: int) -> Color:
+	var shift := (fposmod(float(vid) * 0.137, 1.0) - 0.5) * 0.18  # ±VARIANT_HUE_RANGE/2 (colonies.gd: 0.18)
+	return Color.from_hsv(fposmod(base.h + shift, 1.0), base.s, base.v, 1.0)
 
 
 ## Dispatch the ACTIVE tool at the current brush cell (SP-3.6). POSITION MATTERS end-to-end: brush cell →
@@ -5075,8 +5226,18 @@ func _on_click() -> void:
 		if cx >= 0 and cy >= 0 and cx < snap.width and cy < snap.height:
 			var i: int = cy * snap.width + cx
 			_fill_detail("Cell (%d, %d)" % [cx, cy], _cell_lines(snap, i))
+			# ADR-029 S4: clicking a populated cell SELECTS its colony (packed species*65536+variant key) → that
+			# district pops open to its members regardless of zoom (capped) while neighbours stay aggregated;
+			# clicking empty ground clears the selection. Pure render scope (inv #2): a read of the inert planes.
+			if snap.density[i] > 0.0 and "dominant_species_id" in snap:
+				var sid := int(round(snap.dominant_species_id[i]))
+				var vid := int(round(snap.dominant_variant_id[i])) if ("dominant_variant_id" in snap and i < snap.dominant_variant_id.size()) else 0
+				_set_selected_colony(sid * 65536 + vid)
+			else:
+				_set_selected_colony(-1)
 		else:
 			_detail_panel.visible = false
+			_set_selected_colony(-1)
 	else:
 		var hit := _specimen_at(world)
 		if hit >= 0:
@@ -5413,11 +5574,28 @@ func _show(i: int) -> void:
 		var dom: PackedFloat32Array = snap.dominant_species_id if "dominant_species_id" in snap else PackedFloat32Array()
 		_organisms.set_dominant_species_ids(dom, vis_table)
 	_organisms.set_snapshot(snap, _cell)
-	# ADR-029 S2: feed the colony layer the two off-hash identity planes (dominant_species_id +
-	# dominant_variant_id) + the same species visual table; it derives the district polygons. Guarded so an
-	# older (pre-GSS6) snapshot lacking dominant_variant_id never crashes (colonies.gd treats it as all-0).
-	if _colonies != null and _colonies.has_method("set_snapshot"):
-		_colonies.set_snapshot(snap, _cell, vis_table)
+	# S4: feed the organism layer the GSS6 Variant plane + the selected colony so its per-cell selected-pop
+	# override can key on (species,variant). Read-only (inv #2): an inert per-cell ordinal + a render-scope id.
+	if _organisms.has_method("set_variant_plane"):
+		var var_plane: PackedFloat32Array = snap.dominant_variant_id if "dominant_variant_id" in snap else PackedFloat32Array()
+		_organisms.set_variant_plane(var_plane)
+	if _organisms.has_method("set_selected_colony"):
+		_organisms.set_selected_colony(_selected_colony_id)
+	# S4: resolve any fired-but-unminted brush strokes against THIS (post-edit) snapshot → the colony registry
+	# learns the freshly-minted child Variant id appearing in the disc (ordered passes; inv #3). Then feed the
+	# colony layer the registry + selection BEFORE the snapshot (which rebuilds districts using both).
+	_resolve_pending_colonies(snap)
+	# ADR-029 S2/S4: feed the colony layer the two off-hash identity planes (dominant_species_id +
+	# dominant_variant_id) + the species visual table + the registry + selection; it derives the district polygons
+	# (incl. the brushed child as a nested hole-cut district). Guarded so an older (pre-GSS6) snapshot lacking
+	# dominant_variant_id never crashes (colonies.gd treats it as all-0).
+	if _colonies != null:
+		if _colonies.has_method("set_colony_registry"):
+			_colonies.set_colony_registry(_colony_registry)
+		if _colonies.has_method("set_selected_colony"):
+			_colonies.set_selected_colony(_selected_colony_id)
+		if _colonies.has_method("set_snapshot"):
+			_colonies.set_snapshot(snap, _cell, vis_table)
 	_update_scope_layers()
 	if _iso_ground != null:
 		_iso_ground.set_snapshot(snap, _overlay_mode)  # iso draws ground + data overlay as diamonds

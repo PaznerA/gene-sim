@@ -52,8 +52,8 @@ arc → the VISUAL-POLISH epic below** (the user: the screen is "spammed"/clutte
   five invariant booleans; 187/187 sim-core tests.** Merged `--no-ff`. ADR-029 + CHANGELOG written.
 - `[x]` **S2 `colony-polygon-render-impl`** ✅ — **DONE (2026-06-29)** — `godot/colonies.gd`: deterministic row-major union-find CC → marching-squares contour → DP+Chaikin → fill/outline/label; `main.gd` scope-layer swap (Field=polygons, hides dot-spam). **Gate GREEN; zero Rust (literal byte-identical); verify 3/3.** Merged `--no-ff`. *(deferred to S4: hole-cut nested districts; brushed `--shot`.)*
 - `[x]` **S3 `lod-pop-impl`** ✅ — **DONE (2026-06-29)** — per-colony footprint (`cell×zoom×size_scale`) pop ladder (closed-form, no per-frame redraw); plants pop first by `size_scale`; un-popped microbe cells emit zero sprites (de-spam holds). **Gate GREEN; zero Rust (literal byte-identical); verify 3/3.** Merged `--no-ff`.
-- `[ ]` **S4 `brush-colony-binding-impl`** ✅ — render the brushed disc as a nested district (intra-species hue shift) + selected-pop; also closes the S2/S3 deferred cosmetics (hole-cut nested districts; brushed `--shot`). *dep: S2 ✓ S3 ✓ (+ S1 core bind ✓) — READY NEXT.*
-- `[def]` **S5 `plant-realism-impl`** ✅ — plant canopy hulls, always-visible floor, ≥1-colony guarantee. *dep: S2.*
+- `[x]` **S4 `brush-colony-binding-impl`** ✅ — **DONE (2026-06-29)** — hole-cut nested family district (`_trace_boundaries`+`_draw_holed_fill`, ±0.09 hue shift) tracking its members via the heritable variant key; renderer-side colony registry; click→`set_selected_colony` select-pop capped (viewport + 700-sprite budget); new headless `colony_s4_test.gd` in the gate. **Gate GREEN; zero Rust (literal byte-identical); verify 3/3.** Merged `--no-ff`. Closes the S2/S3 deferred cosmetics.
+- `[ ]` **S5 `plant-realism-impl`** ✅ — plant canopy hulls, always-visible floor, ≥1-colony guarantee. *dep: S2 ✓ — READY NEXT.*
 - `[def]` **S6 `colony-polish-impl`** ✅ *(optional)* — viewport-cull/sprite-budget, district inspect panel, big-map draw-count check. *dep: S3.*
 
 ---
