@@ -127,4 +127,19 @@ if ! printf '%s' "$COUT" | grep -q "COLONY_S4_TEST_OK"; then
   exit 1
 fi
 echo "COLONY S4 OK — $(printf '%s' "$COUT" | grep 'HOLE_CUT_OK')"
+
+# 4. ADR-029 S5 plant-realism render-surface proof (renderer-only, no display): a sub-MIN_COLONY_CELLS PLANT
+# colony renders as a DISTRICT (never a haze speck) while a tiny microbe colony stays haze (microbe unchanged); a
+# plant district is a soft canopy hull with MORE contour points than an equal-shape microbe hard district; every
+# non-empty plant cell lands in a colony (>=1-colony guarantee); the plant ghost-fill floor > the microbe
+# GHOST_FILL_FACTOR. A plant-realism regression (plant decaying to haze, the hull losing its extra smoothing, an
+# unlabeled plant cell, the ghost floor inverting) goes RED here.
+run_godot "$TMP/colony_s5_out.log" --script colony_s5_test.gd
+SOUT="$(cat "$TMP/colony_s5_out.log")"
+if ! printf '%s' "$SOUT" | grep -q "COLONY_S5_TEST_OK"; then
+  echo "FAIL — ADR-029 S5 plant-realism colony render-surface test did not pass. Full output:"
+  printf '%s\n' "$SOUT"
+  exit 1
+fi
+echo "COLONY S5 OK — $(printf '%s' "$SOUT" | grep 'CANOPY_OK')"
 exit 0
