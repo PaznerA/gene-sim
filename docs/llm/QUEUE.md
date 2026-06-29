@@ -46,12 +46,11 @@ arc → the VISUAL-POLISH epic below** (the user: the screen is "spammed"/clutte
 - `[x]` **visual-declutter-colony-design** (`workflow`, DESIGN) — DONE → `proposals/visual-declutter-colony-draft.md`
   (470 lines: ADR-029 draft + the airtight off-hash argument — `hash_world` omits `Species`, so a heritable `Variant`
   tag is hash-neutral the same way — + the 6-slice plan). The colony impl slices below come from §7 of the draft.
-- `[ ]` **S1 `colony-snapshot-channel-impl`** 🛑→**SIGNED OFF (2026-06-28)** — the off-hash heritable `Variant(u16)` tag +
+- `[x]` **S1 `colony-snapshot-channel-impl`** 🛑→**DONE (2026-06-29, ADR-029)** — the off-hash heritable `Variant(u16)` tag +
   `NextVariantId` + `dominant_variant_id` GSS6 channel + brush mint/stamp in `apply_edit_region` + the `snapshot.gd`/byte-gate
-  bump. `.js` authored. Runs AFTER the in-flight #3-v2 finishes (both compile sim-core — not parallelized). **The gate
-  STOP-THE-LINE determinism check is the safety net: if `0x47a0` moves (unexpected — designed hash-neutral, NOT a re-pin),
-  HALT + report.** *(dep: #3-v2 merge — to avoid a shared-`sim-core` compile race.)*
-- `[def]` **S2 `colony-polygon-render-impl`** ✅ — `colonies.gd`: deterministic connected-components → contour → fill/outline/label (renderer-only). *dep: S1.*
+  bump (channels 13→14). **Gate GREEN; `0x47a0_3c8f_6701_f240` BYTE-IDENTICAL (NOT a re-pin); 3-skeptic verify 3/3 on all
+  five invariant booleans; 187/187 sim-core tests.** Merged `--no-ff`. ADR-029 + CHANGELOG written.
+- `[ ]` **S2 `colony-polygon-render-impl`** ✅ — `colonies.gd`: deterministic connected-components → contour → fill/outline/label (renderer-only). *dep: S1 ✓ — READY NEXT.*
 - `[def]` **S3 `lod-pop-impl`** ✅ — the footprint (`cell×zoom×size_scale`) pop ladder; plants pop first; no per-frame redraw. *dep: S2.*
 - `[def]` **S4 `brush-colony-binding-impl`** ✅ — render the brushed disc as a nested district (intra-species hue shift) + selected-pop. *dep: S2 (+ S1 core bind).*
 - `[def]` **S5 `plant-realism-impl`** ✅ — plant canopy hulls, always-visible floor, ≥1-colony guarantee. *dep: S2.*

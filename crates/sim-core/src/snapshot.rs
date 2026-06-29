@@ -19,36 +19,40 @@
 //! ## Binary format ([`GridSnapshot::write_snapshot_bytes`])
 //! Little-endian, `std`-only (no `bincode`/`serde`):
 //! ```text
-//!   bytes 0..4 : ASCII magic "GSS5"
+//!   bytes 0..4 : ASCII magic "GSS6"
 //!   u32 LE     : width
 //!   u32 LE     : height
-//!   u32 LE     : channel_count (= 13)
+//!   u32 LE     : channel_count (= 14)
 //!   u64 LE     : generation
 //!   u32 LE     : population
 //!   then channel-major, each channel's width*height f32 LE values in row-major order,
 //!   channels in order: density, allele_freq, fitness, soil_moisture, soil_nutrients, soil_ph,
-//!   light, free_nutrient, detritus, toxin, kin, alarm, dominant_species_id.
+//!   light, free_nutrient, detritus, toxin, kin, alarm, dominant_species_id, dominant_variant_id.
 //! ```
-//! The last channel `dominant_species_id` (GSS5) carries the MOST-POPULOUS [`crate::SpeciesId`] ordinal in
+//! The `dominant_species_id` channel (GSS5) carries the MOST-POPULOUS [`crate::SpeciesId`] ordinal in
 //! each cell as an exact integer encoded in an `f32` (`u16` 0..=65535 round-trips through `f32` losslessly).
-//! It is `0.0` for empty cells; the renderer maps the id → a per-species size/colour (the species-map view).
-//! Like the chem/pool planes it is a READ-ONLY projection off the LIVING `Species` tags — no `SimRng` draw,
-//! no mutation — so producing it never perturbs the determinism hash (inv #2/#3); the pinned literal is
-//! byte-identical for a single-species run (whose dominant id is uniformly `0`).
+//! GSS6 APPENDS `dominant_variant_id` LAST (offsets 0..12 never reorder): the MOST-POPULOUS off-hash
+//! [`crate::Variant`] colony ordinal per cell, same `u16`-in-`f32` encoding — `0.0` = the wild-type founding
+//! colony of the cell's dominant species. Both are `0.0` for empty cells; the renderer maps the species id →
+//! a per-species size/colour and the variant id → a nested intra-species DISTRICT (ADR-029 S1).
+//! Like the chem/pool planes they are READ-ONLY projections off the LIVING `Species`/`Variant` tags — no
+//! `SimRng` draw, no mutation — so producing them never perturbs the determinism hash (inv #2/#3); the pinned
+//! single-species, no-edit run is byte-identical (both dominant planes uniformly `0`).
 
 use std::io;
 use std::path::Path;
 
-/// ASCII magic header identifying the snapshot binary format (`"GSS5"` = Gene-Sim Snapshot v5; v2 added the
+/// ASCII magic header identifying the snapshot binary format (`"GSS6"` = Gene-Sim Snapshot v6; v2 added the
 /// 3 soil channels, v3 appended the 3 live-pool channels, v4 (ADR-013 F5) appended the 3 chem channels
-/// (toxin/kin/alarm), v5 appends the per-cell `dominant_species_id` plane (the species-map view) — a bumped
-/// magic turns a stale 12-channel reader into a loud bad-magic error, not a silent mis-parse at the wrong offset).
-pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS5";
+/// (toxin/kin/alarm), v5 appended the per-cell `dominant_species_id` plane (the species-map view), v6 (ADR-029
+/// S1) appends the per-cell `dominant_variant_id` colony plane — a bumped magic turns a stale 13-channel reader
+/// into a loud bad-magic error, not a silent mis-parse at the wrong offset).
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"GSS6";
 
 /// The number of per-cell channels a [`GridSnapshot`] carries: `density`, `allele_freq`, `fitness`,
 /// `soil_moisture`, `soil_nutrients`, `soil_ph`, `light`, `free_nutrient`, `detritus`, `toxin`, `kin`, `alarm`,
-/// `dominant_species_id`.
-pub const CHANNEL_COUNT: u32 = 13;
+/// `dominant_species_id`, `dominant_variant_id`.
+pub const CHANNEL_COUNT: u32 = 14;
 
 /// A read-only, derived per-cell grid view of the simulation for the renderer (SPEC §W10).
 ///
@@ -98,6 +102,11 @@ pub struct GridSnapshot {
     /// empty cells. Ties resolve to the LOWEST `SpeciesId` (deterministic). A read-only display projection off
     /// the living `Species` tags (no RNG, no mutation) — the renderer maps it to a per-species size/colour.
     pub dominant_species_id: Vec<f32>,
+    /// Per-cell MOST-POPULOUS off-hash [`crate::Variant`] colony ordinal as an exact `u16`-in-`f32`, row-major
+    /// (GSS6, ADR-029 S1); `0` for empty cells AND for the wild-type founding colony. Ties resolve to the LOWEST
+    /// `Variant` id (deterministic). A read-only display projection off the living `Variant` tags (no RNG, no
+    /// mutation) — the renderer derives nested intra-species DISTRICT polygons from it.
+    pub dominant_variant_id: Vec<f32>,
 }
 
 impl GridSnapshot {
@@ -133,6 +142,7 @@ impl GridSnapshot {
             &self.kin,
             &self.alarm,
             &self.dominant_species_id,
+            &self.dominant_variant_id,
         ] {
             for &v in channel {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -189,6 +199,7 @@ mod tests {
         let kin = read_channel();
         let alarm = read_channel();
         let dominant_species_id = read_channel();
+        let dominant_variant_id = read_channel();
         assert_eq!(off, bytes.len(), "trailing bytes");
 
         GridSnapshot {
@@ -209,6 +220,7 @@ mod tests {
             kin,
             alarm,
             dominant_species_id,
+            dominant_variant_id,
         }
     }
 
@@ -232,6 +244,8 @@ mod tests {
             kin: vec![0.07, 0.14, 0.21, 0.28, 0.35, 0.42],
             alarm: vec![0.5, 0.4, 0.3, 0.2, 0.1, 0.05],
             dominant_species_id: vec![0.0, 1.0, 2.0, 0.0, 3.0, 1.0],
+            // GSS6: exercise the full u16 range (incl. 65535) so the u16-in-f32 round-trip is byte-checked.
+            dominant_variant_id: vec![0.0, 7.0, 42.0, 0.0, 65535.0, 12.0],
         };
         let back = parse(&snap.write_snapshot_bytes());
 
@@ -254,6 +268,8 @@ mod tests {
         assert_eq!(back.kin, snap.kin);
         assert_eq!(back.alarm, snap.alarm);
         assert_eq!(back.dominant_species_id, snap.dominant_species_id);
+        // GSS6: the colony plane round-trips exactly, including u16::MAX in an f32.
+        assert_eq!(back.dominant_variant_id, snap.dominant_variant_id);
         // Full struct equality.
         assert_eq!(back, snap);
     }
@@ -278,10 +294,11 @@ mod tests {
             kin: vec![0.0; 16],
             alarm: vec![0.0; 16],
             dominant_species_id: vec![0.0; 16],
+            dominant_variant_id: vec![0.0; 16],
         };
         let bytes = snap.write_snapshot_bytes();
-        // 28-byte header + 13 channels * 16 cells * 4 bytes.
-        assert_eq!(bytes.len(), 28 + 13 * 16 * 4);
-        assert_eq!(&bytes[0..4], b"GSS5");
+        // 28-byte header + 14 channels * 16 cells * 4 bytes.
+        assert_eq!(bytes.len(), 28 + 14 * 16 * 4);
+        assert_eq!(&bytes[0..4], b"GSS6");
     }
 }
