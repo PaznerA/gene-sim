@@ -142,4 +142,20 @@ if ! printf '%s' "$SOUT" | grep -q "COLONY_S5_TEST_OK"; then
   exit 1
 fi
 echo "COLONY S5 OK — $(printf '%s' "$SOUT" | grep 'CANOPY_OK')"
+
+# 5. ADR-029 S6 colony polish/perf render-surface proof (renderer-only, no display): the PERF LEVER — the Field-scope
+# colony draw-primitive count is O(#colonies), bounded by the connected-region count and INDEPENDENT of cells ×
+# MAX_DOTS_PER_CELL (a 4× bigger grid builds the SAME small district count); the SELECTED-pop cap is hardened so a
+# map-spanning selection cannot re-spam (budget cap + viewport cull, off-screen cells don't charge the budget); the
+# district inspect summary carries the registry fields + live cell-count; label declutter suppresses tiny/overlapping
+# labels. A regression (perf count scaling with cells, re-spam past budget, off-screen cells charging the budget,
+# inspect/declutter break) goes RED here.
+run_godot "$TMP/colony_s6_out.log" --script colony_s6_test.gd
+S6OUT="$(cat "$TMP/colony_s6_out.log")"
+if ! printf '%s' "$S6OUT" | grep -q "COLONY_S6_TEST_OK"; then
+  echo "FAIL — ADR-029 S6 colony polish/perf render-surface test did not pass. Full output:"
+  printf '%s\n' "$S6OUT"
+  exit 1
+fi
+echo "COLONY S6 OK — $(printf '%s' "$S6OUT" | grep 'PERF_LEVER_OK')"
 exit 0

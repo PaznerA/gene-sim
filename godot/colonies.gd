@@ -51,6 +51,14 @@ const PLANT_CANOPY_CORE_LIGHTEN := 0.18  # canopy gradient: lighten toward the d
 const PLANT_CANOPY_RIM_DARKEN := 0.22    # canopy gradient: darken toward the soft rim
 const PLANT_CANOPY_RIM_ALPHA := 0.72     # canopy gradient: the rim fades a touch → a soft mass, not a flat zone
 
+# ADR-029 S6 — LABEL DECLUTTER (renderer-only presentation; inv #2/#3). A label under EVERY district turns the
+# Field scope back into noise. Only the SELECTED district + districts at/above LABEL_MIN_CELLS earn a label, and a
+# deterministic de-overlap pass then drops any label whose centroid sits within LABEL_MIN_SEP_CELLS of an
+# already-placed HIGHER-priority one (priority = selected first, then larger cell-count, then row-major seq). The
+# whole pass is ordered + closed-form — no randf()/time, no hash-order iteration — so the labelling is reproducible.
+const LABEL_MIN_CELLS := 6        # a district below this cell-count is UNLABELED unless it is the selected district
+const LABEL_MIN_SEP_CELLS := 4.0  # two label anchors closer than this (in CELL units) → keep only the higher-priority one
+
 # Per-cell identity ordinals the core exported (row-major, w*h), the two INERT integers the polygons group by.
 var _w: int = 0
 var _h: int = 0
@@ -319,7 +327,8 @@ func _rebuild_colonies() -> void:
 			"label": label, "centroid": centroid, "depth": centroid.x + centroid.y, "seq": cid,
 			# S3 LOD ladder + S4 selection: the species size term, the colony id/bbox (for the bounded row-major
 			# stipple + hole-cut cell-quad fill), and the packed (species,variant) key the selected-pop matches on.
-			"cid": cid, "key": key, "size_scale": size_scale, "is_plant": is_plant,
+			# S6: `count` (the colony's live cell/pop count) for the label-declutter threshold + the inspect card.
+			"cid": cid, "key": key, "size_scale": size_scale, "is_plant": is_plant, "count": count,
 			"minx": agg_minx[cid], "miny": agg_miny[cid], "maxx": agg_maxx[cid], "maxy": agg_maxy[cid],
 		})
 
@@ -622,13 +631,106 @@ func _draw() -> void:
 				var outline := pts
 				outline.append(pts[0])
 				draw_polyline(outline, c["outline"], ow, true)
-		# Centred district label: registry family name (or species glyph) + variant tag + cell-footprint count.
-		if font != null:
+
+	# ADR-029 S6 LABEL DECLUTTER: draw labels in a SEPARATE, deterministic second pass over only the decluttered
+	# subset (_label_plan: the selected district + districts >= LABEL_MIN_CELLS, de-overlapped by centroid distance,
+	# highest-priority first) so the Field scope reads clean instead of a fog of overlapping names. Ordered, no
+	# randf/time (inv #3). Centred label: registry family name (or species glyph) + variant tag + cell-footprint count.
+	if font != null:
+		for c in _label_plan():
 			var lp := _grid_to_world(c["centroid"].x, c["centroid"].y)
 			var txt := str(c["label"])
 			var tw: float = font.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fsize).x
 			draw_string(font, lp - Vector2(tw * 0.5, -float(fsize) * 0.35), txt,
 				HORIZONTAL_ALIGNMENT_LEFT, -1, fsize, Color(1.0, 1.0, 1.0, 0.94))
+
+
+## ADR-029 S6 LABEL DECLUTTER plan: the deterministic subset of DISTRICT entries (non-haze) that earn a label this
+## frame. First a THRESHOLD filter (keep the selected district + any district with count >= LABEL_MIN_CELLS), then a
+## PRIORITY de-overlap (selected first, then larger count, then row-major seq) that greedily drops any label whose
+## centroid is within LABEL_MIN_SEP_CELLS of an already-placed higher-priority one. Pure + ordered (inv #3): a total
+## sort key + a row-major greedy placement, no randf/time, no hash-order iteration. Also the test surface for the
+## declutter (a tiny district is suppressed; the selected district is always kept). Read-only (inv #2).
+func _label_plan() -> Array:
+	var sel := _selected_key
+	var cand: Array = []
+	for c in _colony_draw:
+		if bool(c.get("haze", false)):
+			continue
+		var is_sel := sel >= 0 and int(c.get("key", -1)) == sel
+		if not is_sel and int(c.get("count", 0)) < LABEL_MIN_CELLS:
+			continue
+		cand.append(c)
+	cand.sort_custom(func(a, b):
+		var asel: bool = sel >= 0 and int(a.get("key", -1)) == sel
+		var bsel: bool = sel >= 0 and int(b.get("key", -1)) == sel
+		if asel != bsel:
+			return asel  # the selected district sorts first → it is always placed
+		var ac := int(a.get("count", 0))
+		var bc := int(b.get("count", 0))
+		if ac != bc:
+			return ac > bc  # larger districts win an overlap
+		return int(a.get("seq", 0)) < int(b.get("seq", 0)))  # row-major tiebreak → total order
+	var placed: Array = []  # centroids (cell coords) of labels already accepted this frame
+	var out: Array = []
+	for c in cand:
+		var ctr: Vector2 = c["centroid"]
+		var is_sel := sel >= 0 and int(c.get("key", -1)) == sel
+		var ok := true
+		if not is_sel:
+			for pc in placed:
+				if (pc as Vector2).distance_to(ctr) < LABEL_MIN_SEP_CELLS:
+					ok = false
+					break
+		if ok:
+			placed.append(ctr)
+			out.append(c)
+	return out
+
+
+## ADR-029 S6 PERF-LEVER accessor: the number of DISTRICT draw entries (non-haze polygons) the Field-scope colony
+## layer built for the current snapshot. This is O(#colonies) — bounded by the connected-region count and
+## INDEPENDENT of cells × MAX_DOTS_PER_CELL — so it stays small (tens) for a mostly-single-species field even as the
+## cell count grows 4×. Deterministic read of the cached draw list (inv #3). colony_s6_test.gd asserts it stays flat.
+func district_count() -> int:
+	var n := 0
+	for c in _colony_draw:
+		if not bool(c.get("haze", false)):
+			n += 1
+	return n
+
+
+## ADR-029 S6: the TOTAL cached Field-scope draw primitives (districts + sub-MIN_COLONY_CELLS haze specks) — also
+## O(#colonies), the figure that replaces the old O(cells × MAX_DOTS_PER_CELL) per-organism dot count. Read-only.
+func draw_entry_count() -> int:
+	return _colony_draw.size()
+
+
+## ADR-029 S6 DISTRICT INSPECT: the selected district's summary for main.gd's inspect card — the renderer-side
+## registry fields {species, variant, label, gen_created, parent} joined with the LIVE cell/pop count from the cached
+## draw entry. {} when nothing is selected or the selected key is not a current district. KEYED reads only (inv #3);
+## a pure read of already-built render state (inv #2 — no genotype→phenotype). Cleared by main.gd on deselect.
+func selected_colony_summary() -> Dictionary:
+	if _selected_key < 0:
+		return {}
+	for c in _colony_draw:
+		if bool(c.get("haze", false)):
+			continue
+		if int(c.get("key", -1)) != _selected_key:
+			continue
+		var vid := _selected_key % VARIANT_KEY_BASE
+		var reg: Dictionary = _registry.get(vid, {})
+		return {
+			"species": _selected_key / VARIANT_KEY_BASE,
+			"variant": vid,
+			"key": _selected_key,
+			"count": int(c.get("count", 0)),
+			"label": str(reg.get("label", "")),
+			"gen_created": int(reg.get("gen_created", -1)),
+			"parent": int(reg.get("parent", -1)),
+			"is_plant": bool(c.get("is_plant", false)),
+		}
+	return {}
 
 
 ## S3 mid-band INTERNAL HEAT: a per-cell density stipple over district `c`'s own cells, alpha scaled by `alpha`

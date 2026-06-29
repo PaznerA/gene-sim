@@ -190,6 +190,68 @@ func set_selected_colony(key: int) -> void:
 	queue_redraw()
 
 
+## ADR-029 S6: build the deterministic per-cell visit order ONCE — non-empty cells, iso depth-sorted (cx+cy ascending
+## so nearer cells overdraw farther) with an (x, y) tiebreak making the order TOTAL. Shared by _draw and the
+## selected-pop plan so the budget/cull is counted in the SAME order the cells are drawn. No randf/time (inv #3).
+func _draw_order() -> Array:
+	var order: Array = []
+	for y in _h:
+		for x in _w:
+			if _density[y * _w + x] > 0.0:
+				order.append([(x + y) if _iso != null else 0, x, y])
+	if _iso != null:
+		order.sort_custom(func(a, b):
+			if a[0] != b[0]:
+				return a[0] < b[0]
+			if a[1] != b[1]:
+				return a[1] < b[1]
+			return a[2] < b[2])
+	return order
+
+
+## ADR-029 S6 — the HARDENED selected-pop cap, factored out so _draw and the headless test share one path. Walk the
+## SELECTED colony's cells in the deterministic draw `order` and decide which force-POP: clamp to the visible
+## `world_rect` (off-screen cells are CULLED and DO NOT consume the budget) and stop after SELECTED_POP_BUDGET visible
+## pops, so a map-spanning selected colony can never re-spam. Pure read of the (dominant, variant) planes — no draw,
+## no RNG/time (inv #3); a Color/biology decision never enters here (inv #2). A `world_rect` with no area (headless /
+## no camera) skips the viewport clamp; the budget still applies. Returns the popped-cell index SET + a report
+## {popped, candidates, culled_offscreen, budget_capped} the test asserts on.
+func _selected_pop_plan(order: Array, world_rect: Rect2) -> Dictionary:
+	var popped: Dictionary = {}
+	var candidates := 0
+	var culled := 0
+	var capped := 0
+	if _selected_key < 0:
+		return {"set": popped, "popped": 0, "candidates": 0, "culled_offscreen": 0, "budget_capped": 0}
+	var has_rect := world_rect.has_area()
+	for cell in order:
+		var x: int = cell[1]
+		var y: int = cell[2]
+		var i := y * _w + x
+		if i < 0 or i >= _dominant.size():
+			continue
+		var vid := int(round(_variant[i])) if i < _variant.size() else 0
+		if int(round(_dominant[i])) * VARIANT_KEY_BASE + vid != _selected_key:
+			continue
+		candidates += 1
+		if popped.size() >= SELECTED_POP_BUDGET:
+			capped += 1
+			continue  # budget spent → leave the rest aggregated (anti re-spam)
+		if has_rect and not world_rect.has_point(_cell_world_center(x, y)):
+			culled += 1
+			continue  # off-screen → don't pop, and DON'T charge the budget (visible cells only)
+		popped[i] = true
+	return {"set": popped, "popped": popped.size(), "candidates": candidates,
+		"culled_offscreen": culled, "budget_capped": capped}
+
+
+## ADR-029 S6 test surface: the selected-pop cap REPORT for a given world rect, computed over the live planes in the
+## real draw order — the SAME path _draw uses. colony_s6_test.gd asserts a map-spanning selected colony pops at most
+## SELECTED_POP_BUDGET cells AND that off-screen cells are culled (do not consume the budget). Pure read (inv #3).
+func selected_pop_report(world_rect: Rect2) -> Dictionary:
+	return _selected_pop_plan(_draw_order(), world_rect)
+
+
 ## The {size, color, is_plant} visual for the dominant species at cell index `i`. Reads _dominant (the GSS5
 ## plane) → species_table. Graceful: a missing plane / unknown id → the default plant visual (never a crash).
 func _cell_visual(i: int) -> Dictionary:
@@ -236,25 +298,16 @@ func _draw() -> void:
 	var base_hue: float = float(_glyph_params.get("base_hue", 0.4))
 	var is_microbe: bool = bool(_glyph_params.get("is_microbe", false))
 
-	# Visit non-empty cells. Under iso, depth-sort (cx+cy ascending) so nearer cells overdraw farther. The (x,y)
-	# tiebreak makes the order TOTAL → the S4 selected-pop budget below is counted deterministically (inv #3).
-	var order: Array = []
-	for y in _h:
-		for x in _w:
-			if _density[y * _w + x] > 0.0:
-				order.append([(x + y) if _iso != null else 0, x, y])
-	if _iso != null:
-		order.sort_custom(func(a, b):
-			if a[0] != b[0]:
-				return a[0] < b[0]
-			if a[1] != b[1]:
-				return a[1] < b[1]
-			return a[2] < b[2])
+	# Visit non-empty cells in the deterministic (iso depth, x, y) draw order (inv #3) — shared with the selected-pop
+	# plan below so the budget/cull is counted in the SAME order the cells are drawn.
+	var order := _draw_order()
 
-	# S4 selected-pop cap setup: the world-space viewport rect + a row-major sprite budget so a clicked
-	# map-spanning colony cannot re-spam when it force-pops below its footprint threshold.
+	# ADR-029 S6 HARDENED selected-pop cap: precompute the popped-cell SET once, in that draw order, clamped to the
+	# visible viewport rect AND capped to SELECTED_POP_BUDGET — off-screen selected cells are CULLED and never charge
+	# the budget, so a map-spanning selected colony can no longer re-spam (only on-screen, in-budget cells force-pop).
+	# Single source of truth shared with selected_pop_report (the headless test surface). Deterministic (inv #3).
 	var sel_world_rect := _visible_world_rect()
-	var sel_drawn := 0
+	var sel_pop_set: Dictionary = _selected_pop_plan(order, sel_world_rect).get("set", {})
 
 	for cell in order:
 		var x: int = cell[1]
@@ -277,19 +330,12 @@ func _draw() -> void:
 		# the SAME POP_LO..POP_HI band colonies.gd fades its fill over (pure function of footprint, no per-frame timer).
 		var foot := _cell * _zoom * size_scale
 		var pop_t := clampf((foot - POP_LO_PX) / (POP_HI_PX - POP_LO_PX), 0.0, 1.0)
-		# S4 SELECTED-POP: if this cell belongs to the SELECTED colony, force it open regardless of zoom (its
-		# district "explodes" to members while neighbours keep their footprint rung). CAP it: skip off-screen cells
-		# (viewport clamp) and stop after the per-colony sprite budget (row-major) so a map-spanning selection
-		# cannot re-spam. Pure presentation override (inv #2); the cap is deterministic in the total draw order (inv #3).
-		if _selected_key >= 0 and pop_t < 1.0 and i < _dominant.size():
-			var vid := int(round(_variant[i])) if i < _variant.size() else 0
-			if int(round(_dominant[i])) * VARIANT_KEY_BASE + vid == _selected_key:
-				if sel_drawn >= SELECTED_POP_BUDGET:
-					continue  # budget spent → leave the rest aggregated (anti re-spam; S6 hardens)
-				if sel_world_rect.has_area() and not sel_world_rect.has_point(_cell_world_center(x, y)):
-					continue  # off-screen → don't pop (viewport clamp)
-				sel_drawn += 1
-				pop_t = 1.0
+		# ADR-029 S6 SELECTED-POP: a cell of the SELECTED colony force-opens regardless of zoom (its district
+		# "explodes" to members while neighbours keep their footprint rung) ONLY if it is in the precomputed,
+		# viewport-clamped, budget-capped popped set — so a map-spanning selection can never re-spam. Membership is a
+		# keyed lookup (inv #3); pure presentation override (inv #2). Off-screen / over-budget cells stay aggregated.
+		if _selected_key >= 0 and pop_t < 1.0 and sel_pop_set.has(i):
+			pop_t = 1.0
 		if pop_t <= 0.0:
 			continue  # not popped → colonies.gd owns this cell as a district polygon (zero per-cell sprites)
 		var cell_r := base_r * float(vis.get("size", 1.0))
