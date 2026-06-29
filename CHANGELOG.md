@@ -4,6 +4,30 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Colonies S4 — brush→district render surface (nested family district + select-pop) — RENDERER-ONLY, zero Rust (ADR-029)
+The CRISPR brush now reads as the Cities-Skylines "create district" verb (the core brush→`Variant` bind shipped in
+S1; this is its render surface). (1) **Nested district** — closes the S2 hole-cut deferral: `_trace_boundaries`
+returns the outer loop + interior holes and `_draw_holed_fill`/`_eliminate_holes` cut the brushed child region out of
+the parent species fill so the parent renders as a *frame* around the child; the child draws with a bounded
+intra-species hue shift (`_variant_hue_shift`, ±0.09 around the same species base hue, matched by `main.gd._family_color`)
+so it reads as **family**, not a foreign species. The district key is `sid*65536 + heritable dominant_variant_id`, so
+it tracks its members across steps (the heritable S1 tag — proven: centroid moved `(16.5,12.5)→(20.5,14.5)`).
+(2) **Colony registry** — a renderer-side `variant_id → {species, label, color, gen_created, parent}` assembled from
+`observe_species()` + the renderer's own journaled `ApplyEditRegion` strokes (`_resolve_pending_colonies`: the
+core-minted child variant id is read from the inert `dominant_variant_id` plane via ordered `_pending_brush` +
+sorted-key tally + row-major disc — no hash-order iteration); drives the district label ("Wheat v7 · 49") + a stable
+family color. (3) **Select-pop** — world-click → `set_selected_colony(sid*65536+vid)` forces that district to pop
+open regardless of zoom (overrides the S3 footprint rung for its cells) while neighbours stay aggregated, **capped**
+to a viewport-rect clamp + a `SELECTED_POP_BUDGET=700` per-colony sprite budget (spent on visible cells, in a total
+draw order) so a map-spanning selected colony cannot re-spam (S6 hardens the perf cap). A new headless code-level
+proof `godot/colony_s4_test.gd` (wired into the snapshot gate) asserts HOLE_CUT / PERSIST / REGISTRY / SELECTION. inv
+#2: registry/hue/hole-cut/selection are presentation only — no genotype→phenotype (the brush still calls the existing
+`apply_edit_region` `#[func]`). inv #3: no `randf`/`randi`/`Time`/`OS` in any S4 addition, ordered iteration only, no
+`_process`/Timer; the selected-pop viewport clamp is deterministic given camera state (stable for `--shot`). **Zero
+Rust diff** → pinned literal `0x47a0_3c8f_6701_f240` byte-identical by construction; snapshot stays GSS6/channels=14.
+Gate GREEN (sim-core 187/187, determinism OK, COLONY_S4_TEST_OK); 3-skeptic verify 3/3 on all four invariant
+booleans; all reviewers APPROVE. (Closes the S2/S3 deferred cosmetics.)
+
 ### Colonies S3 — LOD pop ladder (zoom→footprint, plants pop first) — RENDERER-ONLY, zero Rust (ADR-029)
 Replaces the binary scope-layer swap (Field=colonies XOR closer=organisms) with a per-colony LOD ladder keyed on the
 **on-screen organism footprint** `footprint_px = _cell * cam.zoom.x * size_scale(species)` (§4.1 — fixes the wiring

@@ -28,6 +28,11 @@ const ALLELE_HUE_SHIFT := 0.12  # allele_freq shifts the hue ±this AROUND the s
 # 0 → 1 across the SAME POP_LO..POP_HI band colonies.gd fades its fill over — a PURE function of footprint, no timer.
 const POP_LO_PX := 6.0
 const POP_HI_PX := 8.0
+# ADR-029 S4 — SELECTED-POP: a clicked colony pops open regardless of zoom. To stop a map-spanning selected colony
+# re-spamming the screen, the forced-pop sprites are clamped to the visible viewport rect AND a per-colony sprite
+# BUDGET counted in the deterministic draw order (inv #3). Basic cap here; S6 hardens the perf cap.
+const SELECTED_POP_BUDGET := 700
+const VARIANT_KEY_BASE := 65536  # packed colony key = species_id*BASE + variant_id (matches colonies.gd)
 const SpeciesVisualMap := preload("res://species_visual_map.gd")
 
 var _w: int = 0
@@ -43,6 +48,12 @@ var _nutrients: PackedFloat32Array
 # COLOR via _species_table so each cell's organisms render at their dominant species' real-cell scale (plant
 # LARGE, microbes small, symbionts tiny) instead of one shared density-derived radius. Empty → all-default.
 var _dominant: PackedFloat32Array
+# GSS6: per-cell dominant Variant ordinal (row-major, w*h). Combined with _dominant it gives each cell's packed
+# (species,variant) colony key for the S4 selected-pop test. Empty (pre-GSS6 / file-replay) → variant 0 everywhere.
+var _variant: PackedFloat32Array
+# ADR-029 S4: the SELECTED colony key (species*BASE+variant), set on a world-click in main.gd. Its cells POP OPEN
+# regardless of zoom (override the footprint gate), capped to the viewport + a sprite budget. -1 = nothing selected.
+var _selected_key: int = -1
 # species_id:int -> {size:float, color:Color, is_plant:bool}; built in main.gd via SpeciesVisualMap.build_table
 # from observe_species(). Empty (file-replay / pre-feed) → every cell uses the default plant visual (graceful).
 var _species_table: Dictionary = {}
@@ -163,6 +174,22 @@ func set_dominant_species_ids(dominant: PackedFloat32Array, species_table: Dicti
 	queue_redraw()
 
 
+## ADR-029 S4: the GSS6 per-cell dominant Variant plane (snap.dominant_variant_id), so the selected-pop test can
+## compute each cell's packed (species,variant) colony key. Empty → variant 0 everywhere (pre-GSS6 graceful).
+func set_variant_plane(plane: PackedFloat32Array) -> void:
+	_variant = plane
+	queue_redraw()
+
+
+## ADR-029 S4: the SELECTED colony (packed species*BASE+variant key, or -1). Its cells force-pop regardless of
+## zoom (clamped to the viewport + a sprite budget). Guarded so a no-op reselect doesn't thrash a redraw (inv #3).
+func set_selected_colony(key: int) -> void:
+	if key == _selected_key:
+		return
+	_selected_key = key
+	queue_redraw()
+
+
 ## The {size, color, is_plant} visual for the dominant species at cell index `i`. Reads _dominant (the GSS5
 ## plane) → species_table. Graceful: a missing plane / unknown id → the default plant visual (never a crash).
 func _cell_visual(i: int) -> Dictionary:
@@ -189,6 +216,10 @@ func set_snapshot(snap, cell: float) -> void:
 	# size-aware even if set_dominant_species_ids wasn't called separately (the table may still be empty → default).
 	if "dominant_species_id" in snap:
 		_dominant = snap.dominant_species_id
+	# GSS6 S4: pull the per-cell Variant plane so the selected-pop override keys on (species,variant) without a
+	# separate set_variant_plane call (graceful: a pre-GSS6 snapshot lacks it → variant 0 everywhere).
+	if "dominant_variant_id" in snap:
+		_variant = snap.dominant_variant_id
 	if _glyph_params.is_empty():
 		# File-replay or pre-feed: neutral 0.5s so the field still renders as a plausible green population.
 		_glyph_params = _compute_glyph_params({}, _species_key)
@@ -205,14 +236,25 @@ func _draw() -> void:
 	var base_hue: float = float(_glyph_params.get("base_hue", 0.4))
 	var is_microbe: bool = bool(_glyph_params.get("is_microbe", false))
 
-	# Visit non-empty cells. Under iso, depth-sort (cx+cy ascending) so nearer cells overdraw farther.
+	# Visit non-empty cells. Under iso, depth-sort (cx+cy ascending) so nearer cells overdraw farther. The (x,y)
+	# tiebreak makes the order TOTAL → the S4 selected-pop budget below is counted deterministically (inv #3).
 	var order: Array = []
 	for y in _h:
 		for x in _w:
 			if _density[y * _w + x] > 0.0:
 				order.append([(x + y) if _iso != null else 0, x, y])
 	if _iso != null:
-		order.sort_custom(func(a, b): return a[0] < b[0])
+		order.sort_custom(func(a, b):
+			if a[0] != b[0]:
+				return a[0] < b[0]
+			if a[1] != b[1]:
+				return a[1] < b[1]
+			return a[2] < b[2])
+
+	# S4 selected-pop cap setup: the world-space viewport rect + a row-major sprite budget so a clicked
+	# map-spanning colony cannot re-spam when it force-pops below its footprint threshold.
+	var sel_world_rect := _visible_world_rect()
+	var sel_drawn := 0
 
 	for cell in order:
 		var x: int = cell[1]
@@ -235,6 +277,19 @@ func _draw() -> void:
 		# the SAME POP_LO..POP_HI band colonies.gd fades its fill over (pure function of footprint, no per-frame timer).
 		var foot := _cell * _zoom * size_scale
 		var pop_t := clampf((foot - POP_LO_PX) / (POP_HI_PX - POP_LO_PX), 0.0, 1.0)
+		# S4 SELECTED-POP: if this cell belongs to the SELECTED colony, force it open regardless of zoom (its
+		# district "explodes" to members while neighbours keep their footprint rung). CAP it: skip off-screen cells
+		# (viewport clamp) and stop after the per-colony sprite budget (row-major) so a map-spanning selection
+		# cannot re-spam. Pure presentation override (inv #2); the cap is deterministic in the total draw order (inv #3).
+		if _selected_key >= 0 and pop_t < 1.0 and i < _dominant.size():
+			var vid := int(round(_variant[i])) if i < _variant.size() else 0
+			if int(round(_dominant[i])) * VARIANT_KEY_BASE + vid == _selected_key:
+				if sel_drawn >= SELECTED_POP_BUDGET:
+					continue  # budget spent → leave the rest aggregated (anti re-spam; S6 hardens)
+				if sel_world_rect.has_area() and not sel_world_rect.has_point(_cell_world_center(x, y)):
+					continue  # off-screen → don't pop (viewport clamp)
+				sel_drawn += 1
+				pop_t = 1.0
 		if pop_t <= 0.0:
 			continue  # not popped → colonies.gd owns this cell as a district polygon (zero per-cell sprites)
 		var cell_r := base_r * float(vis.get("size", 1.0))
@@ -541,6 +596,30 @@ func _organism_color(allele: float, fitness: float, base_hue: float) -> Color:
 	var sat := 0.6 + 0.3 * fitness
 	var val := 0.6 + 0.4 * fitness
 	return Color.from_hsv(hue, sat, val, 0.97)
+
+
+## S4: the world-space rectangle currently visible through the camera, used to clamp selected-pop sprites to
+## on-screen cells. Best-effort: a degenerate / headless transform → an empty rect (the budget cap still applies).
+## Deterministic given camera state (no RNG/time; inv #3). A 2-cell margin keeps edge-straddling cells popped.
+func _visible_world_rect() -> Rect2:
+	var ct := get_canvas_transform()
+	if is_zero_approx(ct.determinant()):
+		return Rect2()
+	var vp := get_viewport_rect().size
+	if vp.x <= 0.0 or vp.y <= 0.0:
+		return Rect2()
+	var inv := ct.affine_inverse()
+	var rect := Rect2(inv * Vector2.ZERO, Vector2.ZERO)
+	for corner in [Vector2(vp.x, 0.0), Vector2(vp.x, vp.y), Vector2(0.0, vp.y)]:
+		rect = rect.expand(inv * corner)
+	return rect.grow(_cell * 2.0)
+
+
+## World-space centre of cell (x,y), for the selected-pop viewport clamp (iso projects through the transform).
+func _cell_world_center(x: int, y: int) -> Vector2:
+	if _iso != null:
+		return _iso.cell_to_screen(float(x), float(y), _cell)
+	return Vector2((float(x) + 0.5) * _cell, (float(y) + 0.5) * _cell)
 
 
 ## Deterministic [0,1) hash for intra-cell jitter + per-organism variation (visual only).

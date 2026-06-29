@@ -51,6 +51,16 @@ var _dominant_variant: PackedFloat32Array  # may be EMPTY on an older (pre-GSS6)
 var _species_table: Dictionary = {}     # species_id:int -> {size, color, is_plant, morph}; keyed lookups only
 var _iso = null                         # iso.gd; when set, district polygons project into the 2:1 diamond field
 
+# ADR-029 S4 — renderer-side COLONY REGISTRY: variant_id:int -> {species, label, color, gen_created, parent}.
+# Assembled in main.gd (ordered passes) from observe_species() + the journaled ApplyEditRegion brush strokes; used
+# here for a brushed district's STABLE family name + colour (a brushed child reads as the same species, not a foreign
+# one). KEYED access only (has/get) — NEVER iterated for any order-sensitive output (inv #3).
+var _registry: Dictionary = {}
+# ADR-029 S4 — the SELECTED colony key (species_id*VARIANT_KEY_BASE+variant_id), set on a world-click in main.gd.
+# A selected district forces its fill to the popped GHOST so organisms.gd can explode it to members (the selected-pop)
+# regardless of zoom while neighbours stay aggregated. -1 = nothing selected. Presentation-only (inv #2).
+var _selected_key: int = -1
+
 # Row-major label image (compacted colony id per cell; -1 = background). Member so the boundary tracer reads it
 # without copying the PackedInt32Array per colony. Rebuilt in _rebuild_colonies.
 var _labels: PackedInt32Array
@@ -87,6 +97,24 @@ func set_zoom(zoom: float) -> void:
 	if is_equal_approx(zoom, _zoom):
 		return
 	_zoom = zoom
+	queue_redraw()
+
+
+## ADR-029 S4: hand in the renderer-side colony registry (main.gd owns its assembly). Stores it for the NEXT
+## set_snapshot rebuild (which reads it for a brushed district's stable family name + colour) and redraws. No
+## rebuild here — main.gd calls this BEFORE set_snapshot. Keyed reads only downstream (inv #3).
+func set_colony_registry(reg: Dictionary) -> void:
+	_registry = reg
+	queue_redraw()
+
+
+## ADR-029 S4: the SELECTED colony (packed species*BASE+variant key, or -1). A district whose key matches forces
+## its fill to the popped ghost so organisms.gd explodes it to members regardless of zoom. Guarded so a no-op
+## reselect doesn't thrash a redundant redraw (inv #3: redraw only on a real state change).
+func set_selected_colony(key: int) -> void:
+	if key == _selected_key:
+		return
+	_selected_key = key
 	queue_redraw()
 
 
@@ -222,27 +250,48 @@ func _rebuild_colonies() -> void:
 		# S3: the district's species SIZE multiplier (plant 2.2 … symbiont 0.34) — the §4.1 footprint term carried
 		# into the draw entry so plant districts cross the pop threshold FIRST (do NOT clamp it away).
 		var size_scale := float(meta.get("size", SpeciesVisualMap.SIZE_DEFAULT))
+		var key := sid * VARIANT_KEY_BASE + vid
 		if count < MIN_COLONY_CELLS:
 			# Tiny speck → a soft haze blob, not a full district (anti-flicker; the brief's risk #2).
 			_colony_draw.append({"haze": true, "centroid": centroid, "color": base_col, "count": count})
 			continue
-		var loop := _trace_boundary(cid, agg_minx[cid], agg_miny[cid], agg_maxx[cid], agg_maxy[cid])
-		if loop.size() < 3:
+		# ADR-029 S4 — trace ALL boundary loops: loops[0] = the outer hull, loops[1..] = interior HOLES. A brushed
+		# child district is its OWN (species,variant) colony, so the parent species territory has a HOLE punched
+		# where the child sits → the parent renders as a FRAME around the child (the S2 deferred hole-cut). Each
+		# loop is simplified + smoothed; the row-major tracer + sorted hole seeds keep this deterministic (inv #3).
+		var raw_loops := _trace_boundaries(cid, agg_minx[cid], agg_miny[cid], agg_maxx[cid], agg_maxy[cid])
+		if raw_loops.is_empty() or (raw_loops[0] as PackedVector2Array).size() < 3:
 			_colony_draw.append({"haze": true, "centroid": centroid, "color": base_col, "count": count})
 			continue
-		loop = _simplify_closed(loop, SIMPLIFY_EPS)
-		loop = _chaikin_once(loop)
-		var fill := _fill_color(base_col, mean_fit, vid)
+		var loops: Array = []
+		for rl in raw_loops:
+			var s := _simplify_closed(rl, SIMPLIFY_EPS)
+			s = _chaikin_once(s)
+			if s.size() >= 3:
+				loops.append(s)
+		if loops.is_empty():
+			_colony_draw.append({"haze": true, "centroid": centroid, "color": base_col, "count": count})
+			continue
+		# S4 registry: a brush-minted child (vid != 0) takes its STABLE family colour from the renderer-side colony
+		# registry (so the district colour does not drift with mean fitness across frames). Keyed lookup only
+		# (inv #3). Absent (wild-type vid 0 / unregistered) → the species base colour + the bounded computed hue shift.
+		var entry: Dictionary = _registry.get(vid, {}) if vid != 0 else {}
+		var fill: Color
+		if not entry.is_empty():
+			fill = _fill_color(entry.get("color", base_col), mean_fit, 0)  # registry colour already carries the family hue
+		else:
+			fill = _fill_color(base_col, mean_fit, vid)
 		var outline := fill.darkened(0.45)
 		outline.a = 0.92
 		var width := clampf(1.0 + 0.45 * sqrt(float(count)), 1.5, 6.0)
-		var label := str(GLYPH_BY_MORPH.get(morph, "?")) + (" v%d" % vid if vid != 0 else "") + " " + str(count)
+		var label := _district_label(entry, morph, vid, count)
 		_colony_draw.append({
-			"haze": false, "points": loop, "fill": fill, "outline": outline, "width": width,
+			"haze": false, "points": loops[0], "loops": loops, "has_holes": loops.size() > 1,
+			"fill": fill, "outline": outline, "width": width,
 			"label": label, "centroid": centroid, "depth": centroid.x + centroid.y, "seq": cid,
-			# S3 LOD ladder: the species size term + the colony id/bbox so _draw can pick the rung from the
-			# footprint and stipple this district's own cells (bounded, row-major) without an extra label scan.
-			"cid": cid, "size_scale": size_scale,
+			# S3 LOD ladder + S4 selection: the species size term, the colony id/bbox (for the bounded row-major
+			# stipple + hole-cut cell-quad fill), and the packed (species,variant) key the selected-pop matches on.
+			"cid": cid, "key": key, "size_scale": size_scale,
 			"minx": agg_minx[cid], "miny": agg_miny[cid], "maxx": agg_maxx[cid], "maxy": agg_maxy[cid],
 		})
 
@@ -278,13 +327,14 @@ func _uf_find(parent: Array, x: int) -> int:
 	return r
 
 
-## Trace the boundary of colony `cid`'s cell mask into ONE ordered closed loop of grid-corner points (a
-## marching-squares-equivalent edge walk at cell-edge resolution). Each filled cell contributes a directed
-## boundary half-edge per neighbour that is NOT in the colony, wound so the edges chain into a loop. The start
-## corner is the FIRST edge of the topmost-leftmost cell (row-major) → deterministic seed; the walk follows
-## keyed adjacency lookups (never a hash-order iteration). Returns grid-corner coords (corner (cx,cy) is the
-## top-left of cell (cx,cy); range 0.._w / 0.._h).
-func _trace_boundary(cid: int, minx: int, miny: int, maxx: int, maxy: int) -> PackedVector2Array:
+## ADR-029 S4: trace ALL boundary loops of colony `cid`'s cell mask (a marching-squares-equivalent edge walk at
+## cell-edge resolution). loops[0] = the OUTER hull (seeded from the FIRST edge of the topmost-leftmost cell —
+## deterministic); loops[1..] = interior HOLES (e.g. a brushed child district nested inside its parent territory).
+## Each filled cell contributes a directed boundary half-edge per neighbour NOT in the colony, wound so the edges
+## chain into loops. The outer loop walks first; remaining loops are seeded from the SMALLEST unconsumed corner key
+## (adj.keys() SORTED → ordered, never a hash-order walk; inv #3). Grid-corner coords: corner (cx,cy) = top-left of
+## cell (cx,cy), range 0.._w / 0.._h.
+func _trace_boundaries(cid: int, minx: int, miny: int, maxx: int, maxy: int) -> Array:
 	var adj: Dictionary = {}  # start_corner_key -> Array[end_corner_key]; KEYED access only (inv #3)
 	var start_key := -1
 	var edge_count := 0
@@ -294,7 +344,7 @@ func _trace_boundary(cid: int, minx: int, miny: int, maxx: int, maxy: int) -> Pa
 			if _labels[i] != cid:
 				continue
 			# Emit a half-edge per side whose neighbour is outside the colony (or off-grid). Winding (top→left→
-			# bottom→right, each toward the next corner) makes the per-cell edges chain into a single loop.
+			# bottom→right, each toward the next corner) makes the per-cell edges chain into closed loops.
 			# above
 			if y == 0 or _labels[i - _w] != cid:
 				var a0 := _corner(x + 1, y)
@@ -314,23 +364,52 @@ func _trace_boundary(cid: int, minx: int, miny: int, maxx: int, maxy: int) -> Pa
 			if x == _w - 1 or _labels[i + 1] != cid:
 				_add_edge(adj, _corner(x + 1, y + 1), _corner(x + 1, y))
 				edge_count += 1
-	var loop := PackedVector2Array()
+	var loops: Array = []
 	if start_key == -1:
-		return loop
-	var cur := start_key
+		return loops
+	# Outer hull first (deterministic seed = topmost-leftmost cell's top edge).
+	var outer := _walk_loop(adj, start_key, edge_count)
+	if outer.size() >= 3:
+		loops.append(outer)
+	# Remaining loops = interior holes. Seed each from the smallest unconsumed corner key (SORTED keys → inv #3).
+	var rem: Array = adj.keys()
+	rem.sort()
+	for k in rem:
+		var outs: Array = adj.get(k, [])
+		if outs.is_empty():
+			continue
+		var hole := _walk_loop(adj, k, edge_count)
+		if hole.size() >= 3:
+			loops.append(hole)
+	return loops
+
+
+## Walk one closed boundary loop from `start`, consuming out-edges (pop_back = insertion order, deterministic).
+## Stops on return to `start` or after edge_count+2 steps (safety). Returns grid-corner points.
+func _walk_loop(adj: Dictionary, start: int, edge_count: int) -> PackedVector2Array:
+	var loop := PackedVector2Array()
+	var cur := start
 	var steps := 0
 	while true:
 		loop.append(_key_to_grid(cur))
 		var outs: Array = adj.get(cur, [])
 		if outs.is_empty():
 			break
-		var nxt: int = outs.pop_back()  # consume one out-edge (array order = insertion order; deterministic)
+		var nxt: int = outs.pop_back()
 		adj[cur] = outs
 		cur = nxt
 		steps += 1
-		if cur == start_key or steps > edge_count + 2:
+		if cur == start or steps > edge_count + 2:
 			break
 	return loop
+
+
+## ADR-029 S4: a district's label — registry name · variant · count for a brush-minted child (so it reads as a
+## NAMED family district), else the species morph glyph (+ variant tag) + cell-footprint count. Keyed lookup only.
+func _district_label(entry: Dictionary, morph: String, vid: int, count: int) -> String:
+	if not entry.is_empty():
+		return "%s v%d · %d" % [str(entry.get("label", "?")), vid, count]
+	return str(GLYPH_BY_MORPH.get(morph, "?")) + (" v%d" % vid if vid != 0 else "") + " " + str(count)
 
 
 func _add_edge(adj: Dictionary, a: int, b: int) -> void:
@@ -466,25 +545,45 @@ func _draw() -> void:
 		var size_scale: float = float(c.get("size_scale", 1.0))
 		var foot := _cell * _zoom * size_scale
 		var pop_t := clampf((foot - POP_LO_PX) / (POP_HI_PX - POP_LO_PX), 0.0, 1.0)
+		# S4 selected-pop: a clicked district forces FULL pop (fill → ghost) regardless of zoom, so organisms.gd
+		# explodes it to members while neighbours keep their footprint-driven rung. Pure key match (inv #2/#3).
+		if _selected_key >= 0 and int(c.get("key", -1)) == _selected_key:
+			pop_t = 1.0
 		var fill_factor := lerpf(1.0, GHOST_FILL_FACTOR, pop_t)  # 1.0 full district → 0.15 popped (thin ghost + outline)
-		# Project the grid-corner contour into world space (ortho or iso) and draw fill + closed outline.
+		# Project the OUTER grid-corner contour into world space (ortho or iso).
 		var pts := PackedVector2Array()
 		var grid: PackedVector2Array = c["points"]
 		for gp in grid:
 			pts.append(_grid_to_world(gp.x, gp.y))
+		var has_holes: bool = bool(c.get("has_holes", false))
 		if pts.size() >= 3:
 			var fill: Color = c["fill"]
 			fill.a *= fill_factor
-			draw_colored_polygon(pts, fill)
+			if has_holes:
+				# S4 hole-cut: this parent territory encloses a brushed child district → CUT the child region out
+				# of the parent fill so the parent reads as a FRAME around the child (the child draws its own
+				# family-tinted fill in the hole). Bridge+triangulate for one hole; cell-quad masked fill for many.
+				_draw_holed_fill(c, fill)
+			else:
+				draw_colored_polygon(pts, fill)
 			# Mid-band internal heat: a per-cell density stipple that grows across [STIPPLE_MIN..POP_LO] and fades as
 			# the colony pops [POP_LO..POP_HI] (organisms.gd's sprites take over). Pure function of footprint.
 			var stipple_a := clampf((foot - STIPPLE_MIN_PX) / (POP_LO_PX - STIPPLE_MIN_PX), 0.0, 1.0) * (1.0 - pop_t)
 			if stipple_a > 0.01:
 				_draw_density_stipple(c, stipple_a)
-			var outline := pts
-			outline.append(pts[0])
-			draw_polyline(outline, c["outline"], float(c["width"]), true)
-		# Centred district label: species glyph (+ variant tag) + cell-footprint count.
+			# Outline: the outer hull always; for a holed parent, ALSO each hole loop so the inner frame edge
+			# around the child reads as a clean district boundary.
+			if has_holes:
+				for lp in c.get("loops", []):
+					var wl := _project_loop(lp)
+					if wl.size() >= 2:
+						wl.append(wl[0])
+						draw_polyline(wl, c["outline"], float(c["width"]), true)
+			else:
+				var outline := pts
+				outline.append(pts[0])
+				draw_polyline(outline, c["outline"], float(c["width"]), true)
+		# Centred district label: registry family name (or species glyph) + variant tag + cell-footprint count.
 		if font != null:
 			var lp := _grid_to_world(c["centroid"].x, c["centroid"].y)
 			var txt := str(c["label"])
@@ -518,3 +617,124 @@ func _draw_density_stipple(c: Dictionary, alpha: float) -> void:
 				continue
 			var p := _grid_to_world(float(x) + 0.5, float(y) + 0.5)
 			draw_circle(p, r * (0.4 + 0.6 * d), Color(heat.r, heat.g, heat.b, alpha * STIPPLE_MAX_ALPHA * d))
+
+
+## Project a grid-corner loop into world space (ortho or iso). Presentation geometry only.
+func _project_loop(grid: PackedVector2Array) -> PackedVector2Array:
+	var out := PackedVector2Array()
+	for gp in grid:
+		out.append(_grid_to_world(gp.x, gp.y))
+	return out
+
+
+## ADR-029 S4 hole-cut: fill the parent district MINUS its holes. ONE hole (the common single-brush case) →
+## bridge the hole into the outer ring (a zero-width keyhole seam) → triangulate the weakly-simple ring → draw the
+## frame as a triangle fan (the hole region triangulates to nothing). MANY holes (or a degenerate bridge) → a
+## robust per-cell masked fill: draw each parent CELL's quad (the hole cells are simply NOT in this colony's mask,
+## so they are never drawn). Both paths are deterministic (no randf/time, row-major / sorted iteration; inv #3).
+func _draw_holed_fill(c: Dictionary, fill: Color) -> void:
+	var loops: Array = c.get("loops", [])
+	if loops.size() < 2:
+		return
+	var outer := _project_loop(loops[0])
+	var holes: Array = []
+	for hi in range(1, loops.size()):
+		holes.append(_project_loop(loops[hi]))
+	if holes.size() == 1:
+		var ring := _eliminate_holes(outer, holes)
+		var tri := Geometry2D.triangulate_polygon(ring)
+		if tri.size() >= 3:
+			for t in range(0, tri.size(), 3):
+				draw_colored_polygon(PackedVector2Array([ring[tri[t]], ring[tri[t + 1]], ring[tri[t + 2]]]), fill)
+			return
+	_draw_cell_quads(c, fill)
+
+
+## Robust hole-respecting fill fallback: draw each of district `c`'s OWN cells as a quad (the holes are cells not
+## in this colony's mask → never drawn). Bounded to the colony bbox, row-major, keyed on _labels (inv #3).
+func _draw_cell_quads(c: Dictionary, fill: Color) -> void:
+	var cid: int = int(c.get("cid", -1))
+	if cid < 0 or _labels.size() != _w * _h:
+		return
+	var minx: int = int(c.get("minx", 0))
+	var miny: int = int(c.get("miny", 0))
+	var maxx: int = int(c.get("maxx", 0))
+	var maxy: int = int(c.get("maxy", 0))
+	for y in range(miny, maxy + 1):
+		for x in range(minx, maxx + 1):
+			var i := y * _w + x
+			if i < 0 or i >= _labels.size() or _labels[i] != cid:
+				continue
+			draw_colored_polygon(PackedVector2Array([
+				_grid_to_world(float(x), float(y)), _grid_to_world(float(x + 1), float(y)),
+				_grid_to_world(float(x + 1), float(y + 1)), _grid_to_world(float(x), float(y + 1))]), fill)
+
+
+## Signed area of a closed polygon (shoelace; this y-down convention: >0 = clockwise on screen). Pure geometry.
+func _signed_area(p: PackedVector2Array) -> float:
+	var a := 0.0
+	var n := p.size()
+	for i in n:
+		var q := p[(i + 1) % n]
+		a += (q.x - p[i].x) * (q.y + p[i].y)
+	return a
+
+
+## Bridge each hole into the outer ring (earcut "eliminateHoles") → one weakly-simple ring fillable as a frame.
+## The outer is oriented CCW and each hole CW (opposite winding = a hole); each hole is spliced into the ring at a
+## bridge vertex found by a +x ray from the hole's rightmost vertex. Holes are processed by descending max-x (the
+## earcut order). Pure deterministic geometry (no RNG/time; inv #3). Triangulating the result fills outer MINUS holes.
+func _eliminate_holes(outer: PackedVector2Array, holes: Array) -> PackedVector2Array:
+	var ring := outer.duplicate()
+	if _signed_area(ring) > 0.0:  # >0 = CW here → reverse to CCW outer
+		ring.reverse()
+	var order: Array = []
+	for hi in holes.size():
+		var mx := -INF
+		for v in (holes[hi] as PackedVector2Array):
+			mx = maxf(mx, v.x)
+		order.append([mx, hi])
+	order.sort_custom(func(a, b): return a[0] > b[0])
+	for o in order:
+		var h: PackedVector2Array = (holes[o[1]] as PackedVector2Array).duplicate()
+		if _signed_area(h) < 0.0:  # <0 = CCW here → reverse to CW hole
+			h.reverse()
+		var hvi := 0
+		var hvx := -INF
+		for i in h.size():
+			if h[i].x > hvx:
+				hvx = h[i].x
+				hvi = i
+		var bi := _find_bridge_index(ring, h[hvi])
+		var out := PackedVector2Array()
+		for i in range(0, bi + 1):
+			out.append(ring[i])
+		for n in range(h.size() + 1):
+			out.append(h[(hvi + n) % h.size()])
+		for i in range(bi, ring.size()):
+			out.append(ring[i])
+		ring = out
+	return ring
+
+
+## Find the ring vertex to bridge a hole vertex `hv` to: cast a +x ray from `hv`, pick the ring vertex on the
+## straddling edge with the smallest x >= hv.x; fall back to the nearest vertex by x. Deterministic.
+func _find_bridge_index(ring: PackedVector2Array, hv: Vector2) -> int:
+	var best := -1
+	var bestx := INF
+	var n := ring.size()
+	for i in n:
+		var a := ring[i]
+		var b := ring[(i + 1) % n]
+		if (a.y <= hv.y and b.y >= hv.y) or (b.y <= hv.y and a.y >= hv.y):
+			var t := 0.0 if is_equal_approx(b.y, a.y) else (hv.y - a.y) / (b.y - a.y)
+			var ix := a.x + t * (b.x - a.x)
+			if ix >= hv.x - 0.001 and ix < bestx:
+				bestx = ix
+				best = i if a.x > b.x else (i + 1) % n
+	if best == -1:
+		for i in n:
+			if ring[i].x < bestx:
+				bestx = ring[i].x
+				best = i
+	return best

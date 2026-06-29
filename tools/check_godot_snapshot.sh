@@ -114,4 +114,17 @@ for mode in "" "--ortho"; do
   echo "GODOT RENDER OK (${mode:-iso-default}) — $(printf '%s' "$ROUT" | grep 'render scene OK')"
 done
 echo "CODEX INSPECT OK — every species glyph built headlessly + the codex inspect join resolved"
+
+# 3. ADR-029 S4 colony render-surface proof (renderer-only, no display): a brushed child Variant nested in its
+# parent territory makes the parent a hole-cut FRAME (filled area == outer MINUS the child hole), the district
+# tracks its members across a move (the heritable S1 tag), the registry names it, and the selected-pop override +
+# its anti-re-spam budget are present. A geometry regression (hole not cut, district lost on move) goes RED here.
+run_godot "$TMP/colony_s4_out.log" --script colony_s4_test.gd
+COUT="$(cat "$TMP/colony_s4_out.log")"
+if ! printf '%s' "$COUT" | grep -q "COLONY_S4_TEST_OK"; then
+  echo "FAIL — ADR-029 S4 colony render-surface test did not pass. Full output:"
+  printf '%s\n' "$COUT"
+  exit 1
+fi
+echo "COLONY S4 OK — $(printf '%s' "$COUT" | grep 'HOLE_CUT_OK')"
 exit 0
