@@ -1,8 +1,13 @@
 # Pinned spec — D3 surrogate model (the "brute-force gradient")
 
 > Output of the `surrogate-model-design` 3-lens panel → judge. The buildable spec for D3 of the emergent-discovery
-> epic. Awaiting human sign-off on the two flagged decisions (steering target + model choice) before implementation.
-> Companion: ADR-023/024/025 (the D0/D1 scorer + trace, in DECISIONS.md).
+> epic. **Status (2026-06-30):** D3-A (eval log), D3-B.1 (feature encoder) + D3-B.2 (drama-weighted target `D`)
+> IMPLEMENTED + merged; the steering-target constants are pinned in **ADR-033** (`DramaWeights {8,4,40,8,32}`). The two
+> flagged decisions remain a *behavioural* gate: the steering target (drama `D` vs raw `Q`) and the model choice bite
+> where steering actually changes emergent output — wired into **D3-B.4 (steered loop)** and gated as a **D4
+> (batch-showcase) dependency**; surfaced to the human before D4 generates the committed showcase. Defining/pinning
+> the target (D3-B.2) does not pre-empt that.
+> Companion: ADR-023/024/025 (the D0/D1 scorer + trace) + ADR-033 (the drama target), in DECISIONS.md.
 >
 > **Invariants:** #1 std+serde, GPL-clean (heavy ML stays at the process boundary — never linked). #2 reads config +
 > score NUMBERS only, no biology. #3 integer/deterministic/off-hash (the pinned literal `0x47a0_3c8f_6701_f240`
@@ -40,8 +45,8 @@ trait): `BoostStumpInt` (tiny integer GBT) when the log exceeds ~300 rows; heavy
 **subprocess boundary** crate (`crates/oracle-surrogate`, the oracle-slim/oracle-fba pattern) — never linked.
 
 **Target** — predict a **DRAMA-weighted** `D`, not raw Q: `D = (Σ wᵢMᵢ for i∈1..5)/Σw × M6/SCALE`, with
-`DramaWeights = [m1=8, m2=4, m3=40, m4=32→m5=32, m4=8]` → **78% of the weight on dynamism (M3) + events (M5)** (vs
-46% in Q), M6 the unchanged instant-death gate. **Clean separation:** the surrogate STEERS by predicting `D`, but
+`DramaWeights = [w1=8, w2=4, w3=40, w4=8, w5=32]` (sum 92; `w3+w5 = 72/92`) → **78% of the weight on dynamism (M3) +
+events (M5)** (vs ~46% in Q), M6 the unchanged instant-death gate. **Clean separation:** the surrogate STEERS by predicting `D`, but
 gems are still CURATED by `final_score` (Q × novelty) — so the search hunts drama while the library keeps the
 curation criterion. Weights live in a serialized `DramaWeights` struct (ADR-pinned, retune-without-code, like
 `ScoreParams`). This encodes memory `no-hardcoded-balance-open-system` (steer toward living dynamics, not forced

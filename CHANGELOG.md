@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Discovery D3-B.2 — the drama-weighted steering target `D` — HASH-NEUTRAL, off-hash integer (ADR-033)
+The first brute-force batch showed **M1 (coexistence) saturates** → raw quality `Q` (≈46% weight on M1/M2) stops
+separating *dramatic* runs from *placid* ones. New off-hash, pure-integer steering target the surrogate (D3-B.3/B.4)
+will predict: a serde `DramaWeights` struct (`crates/discovery/src/surrogate.rs`, modelled on `ScoreParams`,
+retune-without-code, `version`/`DRAMA_WEIGHTS_VERSION=1` re-pin anchor) with the **pinned default
+`{w1=8, w2=4, w3=40, w4=8, w5=32}`** (sum 92; `w3+w5 = 72/92 = 78%` of the weight on dynamism M3 + events M5, vs ~46%
+in Q), and `drama_target(breakdown:[u16;6], &DramaWeights) -> u64 = (Σ wᵢMᵢ for i∈1..5)/wsum · M6/SCALE` — exactly the
+`Q` combine shape (`ecology.rs:70-71`) with the drama weights, pure integer (zero f64), no RNG, M6 the unchanged
+multiplicative instant-death gate. **Clean steer/curate separation** (load-bearing): `Q`/`final_score`/`ScoreParams`/
+gem curation are **unchanged** — `D` is a separate STEERING target; a test proves `D` ranks a dynamic run above a
+placid-coexisting one where `Q` ranks them opposite. Encodes the standing memory `no-hardcoded-balance-open-system`
+(steer toward living dynamics, not forced stability). Defines the target only — changes no search behaviour, not yet
+wired into the loop (the steered sibling lands in D3-B.4; the behavioural steering sign-off is sequenced to D4 per
+ADR-033). Hash-neutral: pinned literal `0x47a0_3c8f_6701_f240` byte-identical (the target reads the inert `[u16;6]`
+breakdown; `discovery` has no `sim-core` dep); `cargo tree -p discovery` stays `std`+`serde` (inv #5). Gate GREEN
+(discovery 82→90 tests incl. 8 new monotonicity/M6-gate/serde/Q-unchanged tests, sim-core 187/187, determinism OK);
+3-skeptic verify 3/3 on all four invariant booleans. **ADR-033.**
+
 ### Colonies S6 — perf-lever verification + select-pop cull + district inspect + label declutter — RENDERER-ONLY, zero Rust (ADR-029)
 Closes the colony epic with the perf story + UX polish. (1) **Perf-lever verification** (the headline) — a new
 headless `godot/colony_s6_test.gd` builds the colony layer at Field scope on a 48² (2304 cells) and a 96² (9216

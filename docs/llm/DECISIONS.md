@@ -1427,3 +1427,52 @@ tooling / a future Godot GIF loader. The capture is environment-gated (needs a G
 and the gate's coverage of the assembly is the pure-Rust `gifenc` smoke. Real captured frames are colour-rich → a
 6-frame preview is ~300KB even downscaled; a future tighter palette / fewer frames / smaller `--gif-max-dim` would
 shrink it.
+
+---
+
+## ADR-033 — Discovery steering target: the drama-weighted `D` (M3+M5 ≈ 78%) + clean steer/curate separation (D3-B.2)
+
+**Status:** Accepted (2026-06-30). The first brute-force batch showed **M1 (coexistence) SATURATES** — once most
+runs coexist, M1 stops discriminating, so the raw quality `Q` (which spends ~46% of its weight on M1/M2) no longer
+separates a *dramatic* run from a *placid* one. This slice defines the steering target the surrogate (D3-B.3/B.4)
+will predict. It is **off-hash, pure-integer scorer math** (`crates/discovery/src/surrogate.rs`); the pinned literal
+`0x47a0_3c8f_6701_f240` is byte-identical and `cargo tree -p discovery` stays `std`+`serde` only (inv #5).
+
+**Context.** `discovery` already computes a 6-metric `ScoreVec.breakdown:[u16; 6]` (M1 coexistence · M2 evenness ·
+M3 dynamism · M4 trophic · M5 events · M6 survival-gate) and curates gems by `final_score = Q × novelty`. To make an
+*autonomous emergent-run search* hunt the INTERESTING runs (limit-cycles / cascades = high M3 dynamism + M5 events),
+the surrogate needs a target that rewards drama, not stable coexistence.
+
+**Decision.**
+1. **`DramaWeights`** — a serde `Serialize/Deserialize` struct (modelled byte-for-byte on `ScoreParams`, retune-
+   without-code, inv #7) with `w1..w5: u64` + a `wsum()` (M6 excluded), a `version: u32` (`#[serde(default)]`) +
+   `DRAMA_WEIGHTS_VERSION = 1` re-pin self-invalidation anchor. **PINNED default `{w1=8, w2=4, w3=40, w4=8, w5=32}`**
+   (sum 92; `w3+w5 = 72/92 = 78%` of the weight on dynamism + events, vs ~46% in `Q`).
+2. **`drama_target(breakdown: &[u16; 6], &DramaWeights) -> u64`** = `((Σ wᵢMᵢ for i∈1..5)/wsum().max(1)) · M6/SCALE`
+   — EXACTLY the `Q` combine shape (`ecology.rs:70-71`) with the drama weights. Pure integer (zero f64), no RNG, no
+   HashMap; M6 stays the unchanged multiplicative instant-death gate (M6→0 crushes `D` to 0). Strictly monotone
+   non-decreasing in every metric, strictly increasing in M3 & M5 over any non-trivial change (gate open).
+3. **CLEAN STEER/CURATE SEPARATION (load-bearing).** `D` is a NEW, SEPARATE target. `Q` / `final_score` /
+   `final_score_with` / `ScoreParams` / the gem-curation path are **UNCHANGED** (byte-identical, tests pass). The
+   surrogate STEERS the search by predicting `D`; the library still CURATES gems by `final_score` (Q × novelty). A
+   test proves the divergence: `D` ranks a dynamic run above a placid-but-coexisting one where `Q` ranks them
+   opposite.
+
+**Invariant audit.** inv #3 — off-hash, pure-integer, deterministic (no f64/RNG/HashMap); the pinned literal is
+unmoved (the target reads only the inert `[u16; 6]` breakdown; `discovery` has no `sim-core`/`harness` dependency).
+inv #5 — science stays behind the existing scorer surface; `discovery` adds no dependency (`std`+`serde`). inv #7 —
+the weights are a pinned, versioned, ADR-recorded tunable.
+
+**Scope / sequencing of the human sign-off.** This slice only **DEFINES** the target — it changes **no search
+behaviour** and is **not yet wired into the loop** (`discover_evolved` is untouched; the steered sibling lands in
+D3-B.4). The drama-weighted default directly encodes the standing user memory `no-hardcoded-balance-open-system`
+("steer toward living dynamics, not forced stability") and the design judge picked it; it is also fully reversible
+(swap the steering target in one place). The broader steering-target sign-off flagged in `surrogate-model-spec.md`
+(open-question #1: drama `D` vs raw `Q`) bites where steering actually changes emergent output — **wired into D3-B.4
+(steered loop) and gated as a dependency of D4 (batch-showcase)** per `QUEUE.md`; that behavioural decision will be
+surfaced to the human before D4 generates the committed showcase. Pinning the constants here does not pre-empt it.
+
+**Alternatives considered.** Raw `Q` as the steering target: REJECTED — M1 saturation makes it blind to drama
+(the empirical motivation). Replacing `Q` with `D` for curation too: REJECTED — curation wants the
+coexistence/quality criterion; conflating steer + curate loses the "hunt drama, keep a quality library" property.
+A float target / matrix-inversion fit: REJECTED — cross-platform non-determinism (inv #3); integer GD lands in D3-B.3.

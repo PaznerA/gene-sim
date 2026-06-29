@@ -35,7 +35,10 @@ pub use search::{
     caption, crossover, mutate, propose, propose_evolved, EvalRecord, Gem, GemLibrary,
     SearchConfig, SearchSpace, SpeciesAxis,
 };
-pub use surrogate::{encode, FeatureVec, ENCODER_ID, FEAT_DIMS};
+pub use surrogate::{
+    drama_target, drama_target_from, encode, DramaWeights, FeatureVec, DRAMA_WEIGHTS_VERSION,
+    ENCODER_ID, FEAT_DIMS,
+};
 pub use trace::{GenRow, InocRec, PerGenTrace, SpeciesMeta};
 
 use fixed::SCALE;

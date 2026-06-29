@@ -15,6 +15,14 @@
 //! iteration (uses `Vec`/slices/arrays only). NO float. Same `(cfg, space)` → byte-identical [`FeatureVec`].
 //! `master_seed` is EXCLUDED (entropy, not steerable — two configs differing only in `master_seed` encode
 //! identically; asserted by `encode_excludes_master_seed`).
+//!
+//! ## Steering target (sub-slice D3-B.2)
+//! [`drama_target`] computes the DRAMA-weighted `D` the surrogate STEERS by: the `ScoreParams` Q-combine
+//! SHAPE (`ecology::score` — `weighted = Σwᵢmᵢ/wsum; D = weighted*m6/SCALE`) re-weighted via the pinned
+//! [`DramaWeights`] so 78% of the mass sits on dynamism (M3) + events (M5). It is a SEPARATE target from gem
+//! CURATION (`final_score` = Q × novelty, which is UNCHANGED): the search hunts drama while the library keeps
+//! the curation criterion (memory `no-hardcoded-balance-open-system`). Pure integer, RNG-free, `f64`-free;
+//! `m6 == 0` crushes `D` to 0 (the same instant-death survival gate Q uses).
 
 use crate::fixed::{ratio_bp, SCALE};
 use crate::search::{SearchConfig, SearchSpace};
@@ -164,6 +172,93 @@ pub fn encode(cfg: &SearchConfig, space: &SearchSpace) -> FeatureVec {
     f[27] = extremity_bp as i32;
 
     FeatureVec(f)
+}
+
+// ============================================================================
+// D3-B.2 — the DRAMA-weighted steering target `D`
+// ============================================================================
+
+/// PINNED drama-weights version. Bumped on any re-pin of the [`DramaWeights`] default so a model that
+/// serialized its training-target weights can detect a stale pin: the [`DramaWeights::version`] field
+/// travels WITH the serialized struct (a self-invalidation anchor, like `Gem::build_id` / [`ENCODER_ID`]).
+pub const DRAMA_WEIGHTS_VERSION: u32 = 1;
+
+fn default_drama_version() -> u32 {
+    DRAMA_WEIGHTS_VERSION
+}
+
+/// The DRAMA-weighted steering target's tunable weights (ADR-pinned, inv #7) — the surrogate's STEER
+/// criterion, kept CLEANLY SEPARATE from the gem-curation [`ScoreParams`](crate::ScoreParams) (Q × novelty).
+/// Mirrors `ScoreParams`'s combine weights and `wsum()` exactly, but re-weighted so 78% of the mass sits on
+/// dynamism (M3) + events (M5) — biasing the search toward LIVING dynamics (limit-cycles/cascades) over the
+/// placid coexistence Q rewards (memory `no-hardcoded-balance-open-system`). [`Default`] is the pinned
+/// starting point; retune without a code edit. `Serialize`/`Deserialize` so a trained surrogate's target
+/// weights round-trip byte-stable (the [`version`](Self::version) anchor self-invalidates a stale pin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DramaWeights {
+    /// M1 (coexistence) weight.
+    pub w1: u64,
+    /// M2 (evenness) weight.
+    pub w2: u64,
+    /// M3 (dynamism) weight — the dominant drama term.
+    pub w3: u64,
+    /// M4 (trophic structure) weight.
+    pub w4: u64,
+    /// M5 (events) weight — the second drama term.
+    pub w5: u64,
+    /// Pinned-weights version anchor (defaults to [`DRAMA_WEIGHTS_VERSION`]). An old serialization that
+    /// predates this field deserializes to the current version; a re-pin bumps it so a stale model self-detects.
+    #[serde(default = "default_drama_version")]
+    pub version: u32,
+}
+
+impl Default for DramaWeights {
+    fn default() -> Self {
+        // The pinned drama weights (this slice's literal): 78% of the weight on dynamism (M3) + events (M5).
+        // w3 + w5 = 72, WSUM = 92, (w3+w5)*100/WSUM = 78. Tunable without a code edit (ADR-pinned, inv #7).
+        DramaWeights {
+            w1: 8,
+            w2: 4,
+            w3: 40,
+            w4: 8,
+            w5: 32,
+            version: DRAMA_WEIGHTS_VERSION,
+        }
+    }
+}
+
+impl DramaWeights {
+    /// `WSUM = w1+w2+w3+w4+w5` — the weighted-average denominator (M6 is EXCLUDED; it is the multiplicative
+    /// survival gate, mirroring [`ScoreParams::wsum`](crate::ScoreParams::wsum)).
+    #[must_use]
+    pub fn wsum(&self) -> u64 {
+        self.w1 + self.w2 + self.w3 + self.w4 + self.w5
+    }
+}
+
+/// Compute the DRAMA-weighted steering target `D` from a metric breakdown `[m1..m6]`. EXACTLY the Q-combine
+/// SHAPE (`ecology::score`: `weighted = Σwᵢmᵢ/wsum.max(1); D = weighted*m6/SCALE`) but with [`DramaWeights`]
+/// instead of the curation weights — so `D` re-ranks runs by DRAMA while Q / `final_score` curate gems
+/// UNCHANGED. `m6` is the multiplicative survival gate: `m6 == 0` crushes `D` to 0 (the instant-death gate).
+/// PURE INTEGER, RNG-free, no `f64` — same `(breakdown, weights)` → byte-identical `D ∈ [0, SCALE]`.
+#[must_use]
+pub fn drama_target(breakdown: &[u16; 6], w: &DramaWeights) -> u64 {
+    let m1 = u64::from(breakdown[0]);
+    let m2 = u64::from(breakdown[1]);
+    let m3 = u64::from(breakdown[2]);
+    let m4 = u64::from(breakdown[3]);
+    let m5 = u64::from(breakdown[4]);
+    let m6 = u64::from(breakdown[5]);
+    // Mirror `ecology::score`'s combine shape (the weighted average, then the multiplicative m6 gate).
+    let weighted = (w.w1 * m1 + w.w2 * m2 + w.w3 * m3 + w.w4 * m4 + w.w5 * m5) / w.wsum().max(1);
+    weighted * m6 / SCALE
+}
+
+/// [`drama_target`] convenience that forwards a [`ScoreVec`](crate::ScoreVec)'s `breakdown` — so a caller
+/// holding a scored run steers off its metrics without unpacking the array.
+#[must_use]
+pub fn drama_target_from(score: &crate::ScoreVec, w: &DramaWeights) -> u64 {
+    drama_target(&score.breakdown, w)
 }
 
 #[cfg(test)]
@@ -625,5 +720,161 @@ mod tests {
         let json = serde_json::to_string(&f).expect("serialize");
         let back: FeatureVec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(f, back, "FeatureVec must round-trip via serde");
+    }
+
+    // ========================================================================
+    // D3-B.2 — the DRAMA-weighted steering target `D`
+    // ========================================================================
+
+    /// (d) The pinned default weights satisfy the 78% drama share + the WSUM contract.
+    #[test]
+    fn drama_weights_default_is_pinned_78pct() {
+        let w = DramaWeights::default();
+        assert_eq!(
+            [w.w1, w.w2, w.w3, w.w4, w.w5],
+            [8, 4, 40, 8, 32],
+            "pinned weights"
+        );
+        assert_eq!(w.w3 + w.w5, 72, "M3+M5 weight");
+        assert_eq!(w.wsum(), 92, "WSUM = w1+..+w5");
+        assert_eq!((w.w3 + w.w5) * 100 / w.wsum(), 78, "drama share = 78%");
+    }
+
+    /// (a) `D` is STRICTLY MONOTONE increasing in M3 (all else equal), up to saturation. `m6 = SCALE` so the
+    /// gate is fully open and `D == weighted`, making each +Δm3 step visibly raise `D`.
+    #[test]
+    fn drama_target_strictly_monotone_in_m3() {
+        let w = DramaWeights::default();
+        let mut prev: Option<u64> = None;
+        let mut steps = 0;
+        for m3 in (0..=SCALE).step_by(500) {
+            let b: [u16; 6] = [3000, 3000, m3 as u16, 3000, 3000, SCALE as u16];
+            let d = drama_target(&b, &w);
+            if let Some(p) = prev {
+                assert!(
+                    d > p,
+                    "D must strictly increase with M3: {p} -> {d} (m3={m3})"
+                );
+                steps += 1;
+            }
+            prev = Some(d);
+        }
+        assert!(steps > 0, "sweep produced no comparisons");
+    }
+
+    /// (a) `D` is STRICTLY MONOTONE increasing in M5 (all else equal), up to saturation.
+    #[test]
+    fn drama_target_strictly_monotone_in_m5() {
+        let w = DramaWeights::default();
+        let mut prev: Option<u64> = None;
+        let mut steps = 0;
+        for m5 in (0..=SCALE).step_by(500) {
+            let b: [u16; 6] = [3000, 3000, 3000, 3000, m5 as u16, SCALE as u16];
+            let d = drama_target(&b, &w);
+            if let Some(p) = prev {
+                assert!(
+                    d > p,
+                    "D must strictly increase with M5: {p} -> {d} (m5={m5})"
+                );
+                steps += 1;
+            }
+            prev = Some(d);
+        }
+        assert!(steps > 0, "sweep produced no comparisons");
+    }
+
+    /// (b) `m6 == 0` crushes `D` to 0 (the instant-death gate), even at maxed-out drama metrics.
+    #[test]
+    fn drama_target_m6_zero_crushes_to_zero() {
+        let w = DramaWeights::default();
+        let max = SCALE as u16;
+        let dead: [u16; 6] = [max, max, max, max, max, 0];
+        assert_eq!(drama_target(&dead, &w), 0, "m6==0 must crush D to 0");
+        // Sanity: the SAME drama metrics with the gate open are strongly positive.
+        let alive: [u16; 6] = [max, max, max, max, max, max];
+        assert!(drama_target(&alive, &w) > 0, "open gate → D > 0");
+    }
+
+    /// (c) Deterministic + pure integer: same input → byte-identical output (no RNG, no `f64`).
+    #[test]
+    fn drama_target_is_deterministic() {
+        let w = DramaWeights::default();
+        let b: [u16; 6] = [1234, 5678, 9012, 3456, 7890, 9999];
+        assert_eq!(drama_target(&b, &w), drama_target(&b, &w));
+    }
+
+    /// `D` reproduces the `ecology::score` Q-combine SHAPE exactly (the longhand formula) — only the weights differ.
+    #[test]
+    fn drama_target_matches_combine_shape() {
+        let w = DramaWeights::default();
+        let b: [u16; 6] = [1000, 2000, 3000, 4000, 5000, 8000];
+        let m = |i: usize| u64::from(b[i]);
+        let weighted =
+            (w.w1 * m(0) + w.w2 * m(1) + w.w3 * m(2) + w.w4 * m(3) + w.w5 * m(4)) / w.wsum().max(1);
+        let expected = weighted * m(5) / SCALE;
+        assert_eq!(drama_target(&b, &w), expected);
+    }
+
+    /// `drama_target_from` forwards a `ScoreVec`'s breakdown.
+    #[test]
+    fn drama_target_from_forwards_breakdown() {
+        let w = DramaWeights::default();
+        let sv = crate::ScoreVec {
+            quality: 0,
+            breakdown: [1000, 2000, 3000, 4000, 5000, 9000],
+            fingerprint: [0; crate::FP_DIMS],
+        };
+        assert_eq!(drama_target_from(&sv, &w), drama_target(&sv.breakdown, &w));
+    }
+
+    /// (e) `DramaWeights` serde round-trips byte-stable.
+    #[test]
+    fn drama_weights_serde_roundtrip_byte_stable() {
+        let w = DramaWeights::default();
+        let json = serde_json::to_string(&w).expect("serialize");
+        let back: DramaWeights = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(w, back, "DramaWeights must round-trip via serde");
+        let json2 = serde_json::to_string(&back).expect("re-serialize");
+        assert_eq!(
+            json, json2,
+            "serde form must be byte-stable across a round-trip"
+        );
+    }
+
+    /// (f) The whole point: on a drama-heavy vs a placid-but-even breakdown, `D` ranks the DYNAMIC run ABOVE
+    /// the placid one, while the curation Q-combine ranks them the OTHER way. Proves steer ≠ curate.
+    #[test]
+    fn drama_target_ranks_dynamic_above_placid_where_q_does_not() {
+        use crate::ScoreParams;
+        // The Q-combine bp value (the curation criterion's core, pre-SCORE_SCALE/novelty) — same shape as
+        // `ecology::score`, used here purely to RANK two breakdowns under the curation weights.
+        fn q_combine(b: &[u16; 6], p: &ScoreParams) -> u64 {
+            let m = |i: usize| u64::from(b[i]);
+            let weighted = (p.w1 * m(0) + p.w2 * m(1) + p.w3 * m(2) + p.w4 * m(3) + p.w5 * m(4))
+                / p.wsum().max(1);
+            weighted * m(5) / SCALE
+        }
+        let qp = ScoreParams::default();
+        let dw = DramaWeights::default();
+
+        // placid: perfect coexistence + evenness, NO dynamism/events; survives.
+        let placid: [u16; 6] = [10_000, 10_000, 0, 0, 0, 10_000];
+        // dynamic: NO coexistence/evenness, strong dynamism + events; survives.
+        let dynamic: [u16; 6] = [0, 0, 6_000, 0, 6_000, 10_000];
+
+        // Q (curation) ranks the PLACID run above the dynamic one...
+        assert!(
+            q_combine(&placid, &qp) > q_combine(&dynamic, &qp),
+            "Q must rank placid above dynamic (placid={}, dynamic={})",
+            q_combine(&placid, &qp),
+            q_combine(&dynamic, &qp)
+        );
+        // ...but D (steering) ranks the DYNAMIC run strictly above the placid one — the whole point.
+        assert!(
+            drama_target(&dynamic, &dw) > drama_target(&placid, &dw),
+            "D must rank dynamic above placid (dynamic={}, placid={})",
+            drama_target(&dynamic, &dw),
+            drama_target(&placid, &dw)
+        );
     }
 }
