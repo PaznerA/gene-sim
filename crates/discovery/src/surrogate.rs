@@ -261,6 +261,236 @@ pub fn drama_target_from(score: &crate::ScoreVec, w: &DramaWeights) -> u64 {
     drama_target(&score.breakdown, w)
 }
 
+// ============================================================================
+// D3-B.3 — the `Surrogate` trait + the integer `RidgeInt` regressor
+// ============================================================================
+//
+// The inv #5 seam: a tiny pluggable interface that turns the accumulated `(config-features → drama)`
+// evaluations into a cheap `D̂` predictor, so the D2b search (D3-B.4) can pre-filter candidate configs before
+// paying for the expensive headless run. Impls are SWAPPABLE without touching `search` — the steered loop holds
+// a `&mut dyn Surrogate`. Two impls ship here: [`NullSurrogate`] (the passthrough base case) + [`RidgeInt`]
+// (the integer ridge linear regressor, the default). `BoostStumpInt` is the deferred upgrade (same trait).
+//
+// ## Determinism (inv #3) — ZERO f64
+// `RidgeInt` is trained by FIXED-POINT gradient descent (NOT float matrix inversion, which is cross-platform
+// non-deterministic and FORBIDDEN): `θ` is `i64` on [`THETA_SHIFT`], every dot-product / gradient sum runs in
+// an `i128` accumulator (exact, overflow-safe), and the dataset is SORTED ONCE so accumulation is row-order
+// independent. There is NO `f32`/`f64` anywhere on the train or predict path and NO RNG (the `seed` param is
+// accepted for the trait contract but unused by batch GD — reserved for a future minibatch shuffle). Same rows
+// + same constants → byte-identical `θ` → byte-identical predictions. OFF-HASH: the surrogate never builds a
+// `SimRng`/sim env, so the pinned literal `0x47a0_3c8f_6701_f240` is untouched.
+//
+// ## Pins (inv #7)
+// [`THETA_SHIFT`], [`N_ITERS`], [`LR_SHIFT`], [`RIDGE_LAMBDA_SHIFT`] (the ridge λ) and [`RIDGE_MIN_SAMPLES`] are
+// determinism-load-bearing constants; [`RIDGE_BUILD_ID`] travels WITH a serialized model (a self-invalidation
+// anchor, like [`ENCODER_ID`] / [`DRAMA_WEIGHTS_VERSION`]) so a re-pin self-detects a stale model.
+
+/// The pluggable surrogate interface (inv #5). An impl learns `features → predicted drama` from the eval log
+/// and predicts a candidate's `D̂` so the steered search can pre-filter. Swapping impls never touches `search`.
+pub trait Surrogate {
+    /// Fit the model to the `(x, y)` training rows (`x[j]` = [`encode`]d config, `y[j]` = [`drama_target`]).
+    /// DETERMINISTIC + row-order-independent: same rows + same constants → identical model, regardless of the
+    /// order the rows arrive in. `seed` is part of the contract (future minibatch shuffle); batch impls ignore it.
+    fn fit(&mut self, x: &[FeatureVec], y: &[u64], seed: u64);
+    /// Predict the drama `D̂ ∈ [0, SCALE]` for a single encoded config. PURE INTEGER, no `f64`.
+    #[must_use]
+    fn predict(&self, x: &FeatureVec) -> u64;
+    /// Stable identifier (recorded alongside saved models / logs).
+    fn id(&self) -> &'static str;
+    /// The minimum number of training rows before this surrogate should STEER. Below it, the steered loop
+    /// COLD-STARTS to passthrough (behaves like `discover_evolved`). [`NullSurrogate`] sets this to
+    /// [`usize::MAX`] so it NEVER steers — the byte-identical base case.
+    fn min_samples(&self) -> usize;
+}
+
+/// The base-case surrogate (inv #5): a no-op that NEVER steers. `fit` is a no-op, `predict` returns a constant
+/// `0`, and [`min_samples`](Surrogate::min_samples) is [`usize::MAX`] so the D3-B.4 steered loop always
+/// COLD-STARTS to passthrough — a `NullSurrogate`-steered run is BYTE-IDENTICAL to `discover_evolved`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NullSurrogate;
+
+impl Surrogate for NullSurrogate {
+    #[inline]
+    fn fit(&mut self, _x: &[FeatureVec], _y: &[u64], _seed: u64) {
+        // no-op: the base case never learns.
+    }
+    #[inline]
+    fn predict(&self, _x: &FeatureVec) -> u64 {
+        0
+    }
+    #[inline]
+    fn id(&self) -> &'static str {
+        "null-v1"
+    }
+    #[inline]
+    fn min_samples(&self) -> usize {
+        usize::MAX
+    }
+}
+
+/// PINNED fixed-point shift for the `θ` coefficients (inv #7): a stored `θ_i` represents the real coefficient
+/// `θ_i / 2^THETA_SHIFT`. Predict is a pure integer dot product `(θ·x) >> THETA_SHIFT`.
+pub const THETA_SHIFT: u32 = 16;
+
+/// PINNED gradient-descent iteration count (inv #7) — a fixed budget, NO float early-stop (an early-stop on a
+/// float loss would be cross-platform non-deterministic).
+pub const N_ITERS: usize = 2000;
+
+/// PINNED learning-rate shift (inv #7): the per-iteration data step is `Σⱼ rⱼ·xⱼᵢ / (n · 2^LR_SHIFT)`. Tuned
+/// for the bp-grid feature scale (`E[x²] ≈ SCALE²/3`) — roughly a 1/6-of-Newton step, so the dominant drama
+/// features (predator×prey, temp-extremity, …) converge in tens of iterations, well inside [`N_ITERS`]. The
+/// heterogeneous binary features (presence/one-hot) learn slowly under a single shift; a real-eval-log
+/// convergence pass / per-feature scaling is open-question #4, deferred.
+pub const LR_SHIFT: u32 = 11;
+
+/// PINNED ridge λ as a per-iteration weight-decay shift (inv #7): each non-bias `θ_i` is shrunk toward zero by
+/// `θ_i / 2^RIDGE_LAMBDA_SHIFT` each iteration (decoupled L2 / ridge). This is the "ridge" in `RidgeInt`; the
+/// bias term (idx 0) is left unregularized (standard).
+pub const RIDGE_LAMBDA_SHIFT: u32 = 8;
+
+/// The minimum training rows before [`RidgeInt`] should steer (≥ the feature count, so the linear system is not
+/// wildly under-determined). The D3-B.4 steered loop cold-starts to passthrough below this.
+pub const RIDGE_MIN_SAMPLES: usize = FEAT_DIMS;
+
+/// PINNED model build anchor (inv #7), serialized WITH a fitted [`RidgeInt`]. Encodes the load-bearing pins
+/// (dims, shift, iters) so a re-pin of any of them self-invalidates a stale serialized model — mirrors
+/// [`ENCODER_ID`] / `Gem::build_id`. Bump in lockstep with any pin change above.
+pub const RIDGE_BUILD_ID: &str = "ridgeint-v1@dims28-shift16-iters2000";
+
+/// The stable [`Surrogate::id`] string for [`RidgeInt`].
+pub const RIDGE_ID: &str = "ridgeint-v1";
+
+fn default_ridge_build_id() -> String {
+    RIDGE_BUILD_ID.to_string()
+}
+
+/// The integer ridge LINEAR regressor (inv #5 default impl). `θ` (length [`FEAT_DIMS`], on [`THETA_SHIFT`]) is
+/// fit by fixed-point gradient descent on the ridge MSE; predict is a pure integer dot product. Zero `f64` on
+/// any path (inv #3). `serde` so a fitted model round-trips; the [`build_id`](Self::build_id) anchor
+/// self-invalidates a stale pin (inv #7).
+///
+/// ## Fit (fixed-point GD, `i128`-accumulated)
+/// 1. SORT the `(x, y)` rows ONCE by `(y, features)` — a deterministic canonical order. (Integer batch sums are
+///    already exactly order-independent; the sort is the belt-and-suspenders ROW-ORDER-INDEPENDENCE guarantee.)
+/// 2. For [`N_ITERS`] iterations: predict every row (`ŷⱼ = (θ·xⱼ) >> THETA_SHIFT`, UNclamped for the gradient),
+///    form residuals `rⱼ = ŷⱼ − yⱼ`, accumulate the per-feature gradient `Gᵢ = Σⱼ rⱼ·xⱼᵢ` in an `i128`
+///    (exact, overflow-safe), then step `θᵢ −= Gᵢ / (n · 2^LR_SHIFT)` and apply the ridge decay (non-bias).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RidgeInt {
+    /// The fitted coefficients (length [`FEAT_DIMS`]), each an `i64` on [`THETA_SHIFT`]. Zero before [`fit`].
+    theta: Vec<i64>,
+    /// The pinned-build anchor (inv #7) — an old serialization predating this field defaults to
+    /// [`RIDGE_BUILD_ID`]; a re-pin bumps the constant so a stale model self-detects via [`is_current_build`].
+    ///
+    /// [`fit`]: RidgeInt::fit
+    /// [`is_current_build`]: RidgeInt::is_current_build
+    #[serde(default = "default_ridge_build_id")]
+    build_id: String,
+}
+
+impl Default for RidgeInt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RidgeInt {
+    /// A fresh, unfit model — `θ` all zero (so `predict` returns 0 until [`fit`](Surrogate::fit)).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            theta: vec![0i64; FEAT_DIMS],
+            build_id: RIDGE_BUILD_ID.to_string(),
+        }
+    }
+
+    /// The fitted coefficients (length [`FEAT_DIMS`], on [`THETA_SHIFT`]) — introspection for tests / steering.
+    #[must_use]
+    pub fn theta(&self) -> &[i64] {
+        &self.theta
+    }
+
+    /// This model's build anchor (inv #7).
+    #[must_use]
+    pub fn build_id(&self) -> &str {
+        &self.build_id
+    }
+
+    /// Whether this model was built under the CURRENT pinned build — a stale serialized model is detectable.
+    #[must_use]
+    pub fn is_current_build(&self) -> bool {
+        self.build_id == RIDGE_BUILD_ID
+    }
+}
+
+impl Surrogate for RidgeInt {
+    fn fit(&mut self, x: &[FeatureVec], y: &[u64], _seed: u64) {
+        // _seed: batch GD is deterministic and seed-independent (reserved for a future minibatch shuffle).
+        let n = x.len().min(y.len());
+        // Fresh fit: reset θ to zero (the search retrains each generation).
+        self.theta = vec![0i64; FEAT_DIMS];
+        if n == 0 {
+            return;
+        }
+
+        // (1) SORT the row indices ONCE by a deterministic key `(y, features)` → a canonical accumulation order.
+        // Integer batch sums are already exactly order-independent; the sort makes ROW-ORDER-INDEPENDENCE a
+        // structural guarantee (robust to any future order-sensitive op).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| (y[a], x[a].0).cmp(&(y[b], x[b].0)));
+
+        // The combined `n · 2^LR_SHIFT` denominator (mean-gradient + learning rate folded into one division).
+        let lr_den: i128 = (n as i128) << LR_SHIFT;
+
+        for _iter in 0..N_ITERS {
+            // Per-feature gradient sum `Gᵢ = Σⱼ rⱼ·xⱼᵢ`, accumulated in i128 (exact, overflow-safe).
+            let mut grad = [0i128; FEAT_DIMS];
+            for &j in &order {
+                let xj = &x[j].0;
+                // ŷⱼ = (θ·xⱼ) >> THETA_SHIFT — UNclamped (clamping would zero the gradient outside range).
+                let mut acc: i128 = 0;
+                for (&t, &xi) in self.theta.iter().zip(xj.iter()) {
+                    acc += i128::from(t) * i128::from(xi);
+                }
+                let pred = acc >> THETA_SHIFT;
+                let resid = pred - i128::from(y[j]);
+                for (g, &xi) in grad.iter_mut().zip(xj.iter()) {
+                    *g += resid * i128::from(xi);
+                }
+            }
+            // Apply the data step + ridge decay.
+            for (i, t) in self.theta.iter_mut().enumerate() {
+                let step = grad[i] / lr_den; // mean-grad / 2^LR_SHIFT, truncates toward zero
+                let mut v = i128::from(*t) - step;
+                if i != 0 {
+                    // Ridge: decoupled L2 weight-decay toward zero (bias term left unregularized).
+                    v -= v / (1i128 << RIDGE_LAMBDA_SHIFT);
+                }
+                *t = v as i64; // i64 has ample headroom for bp-scale coefficients
+            }
+        }
+    }
+
+    fn predict(&self, x: &FeatureVec) -> u64 {
+        // The dot product θ·x in i128 (zip naturally stops at min(theta.len(), FEAT_DIMS) — robust to a stale
+        // model with a wrong-length θ vector).
+        let mut acc: i128 = 0;
+        for (&t, &xi) in self.theta.iter().zip(x.0.iter()) {
+            acc += i128::from(t) * i128::from(xi);
+        }
+        let pred = acc >> THETA_SHIFT;
+        pred.clamp(0, SCALE as i128) as u64
+    }
+
+    fn id(&self) -> &'static str {
+        RIDGE_ID
+    }
+
+    fn min_samples(&self) -> usize {
+        RIDGE_MIN_SAMPLES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,5 +1106,289 @@ mod tests {
             drama_target(&dynamic, &dw),
             drama_target(&placid, &dw)
         );
+    }
+
+    // ========================================================================
+    // D3-B.3 — the `Surrogate` trait + the integer `RidgeInt` regressor
+    // ========================================================================
+
+    /// A planted-signal dataset: `y = (A·feat[16] + B·feat[27]) / SCALE + bounded noise`, with all other
+    /// features zero (bias = 1). feat[16] = predator×prey, feat[27] = temp-extremity — the two drama features
+    /// the surrogate must learn. Deterministic, pure integer (a splitmix64 supplies bounded noise — NO RNG crate).
+    const PLANT_A: i64 = 6000; // coefficient on feat[16]
+    const PLANT_B: i64 = 3000; // coefficient on feat[27]
+
+    fn planted_dataset() -> (Vec<FeatureVec>, Vec<u64>) {
+        let m = 96usize;
+        let mut xs = Vec::with_capacity(m);
+        let mut ys = Vec::with_capacity(m);
+        let mut noise: u64 = 0x1234_5678_9abc_def0;
+        for r in 0..m {
+            // Spread feat16/feat27 across [0, 8000] via coprime steps (deterministic, well-conditioned).
+            let x16 = ((r as i64 * 101 + 37) % 8001) as i32;
+            let x27 = ((r as i64 * 263 + 11) % 8001) as i32;
+            let mut f = [0i32; FEAT_DIMS];
+            f[0] = 1; // bias
+            f[16] = x16;
+            f[27] = x27;
+            // bounded deterministic noise in [-150, 150].
+            noise = noise
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let nz = ((noise >> 33) % 301) as i64 - 150;
+            let clean = (PLANT_A * x16 as i64 + PLANT_B * x27 as i64) / SCALE as i64;
+            let y = (clean + nz).clamp(0, SCALE as i64) as u64;
+            xs.push(FeatureVec(f));
+            ys.push(y);
+        }
+        (xs, ys)
+    }
+
+    /// The noiseless planted target for a `(feat16, feat27)` pair — the relationship `predict` must track.
+    fn planted_clean(p: i32, q: i32) -> u64 {
+        ((PLANT_A * p as i64 + PLANT_B * q as i64) / SCALE as i64).clamp(0, SCALE as i64) as u64
+    }
+
+    // ---- pinned constants (inv #7) ----
+
+    #[test]
+    fn surrogate_constants_are_pinned() {
+        assert_eq!(THETA_SHIFT, 16);
+        assert_eq!(N_ITERS, 2000);
+        assert_eq!(LR_SHIFT, 11);
+        assert_eq!(RIDGE_LAMBDA_SHIFT, 8);
+        assert_eq!(RIDGE_MIN_SAMPLES, FEAT_DIMS);
+        assert_eq!(RIDGE_BUILD_ID, "ridgeint-v1@dims28-shift16-iters2000");
+        assert_eq!(RIDGE_ID, "ridgeint-v1");
+    }
+
+    // ---- (f) NullSurrogate base case ----
+
+    #[test]
+    fn null_surrogate_is_passthrough_base_case() {
+        let (xs, ys) = planted_dataset();
+        let mut s = NullSurrogate;
+        // predict is a constant 0 before AND after fit (fit is a no-op).
+        assert_eq!(s.predict(&xs[0]), 0);
+        s.fit(&xs, &ys, 123);
+        assert_eq!(s.predict(&xs[0]), 0);
+        assert_eq!(s.predict(&xs[5]), 0);
+        // min_samples = usize::MAX → the steered loop NEVER steers (cold-start passthrough).
+        assert_eq!(s.min_samples(), usize::MAX);
+        assert_eq!(s.id(), "null-v1");
+    }
+
+    // ---- (a) deterministic + byte-identical ----
+
+    #[test]
+    fn ridge_fit_predict_is_deterministic() {
+        let (xs, ys) = planted_dataset();
+        let mut a = RidgeInt::new();
+        let mut b = RidgeInt::new();
+        a.fit(&xs, &ys, 42);
+        b.fit(&xs, &ys, 42);
+        assert_eq!(a, b, "same rows + seed → byte-identical model");
+        assert_eq!(a.theta(), b.theta());
+        for x in &xs {
+            assert_eq!(a.predict(x), b.predict(x), "predictions must be identical");
+        }
+    }
+
+    /// Batch GD is seed-independent (the `seed` param is reserved for a future minibatch shuffle).
+    #[test]
+    fn ridge_fit_is_seed_independent() {
+        let (xs, ys) = planted_dataset();
+        let mut a = RidgeInt::new();
+        let mut b = RidgeInt::new();
+        a.fit(&xs, &ys, 1);
+        b.fit(&xs, &ys, 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(a.theta(), b.theta(), "batch GD ignores the seed");
+    }
+
+    // ---- (b) row-order-independent (the sort-once guarantee) ----
+
+    #[test]
+    fn ridge_fit_is_row_order_independent() {
+        let (xs, ys) = planted_dataset();
+        let mut base = RidgeInt::new();
+        base.fit(&xs, &ys, 7);
+
+        // (i) reversed order — pairs kept together.
+        let mut xr: Vec<_> = xs.clone();
+        let mut yr: Vec<_> = ys.clone();
+        xr.reverse();
+        yr.reverse();
+        let mut rev = RidgeInt::new();
+        rev.fit(&xr, &yr, 7);
+        assert_eq!(base.theta(), rev.theta(), "reversed rows → identical θ");
+
+        // (ii) a non-trivial deterministic permutation (stride interleave).
+        let nrows = xs.len();
+        let mut perm: Vec<usize> = Vec::with_capacity(nrows);
+        let mut k = 0usize;
+        for _ in 0..nrows {
+            perm.push(k);
+            k = (k + 37) % nrows; // 37 coprime with 96 → a full cycle (a true permutation)
+        }
+        let xp: Vec<_> = perm.iter().map(|&i| xs[i]).collect();
+        let yp: Vec<_> = perm.iter().map(|&i| ys[i]).collect();
+        let mut permuted = RidgeInt::new();
+        permuted.fit(&xp, &yp, 7);
+        assert_eq!(
+            base.theta(),
+            permuted.theta(),
+            "permuted rows → identical θ"
+        );
+    }
+
+    // ---- (c) recovers a planted linear signal ----
+
+    #[test]
+    fn ridge_recovers_planted_signal() {
+        let (xs, ys) = planted_dataset();
+        let mut m = RidgeInt::new();
+        m.fit(&xs, &ys, 0xABCD);
+        let theta = m.theta();
+
+        // Ideal coefficients on THETA_SHIFT: A/SCALE and B/SCALE scaled by 2^16.
+        let ideal16 = (PLANT_A << THETA_SHIFT) / SCALE as i64; // ≈ 39321
+        let ideal27 = (PLANT_B << THETA_SHIFT) / SCALE as i64; // ≈ 19660
+
+        // The two planted features are recovered within 20% (a mild ridge shrink + bounded noise).
+        assert!(
+            (theta[16] - ideal16).abs() < ideal16 / 5,
+            "θ[16]={} not within 20% of ideal {ideal16}",
+            theta[16]
+        );
+        assert!(
+            (theta[27] - ideal27).abs() < ideal27 / 5,
+            "θ[27]={} not within 20% of ideal {ideal27}",
+            theta[27]
+        );
+
+        // The two planted features DOMINATE θ — every other coefficient is smaller in magnitude.
+        for i in 0..FEAT_DIMS {
+            if i == 16 || i == 27 {
+                continue;
+            }
+            assert!(
+                theta[i].abs() < theta[27].abs(),
+                "θ[{i}]={} must be dominated by the planted features (θ[27]={})",
+                theta[i],
+                theta[27]
+            );
+        }
+
+        // predict TRACKS the noiseless planted relationship within tolerance on held-out points.
+        for &(p, q) in &[
+            (2000i32, 1000i32),
+            (5000, 4000),
+            (8000, 0),
+            (0, 8000),
+            (4000, 4000),
+            (7000, 7000),
+        ] {
+            let mut f = [0i32; FEAT_DIMS];
+            f[0] = 1;
+            f[16] = p;
+            f[27] = q;
+            let pred = m.predict(&FeatureVec(f));
+            let clean = planted_clean(p, q);
+            let err = pred.abs_diff(clean);
+            assert!(
+                err < 500,
+                "predict({p},{q})={pred} vs planted {clean} — err {err} > 500"
+            );
+        }
+    }
+
+    /// Edge cases: an empty dataset leaves θ zero (predict 0); a single row does not panic.
+    #[test]
+    fn ridge_handles_degenerate_datasets() {
+        let mut empty = RidgeInt::new();
+        empty.fit(&[], &[], 0);
+        assert!(empty.theta().iter().all(|&t| t == 0));
+        assert_eq!(empty.predict(&planted_dataset().0[0]), 0);
+
+        let (xs, ys) = planted_dataset();
+        let mut single = RidgeInt::new();
+        single.fit(&xs[..1], &ys[..1], 0);
+        // does not panic; predict stays clamped in range.
+        let p = single.predict(&xs[0]);
+        assert!(p <= SCALE, "prediction must stay clamped to [0, SCALE]");
+    }
+
+    /// predict is clamped to `[0, SCALE]` even on out-of-distribution / extreme inputs.
+    #[test]
+    fn ridge_predict_is_clamped() {
+        let (xs, ys) = planted_dataset();
+        let mut m = RidgeInt::new();
+        m.fit(&xs, &ys, 0);
+        // Saturate both planted features → the planted relation would exceed SCALE; predict clamps.
+        let mut f = [0i32; FEAT_DIMS];
+        f[0] = 1;
+        f[16] = SCALE as i32;
+        f[27] = SCALE as i32;
+        let pred = m.predict(&FeatureVec(f));
+        assert!(pred <= SCALE, "predict={pred} must clamp to SCALE");
+    }
+
+    // ---- (e) serde round-trip + build_id self-invalidation ----
+
+    #[test]
+    fn ridge_serde_roundtrip_byte_stable() {
+        let (xs, ys) = planted_dataset();
+        let mut m = RidgeInt::new();
+        m.fit(&xs, &ys, 0);
+
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: RidgeInt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(m, back, "RidgeInt must round-trip via serde");
+        let json2 = serde_json::to_string(&back).expect("re-serialize");
+        assert_eq!(json, json2, "serde form must be byte-stable");
+
+        // A fitted model carries the CURRENT build anchor.
+        assert!(back.is_current_build());
+        assert_eq!(back.build_id(), RIDGE_BUILD_ID);
+    }
+
+    #[test]
+    fn ridge_build_id_mismatch_is_detectable() {
+        let mut m = RidgeInt::new();
+        m.fit(&planted_dataset().0, &planted_dataset().1, 0);
+        let json = serde_json::to_string(&m).expect("serialize");
+
+        // A model serialized under a DIFFERENT (stale) build is detectable on load.
+        let stale_json = json.replace(RIDGE_BUILD_ID, "ridgeint-v0@STALE");
+        let stale: RidgeInt = serde_json::from_str(&stale_json).expect("deserialize stale");
+        assert!(
+            !stale.is_current_build(),
+            "a stale build_id must be detectable"
+        );
+        assert_ne!(stale.build_id(), RIDGE_BUILD_ID);
+
+        // A model serialized WITHOUT the field (predates the anchor) defaults to the current build.
+        let theta_json = serde_json::to_string(m.theta()).expect("serialize theta");
+        let no_anchor = format!("{{\"theta\":{theta_json}}}");
+        let defaulted: RidgeInt = serde_json::from_str(&no_anchor).expect("deserialize no-anchor");
+        assert!(
+            defaulted.is_current_build(),
+            "missing anchor → current build"
+        );
+        assert_eq!(defaulted.theta(), m.theta());
+    }
+
+    /// The trait is object-safe — the D3-B.4 steered loop holds a `&mut dyn Surrogate`.
+    #[test]
+    fn surrogate_trait_is_object_safe() {
+        let (xs, ys) = planted_dataset();
+        let mut models: Vec<Box<dyn Surrogate>> =
+            vec![Box::new(NullSurrogate), Box::new(RidgeInt::new())];
+        for m in &mut models {
+            m.fit(&xs, &ys, 0);
+            let _ = m.predict(&xs[0]);
+            let _ = m.id();
+            let _ = m.min_samples();
+        }
     }
 }

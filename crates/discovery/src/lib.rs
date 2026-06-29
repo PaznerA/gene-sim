@@ -36,8 +36,9 @@ pub use search::{
     SearchConfig, SearchSpace, SpeciesAxis,
 };
 pub use surrogate::{
-    drama_target, drama_target_from, encode, DramaWeights, FeatureVec, DRAMA_WEIGHTS_VERSION,
-    ENCODER_ID, FEAT_DIMS,
+    drama_target, drama_target_from, encode, DramaWeights, FeatureVec, NullSurrogate, RidgeInt,
+    Surrogate, DRAMA_WEIGHTS_VERSION, ENCODER_ID, FEAT_DIMS, LR_SHIFT, N_ITERS, RIDGE_BUILD_ID,
+    RIDGE_ID, RIDGE_LAMBDA_SHIFT, RIDGE_MIN_SAMPLES, THETA_SHIFT,
 };
 pub use trace::{GenRow, InocRec, PerGenTrace, SpeciesMeta};
 
