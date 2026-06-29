@@ -30,6 +30,7 @@ pub mod search;
 pub mod surrogate;
 pub mod trace;
 
+pub use ecology::{detect_events, DetectedEvent, EventKind};
 pub use search::{
     caption, crossover, mutate, propose, propose_evolved, EvalRecord, Gem, GemLibrary,
     SearchConfig, SearchSpace, SpeciesAxis,

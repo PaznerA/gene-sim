@@ -310,6 +310,24 @@ pub fn gem_edit_schedule_from_json(
     Ok(gem_edit_schedule(&gem, species_dir))
 }
 
+/// Build a fresh [`GeneSimEnv`] from a resolved [`EnvConfig`] — the SHARED env construction the per-trial scorer
+/// ([`score_config`]) and the off-hash key-frame detector ([`crate::keyframe::config_keyframes`]) both run BEFORE
+/// [`capture_trace`] (roster + climate + containment + consortium), EXACTLY as `record_episode`/`replay` rebuild
+/// it. One definition so a capture's env can never drift between the score path and the preview path (inv #3).
+#[must_use]
+pub(crate) fn build_env(env_config: &EnvConfig) -> crate::GeneSimEnv {
+    let mut env = crate::GeneSimEnv::new(env_config.entity_count);
+    env.set_environment(env_config.env);
+    env.set_roster(env_config.roster.clone());
+    for built in &env_config.consortium {
+        env.register_contaminant(built.clone());
+    }
+    if let Some((level, config)) = &env_config.containment {
+        env.set_containment(*level, config.clone());
+    }
+    env
+}
+
 /// Capture + score one [`SearchConfig`] into a [`Gem`] (the per-trial scoring step). Runs the off-hash
 /// [`capture_trace`] over `gens` generations of the freshly-built env, threading the config's mid-run CRISPR
 /// edit schedule ([`edits_to_actions`] — EMPTY for the default `edit_budget == 0`, so byte-identical to the
@@ -322,15 +340,7 @@ fn score_config(
     saved_fps: &[[u16; discovery::FP_DIMS]],
 ) -> Gem {
     // Build the env from the config (roster + climate + containment), exactly as record_episode/replay rebuild it.
-    let mut env = crate::GeneSimEnv::new(env_config.entity_count);
-    env.set_environment(env_config.env);
-    env.set_roster(env_config.roster.clone());
-    for built in &env_config.consortium {
-        env.register_contaminant(built.clone());
-    }
-    if let Some((level, config)) = &env_config.containment {
-        env.set_containment(*level, config.clone());
-    }
+    let mut env = build_env(env_config);
 
     // Off-hash capture of the config's run (with its scheduled mid-run edits), then the D0 score + the save-time
     // novelty multiplier vs the kept set. The actions resolve against the SAME resolved roster the verify side

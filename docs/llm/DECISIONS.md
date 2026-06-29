@@ -1313,3 +1313,57 @@ become hash-active, a gen-1 starter promoted from an edited gem would silently s
 The fix (queued): reject firing-edit gems in `promote_gen1`, OR recompute the gen-1 `source_hash` from an edit-free
 replay; also store `gens` (+ an edit flag) in the gen-1 doc so it is self-contained re-verifiable. Gate GREEN;
 3-skeptic verify CONFIRMED (5/5 at 3/3); committed library empirically replay-verified.
+
+---
+
+## ADR-032 — Scenario GIF preview: renderer `--shot` capture + in-process pure-Rust GIF assembly
+
+**Status:** Accepted (2026-06-29). The CAPTURE + ASSEMBLE half of the scenario preview, on the off-hash Stage-1
+KEY-EVENT schedule (`crates/harness/src/keyframe.rs`). The `.gif` consumer (gallery preview) already exists
+(ADR-031: "the GIF if present, else a live replay").
+
+**Context.** A discovered gem replays a *story* (boom/crash/takeover, scheduled edits, immigration). The
+`keyframe` detector picks the KEY generations to snapshot (the SAME ecology events the D0 scorer's M5 rewards). To
+turn those into a browsable animated preview next to a starter we need (a) one rendered frame per key gen and (b)
+an animated-GIF assembly — without crossing any invariant.
+
+**Decision.**
+1. **CAPTURE = the renderer's `--shot`, reused via the discovery-load-gem-replay loader** (`tools/make_starter_gif.sh`).
+   For each key gen the script REPLAYS the gem (`godot … --gem <abs> --steps N --shot frame.png`, INCLUDING its
+   mid-run edits) and shoots ONE PNG. **macOS-safe** (the load-bearing capture discipline): a `$(godot…)` PIPE
+   capture HANGS on macOS (a child holds the stdout pipe past Godot's exit), so frames are captured to a FILE under
+   `timeout`, never a pipe (mirrors `check_godot_snapshot.sh`). `--shot` needs a GPU/display → WINDOWED, not
+   `--headless`; on a no-display box the script SKIPs cleanly (exit 0), like the UI gate.
+2. **A minimal renderer hook (inv #2 preserved):** `--gem --shot --steps N` advances the freshly-loaded gem N gens
+   firing each due CORE-resolved edit + scheduled immigration (the SAME `_process` interleave) before the shot, so a
+   per-keyframe frame is DEVELOPED incl. edits. It only drives existing core surfaces (`_live.step` +
+   `_fire_due_gem_edits` + `_fire_due_immigration`); NO genotype→phenotype/biology in GDScript. Each shot is a
+   separate process → a deterministic pure function of `(gem, N)`.
+3. **ASSEMBLE = the in-process, GPL-clean (inv #1) `gif` encoder** (`crates/harness/src/gifenc.rs` + the
+   `--keyframes`/`--assemble-gif` CLI). PNGs are decoded with `png`, nearest-neighbour downscaled to a small
+   thumbnail (default longest side 480px), NeuQuant-quantized (`color_quant`, `gif`'s default feature), and written
+   as a LOOPING GIF (default 30cs/frame → a ~3.6s 12-frame loop, inside the readable ~2-4s window). The slice's
+   documented fallback (an external `imagemagick`/`ffmpeg`) would have to be a SUBPROCESS at the boundary; the
+   pure-Rust path is light enough that we never take it. **Pinned (inv #7): `gif = 0.13`, `png = 0.17`** (both
+   MIT/Apache, image-rs; their closure — `color_quant`/`weezl`/`miniz_oxide`/`flate2`/`fdeflate`/`adler2`/
+   `crc32fast`/`simd-adler32`/`bitflags` — is GPL-free, license gate GREEN). The detached `crates/godot-sim` (which
+   deps `harness`) links them too; its Cargo.lock was refreshed.
+4. **Index hook:** the preview lands at `data/presets/starters/<slug>.gif` — next to the committed `<slug>.json` —
+   so `gallery.gd` finds it at `res://data/presets/starters/<slug>.gif` (it already reads exactly that path). It is
+   staged into `res://` by the SAME recursive `cp -R data/presets/.` run.sh + the byte-gate already do; no new
+   staging. The `.gif` is a GENERATED artifact (`.gitignore`d, re-buildable from the gem), never committed; the
+   index (`*.json` scan) ignores it.
+
+**Hash-neutral (inv #3).** The whole pipeline is off-hash: `--keyframes` runs only the proven hash-neutral trace
+capture; `gifenc` is pure post-processing of inert PNG bytes; the renderer hook only steps the existing
+deterministic core. Pinned literal `0x47a0_3c8f_6701_f240` unmoved (sim-core 184/184, harness 101/101 incl. 5 new
+gifenc tests). The headless smoke (`gifenc::tests::encode_writes_a_valid_looping_multiframe_gif`) asserts a valid,
+non-empty, >1-frame GIF without a GPU; the full pipeline was empirically run end-to-end (6 real `--shot` frames of a
+gem → a 480×404 6-frame looping GIF). Gate GREEN.
+
+**Consequences / known gaps.** Godot 4 has no GIF-from-buffer decoder, so the gallery's IN-ENGINE animated playback
+of the `.gif` is best-effort (it falls back to a live replay) — the `.gif` is still a valid artifact for external
+tooling / a future Godot GIF loader. The capture is environment-gated (needs a GPU/display); CI without one SKIPs,
+and the gate's coverage of the assembly is the pure-Rust `gifenc` smoke. Real captured frames are colour-rich → a
+6-frame preview is ~300KB even downscaled; a future tighter palette / fewer frames / smaller `--gif-max-dim` would
+shrink it.
