@@ -56,23 +56,24 @@ func _init() -> void:
 		_fail("allele_freq out of [0,1]: %s" % af)
 		return
 
-	# snapshot(w, h) -> PackedByteArray of GSS5 bytes (parsed by godot/snapshot.gd).
+	# snapshot(w, h) -> PackedByteArray of GSS6 bytes (parsed by godot/snapshot.gd).
 	var bytes: PackedByteArray = sim.snapshot(16, 12)
 	print("LIVESIM_SNAPSHOT_BYTES=", bytes.size())
 	if bytes.size() < 28:
 		_fail("snapshot too small (%d bytes)" % bytes.size())
 		return
 	var magic := bytes.slice(0, 4).get_string_from_ascii()
-	if magic != "GSS5":
-		_fail("snapshot bad magic '%s' (expected GSS5)" % magic)
+	if magic != "GSS6":
+		_fail("snapshot bad magic '%s' (expected GSS6)" % magic)
 		return
-	# Cross-check the parser: feed the bytes through the real snapshot.gd reader. GSS5 adds the
-	# dominant_species_id plane → channel_count is 13 (a stale 12-channel reader goes RED here).
+	# Cross-check the parser: feed the bytes through the real snapshot.gd reader. GSS6 appends the
+	# dominant_variant_id colony plane after dominant_species_id → channel_count is 14 (a stale 13-channel
+	# reader goes RED here).
 	var w := bytes.decode_u32(4)
 	var h := bytes.decode_u32(8)
 	var channels := bytes.decode_u32(12)
-	if w != 16 or h != 12 or channels != 13:
-		_fail("snapshot header mismatch: %dx%d ch=%d (want 16x12 ch=13)" % [w, h, channels])
+	if w != 16 or h != 12 or channels != 14:
+		_fail("snapshot header mismatch: %dx%d ch=%d (want 16x12 ch=14)" % [w, h, channels])
 		return
 	var expected := 28 + channels * w * h * 4
 	if bytes.size() != expected:

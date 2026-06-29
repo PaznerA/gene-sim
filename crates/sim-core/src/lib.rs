@@ -539,6 +539,14 @@ pub(crate) const MAX_POPULATION: u32 = 2_000_000;
 #[derive(Resource)]
 pub(crate) struct NextOrgId(pub(crate) u64);
 
+/// Monotonic COLONY-id allocator (ADR-029 S1): the id the NEXT minted colony/variation receives. Modelled
+/// byte-for-byte on [`NextOrgId`] — bumped by `wrapping_add(1)` with ZERO `SimRng` draws and NEVER folded into
+/// `hash_world`, so minting a colony id is hash-neutral. Starts at `1` so the FIRST minted colony (`1`) is
+/// distinct from every organism's wild-type founding colony ([`Variant`]`(0)` at reset). A `Resource` so the
+/// single-threaded schedule threads it deterministically (inv #3).
+#[derive(Resource)]
+pub(crate) struct NextVariantId(pub(crate) u16);
+
 /// Cumulative `SimRng` draw counter (ADR-013 F3, finding #4): incremented at EVERY `next_u64` the sim path
 /// consumes (births only at F3), and folded into `hash_world` alongside `final_word`. A birth-enumeration
 /// off-by-one then breaks the hash LOCALLY (on one ISA) instead of drifting into a plausible-but-wrong
@@ -644,6 +652,16 @@ pub(crate) struct Position {
 /// precedent), so tagging organisms is hash-neutral (not folded into `hash_world` at R3-A).
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Species(pub(crate) SpeciesId);
+
+/// Off-hash COLONY / variation tag (ADR-029 S1). Default `0` = the founding/wild-type colony of the organism's
+/// species; a CRISPR brush ([`Simulation::apply_edit_region`]) mints a fresh id (from [`NextVariantId`]) and
+/// stamps every covered org so the disc peels off as a nested DISTRICT. Heritable — offspring inherit their
+/// parent's `Variant` EXACTLY as [`Species`] is copied (the canonical-order spawn pass), so a district keeps
+/// its identity as its members disperse and reproduce. Assigned with ZERO `next_u64` (the off-hash `Species`
+/// precedent) and NEVER folded into `hash_world`, so tagging organisms is hash-neutral. Projected (read-only)
+/// to the off-hash `dominant_variant_id` snapshot channel; lives ONLY in the core (invariant #2).
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Variant(pub(crate) u16);
 
 /// Canonical world grid for per-organism positions (ADR-011). Equal to `soil::SOIL_DIMS` so an organism's
 /// cell maps 1:1 onto a soil cell (no resample for future local-soil coupling). The render snapshot resamples
@@ -1187,6 +1205,9 @@ struct ReproRow {
     thermal: f64,
     px: u32,
     py: u32,
+    /// ADR-029 S1: the parent's off-hash colony tag, carried so the canonical-order birth pass can copy it to
+    /// offspring EXACTLY as `species` is copied (heritable district identity). Off-hash, drawn from no RNG.
+    variant: u16,
 }
 
 /// Immutable per-channel pool plane (`0` light, `1` free_nutrient, `2` detritus).
@@ -1366,6 +1387,7 @@ fn reproduce_or_die(
         &DroughtTol,
         &ThermalTol,
         &Position,
+        &Variant,
     )>,
 ) {
     use chem::ChemModifier as _;
@@ -1384,7 +1406,7 @@ fn reproduce_or_die(
     let mut rows = std::mem::take(&mut repro_scratch.rows);
     rows.clear();
     rows.extend(q.iter().map(
-        |(entity, id, sp, energy, biomass, age, g, d, t, p)| ReproRow {
+        |(entity, id, sp, energy, biomass, age, g, d, t, p, v)| ReproRow {
             cell: cell_index(p, width),
             species: sp.0 .0,
             org: id.0,
@@ -1397,6 +1419,7 @@ fn reproduce_or_die(
             thermal: t.0,
             px: p.x,
             py: p.y,
+            variant: v.0,
         },
     ));
     rows.sort_unstable_by_key(|r| (r.cell, r.species, r.org));
@@ -1472,7 +1495,7 @@ fn reproduce_or_die(
     dead_set.clear();
     dead_set.extend(dead.iter().copied());
     dead_set.sort_unstable();
-    for (entity, id, _sp, mut energy, _b, _a, _g, _d, _t, _p) in q.iter_mut() {
+    for (entity, id, _sp, mut energy, _b, _a, _g, _d, _t, _p, _v) in q.iter_mut() {
         if dead_set.binary_search(&entity).is_ok() {
             continue; // about to despawn; its J already deposited
         }
@@ -1503,6 +1526,9 @@ fn reproduce_or_die(
         thermal: f64,
         px: u32,
         py: u32,
+        /// ADR-029 S1: inherited off-hash colony tag (copied verbatim from the parent's `Variant`, EXACTLY as
+        /// `species` is). A pure label assignment — no RNG, never folded into `hash_world`.
+        variant: u16,
     }
     let mut children: Vec<Child> = Vec::new();
     for r in &rows {
@@ -1558,6 +1584,9 @@ fn reproduce_or_die(
             thermal: child_t,
             px: nx,
             py: ny,
+            // ADR-029 S1: inherit the parent's colony tag verbatim (heritable district identity), exactly as
+            // `species` is inherited. Off-hash, no RNG.
+            variant: r.variant,
         });
         population += 1;
     }
@@ -1566,7 +1595,7 @@ fn reproduce_or_die(
     sort_merge_org_i64(&mut parent_debit);
     // Apply parent debits (the endowment spent) to the live survivors.
     if !parent_debit.is_empty() {
-        for (_entity, id, _sp, mut energy, _b, _a, _g, _d, _t, _p) in q.iter_mut() {
+        for (_entity, id, _sp, mut energy, _b, _a, _g, _d, _t, _p, _v) in q.iter_mut() {
             if let Some(debit) = org_lookup(&parent_debit, id.0) {
                 energy.0 -= debit;
             }
@@ -1584,6 +1613,8 @@ fn reproduce_or_die(
             ThermalTol(c.thermal),
             Position { x: c.px, y: c.py },
             Species(SpeciesId(c.species)),
+            // ADR-029 S1: spawn the inherited off-hash colony tag alongside Species (same hash-neutral discipline).
+            Variant(c.variant),
         ));
     }
     // Return the reused buffers to the scratch resource (their allocations survive to the next tick).
@@ -1705,10 +1736,12 @@ pub struct SpeciesObservation {
     pub role: gp::TrophicRole,
     /// This species' genome expressed through ITS OWN map (microbe traits for E. coli, plant traits for plants).
     pub phenotype: Phenotype,
-    /// Count of LIVING organisms carrying this `Species(SpeciesId)` tag. A PURE read of already-hashed state
-    /// (the [`Species`]/[`OrgId`] components are part of `hash_world`'s row tuple), NEVER folded into
-    /// `hash_world` itself — it adds no new hash input and cannot move the determinism hash (inv #3). Summed
-    /// over every species it equals the total living-org count by construction (each org carries one tag).
+    /// Count of LIVING organisms carrying this `Species(SpeciesId)` tag. A PURE read of the living set: only
+    /// [`OrgId`] is `hash_world`'s row SORT KEY — [`Species`] is OFF-hash (it is NOT in the `hash_world` row
+    /// tuple, which folds `OrgId, Energy, Biomass, Age, Genotype, DroughtTol, ThermalTol, Position`). That
+    /// off-hash `Species` precedent is exactly what licenses the off-hash [`Variant`] colony tag. This count is
+    /// NEVER folded into `hash_world` itself — it adds no new hash input and cannot move the determinism hash
+    /// (inv #3). Summed over every species it equals the total living-org count (each org carries one tag).
     pub population_size: u32,
     /// Mean per-individual [`Genotype`] in `[0, 1]` over THIS species' living orgs (`0.0` for an empty species,
     /// mirroring [`mean_genotype`]'s empty convention). Derived from the already-hashed [`Genotype`] component
@@ -1905,6 +1938,9 @@ impl Simulation {
                     ThermalTol(thermal),
                     placement(config.seed, org_i as u32),
                     Species(SpeciesId(sid as u16)),
+                    // ADR-029 S1: every org spawns in its species' WILD-TYPE founding colony (Variant(0)). Off-hash
+                    // (not in the hash_world tuple, the Species precedent), so adding it is byte-neutral.
+                    Variant(0),
                 ));
                 org_i += 1;
             }
@@ -1987,6 +2023,10 @@ impl Simulation {
         // ADR-013 F3 allocators: the monotonic OrgId source (never reuses a despawned id) and the draw counter
         // (folded into hash_world so a birth-enumeration off-by-one breaks the hash locally).
         world.insert_resource(NextOrgId(next_org_id));
+        // ADR-029 S1: the off-hash colony-id allocator. Starts at 1 so the first brush-minted district (id 1) is
+        // distinct from every org's wild-type founding colony (Variant(0)). NOT folded into hash_world — minting a
+        // colony id draws no SimRng and reaches the hash through nothing, so the pinned no-edit run is byte-identical.
+        world.insert_resource(NextVariantId(1));
         world.insert_resource(DrawCount::default());
         // ADR-013 F4: the MEASURED S×S FlowMatrix (per-generation, reset each tick) + the per-cell, per-species
         // PoolProvenance ledger that attributes detritus/free_nutrient flow. Sized to the registry length; the
@@ -2175,7 +2215,9 @@ impl Simulation {
     /// Channels (each `width * height`, row-major, in `[0, 1]`): `density` = per-cell count / busiest-cell
     /// count; `allele_freq` = mean [`Genotype`] in the cell; `fitness` = mean [`Energy`] in the cell;
     /// `soil_moisture`/`soil_nutrients`/`soil_ph` = the static `SoilField` resampled; `light`/`free_nutrient`/
-    /// `detritus` = the LIVE [`PoolStock`] joule planes resampled and normalized by [`POOL_CAP`].
+    /// `detritus` = the LIVE [`PoolStock`] joule planes resampled and normalized by [`POOL_CAP`];
+    /// `dominant_species_id` (GSS5) / `dominant_variant_id` (GSS6, ADR-029 S1) = the per-cell most-populous
+    /// off-hash `Species` / `Variant` ordinal (lowest-id tiebreak), `0` for empty cells.
     /// Empty cells are `0` on the population channels. Now reflects REAL spatial structure (clusters/clines from
     /// inherited dispersal), not a derived layout.
     ///
@@ -2188,13 +2230,14 @@ impl Simulation {
 
         // Collect organisms in STABLE OrgId order (decouples from ECS archetype iteration — inv. #3),
         // carrying each one's REAL world Position (ADR-011 S-C — no longer the OrgId-hash layout) AND its
-        // Species tag (GSS5: the per-cell dominant-species projection). Reading the already-spawned Species
-        // ordinal draws ZERO SimRng and mutates nothing — a read-only display projection (inv #2/#3).
-        let mut rows: Vec<(u64, f64, i64, u32, u32, u16)> = self
+        // Species tag (GSS5: the per-cell dominant-species projection) AND its off-hash Variant tag (GSS6,
+        // ADR-029 S1: the per-cell dominant-colony projection). Reading the already-spawned Species/Variant
+        // ordinals draws ZERO SimRng and mutates nothing — a read-only display projection (inv #2/#3).
+        let mut rows: Vec<(u64, f64, i64, u32, u32, u16, u16)> = self
             .world
-            .query::<(&OrgId, &Genotype, &Energy, &Position, &Species)>()
+            .query::<(&OrgId, &Genotype, &Energy, &Position, &Species, &Variant)>()
             .iter(&self.world)
-            .map(|(id, g, e, p, s)| (id.0, g.0, e.0, p.x, p.y, s.0.ordinal()))
+            .map(|(id, g, e, p, s, v)| (id.0, g.0, e.0, p.x, p.y, s.0.ordinal(), v.0))
             .collect();
         rows.sort_unstable_by_key(|r| r.0);
         let population = rows.len() as u32;
@@ -2207,8 +2250,12 @@ impl Simulation {
         // ordinal — no `HashMap` (inv #3) — so the most-populous id with a LOWEST-ordinal tiebreak is a
         // single deterministic linear scan. Rosters are tiny (≤ a handful), so the per-cell Vec stays short.
         let mut species_tally: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cells];
+        // Per-cell VARIANT/colony tally (GSS6, ADR-029 S1) — line-for-line the species tally: a `Vec<(Variant
+        // ordinal, count)>` per cell kept SORTED by ordinal (no `HashMap`, inv #3), so the most-populous colony
+        // with a LOWEST-id tiebreak is a single deterministic linear scan. Built in the SAME OrgId-sorted pass.
+        let mut variant_tally: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cells];
 
-        for (_id, g, e, px, py, sid) in &rows {
+        for (_id, g, e, px, py, sid, vid) in &rows {
             // Resample the organism's REAL world cell (px,py on WORLD_DIMS) onto the render grid — no RNG,
             // no OrgId hash. Clamp guards the top edge when render dims exceed the world grid.
             let x = ((u64::from(*px) * u64::from(width)) / u64::from(WORLD_DIMS.0))
@@ -2225,6 +2272,12 @@ impl Simulation {
                 Ok(idx) => tally[idx].1 += 1,
                 Err(idx) => tally.insert(idx, (*sid, 1)),
             }
+            // GSS6: tally this organism's colony into the cell's ordinal-sorted bucket (insertion keeps it sorted).
+            let vtally = &mut variant_tally[cell];
+            match vtally.binary_search_by_key(vid, |&(v, _)| v) {
+                Ok(idx) => vtally[idx].1 += 1,
+                Err(idx) => vtally.insert(idx, (*vid, 1)),
+            }
         }
 
         let max_count = count.iter().copied().max().unwrap_or(0);
@@ -2232,6 +2285,7 @@ impl Simulation {
         let mut allele_freq = vec![0.0f32; cells];
         let mut fitness = vec![0.0f32; cells];
         let mut dominant_species_id = vec![0.0f32; cells];
+        let mut dominant_variant_id = vec![0.0f32; cells];
         for c in 0..cells {
             let n = count[c];
             if n == 0 {
@@ -2255,6 +2309,18 @@ impl Simulation {
                 }
             }
             dominant_species_id[c] = f32::from(best_id);
+            // GSS6 (ADR-029 S1): the MOST-POPULOUS Variant/colony in the cell, line-for-line the species block.
+            // The ordinal-sorted Vec means the FIRST max found is the lowest-id one (deterministic tiebreak →
+            // lowest Variant id). A u16 ordinal round-trips through f32 exactly; 0.0 = the wild-type colony.
+            let mut best_vid = 0u16;
+            let mut best_vn = 0u32;
+            for &(vid, vn) in &variant_tally[c] {
+                if vn > best_vn {
+                    best_vn = vn;
+                    best_vid = vid;
+                }
+            }
+            dominant_variant_id[c] = f32::from(best_vid);
         }
 
         // Resample the static soil field onto the snapshot grid (read-only, no RNG → off the hash path).
@@ -2365,6 +2431,7 @@ impl Simulation {
             kin,
             alarm,
             dominant_species_id,
+            dominant_variant_id,
         }
     }
 
@@ -2646,6 +2713,14 @@ impl Simulation {
         let seed_energy = endow_j - seed_biomass;
         // Mint count·endow_j into the world via the immigration tap (the conserved arrival accounting).
         self.world.resource_mut::<ledger::Ledger>().immigration += endow_j * i64::from(count);
+        // ADR-029 S1: a contaminant arrival IS a new colony — mint ONE fresh off-hash colony id (zero SimRng, the
+        // NextOrgId minting discipline) and stamp every inoculated org so the immigrant reads as its own district.
+        let inoc_variant = {
+            let mut next_variant = self.world.resource_mut::<NextVariantId>();
+            let id = next_variant.0;
+            next_variant.0 = next_variant.0.wrapping_add(1);
+            id
+        };
         // Spawn count orgs round-robin across the placement cells in (cell_index, slot) order; OrgIds monotonic.
         for slot in 0..count {
             let (x, y) = place_cells[(slot as usize) % place_cells.len()];
@@ -2666,6 +2741,8 @@ impl Simulation {
                 ThermalTol(0.5),
                 Position { x, y },
                 Species(sid),
+                // ADR-029 S1: the immigrant's fresh off-hash colony tag (a new district). Off-hash, no RNG.
+                Variant(inoc_variant),
             ));
         }
         count
@@ -2720,9 +2797,11 @@ impl Simulation {
             thermal: f64,
             px: u32,
             py: u32,
+            /// ADR-029 S1: the template's off-hash colony tag — a faithful PCR clone inherits its district too.
+            variant: u16,
         }
         let mut census: Vec<Template> = Vec::new();
-        for (id, sp, g, d, t, p) in self
+        for (id, sp, g, d, t, p, v) in self
             .world
             .query::<(
                 &OrgId,
@@ -2731,6 +2810,7 @@ impl Simulation {
                 &DroughtTol,
                 &ThermalTol,
                 &Position,
+                &Variant,
             )>()
             .iter(&self.world)
         {
@@ -2743,6 +2823,7 @@ impl Simulation {
                     thermal: t.0,
                     px: p.x,
                     py: p.y,
+                    variant: v.0,
                 });
             }
         }
@@ -2758,8 +2839,14 @@ impl Simulation {
         // Spawn count clones round-robin over the sorted census; each inherits its template VERBATIM (no mutate).
         for k in 0..count {
             let tpl = &census[(k as usize) % census.len()];
-            let (genotype, drought, thermal, px, py) =
-                (tpl.genotype, tpl.drought, tpl.thermal, tpl.px, tpl.py);
+            let (genotype, drought, thermal, px, py, variant) = (
+                tpl.genotype,
+                tpl.drought,
+                tpl.thermal,
+                tpl.px,
+                tpl.py,
+                tpl.variant,
+            );
             let org = {
                 let mut next = self.world.resource_mut::<NextOrgId>();
                 let id = next.0;
@@ -2778,6 +2865,8 @@ impl Simulation {
                 // Daughter-cell placement: the clone co-locates on its template's cell (deterministic, zero RNG).
                 Position { x: px, y: py },
                 Species(sid),
+                // ADR-029 S1: faithful PCR keeps the template's off-hash colony tag (same district). No RNG.
+                Variant(variant),
             ));
         }
         count
@@ -3211,16 +3300,28 @@ impl Simulation {
         };
         self.world.resource_mut::<SimRng>().0 = rng;
 
-        // Shift every in-region individual's allele by the gate-derived delta. Per-org `g += delta` is
-        // order-independent (and the end-of-run hash sorts by OrgId), so no draw and no HashMap here (inv #3).
+        // ADR-029 S1 — the BRUSH→DISTRICT bind: mint ONE fresh off-hash colony id (zero SimRng, exactly the
+        // NextOrgId minting discipline) BEFORE the covered loop, then stamp it on every covered org below. No new
+        // action, no new wire field, no new RNG draw — a pure data write, so the determinism hash is unmoved.
+        let cid = {
+            let mut next_variant = self.world.resource_mut::<NextVariantId>();
+            let id = next_variant.0;
+            next_variant.0 = next_variant.0.wrapping_add(1);
+            id
+        };
+
+        // Shift every in-region individual's allele by the gate-derived delta AND stamp the colony id. Per-org
+        // `g += delta` and `variant = cid` are order-independent (the end-of-run hash sorts by OrgId, and Variant
+        // is OFF-hash), so no draw and no HashMap here (inv #3).
         let mut covered = 0u32;
-        for (_id, p, mut g) in self
+        for (_id, p, mut g, mut variant) in self
             .world
-            .query::<(&OrgId, &Position, &mut Genotype)>()
+            .query::<(&OrgId, &Position, &mut Genotype, &mut Variant)>()
             .iter_mut(&mut self.world)
         {
             if region.contains(p.x, p.y) {
                 g.0 = (g.0 + delta).clamp(0.0, 1.0);
+                variant.0 = cid;
                 covered += 1;
             }
         }
@@ -4819,6 +4920,139 @@ mod tests {
         assert!(
             distinct.len() >= 2,
             "a 3-species run should leave at least two distinct dominant ids across the field, got {}",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn snapshot_single_species_no_edit_dominant_variant_id_is_uniformly_zero() {
+        // GSS6 (ADR-029 S1): a single-species run with NO brush leaves every org in its wild-type founding
+        // colony Variant(0), so EVERY populated cell's dominant colony is 0 and every empty cell stays 0 — the
+        // plane is uniformly 0.0. This is the byte-identical-for-no-edit guarantee at the channel level (the
+        // hash test below proves the literal is unmoved). Cloned from the dominant_species_id precedent.
+        let cfg = SimConfig {
+            seed: 7,
+            generations: 12,
+            entity_count: 400,
+        };
+        let mut sim = Simulation::reset(&cfg);
+        sim.step(cfg.generations);
+        let snap = sim.snapshot(16, 16);
+        assert_eq!(snap.dominant_variant_id.len(), 16 * 16);
+        assert!(
+            snap.dominant_variant_id.iter().all(|&v| v == 0.0),
+            "a no-edit run's dominant_variant_id plane must be uniformly 0"
+        );
+    }
+
+    #[test]
+    fn brush_mints_distinct_variant_id_while_hash_is_byte_identical() {
+        // ADR-029 S1 — the load-bearing STOP-THE-LINE property: stamping a colony id with a CRISPR brush mints a
+        // DISTINCT in-region dominant_variant_id WHILE leaving the determinism hash BYTE-IDENTICAL to the no-brush
+        // run. We brush with a delta of 0.0 and a closure that draws ZERO SimRng, so the ONLY world change is the
+        // off-hash Variant stamp: genotype is byte-unchanged (`g + 0.0` clamps to itself), no birth/death shifts,
+        // the SimRng stream is preserved → the hash MUST be identical (Variant is not in the hash_world tuple).
+        let cfg = SimConfig {
+            seed: 31,
+            generations: 20,
+            entity_count: 1000,
+        };
+        let (w, h) = (24u32, 24u32);
+
+        // Clean run: no brush.
+        let mut clean = Simulation::reset(&cfg);
+        clean.step(cfg.generations);
+        let clean_snap = clean.snapshot(w, h);
+        let clean_hash = clean.run_stats().hash;
+
+        // Brushed run: identical evolution, then a delta-0 brush stamps a district (off-hash, zero draws).
+        let mut brushed = Simulation::reset(&cfg);
+        brushed.step(cfg.generations);
+        let region = Region {
+            cx: WORLD_DIMS.0 / 2,
+            cy: WORLD_DIMS.1 / 2,
+            radius: WORLD_DIMS.0 / 4,
+        };
+        let (_r, covered) = brushed.apply_edit_region(region, |_genome, _rng| ((), 0.0));
+        assert!(
+            covered > 0,
+            "the brush must cover live organisms to stamp a district"
+        );
+        let brushed_snap = brushed.snapshot(w, h);
+        let brushed_hash = brushed.run_stats().hash;
+
+        // (1) Hash-neutrality: the colony stamp does NOT move the determinism hash (inv #3).
+        assert_eq!(
+            clean_hash, brushed_hash,
+            "stamping a colony id (Variant, delta 0, zero draws) must be hash-neutral (inv #3)"
+        );
+        // (2) The clean run has NO districts.
+        assert!(
+            clean_snap.dominant_variant_id.iter().all(|&v| v == 0.0),
+            "a no-edit run's dominant_variant_id plane must be uniformly 0"
+        );
+        // (3) The brush minted a DISTINCT colony id (the first minted id is 1, distinct from wild-type 0).
+        assert!(
+            brushed_snap.dominant_variant_id.contains(&1.0),
+            "the brush must mint a distinct (id 1) in-region dominant_variant_id"
+        );
+        // (4) Only the colony plane changed — the species plane + density are byte-identical (the stamp touches
+        //     no biology, no position, no count). The district is a PURE off-hash render projection.
+        assert_eq!(
+            clean_snap.dominant_species_id, brushed_snap.dominant_species_id,
+            "the colony stamp must not perturb the per-cell dominant species"
+        );
+        assert_eq!(
+            clean_snap.density, brushed_snap.density,
+            "the colony stamp must not perturb the density channel"
+        );
+    }
+
+    #[test]
+    fn replayed_brush_sequence_reproduces_identical_district_ids() {
+        // ADR-029 S1: the district id is DERIVED from the ORDER of ApplyEditRegion events (each `wrapping_add(1)`
+        // on NextVariantId), never journaled — so replaying the same brush sequence (what the harness does when
+        // it replays actions.ndjson) re-mints identical ids at identical Tick positions. We run the SAME
+        // step/brush/step/brush/step schedule twice and assert the dominant_variant_id planes are byte-identical,
+        // and that two distinct brushes produce two distinct non-zero district ids (ids 1 then 2).
+        let cfg = SimConfig {
+            seed: 99,
+            generations: 0,
+            entity_count: 1000,
+        };
+        let region_a = Region {
+            cx: WORLD_DIMS.0 / 3,
+            cy: WORLD_DIMS.1 / 3,
+            radius: WORLD_DIMS.0 / 6,
+        };
+        let region_b = Region {
+            cx: (WORLD_DIMS.0 * 2) / 3,
+            cy: (WORLD_DIMS.1 * 2) / 3,
+            radius: WORLD_DIMS.0 / 6,
+        };
+        let brushed_run = || -> Vec<f32> {
+            let mut sim = Simulation::reset(&cfg);
+            sim.step(10);
+            let (_a, ca) = sim.apply_edit_region(region_a, |_g, _r| ((), 0.0)); // mints district 1
+            let (_b, cb) = sim.apply_edit_region(region_b, |_g, _r| ((), 0.0)); // mints district 2
+            assert!(ca > 0 && cb > 0, "both brushes must cover live organisms");
+            sim.step(10);
+            sim.snapshot(24, 24).dominant_variant_id
+        };
+        let first = brushed_run();
+        let second = brushed_run();
+        assert_eq!(
+            first, second,
+            "replaying the same brush sequence must reproduce byte-identical district ids (inv #3)"
+        );
+        let distinct: std::collections::BTreeSet<u32> = first
+            .iter()
+            .filter(|&&v| v != 0.0)
+            .map(|&v| v.to_bits())
+            .collect();
+        assert!(
+            distinct.len() >= 2,
+            "two distinct brushes should leave at least two distinct non-zero district ids, got {}",
             distinct.len()
         );
     }

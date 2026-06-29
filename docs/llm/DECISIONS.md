@@ -1247,9 +1247,69 @@ resumes after a loaded session.
 
 ---
 
+## ADR-029 — COLONIES: off-hash `dominant_variant_id` channel (GSS6) + heritable `Variant` tag, renderer-derived district polygons + size/zoom LOD pop
+
+**Status:** Accepted (2026-06-29). S1 channel slice landed — gate GREEN; the pinned literal `0x47a0_3c8f_6701_f240`
+is BYTE-IDENTICAL at `crates/sim-core/src/lib.rs:3544` (`determinism_hash_is_pinned`) + `:3708`
+(`species_signatures_export_is_hash_neutral`), both pins green UNCHANGED (the inserted code shifted them down
+~101 lines but touched neither literal). **NOT a re-pin.** 187/187 sim-core determinism tests pass. S2–S6 are
+renderer-only and depend on this channel.
+
+**Context.** The play map draws up to `MAX_DOTS_PER_CELL` per non-empty cell → unreadable "spam" at Field scope,
+and the per-organism draw cost is the wall bigger maps hit ([[perf-bigger-maps-needs-structural-change]]). The core
+already ships an off-hash per-cell `dominant_species_id` projection (GSS5, ADR-021) of the off-hash `Species` tag.
+A "colony" is the same construction one level finer: group a contiguous population (incl. brush-created variations)
+into one Cities-Skylines district polygon.
+
+**Decision.**
+1. Add an off-hash, heritable, spawn-assigned `Variant(u16)` component (default 0 = founding colony of the species),
+   minted from a monotonic `NextVariantId` resource — modelled byte-for-byte on the off-hash `Species` tag +
+   `NextOrgId`. Inherited by offspring exactly as `Species` is (through `ReproRow`/`Child`/spawn).
+2. Project it to a `dominant_variant_id` snapshot channel (GSS6: magic GSS5→GSS6, `CHANNEL_COUNT` 13→14, appended
+   LAST so offsets 0..12 never reorder) — the per-cell most-populous Variant ordinal, computed in `snapshot()` by an
+   ordinal-sorted per-cell tally (no HashMap, lowest-id tiebreak, zero SimRng), exactly like `dominant_species_id`.
+3. A CRISPR brush (`Action::ApplyEditRegion`, already journaled) mints one fresh `Variant` id and stamps it on the
+   covered organisms — a 2-line extension of the existing covered loop, no new action, no new wire field, no new RNG
+   draw. The disc becomes a nested district; the district keeps its identity as members disperse/reproduce.
+   (`region_inoculate` may stamp a fresh id too. Note: the mint is per-EVENT, before the covered loop, so a
+   zero-coverage brush still consumes one id — off-hash + harmless.)
+4. The renderer (new `colonies.gd`, sibling under `organisms.gd`) derives colony GEOMETRY: deterministic
+   connected-components over (`dominant_species_id`, `dominant_variant_id`) → marching-squares/hull contour → fill +
+   outline + label. A size×zoom footprint ladder pops selected/large colonies open to the existing `organisms.gd`
+   morph glyphs; plants are always-visible, pop first, and render as a soft canopy hull. *(S2–S6.)*
+
+**Invariant audit.**
+- inv #2 — core decides per-cell colony IDENTITY (a read-only projection of tags); renderer derives GEOMETRY
+  (CC/contour/label = presentation, not biology). No genotype→phenotype in GDScript.
+- inv #3 — `Variant`/`NextVariantId`/`dominant_variant_id` are NOT in `hash_world` (which omits `Species` too — the
+  off-hash proof); assigned with zero SimRng; snapshot is downstream of the tick; `hash_world`+snapshot sort by
+  `OrgId` so archetype order never reaches the hash. The pinned single-species-plant config issues zero
+  `ApplyEditRegion` → all orgs stay `Variant(0)` → channel uniformly 0.0 → `0x47a0_3c8f_6701_f240` BYTE-IDENTICAL.
+  NOT a re-pin. `actions.ndjson` stays byte-identical (ids are derived from event order, not journaled).
+- inv #6 — the brush stays a regional operator action; only its display grouping is new.
+
+**Consequences.**
+- (+) de-spam (O(#colonies) draws vs O(cells×5)); the bigger-maps LOD draw lever.
+- (+) brush edits are legible as nested districts that survive replay.
+- (−) snapshot binary format bumps GSS5→GSS6 (render format, independent of `hash_world`); every 13-channel
+  reader/gate moves to 14 in the same slice (`godot/snapshot.gd` + `tools/check_godot_snapshot.sh` +
+  `livesim_smoke.gd`).
+- (−) u16 variant-id ceiling (65 535 brush edits/run) to preserve exact u16-in-f32 round-trip; per-run; documented.
+
+**Alternatives considered.**
+- Lens C: derive `colony_id` by connected-components over (`dominant_species_id`, `allele_band`) with NO new core
+  tag. REJECTED: loses district identity when the edited disc mixes/drifts; band-thrashing flicker; conflates
+  identity with geometry and puts presentation geometry in the core. (Kept its render LOD ideas.)
+- u32 variant id: REJECTED — silently loses precision in the f32 channel unless widened to two planes (overkill for
+  a PoC).
+- Hold variants in a parallel off-hash `Vec<u16>` side-table instead of an ECS component: fallback only (fiddlier
+  across births/deaths); the component is provably outside the hashed set, so it is preferred.
+
+---
+
 ## ADR-030 — Gem replay fidelity: resolution stays in core (`gem_edit_schedule`) + off-hash `Gem.gens_requested`
 
-**Status:** Accepted (2026-06-28). (ADR-029 is reserved for the colony epic — pasted when its S1 channel slice lands.)
+**Status:** Accepted (2026-06-28).
 
 **Context.** Load-gem-replay lets the renderer reconstruct + play a discovered gem (config + scheduled CRISPR
 edits) so the player WATCHES the scenario. The first attempt resolved the mid-run edits IN GDSCRIPT and diverged
@@ -1285,7 +1345,7 @@ tests. Gate GREEN; 3-skeptic verify CONFIRMED (4/4 at 3/3).
 ## ADR-031 — Starter-map library: committed gen-1 + gen-N-checkpoint content from the auto-research
 
 **Status:** Accepted (2026-06-29). The capstone of the auto-research → playable-content loop (curated gems →
-`proposals/starter-candidates.json` → committed starters). (ADR-029 reserved for the colony epic.)
+`proposals/starter-candidates.json` → committed starters).
 
 **Context.** The discovery search produces round-trip-verified gems (config + scheduled edits). To make them
 playable + browsable, a `promote` tool (`crates/harness/src/promote.rs`) turns a curated gem into a **committed**

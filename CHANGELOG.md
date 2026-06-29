@@ -4,6 +4,27 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Colonies S1 — off-hash `Variant` tag + `dominant_variant_id` GSS6 channel + the brush→district bind — HASH-NEUTRAL (ADR-029)
+The single core/snapshot slice of the colony epic (the 🛑 STOP-THE-LINE slice, human-signed-off; S2–S6 are
+renderer-only and build on it). `crates/sim-core`: a heritable, spawn-assigned `Variant(u16)` component (default 0 =
+founding colony of the species) minted from a monotonic `NextVariantId` resource — modelled byte-for-byte on the
+off-hash `Species` tag + `NextOrgId`, inherited through `ReproRow`/`Child`/spawn exactly as `Species` is (zero
+SimRng). `apply_edit_region` mints one fresh id and stamps it on every covered organism — the Cities-Skylines
+"create district" bind, a 2-line extension of the existing covered loop with **no new action, no new wire field, no
+new RNG draw**. A `dominant_variant_id` snapshot channel (snapshot format magic GSS5→GSS6, `CHANNEL_COUNT` 13→14,
+appended LAST so offsets 0..12 never reorder): the per-cell most-populous Variant ordinal, computed by an
+ordinal-sorted per-cell tally (no HashMap, lowest-id tiebreak, zero SimRng) — line-for-line the `dominant_species_id`
+block. `godot/snapshot.gd` reads GSS6/14 (dynamic channel_count, plane appended last); `tools/check_godot_snapshot.sh`
++ `livesim_smoke.gd` move to channels=14/GSS6 in the same slice (no stale 13-channel reader). The hash-neutrality is
+airtight: `hash_world` OMITS `Species` (the off-hash proof) and sorts by `OrgId`, so a spawn-assigned off-SimRng tag
+never reaches the hash — the pinned single-species-plant config issues zero `ApplyEditRegion` → every org stays
+`Variant(0)` → channel uniformly 0.0 → pinned literal `0x47a0_3c8f_6701_f240` **BYTE-IDENTICAL** (NOT a re-pin; both
+pins green unchanged at `lib.rs:3544`/`:3708`; `actions.ndjson` byte-identical, ids derived from event order). Tests:
+u16-in-f32 byte round-trip, single-species/no-edit → uniformly 0.0, brush mints a DISTINCT in-region
+`dominant_variant_id` WHILE `run_headless().hash` is byte-identical to the no-brush run, replay reproduces identical
+district ids. 187/187 sim-core determinism tests pass. Corrected the stale `lib.rs` doc comment (Species is off-hash).
+Gate GREEN; 3-skeptic verify 3/3 on all five invariant booleans.
+
 ### Scenario GIF preview — CAPTURE + ASSEMBLE on the off-hash key-event schedule — HASH-NEUTRAL
 The renderer-side half of the scenario preview (the schedule itself is `harness::keyframe`, ADR-032). `--keyframes
 <gem>` prints the off-hash KEY generations to snapshot (boom/crash/takeover/edit/immigrate + start/context/final
