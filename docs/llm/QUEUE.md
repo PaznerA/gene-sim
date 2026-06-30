@@ -133,9 +133,13 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 > `BBa_*` devices** (one-click "připravené" edits). RCT-style browser, datasheets, effect preview, OVERSIGHT credit
 > cost by complexity. Renderer-side UI (inv #2) over the SBOL core (parts = SBOL Components SB3, snap-validation =
 > SB1 validator, apply = a journaled SBOL-grounded edit). Seed: `proposals/intervention-rework-bioblocks-draft.md`.
-- `[ ]` **intervention-rework-bioblocks-design** (`workflow`, DESIGN) — `.js` authored, READY. The BioBlocks composer
-  UX + the iGEM ready-edits library curation/licensing plan + the rework of the current tools/Variant-Lab/OVERSIGHT +
-  the SBOL grounding + an ADR-draft. **DESIGN ONLY, doc-only; can run NOW** (the impl slices gate on SBOL SB1–SB3).
+- `[x]` **intervention-rework-bioblocks-design** (`workflow`, DESIGN) — **DONE (2026-06-30) — APPROVE, verify 4/4.**
+  Expanded `proposals/intervention-rework-bioblocks-draft.md` into a buildable spec + ADR-038 draft: RCT-style composer
+  (shape-encodes-SO-role snap canvas over a core `grammar_hints.json`; the authoritative check stays the SBOL
+  validator at preview+apply), real `BBa_*` parts by REFERENCE (knockout/toggle `[placeholder]` to resolve at IR1),
+  apply desugars to the EXISTING journaled `ApplyEdit`/`ApplyEditRegion` (pinned config byte-identical). **Conditions
+  for the impl slices:** IR1 MUST web-confirm iGEM Terms before bundling any sequence (the page 403'd); the whole epic
+  gates on the unsigned SBOL foundation. Merged `--no-ff`. (inv #2/#3/#1/SBOL-coherence all 4/4.)
 - `[def]` **IR1 igem-library-data** — curate real iGEM `BBa_*` parts + ready devices as data, grounded in SBOL Components (datasheets); inv #1 licensing. *dep: SBOL SB3.*
 - `[def]` **IR2 bioblocks-composer-ui** (renderer) — the block snap canvas + assembly-grammar guidance (shape-compatible) + effect preview. *dep: IR1 + SBOL SB1.*
 - `[def]` **IR3 ready-edits-library-ui** (renderer) — RCT-style browser of ready devices + the player's saved devices (Variant Lab generalized); one-click apply. *dep: IR1.*
