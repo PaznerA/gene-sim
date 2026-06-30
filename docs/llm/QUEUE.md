@@ -126,7 +126,24 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 - `[def]` **SB3 biobrick-parts-catalog + assembly-grammar** — registry-grounded standard parts (datasheets via `Parameter`/SBOL `Measure`) + the composition grammar (brush = insert/replace a standard part). Mostly data + grammar. *dep: SB2.*
 - `[def]` **SB4 sbol-reference-validator-subprocess** (inv #1/#5) — optional pySBOL3/libSBOLj conformance at the process boundary. *dep: SB1.*
 - `[def]` **SB5 sbol-import-export** — round-trip designs to/from SBOL3 documents / SynBioHub. *dep: SB1.*
-- `[def]` **SB6 synbio-sandbox-ui** (renderer-only) — compose a species from standard parts (grammar-guided); read the SBOL design in the codex/specimen view. *dep: SB3.*
+- `[def]` **SB6 synbio-sandbox-ui** (renderer-only) — compose a species from standard parts (grammar-guided); read the SBOL design in the codex/specimen view. *dep: SB3.* **→ absorbed/refined by the INTERVENTION REWORK epic below.**
+
+**🧩 INTERVENTION REWORK — "BioBlocks" (user brief 2026-06-30; the gameplay payoff of the SBOL foundation):**
+> *"rework interventions … příjemné UI, které staví na BioBricks a s možností použít 'připravené' editace z iGEM
+> knihovny."* Rework today's low-level tool brush (CRISPR `apply_edit_region` poke-a-locus + the player-snapshot
+> Variant Lab) into a **block-based ("BioBlocks") composer** — snap standard part blocks (promoter/RBS/CDS/terminator,
+> grammar-guided so only compatible shapes connect = the closed-world *felt*) — PLUS a **library of ready-made iGEM
+> `BBa_*` devices** (one-click "připravené" edits). RCT-style browser, datasheets, effect preview, OVERSIGHT credit
+> cost by complexity. Renderer-side UI (inv #2) over the SBOL core (parts = SBOL Components SB3, snap-validation =
+> SB1 validator, apply = a journaled SBOL-grounded edit). Seed: `proposals/intervention-rework-bioblocks-draft.md`.
+- `[ ]` **intervention-rework-bioblocks-design** (`workflow`, DESIGN) — `.js` authored, READY. The BioBlocks composer
+  UX + the iGEM ready-edits library curation/licensing plan + the rework of the current tools/Variant-Lab/OVERSIGHT +
+  the SBOL grounding + an ADR-draft. **DESIGN ONLY, doc-only; can run NOW** (the impl slices gate on SBOL SB1–SB3).
+- `[def]` **IR1 igem-library-data** — curate real iGEM `BBa_*` parts + ready devices as data, grounded in SBOL Components (datasheets); inv #1 licensing. *dep: SBOL SB3.*
+- `[def]` **IR2 bioblocks-composer-ui** (renderer) — the block snap canvas + assembly-grammar guidance (shape-compatible) + effect preview. *dep: IR1 + SBOL SB1.*
+- `[def]` **IR3 ready-edits-library-ui** (renderer) — RCT-style browser of ready devices + the player's saved devices (Variant Lab generalized); one-click apply. *dep: IR1.*
+- `[def]` **IR4 apply-device-as-journaled-edit** (core) — device → validated (closed-world) SBOL-grounded journaled edit; OVERSIGHT cost by complexity. Hash-relevant only for device runs (pinned config neutral). *dep: SBOL SB2.*
+- `[def]` **IR5 rework-current-tools** (renderer) — migrate `TOOL_CRISPR` onto the composer; reskin the regional operators; Variant Lab → the saved-devices shelf. *dep: IR2+IR3+IR4.*
 
 ---
 
