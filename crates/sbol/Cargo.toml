@@ -1,0 +1,15 @@
+[package]
+name = "sbol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hand-rolled SBOL3 (v3.1.0) JSON-LD subset + deterministic in-core closed-world validator (std + serde only). ADR-037 draft / SB1."
+
+[dependencies]
+# Internal path crate — the SBOL Component wraps these genome types (SoTermId, DnaSequence, Genome).
+genome = { workspace = true }
+# MIT/Apache-2.0 — derive(Serialize/Deserialize) for the fixed JSON-LD subset. (inv #1: permissive, linked.)
+serde = { workspace = true }
+# MIT/Apache-2.0 — the JSON-LD writer/reader; NO RDF engine, NO network (proposal §2.2). Used in tests too.
+serde_json = { workspace = true }

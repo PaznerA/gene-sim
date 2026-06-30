@@ -1596,3 +1596,57 @@ W2 (main.gd command API) / W3 (lifecycle) follow; W4 (optional inter-gen interpo
 doesn't pay). Shared `Arc<Mutex<GeneSimEnv>>` (reintroduces the `&mut` hazard under a lock + main-thread stalls).
 `crossbeam`/`triple_buffer`/`arc-swap` (a plain `Mutex` on a ~few-KB latest-wins slot at 60 Hz is enough — zero new
 deps wins). A `Condvar` park (lost-wakeup race — `rx.recv()` is simpler and correct).
+
+---
+
+## ADR-037 — SBOL as the genetic-design language: `crates/sbol` model + closed-world validator (SB1) + the closed-world law
+
+**Status:** Accepted (2026-06-30) for the **pins + the SB1 scaffold**. **Hash-neutral** — `crates/sbol` is new +
+**unwired** (not referenced by any sim crate; the closed-world gate is wired at SB2, the 🔁 re-pin), so the pinned
+literal `0x47a0_3c8f_6701_f240` is byte-identical (sim-core untouched). *(ADR number: DECISIONS.md was at ADR-036;
+ADR-035 is reserved on the held `auto/discovery-steered-loop-2026-06-30` branch — it slots in above ADR-036 when
+that branch merges.)*
+
+**Context.** gene-sim's genome model is already ontology-first (`genome::Locus.tags.so_term` is a Sequence Ontology
+term — SBOL `Component` roles ARE SO terms; real NCBI CDS sequences; `crispr` edits `DnaSequence`). Deep SBOL
+integration (user brief) is therefore a **formalization + a validation gate**, not new biology, with a **closed-world
+rule**: no genetic process executes that is not defined as an SBOL construct.
+
+**Decision (SB1 + the pins).**
+1. **A new `crates/sbol` crate — `std` + `serde` + `serde_json` only** (no RDF engine / Oxigraph / network / GPL;
+   `cargo tree -p sbol` = `genome` (path) + serde + serde_json). The §5-minimal **SBOL3** subset:
+   `SbolDocument`/`Component`/`Feature`/`Sequence`/`Range`/`Interaction`/`Participation`/`Constraint`, wrapping the
+   existing `SoTermId`/`DnaSequence`, with interned **ordered** ids (`IriId(u32)` over a Vec-backed document-order
+   interner — **no HashMap**) + a fixed JSON-LD subset via `serde_json`. **Reuse-vs-reinvent (SPEC §2.2):** a
+   hand-rolled focused subset is preferred over a third-party Rust SBOL crate (an RDF-engine-backed crate is a
+   determinism + footprint + bus-factor risk on the hot path; full conformance/SBOL2/SynBioHub go to a **subprocess**
+   at SB4 — the `oracle-slim` pattern).
+2. **The in-core closed-world validator** behind the inv #5 `SbolValidator` trait (`InCoreValidator` default +
+   `SubprocessValidator` stub for SB4). A **pure, RNG-free, ordered** function returning an ordered
+   `Vec<SbolViolation>`; it rejects on (1) unknown/illegal SO role, (2) malformed `Sequence`, (3) out-of-bounds
+   `Range`, (4) RFC10 transcription-unit grammar violation, (5) ungrounded `Interaction` (missing SBO type /
+   participant not found). 13 tests: accepts well-formed designs, one reject per condition, byte-stable JSON-LD
+   round-trip, deterministic + id-shuffle-stable ordering.
+
+**Pinned versions (inv #7).** **SBOL3 v3.1.0** (the `SBOL3_CONTEXT`); the **BioBrick RFC10** part-class grammar
+(`transcription_unit := promoter rbs cds+ terminator`; Type-IIS/MoClo/3A deferred); the Sequence Ontology terms
+(promoter SO:0000167, RBS SO:0000139, CDS SO:0000316, terminator SO:0000141, gene SO:0000704) and the SBO interaction
+terms used; ontologies referenced by IRI, **never bundled**. The new crate `sbol` v0.1.0.
+
+**The closed-world law (candidate inv #8).** *No genetic component/edit/interaction executes that is not grounded in
+a valid SBOL construct.* This ADR pins it as **binding design law now**; **elevation to the numbered invariant list
+(inv #8 in SPEC §2.1 + CLAUDE.md) is deferred to the SB2 sign-off** (the *interaction* half — encoding trophic
+effects as SBO `Interaction`s — is off-label SBO and not yet on fully canonical ground; elevating before SB2 would
+harden a rule we might still soften). Until elevated, a violation is an ADR-owned design rejection.
+
+**Scope / sequencing.** SB1 (this) = the model + validator, hash-neutral + unwired. **SB2** wires the gate into
+`SpeciesSpec::build` + `apply_edit` (in front of genotype→phenotype) — a **🔁 STOP-THE-LINE re-pin** needing explicit
+sign-off + the multi-ISA gate (`hash_world` folds `parameter_count` + the genotype/tolerance f64s; the SBOL view is
+an additive projection that preserves them → hash-neutral *by construction*, but any accidental move is a
+revert-not-re-pin defect). SB3 (parts catalog) / SB4 (subprocess validator) / SB5 (import-export) / SB6
+(synbio-sandbox-ui, absorbed by the BioBlocks intervention epic) follow.
+
+**Alternatives considered.** A third-party Rust SBOL crate as a core dep: REJECTED (RDF/network/footprint/bus-factor;
+quarantine to subprocess). Full RDF/Turtle in-core: REJECTED (overkill; the fixed JSON-LD subset round-trips what we
+need). Elevating inv #8 now: DEFERRED to SB2 (the off-label SBO caveat). Deferring the closed-world rule entirely:
+REJECTED — it is the user's core ask ("nesmí proběhnout proces, který není v tomto jazyce definovaný").
