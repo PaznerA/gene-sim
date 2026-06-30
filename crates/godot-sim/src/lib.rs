@@ -27,6 +27,13 @@ use godot::prelude::*;
 use harness::{Action, EditAction, Env, GeneSimEnv, RegionSpec};
 use sim_core::{EnvParams, Observation, Simulation};
 
+/// W1 SCAFFOLD (ADR-036; `docs/llm/proposals/worker-thread-parallelization-draft.md`): the off-thread sim
+/// worker (`SimWorker`/`SimCommand`/`FrameBundle`/`advance_one_gen`/`WorkerHandle`). **Pure Rust, no
+/// `godot::` type** — proven by its own determinism tests, NOT yet wired into `LiveSim`/`main.gd` (that is
+/// W2). The live game loop stays on its current synchronous path; this module is unreferenced until W2,
+/// hence its `#![allow(dead_code)]`.
+mod worker;
+
 /// gdext entry point. Registers every `#[derive(GodotClass)]` in this crate (here: [`LiveSim`]).
 struct GodotSimExtension;
 

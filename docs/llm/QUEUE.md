@@ -86,11 +86,8 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
   `gen_abs ≤ G+LIVE_STEP` before advance; immigration `drain(G+1)` after — now byte-match the shipped interleave),
   a read-routing miss, a Condvar lost-wakeup. Re-verify: `determinism_argument_airtight 3/3`, `&mut`-resolved 3/3,
   deps 3/3.** Zero new crates (std-only). ADR-036 draft in §7.
-- `[ ]` **W1 worker-scaffold-impl** 🛑 — `crates/godot-sim` `SimWorker`/`SimCommand`/`FrameBundle` + `advance_one_gen`
-  (the gem/immigration interleave moves into Rust) + spawn/JOIN/`recv()`-park. **STOP-THE-LINE-adjacent (inv #3):
-  must NOT land without the 3 determinism tests GREEN (incl. the gem+immigration boundary test) + `0x47a0` unmoved +
-  sign-off.** *dep: design ✓ + human sign-off.*
-- `[def]` **W2 main-gd-command-api-impl** (renderer-only) — `main.gd._process`/`_publish_frame` → post commands + read the latest `FrameBundle` each frame at 60 FPS; brush/edit/oversight → `SimCommand`. *dep: W1.*
+- `[x]` **W1 worker-scaffold-impl** 🛑 — **DONE (2026-06-30, ADR-036, signed-off)** — `crates/godot-sim/worker.rs`: `SimWorker` (owns env, single-mutator) + `SimCommand` + `FrameBundle` + `advance_one_gen` (gem/immigration interleave into Rust, exact shipped predicates) + `recv()`-park. **SCAFFOLD UNWIRED** (`lib.rs` = `mod worker;`; live loop unchanged → W2 wires it). **4/4 worker determinism tests GREEN (incl. the gem+immigration boundary test); `0x47a0` byte-identical (sim-core untouched); zero new crates; gate.sh gained HARD step 4c to enforce the tests.** 3-skeptic verify 3/3. Merged `--no-ff`.
+- `[ ]` **W2 main-gd-command-api-impl** (renderer-only) — `main.gd._process`/`_publish_frame` → post commands + read the latest `FrameBundle` each frame at 60 FPS; brush/edit/oversight → `SimCommand`. *dep: W1 ✓ — READY NEXT.*
 - `[def]` **W3 lifecycle-impl** — pause/reset/`load_session`/quit clean JOIN + spawn-panic handling. *dep: W1.*
 - `[def]` **W4** *(optional)* — presentation interpolation between generations (visual 60 FPS smoothness over a 2 Hz sim). *dep: W2.*
 

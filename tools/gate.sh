@@ -56,6 +56,25 @@ else
   record "N/A" "determinism-multi-isa"
 fi
 
+step "4c/10  cargo test godot-sim worker::   (HARD — inv. #3 worker-vs-sync byte-identity, ADR-036)"
+# crates/godot-sim is workspace-DETACHED, so step 3's `cargo test --workspace` does NOT cover it. The
+# worker-thread parallelization (ADR-036) is defended by pure-Rust determinism tests (worker == synchronous
+# byte-identical, incl. the gem+immigration BOUNDARY test) — run them HERE, gated only on cargo (they need no
+# Godot runtime). A real test FAILURE is a HARD fail (the safety net caught a regression); if the detached crate
+# can't build (gdext deps unavailable) we SKIP clean, mirroring check_livesim.sh's cdylib-build skip (CI authoritative).
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "SKIP — cargo not installed"; record SKIP "godot-sim-worker-determinism"
+elif [ ! -f crates/godot-sim/Cargo.toml ]; then
+  echo "N/A — crates/godot-sim not present."; record "N/A" "godot-sim-worker-determinism"
+elif cargo test --manifest-path crates/godot-sim/Cargo.toml worker:: >/tmp/godot_sim_worker_test.log 2>&1; then
+  tail -6 /tmp/godot_sim_worker_test.log; record PASS "godot-sim-worker-determinism"
+elif grep -q "test result: FAILED" /tmp/godot_sim_worker_test.log; then
+  cat /tmp/godot_sim_worker_test.log; record FAIL "godot-sim-worker-determinism [HARD]"
+else
+  echo "SKIP — godot-sim worker tests did not build (gdext deps unavailable?); CI is authoritative."
+  record SKIP "godot-sim-worker-determinism"
+fi
+
 step "5/10  cargo test --workspace --features proptest"
 if cargo test --workspace --features proptest; then record PASS "proptest"; else record FAIL "proptest"; fi
 
