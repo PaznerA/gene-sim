@@ -4,6 +4,15 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### `CONTRIBUTING.md` — the contributor guide (beta-hardening, doc-only)
+A new top-level `CONTRIBUTING.md` codifying the workflow this repo already runs: the 7 STOP-THE-LINE invariants
+(SPEC §2.1), build/run, the single `tools/gate.sh` (the 10-step table + which gates are HARD/skippable), the
+determinism discipline (the pinned literal `0x47a0_3c8f_6701_f240`; hash-neutral by default vs a deliberate
+ADR-owned 🔁 re-pin), the per-slice loop (LOAD→PLAN→IMPLEMENT→GATE→REFLECT→COMMIT→CLOSE), the branch→gate→merge
+`--no-ff` workflow + conventional commits + the `Co-Authored-By` trailer, the append-only ADR process, a pre-PR
+invariant self-check, and the licensing posture (TBD per `README.md`; crate metadata `MIT OR Apache-2.0`; GPL stays
+behind the subprocess boundary, inv #1). Doc-only — no code touched, the gate is unaffected.
+
 ### Replay error handling — typed `ReplayError` enum + a corrupt-input proptest — HASH-NEUTRAL, off-hash (beta-hardening)
 The replay parse path already returned `io::Result` gracefully (never panicked); this slice makes it **typed** and
 **proves** the no-panic property. A `ReplayError` enum (`crates/harness/src/replay.rs`) with 5 distinct variants —
