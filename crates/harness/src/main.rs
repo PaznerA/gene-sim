@@ -832,7 +832,7 @@ fn run_promote_gem(
             harness::promote::promote_checkpoint(&gem, slug, &name, n, &species_dir, &starters_dir)
                 .map(|p| (p, format!("checkpoint @gen {n}")))
         }
-        None => harness::promote::promote_gen1(&gem, slug, &name, &starters_dir)
+        None => harness::promote::promote_gen1(&gem, slug, &name, &species_dir, &starters_dir)
             .map(|p| (p, "gen-1".to_string())),
     };
     match outcome {
@@ -863,13 +863,14 @@ fn run_promote_gem(
 /// gitignored; the written starters live under the committed `data/presets/starters/`.
 fn run_promote_default_set(max: usize) -> ExitCode {
     let gems_dir = PathBuf::from("data/runs/gems");
+    let species_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"));
     let starters_dir = PathBuf::from("data/presets/starters");
     println!(
         "gene-sim promote (DEFAULT SET) · gems={} · starters={} · max={max}",
         gems_dir.display(),
         starters_dir.display()
     );
-    match harness::promote::promote_default_set(&gems_dir, &starters_dir, max) {
+    match harness::promote::promote_default_set(&gems_dir, &species_dir, &starters_dir, max) {
         Ok(slugs) => {
             if slugs.is_empty() {
                 println!(

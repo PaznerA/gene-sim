@@ -1375,6 +1375,13 @@ become hash-active, a gen-1 starter promoted from an edited gem would silently s
 The fix (queued): reject firing-edit gems in `promote_gen1`, OR recompute the gen-1 `source_hash` from an edit-free
 replay; also store `gens` (+ an edit flag) in the gen-1 doc so it is self-contained re-verifiable. Gate GREEN;
 3-skeptic verify CONFIRMED (5/5 at 3/3); committed library empirically replay-verified.
+**RESOLVED 2026-06-30** (`starter-promote-hardening`, off-hash harness tooling): took the RECOMPUTE option —
+`promote_gen1` now derives `source_hash` from an EDIT-FREE replay of the pristine config (`build_journal(&[], gens)`
+→ `record_episode` → replay-verified `record == replay`), removing the blind `gem.recorded_hash` copy, so the stored
+hash always equals what the edit-free gen-1 config actually produces (correct even when CRISPR edits become
+hash-active). `Gen1Starter` gained `gens` + `source_had_edits` (both `#[serde(default)]` → the committed library
+still loads, not re-promoted). `0x47a0_3c8f_6701_f240` byte-identical; 11/11 promote tests (incl. an edited-gem
+fixture + a self-contained re-verify). No separate ADR (the design was already recorded here).
 
 ---
 

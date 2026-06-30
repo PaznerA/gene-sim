@@ -4,6 +4,23 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Starter-promote hardening — gen-1 `source_hash` recomputed from an edit-free replay — HASH-NEUTRAL, off-hash tooling (ADR-031 trap closed)
+Closes the ADR-031 latent trap: `promote_gen1` used to copy `source_hash = hex16(gem.recorded_hash)` while dropping
+the gem's edits — correct only while CRISPR edits stay hash-neutral; a gen-1 starter promoted from an *edited* gem
+would silently stop replaying to its `source_hash` once edits become hash-active. Now `promote_gen1` **RECOMPUTES**
+the gen-1 `source_hash` from an EDIT-FREE replay of the pristine `StarterConfig` (`build_journal(&[], gens)` =
+`Advance(1)·gens` → `record_episode` → replay-verified `record == replay`, the existing deterministic contract — no
+hand-rolled hash path), so the stored hash always equals what the edit-free config actually produces, whether or not
+the source gem carried edits. `Gen1Starter` gains `gens` (the source horizon) + `source_had_edits: bool`, both
+`#[serde(default)]` so the committed starter library still deserializes + the gallery stays green (the committed
+docs are **not** re-promoted/rewritten — their source gems are gone from disk and they're already edit-free).
+Off-hash harness tooling → pinned literal `0x47a0_3c8f_6701_f240` byte-identical (sim-core untouched; the recompute
+runs the *source* config, never the pinned determinism config); `cargo tree -p harness` adds no dependency. Tests:
+an edited-gem fixture stores the edit-free hash + flags `source_had_edits`, a gen-1 doc is self-contained
+re-verifiable (re-run from `config`+`source_seed`+`gens` reproduces `source_hash`), and the committed library loads
+under the new struct (11/11 promote tests). Gate GREEN (sim-core 187/187, determinism OK); 3-skeptic verify 3/3 on
+all four invariant booleans. (ADR-031's "known trap" marked RESOLVED — no new ADR.)
+
 ### OVERSIGHT UI polish — safe q default + honest due-epoch label + ledger resumes after load — RENDERER-ONLY, zero Rust (ADR-028 follow-ups)
 The three ADR-028 #3-verify follow-ups, all in `godot/main.gd` (renderer-only). (1) The growth-ratio `q` SpinBox now
 **defaults to `1000` (wild-type / no-op)** instead of `0` (growth-lethal KO), so opening the OVERSIGHT panel and
