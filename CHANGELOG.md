@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### SBOL model + closed-world validator (SB1) — new `crates/sbol`, std-only — HASH-NEUTRAL, unwired (ADR-037)
+The first slice of the deep SBOL integration: a new **`crates/sbol`** (`std` + `serde` + `serde_json` only — NO RDF
+engine / Oxigraph / network / GPL; `cargo tree -p sbol` = `genome` + serde + serde_json). The §5-minimal **SBOL3
+v3.1.0** subset (`SbolDocument`/`Component`/`Feature`/`Sequence`/`Range`/`Interaction`/`Participation`/`Constraint`),
+wrapping the existing `genome::SoTermId`/`DnaSequence`, with interned **ordered** ids (`IriId(u32)` over a Vec-backed
+document-order interner — **no HashMap**) + a fixed JSON-LD subset via `serde_json`. The in-core **closed-world
+validator** behind the inv #5 `SbolValidator` trait (`InCoreValidator` default + a `SubprocessValidator` stub for the
+SB4 boundary): a pure, RNG-free, ordered function returning an ordered `Vec<SbolViolation>` that rejects on unknown SO
+role, malformed `Sequence`, out-of-bounds `Range`, RFC10 transcription-unit grammar violation, or an ungrounded
+`Interaction` (missing SBO type / participant not found). A `Genome → SbolDocument` read-only projection. 13 tests
+(accepts well-formed designs, one reject per condition, byte-stable JSON-LD round-trip, deterministic + id-shuffle-
+stable ordering). **Hash-neutral + UNWIRED** — `crates/sbol` is not referenced by any sim crate (the closed-world
+gate is wired at SB2, the 🔁 re-pin); sim-core untouched → the pinned literal `0x47a0_3c8f_6701_f240` is byte-identical
+(`determinism_hash_is_pinned` green). Pinned (inv #7): SBOL3 v3.1.0, BioBrick RFC10 grammar, the SO/SBO term numbers,
+`sbol` v0.1.0. Gate GREEN (sbol 13/13, sim-core 187/187, determinism OK); 3-skeptic verify 3/3 on all four invariant
+booleans. **ADR-037** (also pins the closed-world law as binding design law; elevation to inv #8 deferred to the SB2
+sign-off).
+
 ### Worker-thread W1 — the off-thread sim worker SCAFFOLD — HASH-NEUTRAL, std-only (ADR-036)
 The first slice of the worker-thread parallelization (the user-chosen perf fix; STOP-THE-LINE-adjacent inv #3,
 **human-signed-off**). A new pure-Rust `crates/godot-sim/src/worker.rs` (zero `godot::` imports): `SimWorker` owns
