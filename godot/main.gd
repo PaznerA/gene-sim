@@ -1544,7 +1544,7 @@ func _build_oversight_ui(ui: CanvasLayer) -> void:
 	# Lower = stronger loss-of-function → a smaller demand factor (toward 0.5×). Just an int — biology stays in core.
 	var q_row := HBoxContainer.new()
 	q_row.add_child(_dim_label("Growth ratio q:"))
-	_oversight_ratio = _make_spin(0, 1000, 10, 0)
+	_oversight_ratio = _make_spin(0, 1000, 10, 1000)
 	_oversight_ratio.tooltip_text = "FBA growth-ratio permille: 1000 = wild-type (no-op), 0 = growth-lethal knockout.\nLower = stronger loss-of-function → a smaller demand factor (toward 0.5×). The core maps it (inv #2)."
 	q_row.add_child(_oversight_ratio)
 	col.add_child(q_row)
@@ -1648,15 +1648,16 @@ func _on_oversight_commit_pressed() -> void:
 	var applied := bool(outcome.get("applied", false))
 	if applied:
 		var factor := int(outcome.get("factor_q", 1000))
-		var due_epoch := int(outcome.get("due_epoch", 0))
+		var due_epoch := int(outcome.get("due_epoch", 0))  # core's effective/accounting epoch (ADR-028: applied now)
 		var req_id := int(outcome.get("req_id", 0))
-		# Mark it where the player committed (the journaled Request/Commit pair lands here); the Tick-counted
-		# due_epoch the edit takes effect at is surfaced in the marker label (the timeline axis is per-generation).
+		# Mark it where the player committed (the journaled Request/Commit pair lands here). The renderer path applies
+		# the commit IMMEDIATELY (ADR-028 immediate-commit — the effect lands on the next Advance), so the core's
+		# due_epoch is the EFFECTIVE / accounting epoch surfaced in the label, NOT a deferral (axis is per-generation).
 		var gen := int(_live.observe().get("generation", 0)) if _live.has_method("observe") else 0
 		_record_oversight_marker(
-			gen, "OVERSIGHT q=%d → %.3f× · due epoch %d · req %d" % [q, float(factor) / 1000.0, due_epoch, req_id])
+			gen, "OVERSIGHT q=%d → %.3f× · applied now · effective epoch %d · req %d" % [q, float(factor) / 1000.0, due_epoch, req_id])
 		_set_oversight_status(
-			"✓ committed q=%d → %.3f× (req %d, due epoch %d)" % [q, float(factor) / 1000.0, req_id, due_epoch], true)
+			"✓ committed now q=%d → %.3f× (req %d, effective epoch %d)" % [q, float(factor) / 1000.0, req_id, due_epoch], true)
 	else:
 		_set_oversight_status("✗ %s" % str(outcome.get("reason", "rejected")), false)
 	_refresh_oversight_panel()  # reflect the spent credit + re-gate the Commit button immediately
@@ -3354,6 +3355,13 @@ func _resync_to_live() -> void:
 	if _timeline != null:
 		_timeline.setup([snap.generation])
 		_timeline.set_markers(_injections)
+	# ADR-028 follow-up (FIX 3): a checkpoint / session load resyncs through here against a freshly-restored core —
+	# RE-ACTIVATE the OVERSIGHT panel + refresh the ledger so the credit economy RESUMES (the same activation the
+	# fresh-run build uses). has_method-guarded (inv #2): an older cdylib without oversight_state degrades to an
+	# inactive panel rather than erroring; the ledger numbers still come from the core oversight_state() #[func].
+	if _oversight_panel != null:
+		_oversight_panel.set_active(_live != null and _live.has_method("oversight_state") and _view_mode == VIEW_ECOSYSTEM)
+		_refresh_oversight_panel()
 	_show(0)
 	_update_play_button()
 

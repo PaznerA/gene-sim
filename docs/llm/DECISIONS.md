@@ -1243,7 +1243,9 @@ sampling granularity differs (renderer per `step(n)`, headless per-gen) — no d
 GREEN; 3-skeptic verify CONFIRMED (5/5 claims at 3/3). **Follow-up UX (tracked in QUEUE `oversight-ui-polish`):**
 default the "growth ratio q" knob to `1000` (wild-type/no-op) instead of `0` (growth-lethal); align the
 due-epoch marker label with the immediate-commit semantics; re-enable oversight in `load_session` so the ledger
-resumes after a loaded session.
+resumes after a loaded session. **RESOLVED 2026-06-30** (`oversight-ui-polish`, renderer-only, hash-neutral): all
+three landed — q default `1000`; the label now reads "applied now / effective epoch"; `_resync_to_live` re-activates
+the panel on both load paths. No separate ADR (no new load-bearing decision).
 
 ---
 
