@@ -4,6 +4,24 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Replay error handling — typed `ReplayError` enum + a corrupt-input proptest — HASH-NEUTRAL, off-hash (beta-hardening)
+The replay parse path already returned `io::Result` gracefully (never panicked); this slice makes it **typed** and
+**proves** the no-panic property. A `ReplayError` enum (`crates/harness/src/replay.rs`) with 5 distinct variants —
+`MissingFile{which,source}`, `MalformedSeedJson`, `MalformedAction{line,msg}`, `ActionCountMismatch{expected,found}`,
+`SpecBuildFailed` — replaces the flattened `io::ErrorKind::InvalidData` in `read_journal`/`replay`/`env_config`, so a
+caller can distinguish corruption kinds. `impl From<ReplayError> for io::Error` (kind `InvalidData`) bridges it, so
+every existing `io::Result` caller still compiles unchanged (`promote.rs` via `?`, `discover.rs` via a one-line
+`.map_err(io::Error::from)`, `main.rs`/`campaign.rs`/`godot-sim` match on `Display`). A **proptest** (6 cases + 2
+unit tests, 18/18 replay tests) throws arbitrary/corrupt bytes at `read_journal`/`replay` — random bytes, truncated
+JSON, wrong `action_count`, garbage action lines, a malformed guide — and proves it **always returns
+`Err(ReplayError)`, never panics/UB** (proptest's panic-catch is the real guarantee). The production read path has
+zero `unwrap`/`expect`/`panic!`/indexing. **Hash-neutral**: a valid journal still replays to the **same** hash
+(`record_then_replay_is_bit_identical` + `round_tripped_journal_replays_to_recorded_hash` pass); pinned literal
+`0x47a0_3c8f_6701_f240` byte-identical (sim-core untouched). **No new dependency** — `proptest` was already a pinned
+(`1.x`, MIT/Apache) workspace **dev**-dependency (absent from `cargo tree -p harness -e normal`). Gate GREEN
+(sim-core 187/187, determinism OK); 3-skeptic verify 3/3 on all four invariant booleans; both reviewers APPROVE.
+(No ADR — typed errors over an already-graceful path, reusing a pre-pinned dev-dep, are not a load-bearing decision.)
+
 ### Starter-promote hardening — gen-1 `source_hash` recomputed from an edit-free replay — HASH-NEUTRAL, off-hash tooling (ADR-031 trap closed)
 Closes the ADR-031 latent trap: `promote_gen1` used to copy `source_hash = hex16(gem.recorded_hash)` while dropping
 the gem's edits — correct only while CRISPR edits stay hash-neutral; a gen-1 starter promoted from an *edited* gem
