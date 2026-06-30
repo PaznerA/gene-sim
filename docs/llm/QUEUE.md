@@ -87,9 +87,10 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
   a read-routing miss, a Condvar lost-wakeup. Re-verify: `determinism_argument_airtight 3/3`, `&mut`-resolved 3/3,
   deps 3/3.** Zero new crates (std-only). ADR-036 draft in §7.
 - `[x]` **W1 worker-scaffold-impl** 🛑 — **DONE (2026-06-30, ADR-036, signed-off)** — `crates/godot-sim/worker.rs`: `SimWorker` (owns env, single-mutator) + `SimCommand` + `FrameBundle` + `advance_one_gen` (gem/immigration interleave into Rust, exact shipped predicates) + `recv()`-park. **SCAFFOLD UNWIRED** (`lib.rs` = `mod worker;`; live loop unchanged → W2 wires it). **4/4 worker determinism tests GREEN (incl. the gem+immigration boundary test); `0x47a0` byte-identical (sim-core untouched); zero new crates; gate.sh gained HARD step 4c to enforce the tests.** 3-skeptic verify 3/3. Merged `--no-ff`.
-- `[ ]` **W2 main-gd-command-api-impl** (renderer-only) — `main.gd._process`/`_publish_frame` → post commands + read the latest `FrameBundle` each frame at 60 FPS; brush/edit/oversight → `SimCommand`. *dep: W1 ✓ — READY NEXT.*
-- `[def]` **W3 lifecycle-impl** — pause/reset/`load_session`/quit clean JOIN + spawn-panic handling. *dep: W1.*
-- `[def]` **W4** *(optional)* — presentation interpolation between generations (visual 60 FPS smoothness over a 2 Hz sim). *dep: W2.*
+- `[ ]` **THE FPS WIN — `sim-worker-go-live-impl`** (was W2+W3) 🛑 — **USER PRIORITY #1 (2026-06-30), `.js` authored, READY NEXT.** Wire the LIVE game onto the worker: `LiveSim` owns a `WorkerHandle` + delegates every `#[func]`; `main.gd._process` drops the synchronous step loop → set speed + read the latest `FrameBundle` each render tick at engine FPS (the sim leaves the render thread); incl. the clean lifecycle (reset/load/pause/quit JOIN + spawn-panic). STOP-THE-LINE-adjacent: the threaded live game must be journal/replay byte-identical (the `worker::tests` + a scripted-live-session test, enforced by gate step 4c) + `0x47a0` unmoved. *dep: worker scaffold ✓.* **Launch when the SBOL crate frees the compile lane.**
+- `[def]` **robust-testing pass** — **USER PRIORITY #2** — harden + test the threaded game experience: more determinism/replay/lifecycle/edge-case tests, a perf measurement (FPS decoupled under load / big entity count), thread-leak + reset-churn checks. *dep: the FPS win.*
+- `[def]` **W4** *(optional)* — presentation interpolation between generations (visual 60 FPS smoothness over a ~2 Hz sim). *dep: the FPS win.*
+> **USER PRIORITY ORDER (2026-06-30): (1) the FPS win → (2) the robust-testing pass → (3) the INTERVENTION REWORK epic below.** The SBOL foundation crate is in flight (it's the dependency for #3); the FPS win runs the moment it frees the compile lane.
 
 **Polish & QoL:**
 - `[x]` **starter-promote-hardening** — **DONE (2026-06-30, ADR-031 trap closed)** — `promote_gen1` RECOMPUTES the gen-1 `source_hash` from an edit-free replay (`build_journal(&[], gens)` → `record_episode` → replay-verified), removing the blind `gem.recorded_hash` copy; `Gen1Starter` gains `gens` + `source_had_edits` (`#[serde(default)]`, committed library still loads). **Gate GREEN; `0x47a0` byte-identical; verify 3/3.** Merged `--no-ff`.
@@ -133,6 +134,8 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 > `BBa_*` devices** (one-click "připravené" edits). RCT-style browser, datasheets, effect preview, OVERSIGHT credit
 > cost by complexity. Renderer-side UI (inv #2) over the SBOL core (parts = SBOL Components SB3, snap-validation =
 > SB1 validator, apply = a journaled SBOL-grounded edit). Seed: `proposals/intervention-rework-bioblocks-draft.md`.
+> **USER PRIORITY #3 (after the FPS win + robust testing). PRE-AUTHORIZED: rebuilding the committed starter/preset
+> maps is OK if this rework needs it (the device-based edit model may change how presets compose) — not a blocker.**
 - `[x]` **intervention-rework-bioblocks-design** (`workflow`, DESIGN) — **DONE (2026-06-30) — APPROVE, verify 4/4.**
   Expanded `proposals/intervention-rework-bioblocks-draft.md` into a buildable spec + ADR-038 draft: RCT-style composer
   (shape-encodes-SO-role snap canvas over a core `grammar_hints.json`; the authoritative check stays the SBOL
