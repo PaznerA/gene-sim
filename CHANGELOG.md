@@ -4,6 +4,26 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Worker-thread W1 — the off-thread sim worker SCAFFOLD — HASH-NEUTRAL, std-only (ADR-036)
+The first slice of the worker-thread parallelization (the user-chosen perf fix; STOP-THE-LINE-adjacent inv #3,
+**human-signed-off**). A new pure-Rust `crates/godot-sim/src/worker.rs` (zero `godot::` imports): `SimWorker` owns
+`GeneSimEnv` on one worker thread (the `&mut` hazard resolved by **single ownership**, not locking), a FIFO
+`SimCommand` channel (main→worker), an `Arc<Mutex<Option<FrameBundle>>>` latest-wins read slot (worker→main, no
+compute under the lock), and `advance_one_gen` which relocates the per-gen `gem→step→immigration` interleave from
+GDScript into Rust with the **exact shipped gen-boundary predicates** — gem edits at `gen_abs <=
+env.generation()+LIVE_STEP` before the advance (`main.gd:1219`), immigration at `drain_due_inoculations(env.generation()+1)`
+after (`godot-sim:972-973`). The paused worker parks on blocking `rx.recv()` (race-free, no Condvar). **SCAFFOLD
+ONLY** — `lib.rs` changes are just `mod worker;`; every `#[func]` + the live `_process` loop are untouched (W2 wires
+it), so the worker path is exercised only by tests and the game still runs the old way. **Hash-neutral:** sim-core is
+untouched → the pinned literal `0x47a0_3c8f_6701_f240` is byte-identical; **zero new crates** (std `mpsc`/`Arc`/
+`Mutex`/`thread`). Four pure-Rust `worker::tests` prove it: `worker_run_is_byte_identical_to_synchronous` (publishes
+the FrameBundle mid-run → the whole snapshot/observe/flow/oversight projection is off-hash), the interleaved-actions
+test, the **gem+immigration boundary** test (the guard that `advance_one_gen` matches the shipped interleave), and a
+`recv`-park test. Because `crates/godot-sim` is workspace-detached (`cargo test --workspace` skips it), **`tools/gate.sh`
+gains a HARD step 4c** running `cargo test --manifest-path crates/godot-sim/Cargo.toml worker::` (cargo-gated; a real
+failure is HARD, a build-unavailable case SKIPs). Gate GREEN (sim-core 187/187, determinism OK, 4/4 worker tests);
+3-skeptic verify 3/3 on all four invariant booleans. **ADR-036.** W2 (main.gd command API) is next.
+
 ### Live-session sparkline — per-marker effect sparkline on the timeline — RENDERER-ONLY, zero Rust
 A per-gen EFFECT sparkline on the timeline intervention markers (the P4/P6 follow-up). For a marker at generation G,
 `main.gd._markers_with_effect` forward-scans `_snaps` (ascending), skips `gen <= G`, and collects `_fit_history`

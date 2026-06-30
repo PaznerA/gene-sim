@@ -1541,3 +1541,58 @@ under the pinned dynamics); a `saturating` cast / `debug_assert` is a cheap futu
 trait as `BoostStumpInt`, with heavy ML kept at a subprocess boundary (inv #1). Linking a Rust ML crate
 (`linfa`/`smartcore`): REJECTED — drags a heavy dep tree into the in-process `discovery` crate (inv #5); the
 hand-rolled integer regressor is ~200 lines and determinism-exact.
+
+---
+
+## ADR-036 — Off-thread sim worker (W1 scaffold): `std-channel` + ownership-resolved `&mut`, byte-identical
+
+**Status:** Accepted (2026-06-30). **Human-signed-off** (the user approved W1, a STOP-THE-LINE-adjacent inv #3
+slice). **NOT a re-pin** — the pinned literal `0x47a0_3c8f_6701_f240` (`crates/sim-core/src/lib.rs:3544`/`:3708`) is
+byte-identical (W1 is `crates/godot-sim` only; sim-core untouched). **W1 = the SCAFFOLD** in the detached
+`crates/godot-sim` (`worker.rs`); the live `main.gd._process` loop is UNCHANGED until **W2** wires it. *(ADR number:
+DECISIONS.md was at ADR-034; ADR-035 is reserved on the pending `auto/discovery-steered-loop-2026-06-30` branch — it
+will slot in above this entry when that branch merges.)*
+
+**Context.** The decoupled-single-thread live loop hit its ceiling — the sim step **and** the heavy
+`snapshot()`+`observe()`+projection share Godot's main-thread frame budget, so a fast/large sim steals input-frame
+time and FPS drops below the user's ≥30 FPS bar (zoom/pan feel coupled to the sim cadence). Sim-step data-parallelism
+is closed (ADR-020 / rayon doesn't pay). The lever is to move the *single-threaded* step + the heavy read off the
+input/render thread.
+
+**Decision.** Move `GeneSimEnv` onto **one owned worker thread** that is its **sole mutator**. `LiveSim` becomes (in
+W2) a main-thread proxy holding a `std::sync::mpsc::Sender<SimCommand>` (main→worker, FIFO, covering every mutating
+`#[func]`), an `Arc<Mutex<Option<FrameBundle>>>` latest-wins read slot (worker→main, an off-hash read copy — no
+compute under the lock), and a `JoinHandle`. The per-gen `gem→step→immigration` interleave moves from GDScript into
+Rust `advance_one_gen`. The paused worker parks on **blocking `rx.recv()`** (race-free — std `mpsc` has no
+lost-wakeup; **no Condvar**, after the adversarial review caught a Condvar lost-wakeup in the first draft). **Zero new
+crates** (std `mpsc`/`Arc`/`Mutex`/`thread`).
+
+**The `&mut` hazard.** Every `LiveSim` method is `&mut self`; a shared worker reference would alias. **Resolved by
+ownership, not locking** — the env *moves into* the worker; the main thread holds no reference to it. The `Mutex`
+guards only the frame-slot pointer (one writer, one reader).
+
+**Determinism guarantee (load-bearing).** Byte-identical because: (D1) the hash oracle is a sim-core path this design
+never touches; (D2) time advances only by integer `Advance(LIVE_STEP)` — `sleep`/`SetSpeed` is pure pacing, never sim
+content; (D3) single-producer→single-consumer FIFO commands applied at the gen boundary reproduce the synchronous
+call order exactly (brush-between-whole-gens preserved); (D4) the snapshot is a proven off-hash read copy. The two
+gen-boundary predicates the review hardened are byte-for-byte the shipped interleave: gem edits fire at
+`gen_abs <= env.generation()+LIVE_STEP` **before** the advance (`main.gd:1219`); immigration drains at
+`drain_due_inoculations(env.generation()+1)` **after** (`godot-sim:972-973` + `harness` `due_epoch < up_to`).
+**Enforced by the gate:** four pure-Rust `worker::tests` in `crates/godot-sim` —
+`worker_run_is_byte_identical_to_synchronous` (publishes the FrameBundle mid-run, so the whole
+snapshot/observe/flow/oversight projection is proven off-hash), `worker_journal_matches_synchronous_with_interleaved_actions`,
+`worker_matches_synchronous_through_the_gem_and_immigration_boundaries` (the boundary guard), and
+`worker_parks_on_recv_and_a_command_wakes_it`. Because `crates/godot-sim` is **workspace-DETACHED**, `cargo test
+--workspace` does not cover it — so **`tools/gate.sh` gains a HARD step `4c`** running
+`cargo test --manifest-path crates/godot-sim/Cargo.toml worker::` (cargo-gated, not godot-gated; a real test FAILURE
+is a HARD fail, a build-unavailable case SKIPs clean). 4/4 green at W1 landing.
+
+**Consequences.** + the UI decouples from the sim under load (W2 delivers the FPS win); + `advance_one_gen`
+centralizes the deterministic interleave in Rust (a net inv #2 improvement — less orchestration in GDScript). −
+two interleave predicates are now load-bearing in Rust (guarded by the boundary test). The scaffold is unwired (W1);
+W2 (main.gd command API) / W3 (lifecycle) follow; W4 (optional inter-gen interpolation) is deferred.
+
+**Rejected alternatives.** Stay single-threaded (the FPS-vs-sim coupling is the problem). Sim-step rayon (ADR-020 —
+doesn't pay). Shared `Arc<Mutex<GeneSimEnv>>` (reintroduces the `&mut` hazard under a lock + main-thread stalls).
+`crossbeam`/`triple_buffer`/`arc-swap` (a plain `Mutex` on a ~few-KB latest-wins slot at 60 Hz is enough — zero new
+deps wins). A `Condvar` park (lost-wakeup race — `rx.recv()` is simpler and correct).
