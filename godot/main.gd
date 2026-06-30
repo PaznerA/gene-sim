@@ -111,6 +111,7 @@ const LIVE_GRID := Vector2i(32, 32)  # snapshot grid pulled from LiveSim each ti
 # a render cell maps 1:1 to a world cell — the selective brush picks world cells directly, ADR-011 S-F)
 const LIVE_STEP := 1  # generations advanced per tick (a FIXED integer — deterministic cadence, inv #3)
 const LIVE_HISTORY := 150  # rolling snapshot buffer kept for the timeline / scrubbing
+const EFFECT_WINDOW := 18  # live-session-sparkline: max recorded history points sampled AFTER a marker's gen
 # LOAD-GEM-REPLAY v2: the entity_count a loaded gem's run resets under — mirrors the harness DISCOVER_ENTITY_COUNT
 # (the per-species roster counts drive the actual spawn; this only feeds the metadata fold, so it must match for
 # the closest reproduction of the captured run).
@@ -700,8 +701,7 @@ func _on_gallery_play_checkpoint(slug: String, markers: Array) -> void:
 		push_warning("Starters: failed to load checkpoint session %s" % slug)
 		return
 	_injections = markers.duplicate()  # the recorded-edit projection (renderer-side; inv #2)
-	if _timeline != null:
-		_timeline.set_markers(_injections)
+	_push_timeline_markers()
 
 
 ## Back from the gallery → reopen the new-run main menu.
@@ -1075,7 +1075,7 @@ func _publish_frame() -> void:
 		for s in _snaps:
 			gens.append(s.generation)
 		_timeline.setup(gens)
-		_timeline.set_markers(_injections)
+		_push_timeline_markers()
 	_show(_snaps.size() - 1)
 	_refresh_oversight_panel()  # OVERSIGHT credit accrues as mineralization earns it — keep the ledger readout live
 	_poll_population_alerts()  # Item (c): per-species extinction/boom flash vs the prior render frame (--live)
@@ -1673,8 +1673,7 @@ func _record_oversight_marker(generation: int, label: String) -> void:
 		"applied": true,
 		"label": label,
 	})
-	if _timeline != null:
-		_timeline.set_markers(_injections)
+	_push_timeline_markers()
 
 
 ## Show an OVERSIGHT verdict in its own status line (green ok / red fail). Separate from the INTERVENE status so the
@@ -2096,8 +2095,68 @@ func _record_tool_outcome(tool: int, outcome: Dictionary) -> void:
 		"applied": applied,
 		"label": detail,
 	})
+	_push_timeline_markers()
+
+
+## Push the intervention markers to the timeline WITH a per-marker effect series attached (live-session-sparkline).
+## The single funnel every marker-set site routes through, so the timeline always gets the same effect-augmented
+## copy. Renderer-only presentation (inv #2): it does NOT mutate `_injections` (the journal projection stays the
+## source of truth) — it hands the timeline a derived copy. No-op without a timeline.
+func _push_timeline_markers() -> void:
 	if _timeline != null:
-		_timeline.set_markers(_injections)
+		_timeline.set_markers(_markers_with_effect(_injections))
+
+
+## Build a render-only COPY of `markers` with a normalized `effect` PackedFloat32Array attached to each, for the
+## timeline's selected-marker sparkline. For a marker at generation G the effect series is the run metric (mean
+## fitness — _fit_history) sliced from the ORDERED render history over the bounded window of recorded points AFTER
+## G, ending at the NEXT marker's generation or after EFFECT_WINDOW points (whichever comes first), then normalized
+## to the window's own min..max for [0,1] drawing.
+##
+## inv #2 (render-only): reads the off-hash render projection `_fit_history` (aligned 1:1 with `_snaps[].generation`,
+## both appended/popped in lock-step in _publish_frame) + the marker's stored generation; computes NO genotype→
+## phenotype. inv #3 (determinism): a FORWARD slice of an ORDERED Array — no Dictionary/hash-order iteration, no
+## randf/randi/Time/OS — so the same history yields the same series. A window with < 2 points → no `effect` key
+## (the timeline then draws nothing extra for that marker).
+func _markers_with_effect(markers: Array) -> Array:
+	var out: Array = []
+	out.resize(markers.size())
+	var n: int = mini(_fit_history.size(), _snaps.size())  # histories track _snaps in lock-step; clamp defensively
+	for mi in markers.size():
+		var m: Dictionary = markers[mi]
+		var aug: Dictionary = m.duplicate()
+		var g: int = int(m.get("generation", 0))
+		# The NEXT marker's generation bounds this marker's window so each chart shows ITS OWN effect, not the
+		# following intervention's. Ordered scan over the marker list (no hash-order dependence).
+		var next_g: int = 0x7fffffff
+		for mj in markers.size():
+			var og: int = int(markers[mj].get("generation", 0))
+			if og > g and og < next_g:
+				next_g = og
+		# Slice the ordered history strictly AFTER G (_snaps[].generation is ascending → a forward scan), bounded by
+		# the next marker / EFFECT_WINDOW points; track min..max for the [0,1] normalization.
+		var series := PackedFloat32Array()
+		var lo := 1.0
+		var hi := 0.0
+		for i in n:
+			var gi: int = int(_snaps[i].generation)
+			if gi <= g:
+				continue
+			if gi >= next_g or series.size() >= EFFECT_WINDOW:
+				break
+			var val := clampf(float(_fit_history[i]), 0.0, 1.0)
+			series.append(val)
+			lo = minf(lo, val)
+			hi = maxf(hi, val)
+		if series.size() >= 2:
+			# Normalize to the window's own min..max so a small-but-real change reads as a full-height trace; a flat
+			# window collapses to a mid-line rather than a misleading spike.
+			var span := hi - lo
+			for k in series.size():
+				series[k] = (series[k] - lo) / span if span > 0.0001 else 0.5
+			aug["effect"] = series
+		out[mi] = aug
+	return out
 
 
 ## Select an intervention tool (SP-3.6): swap its param sub-panel into view + retint the brush so the painted disc
@@ -3354,7 +3413,7 @@ func _resync_to_live() -> void:
 	_render_carry = 0.0
 	if _timeline != null:
 		_timeline.setup([snap.generation])
-		_timeline.set_markers(_injections)
+		_push_timeline_markers()
 	# ADR-028 follow-up (FIX 3): a checkpoint / session load resyncs through here against a freshly-restored core —
 	# RE-ACTIVATE the OVERSIGHT panel + refresh the ledger so the credit economy RESUMES (the same activation the
 	# fresh-run build uses). has_method-guarded (inv #2): an older cdylib without oversight_state degrades to an
@@ -3413,8 +3472,7 @@ func _rebuild_markers_from_journal() -> void:
 				"applied": true,  # a journaled Action replayed → it landed (the journal records what fired)
 				"label": str(d.get("detail", "")),
 			})
-	if _timeline != null:
-		_timeline.set_markers(_injections)
+	_push_timeline_markers()
 
 
 ## Map a journal Action `kind` tag (the LiveSim journal_actions export, when present) to a palette tool index, or

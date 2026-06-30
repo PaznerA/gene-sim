@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### Live-session sparkline — per-marker effect sparkline on the timeline — RENDERER-ONLY, zero Rust
+A per-gen EFFECT sparkline on the timeline intervention markers (the P4/P6 follow-up). For a marker at generation G,
+`main.gd._markers_with_effect` forward-scans `_snaps` (ascending), skips `gen <= G`, and collects `_fit_history`
+(mean fitness — the most universally legible metric across all 7 tools) for the gens strictly after G, stopping at
+the next marker's gen or after `EFFECT_WINDOW=18` points; normalized to the window and attached to a **copy** of the
+marker dict (`_injections` is never mutated). `timeline.gd._draw_effect_spark` draws it via `draw_polyline` **only for
+the hovered marker** — a bounded `SPARK_W=60 × SPARK_H=24` card — so with nothing hovered the timeline looks exactly
+as today (no re-clutter, the user's standing anti-spam concern). inv #2: reads only the existing off-hash
+`_fit_history` projection + `_snaps[].generation` — no `_live`/core call, no genotype→phenotype. inv #3: ordered
+index-based iteration (no Dictionary/hash-order), no `randf`/`Time`/`OS`, no `_process`/Timer — `queue_redraw` fires
+only on hover-index change / mouse-exit / the pre-existing snapshot cadence. **Zero Rust diff** → pinned literal
+`0x47a0_3c8f_6701_f240` byte-identical. Gate GREEN (sim-core 187/187, determinism OK); 3-skeptic verify 3/3 on all
+four invariant booleans; both reviewers APPROVE. (Non-blocking: the per-marker series is recomputed each publish
+though only the hovered one is drawn — cheap at the bounded marker/history counts, could defer to hover-time later.)
+
 ### `CONTRIBUTING.md` — the contributor guide (beta-hardening, doc-only)
 A new top-level `CONTRIBUTING.md` codifying the workflow this repo already runs: the 7 STOP-THE-LINE invariants
 (SPEC §2.1), build/run, the single `tools/gate.sh` (the 10-step table + which gates are HARD/skippable), the

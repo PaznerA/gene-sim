@@ -97,7 +97,7 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 **Polish & QoL:**
 - `[x]` **starter-promote-hardening** — **DONE (2026-06-30, ADR-031 trap closed)** — `promote_gen1` RECOMPUTES the gen-1 `source_hash` from an edit-free replay (`build_journal(&[], gens)` → `record_episode` → replay-verified), removing the blind `gem.recorded_hash` copy; `Gen1Starter` gains `gens` + `source_had_edits` (`#[serde(default)]`, committed library still loads). **Gate GREEN; `0x47a0` byte-identical; verify 3/3.** Merged `--no-ff`.
 - `[x]` **oversight-ui-polish** — **DONE (2026-06-30)** — the ADR-028 #3-verify follow-ups (renderer-only): q knob defaults to `1000` (wild-type, not `0`/lethal KO; control + both fallbacks agree); due-epoch label → "applied now / effective epoch %d" (immediate-commit honest); oversight re-activates in `_resync_to_live` after `load_session` (both load paths, has_method-guarded). **Gate GREEN; zero Rust (`0x47a0` byte-identical); verify 3/3.** Merged `--no-ff`.
-- `[def]` **live-session-sparkline-impl** — `save_session`/`load_session` already exist; add a per-gen effect sparkline on the injection/timeline markers (P4/P6 follow-up). Minor.
+- `[x]` **live-session-sparkline-impl** — **DONE (2026-06-30)** — per-gen effect sparkline (mean fitness over the window after a marker, from `_fit_history`) drawn for the HOVERED marker only (bounded 60×24 card, no re-clutter); `_injections` never mutated. **Gate GREEN; zero Rust (`0x47a0` byte-identical); verify 3/3.** Merged `--no-ff`.
 
 **Sign-off granted 2026-06-28 ("zelená všem blockerům") — but gated by readiness, not approval:**
 - 🛑 **R3-F3 resource coupling** — SIGNED OFF, **but still UNDESIGNED** (blocked on the R1.2/R1.3 spatial-`Cell` design
