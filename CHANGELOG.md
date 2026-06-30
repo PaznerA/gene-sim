@@ -4,6 +4,21 @@ All notable changes per slice. One slice = one entry. Format loosely follows Kee
 
 ## [Unreleased]
 
+### OVERSIGHT UI polish — safe q default + honest due-epoch label + ledger resumes after load — RENDERER-ONLY, zero Rust (ADR-028 follow-ups)
+The three ADR-028 #3-verify follow-ups, all in `godot/main.gd` (renderer-only). (1) The growth-ratio `q` SpinBox now
+**defaults to `1000` (wild-type / no-op)** instead of `0` (growth-lethal KO), so opening the OVERSIGHT panel and
+committing without touching the knob is a no-op — the control default + both the preview and commit fallbacks agree
+on `1000`. (2) The timeline marker + status labels now read **"applied now / effective epoch %d"** / **"committed
+now … effective epoch %d"** instead of the old "due epoch N" wording that implied a deferral the renderer's
+immediate-commit path never performs (the epoch reads as the effect/accounting epoch; `due_epoch` still sourced from
+the core dict). (3) OVERSIGHT **resumes after `load_session`** — `_resync_to_live` re-activates the panel +
+`_refresh_oversight_panel()` on both load paths (starter checkpoint + `_on_load_pressed`), `has_method`-guarded so an
+older cdylib degrades gracefully — no dead/stale ledger on a loaded checkpoint. inv #2: GDScript marshals only
+ints/strings; the credit economy / FBA→factor map stays a core `#[func]` read. **Zero Rust diff** → pinned literal
+`0x47a0_3c8f_6701_f240` byte-identical by construction (the `q` knob is a UI default, not the headless determinism
+config). Gate GREEN (sim-core 187/187, determinism OK); 3-skeptic verify 3/3 on all four invariant booleans; both
+reviewers APPROVE. (ADR-028's follow-up bullet is now resolved — no new ADR required.)
+
 ### Discovery D3-B.3 — `RidgeInt` integer ridge regressor + pluggable `Surrogate` trait — HASH-NEUTRAL, zero f64 (ADR-034)
 The surrogate model the steered loop (D3-B.4) will fit on the eval log to predict the drama target `D` (ADR-033).
 Off-hash, pure-integer (`crates/discovery/src/surrogate.rs`). (1) **`Surrogate` trait** (inv #5 seam) — `fit(&mut,
