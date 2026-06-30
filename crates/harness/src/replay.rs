@@ -16,6 +16,7 @@
 //! the hash cannot differ. The `run_id` is derived from the config (no wall-clock), mirroring the CLI,
 //! so the output path is itself reproducible.
 
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,87 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Action, Env, GeneSimEnv};
 use sim_core::{ConsortiumConfig, ContainmentLevel, EnvParams};
+
+/// A typed failure of reading/replaying a recorded journal (the `read_journal` / [`replay`] / [`env_config`]
+/// parse path). Each variant carries enough context to diagnose the corruption WITHOUT a panic — replaying a
+/// tampered/garbage save can NEVER abort the process, it always returns one of these.
+///
+/// This is purely the **error typing** of the read path; it is OFF-HASH. A *valid* journal still replays to the
+/// identical [`sim_core::RunStats::hash`] (invariant #3 — the happy path is byte-identical). Existing `io::Result`
+/// callers keep compiling unchanged: [`From<ReplayError>`](#impl-From<ReplayError>-for-Error) bridges this into an
+/// [`io::Error`] of kind [`io::ErrorKind::InvalidData`] so a `?` in an `io::Result` function still works.
+///
+/// [`env_config`]: SeedJson::env_config
+#[derive(Debug)]
+pub enum ReplayError {
+    /// A required journal file (`seed.json` / `actions.ndjson`) was absent or unreadable. `which` is the file
+    /// name; `source` is the underlying [`io::Error`].
+    MissingFile {
+        /// The journal file that could not be read (`seed.json` or `actions.ndjson`).
+        which: &'static str,
+        /// The underlying filesystem error (e.g. `NotFound`, permission denied).
+        source: io::Error,
+    },
+    /// `seed.json` was present but did not parse as the [`SeedJson`] schema (truncated / non-JSON / wrong shape).
+    /// Carries the `serde_json` error message.
+    MalformedSeedJson(String),
+    /// A line in `actions.ndjson` did not parse as an [`Action`] (garbage line, or a malformed guide whose
+    /// [`crispr::GuideSequence`] validation rejected it). `line` is 1-based; `msg` is the `serde_json` message.
+    MalformedAction {
+        /// 1-based line number in `actions.ndjson`.
+        line: usize,
+        /// The `serde_json` error message (e.g. `invalid guide sequence …`).
+        msg: String,
+    },
+    /// `seed.json`'s recorded `action_count` disagreed with the number of non-blank `actions.ndjson` lines.
+    ActionCountMismatch {
+        /// The count `seed.json` claims.
+        expected: usize,
+        /// The non-blank lines actually present in `actions.ndjson`.
+        found: usize,
+    },
+    /// A persisted species spec in `seed.json` (roster / selected species / consortium) failed to rebuild — a
+    /// corrupt/tampered save (e.g. a non-ACGT base or out-of-domain parameter). Carries the build error message.
+    SpecBuildFailed(String),
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplayError::MissingFile { which, source } => {
+                write!(f, "missing or unreadable {which}: {source}")
+            }
+            ReplayError::MalformedSeedJson(msg) => write!(f, "malformed seed.json: {msg}"),
+            // Message format preserved from the historical io::Error so existing diagnostics still read the same.
+            ReplayError::MalformedAction { line, msg } => {
+                write!(f, "actions.ndjson line {line}: {msg}")
+            }
+            ReplayError::ActionCountMismatch { expected, found } => write!(
+                f,
+                "action_count mismatch: seed.json says {expected}, actions.ndjson has {found}"
+            ),
+            ReplayError::SpecBuildFailed(msg) => write!(f, "species spec failed to rebuild: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReplayError::MissingFile { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Bridge a [`ReplayError`] back into an [`io::Error`] (kind [`io::ErrorKind::InvalidData`], the [`Display`] as the
+/// message) so the existing `io::Result` callers ([`record_episode`] round-trip, `promote.rs`, `discover.rs`) keep
+/// compiling: a `replay(..)?` / `read_journal(..)?` in an `io::Result` function converts via this `From`.
+impl From<ReplayError> for io::Error {
+    fn from(e: ReplayError) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+    }
+}
 
 /// Pinned tool versions recorded into [`SeedJson`] (invariant #7). These mirror the strings the CLI
 /// writes (`crates/harness/src/main.rs`) so a logged episode records the same reproducibility metadata.
@@ -319,20 +401,19 @@ impl SeedJson {
     /// historical single-species `EnvConfig` (hash-neutral).
     ///
     /// # Errors
-    /// An [`io::Error`] of kind [`io::ErrorKind::InvalidData`] if any persisted species spec fails to rebuild
-    /// (a corrupt/tampered save).
-    pub fn env_config(&self) -> io::Result<EnvConfig> {
+    /// [`ReplayError::SpecBuildFailed`] if any persisted species spec fails to rebuild (a corrupt/tampered save).
+    pub fn env_config(&self) -> Result<EnvConfig, ReplayError> {
         let mut roster = Vec::with_capacity(self.roster.len());
         for row in &self.roster {
-            roster.push((row.species.build()?, row.count));
+            roster.push((row.species.build().map_err(spec_build_failed)?, row.count));
         }
         let species = match &self.species {
-            Some(s) => Some(s.build()?),
+            Some(s) => Some(s.build().map_err(spec_build_failed)?),
             None => None,
         };
         let mut consortium = Vec::with_capacity(self.consortium.len());
         for c in &self.consortium {
-            consortium.push(c.build()?);
+            consortium.push(c.build().map_err(spec_build_failed)?);
         }
         Ok(EnvConfig {
             entity_count: self.entity_count,
@@ -444,10 +525,14 @@ pub fn record_episode(
 /// [`record_episode`] returned (SPEC §6 — bit-identical by construction, invariant #3).
 ///
 /// # Errors
-/// Returns an [`io::Error`] if a file is missing, malformed (invalid JSON — including a malformed guide,
-/// whose validation is preserved by [`crispr::GuideSequence`]'s deserialize), or if `actions.ndjson`'s
-/// line count disagrees with `seed.json`'s `action_count`.
-pub fn replay(dir: impl AsRef<Path>) -> io::Result<u64> {
+/// Returns a [`ReplayError`] if a file is missing ([`MissingFile`](ReplayError::MissingFile)), malformed
+/// ([`MalformedSeedJson`](ReplayError::MalformedSeedJson) / [`MalformedAction`](ReplayError::MalformedAction) —
+/// including a malformed guide, whose validation is preserved by [`crispr::GuideSequence`]'s deserialize), if
+/// `actions.ndjson`'s line count disagrees with `seed.json`'s `action_count`
+/// ([`ActionCountMismatch`](ReplayError::ActionCountMismatch)), or if a persisted species spec fails to rebuild
+/// ([`SpecBuildFailed`](ReplayError::SpecBuildFailed)). Converts into an [`io::Error`] (`InvalidData`) for
+/// `io::Result` callers via [`From<ReplayError>`](ReplayError).
+pub fn replay(dir: impl AsRef<Path>) -> Result<u64, ReplayError> {
     let (seed_json, actions) = read_journal(dir)?;
     // ADR-019 R2: rebuild the FULL composition (roster / species / consortium / containment), not just the
     // population + climate, so a contaminated/multi-species/non-default run replays to the recorded hash.
@@ -460,37 +545,46 @@ pub fn replay(dir: impl AsRef<Path>) -> io::Result<u64> {
 /// LOAD restores the exact session by `reset(seed)` + replaying these actions deterministically (inv #3).
 ///
 /// # Errors
-/// Missing/malformed `seed.json` or `actions.ndjson` (incl. a malformed guide), or an `action_count` mismatch.
-pub fn read_journal(dir: impl AsRef<Path>) -> io::Result<(SeedJson, Vec<Action>)> {
+/// A [`ReplayError`]: [`MissingFile`](ReplayError::MissingFile) (absent/unreadable `seed.json` / `actions.ndjson`),
+/// [`MalformedSeedJson`](ReplayError::MalformedSeedJson), [`MalformedAction`](ReplayError::MalformedAction) (incl. a
+/// malformed guide), or [`ActionCountMismatch`](ReplayError::ActionCountMismatch). Never panics on a corrupt input —
+/// always a typed `Err`.
+pub fn read_journal(dir: impl AsRef<Path>) -> Result<(SeedJson, Vec<Action>), ReplayError> {
     let dir = dir.as_ref();
-    let seed_json: SeedJson =
-        serde_json::from_str(&std::fs::read_to_string(dir.join(SEED_FILE))?).map_err(to_io)?;
+    let seed_str = std::fs::read_to_string(dir.join(SEED_FILE)).map_err(|source| {
+        ReplayError::MissingFile {
+            which: SEED_FILE,
+            source,
+        }
+    })?;
+    let seed_json: SeedJson = serde_json::from_str(&seed_str)
+        .map_err(|e| ReplayError::MalformedSeedJson(e.to_string()))?;
 
-    let actions_str = std::fs::read_to_string(dir.join(ACTIONS_FILE))?;
+    let actions_str = std::fs::read_to_string(dir.join(ACTIONS_FILE)).map_err(|source| {
+        ReplayError::MissingFile {
+            which: ACTIONS_FILE,
+            source,
+        }
+    })?;
     let mut actions: Vec<Action> = Vec::new();
     for (i, line) in actions_str.lines().enumerate() {
         if line.trim().is_empty() {
             continue; // tolerate a trailing newline / blank lines
         }
-        let action: Action = serde_json::from_str(line).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("actions.ndjson line {}: {e}", i + 1),
-            )
-        })?;
+        let action: Action =
+            serde_json::from_str(line).map_err(|e| ReplayError::MalformedAction {
+                line: i + 1,
+                msg: e.to_string(),
+            })?;
         actions.push(action);
     }
 
     // Sanity: the log is internally consistent (count in seed.json matches the ndjson lines).
     if actions.len() != seed_json.action_count {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "action_count mismatch: seed.json says {}, actions.ndjson has {}",
-                seed_json.action_count,
-                actions.len()
-            ),
-        ));
+        return Err(ReplayError::ActionCountMismatch {
+            expected: seed_json.action_count,
+            found: actions.len(),
+        });
     }
     Ok((seed_json, actions))
 }
@@ -532,6 +626,12 @@ pub fn save_journal(
 /// Map a `serde_json` error into an [`io::Error`] so the public API surfaces a single error type.
 fn to_io(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// Map a persisted-species rebuild failure (an [`io::Error`] from [`SpeciesJson::build`]) into the typed
+/// [`ReplayError::SpecBuildFailed`] for the [`SeedJson::env_config`] parse path.
+fn spec_build_failed(e: io::Error) -> ReplayError {
+    ReplayError::SpecBuildFailed(e.to_string())
 }
 
 #[cfg(test)]
@@ -953,11 +1053,16 @@ mod tests {
         .unwrap();
 
         let err = replay(&recorded.dir).expect_err("malformed guide must fail to deserialize");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            matches!(err, ReplayError::MalformedAction { line: 1, .. }),
+            "expected a MalformedAction on line 1, got: {err:?}"
+        );
         assert!(
             err.to_string().contains("invalid guide sequence"),
             "unexpected error: {err}"
         );
+        // The io::Error bridge preserves the InvalidData contract the io::Result callers relied on.
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::InvalidData);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -979,10 +1084,249 @@ mod tests {
 
         let err = replay(&recorded.dir).expect_err("count mismatch must be rejected");
         assert!(
+            matches!(err, ReplayError::ActionCountMismatch { .. }),
+            "expected ActionCountMismatch, got: {err:?}"
+        );
+        assert!(
             err.to_string().contains("action_count mismatch"),
             "got: {err}"
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_seed_json_is_typed_missing_file() {
+        // An empty dir (no seed.json) → a typed MissingFile{which:"seed.json"}, never a panic.
+        let dir = temp_dir("missing_seed");
+        let err = read_journal(&dir).expect_err("a dir with no seed.json must fail");
+        assert!(
+            matches!(err, ReplayError::MissingFile { which, .. } if which == SEED_FILE),
+            "expected MissingFile(seed.json), got: {err:?}"
+        );
+        // replay() surfaces the same typed error.
+        assert!(
+            matches!(replay(&dir), Err(ReplayError::MissingFile { which, .. }) if which == SEED_FILE),
+            "replay must surface MissingFile(seed.json)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn malformed_seed_json_is_typed() {
+        // Readable-but-not-JSON seed.json → MalformedSeedJson (a clean typed Err, not a panic). (Non-UTF-8 bytes
+        // are caught one stage earlier by read_to_string as an unreadable MissingFile — also typed, no panic.)
+        let dir = temp_dir("malformed_seed");
+        std::fs::write(dir.join(SEED_FILE), b"not json {{{ ][ truncated").unwrap();
+        std::fs::write(dir.join(ACTIONS_FILE), "").unwrap();
+        let err = read_journal(&dir).expect_err("garbage seed.json must fail");
+        assert!(
+            matches!(err, ReplayError::MalformedSeedJson(_)),
+            "expected MalformedSeedJson, got: {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- proptest: the robustness proof (no panic / no UB on ANY corrupt input) -------------------------
+    // proptest is a TEST-ONLY (dev-dependency) MIT/Apache crate (inv #7 — pinned at the workspace root). It is
+    // NOT a runtime/shipped dependency (`cargo tree -p harness -e normal` does not list it).
+    use proptest::prelude::*;
+
+    /// A fresh, isolated temp dir for a single proptest case (keyed by an arbitrary nonce so concurrent cases
+    /// never collide). Returns the dir path; the caller writes seed.json / actions.ndjson into it.
+    fn proptest_dir(nonce: u64) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("gene_sim_replay_pt_{}_{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create proptest dir");
+        dir
+    }
+
+    proptest! {
+        // The KEY assertion across the whole corpus: read_journal / replay return a TYPED Err (or Ok) but NEVER
+        // PANIC and never UB, no matter what bytes land on disk as seed.json / actions.ndjson.
+
+        /// Arbitrary bytes as seed.json (+ arbitrary actions.ndjson) — random garbage must never panic. Either
+        /// it is a typed Err, or (vanishingly rarely) valid JSON that parses to Ok — both are fine; a PANIC is not.
+        #[test]
+        fn arbitrary_bytes_seed_json_never_panics(
+            nonce in any::<u64>(),
+            seed_bytes in prop::collection::vec(any::<u8>(), 0..256),
+            actions_str in ".{0,256}",
+        ) {
+            let dir = proptest_dir(nonce);
+            std::fs::write(dir.join(SEED_FILE), &seed_bytes).unwrap();
+            std::fs::write(dir.join(ACTIONS_FILE), actions_str.as_bytes()).unwrap();
+            // No panic on either entry point; if read_journal succeeds, replay must not panic either.
+            let r = read_journal(&dir);
+            prop_assert!(r.is_ok() || r.is_err());
+            let _ = replay(&dir);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// Truncated / not-valid JSON seed.json (a JSON-ish prefix) — must be a typed Err, never a panic.
+        #[test]
+        fn truncated_seed_json_is_err_no_panic(
+            nonce in any::<u64>(),
+            frag in r#"\{"seed":[0-9]{0,6}(,"entity_count":[0-9]{0,4})?"#, // a deliberately UNCLOSED object
+        ) {
+            let dir = proptest_dir(nonce);
+            std::fs::write(dir.join(SEED_FILE), frag.as_bytes()).unwrap();
+            std::fs::write(dir.join(ACTIONS_FILE), b"").unwrap();
+            // An unterminated object is never a valid SeedJson → a typed Err, no panic.
+            prop_assert!(matches!(read_journal(&dir), Err(ReplayError::MalformedSeedJson(_))));
+            let _ = replay(&dir);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A VALID seed.json whose `action_count` disagrees with the ndjson line count → ActionCountMismatch.
+        #[test]
+        fn wrong_action_count_is_mismatch(
+            nonce in any::<u64>(),
+            claimed in 0usize..50,
+            advances in prop::collection::vec(0u64..1000, 0..20),
+        ) {
+            // Only exercise the mismatch case (skip the accidental match — covered by the happy-path test).
+            prop_assume!(claimed != advances.len());
+            let dir = proptest_dir(nonce);
+            let seed_json = SeedJson {
+                seed: 1,
+                generations: 0,
+                entity_count: 10,
+                action_count: claimed, // deliberately WRONG vs the ndjson below
+                lat: 0.0,
+                lon: 0.0,
+                avg_temp: 0.5,
+                season: 0,
+                roster: Vec::new(),
+                species: None,
+                consortium: Vec::new(),
+                containment: None,
+                toolchain: Toolchain::default(),
+                harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            std::fs::write(
+                dir.join(SEED_FILE),
+                serde_json::to_string_pretty(&seed_json).unwrap(),
+            )
+            .unwrap();
+            let ndjson: String = advances
+                .iter()
+                .map(|n| format!("{}\n", serde_json::to_string(&Action::Advance(*n)).unwrap()))
+                .collect();
+            std::fs::write(dir.join(ACTIONS_FILE), ndjson).unwrap();
+
+            let err = read_journal(&dir).expect_err("a wrong action_count must be rejected");
+            // (bind to a bool — `prop_assert!` stringifies its arg as a format string, so braces in a `matches!`
+            // pattern would be mis-read as format placeholders.)
+            let is_mismatch = matches!(
+                err,
+                ReplayError::ActionCountMismatch { expected, found }
+                    if expected == claimed && found == advances.len()
+            );
+            prop_assert!(is_mismatch);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A valid seed.json (action_count=1) with an arbitrary GARBAGE actions.ndjson line → either a typed
+        /// MalformedAction (the line is not a valid Action) or, if it happens to parse, no panic. Never a panic.
+        #[test]
+        fn garbage_action_line_never_panics(
+            nonce in any::<u64>(),
+            garbage in "[^\n]{1,64}",
+        ) {
+            let dir = proptest_dir(nonce);
+            let seed_json = SeedJson {
+                seed: 1,
+                generations: 0,
+                entity_count: 10,
+                action_count: 1,
+                lat: 0.0,
+                lon: 0.0,
+                avg_temp: 0.5,
+                season: 0,
+                roster: Vec::new(),
+                species: None,
+                consortium: Vec::new(),
+                containment: None,
+                toolchain: Toolchain::default(),
+                harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            std::fs::write(
+                dir.join(SEED_FILE),
+                serde_json::to_string_pretty(&seed_json).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join(ACTIONS_FILE), format!("{garbage}\n")).unwrap();
+            // Whatever the bytes, the call returns a typed Result without panicking.
+            let r = read_journal(&dir);
+            prop_assert!(r.is_ok() || r.is_err());
+            let _ = replay(&dir);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A MALFORMED GUIDE inside an ApplyEdit action line (non-ACGT bases) → MalformedAction (GuideSequence
+        /// validation preserved through deserialize), never a panic, for an arbitrary bad guide string.
+        #[test]
+        fn malformed_guide_in_action_is_typed(
+            nonce in any::<u64>(),
+            bad_guide in "[^ACGT\"\\\\]{1,24}", // at least one non-ACGT (and no quote/backslash) base → invalid
+        ) {
+            let dir = proptest_dir(nonce);
+            let seed_json = SeedJson {
+                seed: 1,
+                generations: 0,
+                entity_count: 10,
+                action_count: 1,
+                lat: 0.0,
+                lon: 0.0,
+                avg_temp: 0.5,
+                season: 0,
+                roster: Vec::new(),
+                species: None,
+                consortium: Vec::new(),
+                containment: None,
+                toolchain: Toolchain::default(),
+                harness_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            std::fs::write(
+                dir.join(SEED_FILE),
+                serde_json::to_string_pretty(&seed_json).unwrap(),
+            )
+            .unwrap();
+            let line = format!(
+                "{{\"ApplyEdit\":{{\"cas\":0,\"target\":0,\"guide\":\"{bad_guide}\"}}}}\n"
+            );
+            std::fs::write(dir.join(ACTIONS_FILE), line).unwrap();
+            // An invalid guide is rejected by GuideSequence's deserialize → a typed MalformedAction, never a panic.
+            let is_malformed_action = matches!(
+                read_journal(&dir),
+                Err(ReplayError::MalformedAction { line: 1, .. })
+            );
+            prop_assert!(is_malformed_action);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    proptest! {
+        // The happy-path case RUNS a sim per case (record + replay), so cap the case count to keep it fast.
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// HAPPY PATH (proptest): a round-tripped record_episode journal replays Ok to the recorded hash for an
+        /// arbitrary seed + action mix — the determinism contract holds across the corpus (inv #3, the same hash).
+        #[test]
+        fn round_tripped_journal_replays_to_recorded_hash(
+            nonce in any::<u64>(),
+            seed in any::<u64>(),
+            advances in prop::collection::vec(0u64..40, 0..6),
+        ) {
+            let dir = proptest_dir(nonce);
+            let env_config = EnvConfig { entity_count: 48, ..Default::default() };
+            let actions: Vec<Action> = advances.iter().map(|n| Action::Advance(*n)).collect();
+            let recorded = record_episode(&env_config, seed, &actions, &dir).expect("record");
+            let replayed = replay(&recorded.dir).expect("a valid journal must replay Ok");
+            prop_assert_eq!(replayed, recorded.hash);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

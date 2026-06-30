@@ -910,8 +910,13 @@ fn verify_source_gem(gem: &Gem, gens: u32, species_dir: &Path, out_dir: &Path) {
 
     let stage = out_dir.join(".verify-source");
     let _ = std::fs::remove_dir_all(&stage);
-    let outcome = record_episode(&env_config, seed, &journal, &stage)
-        .and_then(|recorded| replay(&recorded.dir).map(|replayed| (recorded.hash, replayed)));
+    let outcome = record_episode(&env_config, seed, &journal, &stage).and_then(|recorded| {
+        // `replay` now yields a typed `ReplayError`; bridge it back to `io::Error` so this `and_then` chain
+        // (whose error type is `record_episode`'s `io::Error`) keeps its single error type (off-hash meta-level).
+        replay(&recorded.dir)
+            .map(|replayed| (recorded.hash, replayed))
+            .map_err(io::Error::from)
+    });
     let _ = std::fs::remove_dir_all(&stage);
 
     match outcome {
