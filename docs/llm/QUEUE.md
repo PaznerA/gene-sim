@@ -75,6 +75,25 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 - `[def]` **unsafe-policy-adr** (`direct`) — ADR documenting the `forbid(unsafe_code)` rule + the one `godot-sim` `unsafe impl` exception.
 - `[def]` **docs-housekeeping** (`direct`) — delete the stale untracked `docs/llm/weakspots.md` (hallucinates a non-existent Python project) + triage `docs/llm/glmTakeover/`; add `ADR-INDEX.md`.
 
+**⚡ PERF EPIC — worker-thread sim parallelization (user-chosen 2026-06-30; DESIGN DONE → awaiting sign-off):**
+> Diagnosis: the sim steps SYNCHRONOUSLY on the Godot main/render thread (`main.gd._process` `for _i in steps:
+> _live.step()`) + the world repaints only at the step rate — under load the step+publish hitches the frame; the UI
+> isn't parallelized. User chose the full fix (not the band-aid). Design: `proposals/worker-thread-parallelization-draft.md`.
+- `[x]` **worker-thread-parallelization-design** (`workflow`, DESIGN) — **DONE (2026-06-30) — sound, ready for sign-off.**
+  The worker owns `LiveSim` (sole mutator); main = input+render only; main→worker FIFO `SimCommand` queue; worker→main
+  latest-wins `FrameBundle` (Mutex slot, no compute under lock); paced worker, paused parks on blocking `rx.recv()`
+  (race-free, no Condvar). **Adversarial review (2 rounds) caught + fixed: 2 determinism off-by-ones (gem-fire
+  `gen_abs ≤ G+LIVE_STEP` before advance; immigration `drain(G+1)` after — now byte-match the shipped interleave),
+  a read-routing miss, a Condvar lost-wakeup. Re-verify: `determinism_argument_airtight 3/3`, `&mut`-resolved 3/3,
+  deps 3/3.** Zero new crates (std-only). ADR-036 draft in §7.
+- `[ ]` **W1 worker-scaffold-impl** 🛑 — `crates/godot-sim` `SimWorker`/`SimCommand`/`FrameBundle` + `advance_one_gen`
+  (the gem/immigration interleave moves into Rust) + spawn/JOIN/`recv()`-park. **STOP-THE-LINE-adjacent (inv #3):
+  must NOT land without the 3 determinism tests GREEN (incl. the gem+immigration boundary test) + `0x47a0` unmoved +
+  sign-off.** *dep: design ✓ + human sign-off.*
+- `[def]` **W2 main-gd-command-api-impl** (renderer-only) — `main.gd._process`/`_publish_frame` → post commands + read the latest `FrameBundle` each frame at 60 FPS; brush/edit/oversight → `SimCommand`. *dep: W1.*
+- `[def]` **W3 lifecycle-impl** — pause/reset/`load_session`/quit clean JOIN + spawn-panic handling. *dep: W1.*
+- `[def]` **W4** *(optional)* — presentation interpolation between generations (visual 60 FPS smoothness over a 2 Hz sim). *dep: W2.*
+
 **Polish & QoL:**
 - `[x]` **starter-promote-hardening** — **DONE (2026-06-30, ADR-031 trap closed)** — `promote_gen1` RECOMPUTES the gen-1 `source_hash` from an edit-free replay (`build_journal(&[], gens)` → `record_episode` → replay-verified), removing the blind `gem.recorded_hash` copy; `Gen1Starter` gains `gens` + `source_had_edits` (`#[serde(default)]`, committed library still loads). **Gate GREEN; `0x47a0` byte-identical; verify 3/3.** Merged `--no-ff`.
 - `[x]` **oversight-ui-polish** — **DONE (2026-06-30)** — the ADR-028 #3-verify follow-ups (renderer-only): q knob defaults to `1000` (wild-type, not `0`/lethal KO; control + both fallbacks agree); due-epoch label → "applied now / effective epoch %d" (immediate-commit honest); oversight re-activates in `_resync_to_live` after `load_session` (both load paths, has_method-guarded). **Gate GREEN; zero Rust (`0x47a0` byte-identical); verify 3/3.** Merged `--no-ff`.
