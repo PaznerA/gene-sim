@@ -1,14 +1,20 @@
 //! STARTER-MAP PROMOTE — turn a verified emergent-run [`Gem`] into a committed, gallery-ready STARTER for the
 //! renderer's starter library (the discovery → curated-content bridge). Meta-level only: the sim runs stay pure
 //! functions of their configs (inv #3), so promoting a gem never moves the pinned literal
-//! `0x47a0_3c8f_6701_f240` — a GEN-1 starter just COPIES the gem's fresh config + provenance, and a GEN-N
-//! checkpoint REPLAYS the gem's journal through the SAME deterministic [`record_episode`]/[`replay`] contract.
+//! `0x47a0_3c8f_6701_f240` — both shapes only ever drive the SAME deterministic [`record_episode`]/[`replay`]
+//! contract (a GEN-1 starter records the EDIT-FREE pristine config; a GEN-N checkpoint records the gem's
+//! edit-interleaved journal).
 //!
 //! ## Two shapes (mirroring the gem's two reproducibility tiers)
 //! - **GEN-1 (pristine fresh config)** — [`promote_gen1`] writes `<starters_dir>/<slug>.json`: a
 //!   primordial.json-shaped [`StarterConfig`] (roster + climate + containment, **NO edits** — gen-1 is the
-//!   pristine pre-edit starting point) plus gallery metadata + the source gem's `recorded_hash` (provenance,
-//!   inv #7). The player picks the run length; nothing is replayed at promote time.
+//!   pristine pre-edit starting point) plus gallery metadata + provenance (`source_seed`, `gens`). The stored
+//!   `source_hash` is RECOMPUTED from an edit-free replay of the pristine config over `gens` (NOT a blind copy
+//!   of the gem's `recorded_hash`): the gen-1 starter drops the gem's edits, so its hash MUST be what the
+//!   edit-free config actually produces. For an edit-free gem this equals `gem.recorded_hash` (unchanged); for
+//!   a gem that carried (today hash-neutral) edits it is the pristine hash, so the doc stays self-consistent
+//!   even once edits become hash-active (ADR-031 known trap → fixed). The doc is self-contained re-verifiable:
+//!   re-run the stored config for `gens` → `source_hash`. The player picks the actual run length.
 //! - **GEN-N CHECKPOINT** — [`promote_checkpoint`] records the gem's edit-interleaved journal up to generation
 //!   `N` into `<starters_dir>/<slug>/` as the SAME session format [`crate::replay::save_journal`] /
 //!   `load_session` read (seed.json + actions.ndjson), plus a sibling `starter.json` metadata. The recorded
@@ -73,7 +79,9 @@ impl StarterConfig {
 }
 
 /// A GEN-1 starter doc (`<starters_dir>/<slug>.json`): the pristine [`StarterConfig`] + gallery metadata +
-/// provenance. `source_hash` is the hex of the source gem's `recorded_hash` (inv #7 traceability).
+/// provenance. `source_hash` is the hex of the EDIT-FREE replay of the pristine config over `gens` (inv #7
+/// traceability + a self-contained reproducibility anchor): a reader can re-run the config for `gens` and
+/// assert the hash, with NO access to the source gem.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gen1Starter {
     /// Human-readable starter name (the gallery title).
@@ -82,10 +90,21 @@ pub struct Gen1Starter {
     pub caption: String,
     /// The dynamics shape (the caption's leading word, e.g. `"drift"`) — the gallery's category facet.
     pub dynamics: String,
-    /// Hex of the source gem's `recorded_hash` (16 lowercase hex digits) — provenance + reproducibility anchor.
+    /// Hex of the EDIT-FREE replay hash of the pristine config over `gens` (16 lowercase hex digits) — the
+    /// reproducibility anchor (== `gem.recorded_hash` for an edit-free source gem; the pristine hash otherwise).
     pub source_hash: String,
-    /// The source gem's master seed (so the fresh config can be re-run to the source hash, edit-free).
+    /// The source gem's master seed (so the fresh config can be re-run to `source_hash`, edit-free).
     pub source_seed: u64,
+    /// The horizon `source_hash` was recomputed over (the source gem's `gens_requested`, falling back to its
+    /// early-stopped `gens`). Stored so the doc is SELF-CONTAINED re-verifiable. `#[serde(default)]` → `0` for a
+    /// pre-fix committed starter that predates this field (those are edit-free; their stored hash is correct).
+    #[serde(default)]
+    pub gens: u32,
+    /// Did the SOURCE gem carry a non-empty edit schedule (provenance — the gen-1 starter still drops the edits;
+    /// `source_hash` is always the edit-free replay). `#[serde(default)]` → `false` for a pre-fix committed
+    /// starter (all of which were promoted from edit-free / no-op-edit gems).
+    #[serde(default)]
+    pub source_had_edits: bool,
     /// The pristine fresh config (roster + climate + containment, NO edits).
     pub config: StarterConfig,
 }
@@ -186,20 +205,88 @@ fn slugify(s: &str) -> String {
 
 /// Promote a gem as a GEN-1 (pristine fresh-config) starter into `<starters_dir>/<slug>.json`. Writes the
 /// [`Gen1Starter`] doc (pretty JSON, git-friendly); the dir is created if absent. Returns the written path.
-/// NO sim run happens (gen-1 just copies the gem's fresh config + provenance — inv #3 trivially holds).
+///
+/// The stored `source_hash` is RECOMPUTED from an EDIT-FREE replay of the pristine [`StarterConfig`] (NOT a
+/// blind copy of `gem.recorded_hash`): the gen-1 starter drops the gem's edits, so its hash MUST equal what the
+/// edit-free config actually produces. The config is rebuilt via [`env_config_for`] (the SAME `data/species`
+/// boundary the verify path uses) and run over `gens` (the gem's `gens_requested`, falling back to its
+/// early-stopped `gens` for a pre-fix gem) with an edit-free journal ([`build_journal`]`(&[], gens)` →
+/// `Advance(1)*gens`); the recorded hash is replay-verified (`record_episode == replay`, the gem
+/// reproducibility contract, inv #3) BEFORE it is stored. For an edit-free gem this hash equals
+/// `gem.recorded_hash` (unchanged behaviour); for a gem that carried (today hash-neutral) edits it is the
+/// pristine hash — so the doc stays self-consistent even once edits become hash-active (ADR-031 known trap →
+/// fixed). The gem still NEVER moves the pinned literal: this is a pure function of the (edit-free) config.
 ///
 /// # Errors
-/// An [`io::Error`] from creating the dir or writing the file (serialization of the well-typed doc is
-/// surfaced as [`io::ErrorKind::InvalidData`] if it ever fails).
-pub fn promote_gen1(gem: &Gem, slug: &str, name: &str, starters_dir: &Path) -> io::Result<PathBuf> {
+/// An [`io::Error`] if the gem's roster no longer resolves under `species_dir`, if recording/replaying fails,
+/// if the edit-free run does not replay stably (non-reproducible), or from any file write/serialization.
+pub fn promote_gen1(
+    gem: &Gem,
+    slug: &str,
+    name: &str,
+    species_dir: &Path,
+    starters_dir: &Path,
+) -> io::Result<PathBuf> {
     std::fs::create_dir_all(starters_dir)?;
+
+    let config = StarterConfig::from_gem(gem);
+    let source_seed = gem.config.master_seed;
+    let source_had_edits = !gem.config.edits.is_empty();
+    // The horizon the source gem ran/scored over (its requested `gens_requested` for a v2 gem, the early-stopped
+    // `gem.gens` for a pre-fix gem whose `gens_requested` defaulted to 0) — mirrors `promote_checkpoint` +
+    // `gem_edit_schedule`. Stored so the gen-1 doc is self-contained re-verifiable (re-run the config for `gens`).
+    let gens = if gem.gens_requested == 0 {
+        gem.gens
+    } else {
+        gem.gens_requested
+    };
+
+    // Rebuild the EDIT-FREE env for the pristine config (drops the gem's edit schedule). `env_config_for` resolves
+    // the roster through `data/species/<key>.json` exactly as the verify path does; a roster that no longer
+    // resolves is a hard error (never a silently-broken starter), like `promote_checkpoint`.
+    let search_cfg = config.to_search_config(source_seed);
+    let (env_config, skipped) = env_config_for(&search_cfg, species_dir);
+    for (key, err) in &skipped {
+        eprintln!("promote: gen-1 {slug:?}: skipped species {key:?} ({err})");
+    }
+    let env_config = env_config.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "gem (seed {source_seed:016x}) roster does not resolve under {}",
+                species_dir.display()
+            ),
+        )
+    })?;
+
+    // RECOMPUTE the source hash: record the edit-free journal (Advance(1)*gens) via a THROWAWAY stage and
+    // replay-verify the recorded run reproduces it (record == replay — the gem reproducibility contract, inv #3).
+    // This is meta-level (the SAME machinery as the verify path); the pinned literal is unmoved.
+    let journal = build_journal(&[], gens);
+    let stage = starters_dir.join(format!(".verify-gen1-{slug}"));
+    let _ = std::fs::remove_dir_all(&stage);
+    let recorded = record_episode(&env_config, source_seed, &journal, &stage)?;
+    let canonical = recorded.hash;
+    let replayed = replay(&recorded.dir)?;
+    let _ = std::fs::remove_dir_all(&stage);
+    if replayed != canonical {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "gen-1 starter {slug:?} does not replay stably (recorded {canonical:016x}, replay {replayed:016x})"
+            ),
+        ));
+    }
+
     let doc = Gen1Starter {
         name: name.to_string(),
         caption: gem.caption.clone(),
         dynamics: dynamics_from_caption(&gem.caption),
-        source_hash: hex16(gem.recorded_hash),
-        source_seed: gem.config.master_seed,
-        config: StarterConfig::from_gem(gem),
+        source_hash: hex16(canonical),
+        source_seed,
+        gens,
+        source_had_edits,
+        config,
     };
     let path = starters_dir.join(format!("{slug}.json"));
     let json = serde_json::to_string_pretty(&doc).map_err(to_io)?;
@@ -418,12 +505,15 @@ fn select_distinct_dynamics(mut gems: Vec<Gem>, max: usize) -> Vec<(String, Stri
 /// Promote a sensible DEFAULT set of GEN-1 starters from `gems_dir` (one per distinct dynamics shape, best
 /// first, capped at `max`) into `starters_dir`, then rebuild the index. Returns the promoted slugs (empty when
 /// no gems are found — the index is still rebuilt). The default fallback when a caller passes no explicit
-/// candidate selection.
+/// candidate selection. Each gen-1 promote recomputes its `source_hash` from an edit-free replay (so the
+/// roster is resolved through `species_dir`).
 ///
 /// # Errors
-/// An [`io::Error`] from reading gems, writing a starter, or rebuilding the index.
+/// An [`io::Error`] from reading gems, recomputing/writing a starter (incl. an unresolvable roster), or
+/// rebuilding the index.
 pub fn promote_default_set(
     gems_dir: &Path,
+    species_dir: &Path,
     starters_dir: &Path,
     max: usize,
 ) -> io::Result<Vec<String>> {
@@ -431,7 +521,7 @@ pub fn promote_default_set(
     let chosen = select_distinct_dynamics(gems, max);
     let mut slugs = Vec::with_capacity(chosen.len());
     for (slug, name, gem) in &chosen {
-        promote_gen1(gem, slug, name, starters_dir)?;
+        promote_gen1(gem, slug, name, species_dir, starters_dir)?;
         slugs.push(slug.clone());
     }
     rebuild_index(starters_dir)?;
@@ -454,6 +544,14 @@ mod tests {
     /// The repo-root `data/species` dir (the byte-mover boundary; mirrors the discover/replay test helpers).
     fn species_dir() -> PathBuf {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/species"))
+    }
+
+    /// The repo-root committed starter library (`data/presets/starters`) — the already-shipped gen-1 docs.
+    fn committed_starters_dir() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/presets/starters"
+        ))
     }
 
     /// A RAII temp dir guard (std-only cleanup — the harness has no `tempfile` dep). Removes the dir on drop.
@@ -543,6 +641,29 @@ mod tests {
         }
     }
 
+    /// Recompute a gem's EDIT-FREE replay hash exactly as [`promote_gen1`] does — rebuild the PRISTINE config's
+    /// env, run `Advance(1)*horizon`, take the hash — via the public surface, so a test can assert the stored
+    /// `source_hash` matches WITHOUT trusting `promote_gen1`'s internals. The horizon mirrors `promote_gen1`
+    /// (`gens_requested`, falling back to `gens`).
+    fn edit_free_replay_hash(gem: &Gem, stage: &Path) -> u64 {
+        let cfg = StarterConfig::from_gem(gem);
+        let horizon = if gem.gens_requested == 0 {
+            gem.gens
+        } else {
+            gem.gens_requested
+        };
+        let search = cfg.to_search_config(gem.config.master_seed);
+        let (env, _) = env_config_for(&search, &species_dir());
+        let env = env.expect("pristine env resolves");
+        let journal = build_journal(&[], horizon);
+        let _ = std::fs::remove_dir_all(stage);
+        let h = record_episode(&env, gem.config.master_seed, &journal, stage)
+            .expect("record edit-free")
+            .hash;
+        let _ = std::fs::remove_dir_all(stage);
+        h
+    }
+
     #[test]
     fn dynamics_facet_is_the_caption_leading_word() {
         assert_eq!(dynamics_from_caption("drift · 1 spp · steady"), "drift");
@@ -555,9 +676,9 @@ mod tests {
 
     #[test]
     fn gen1_starter_rebuilds_same_env_and_replays_to_source_hash() {
-        // THE GEN-1 CONTRACT: a promoted gen-1 starter's stored config rebuilds the SAME EnvConfig as the source
-        // gem AND (edit-free) replays to the gem's recorded_hash (== source_hash). The promoted doc carries the
-        // gem's provenance (source_hash hex, source_seed) faithfully.
+        // TEST (a) — THE EDIT-FREE GEN-1 CONTRACT: a promoted gen-1 starter's stored config rebuilds the SAME
+        // EnvConfig as the source gem AND its RECOMPUTED source_hash == the edit-free replay hash == the gem's
+        // recorded_hash (an edit-free gem → unchanged behaviour). source_had_edits is false; gens is the horizon.
         let tmp = TempDir::new("gen1");
         let gens = 40u32;
         let cfg = edit_free_config(0x57A1_0001);
@@ -569,15 +690,22 @@ mod tests {
         );
 
         let starters = tmp.path().join("starters");
-        let path = promote_gen1(&gem, "drift", "Drift", &starters).expect("promote gen-1");
+        let path =
+            promote_gen1(&gem, "drift", "Drift", &species_dir(), &starters).expect("promote gen-1");
 
-        // The written doc round-trips with faithful provenance.
+        // The written doc round-trips with faithful provenance. For an EDIT-FREE gem the recomputed source_hash
+        // is byte-identical to gem.recorded_hash (the edit-free journal IS the gem's journal).
         let doc: Gen1Starter =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
         assert_eq!(doc.source_hash, hex16(gem.recorded_hash));
         assert_eq!(doc.source_seed, gem.config.master_seed);
         assert_eq!(doc.dynamics, "drift");
         assert_eq!(doc.config, StarterConfig::from_gem(&gem));
+        assert!(
+            !doc.source_had_edits,
+            "an edit-free gem promotes a source_had_edits=false starter"
+        );
+        assert_eq!(doc.gens, gem.gens, "gens is the recompute horizon");
 
         // (1) the starter config rebuilds the SAME SearchConfig as the (edit-free) gem → the SAME EnvConfig.
         let rebuilt = doc.config.to_search_config(doc.source_seed);
@@ -615,6 +743,176 @@ mod tests {
             hex16(replayed),
             doc.source_hash,
             "the replayed hash equals the doc's source_hash text"
+        );
+    }
+
+    #[test]
+    fn gen1_from_an_edited_gem_stores_the_edit_free_hash_and_flags_the_source() {
+        // TEST (b) — THE ADR-031 FIX: a gem that CARRIES a (today hash-neutral) firing edit promotes a gen-1
+        // starter whose stored source_hash is the EDIT-FREE replay of the PRISTINE config (NOT a blind copy of
+        // gem.recorded_hash) + source_had_edits=true. Once edits become hash-active, the stored hash still equals
+        // what the edit-free gen-1 config actually produces, so the doc never silently stops replaying.
+        let tmp = TempDir::new("gen1-edited");
+        let gens = 60u32;
+        let cfg = edited_config(0xED17_0003);
+        assert!(
+            !cfg.edits.is_empty(),
+            "fixture carries a firing edit schedule"
+        );
+        let gem = build_gem(
+            &cfg,
+            gens,
+            "eventful · 2 spp · edits",
+            &tmp.path().join("stage"),
+        );
+
+        let starters = tmp.path().join("starters");
+        let path = promote_gen1(&gem, "eventful", "Eventful", &species_dir(), &starters)
+            .expect("promote gen-1");
+        let doc: Gen1Starter =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // The pristine config drops the edits; source_had_edits records the PROVENANCE (the gem had edits).
+        assert!(doc.source_had_edits, "the source gem carried edits");
+        assert!(doc.config.roster.iter().any(|(_, n)| *n > 0));
+        assert_eq!(
+            doc.gens, gem.gens_requested,
+            "gens is the recompute horizon"
+        );
+
+        // The stored hash equals an INDEPENDENT edit-free replay of the pristine config (the meaningful
+        // invariant, robust to edits becoming hash-active) — it is NOT defined as gem.recorded_hash.
+        let editfree = edit_free_replay_hash(&gem, &tmp.path().join("ef-stage"));
+        assert_eq!(
+            doc.source_hash,
+            hex16(editfree),
+            "source_hash is the edit-free replay of the pristine config"
+        );
+    }
+
+    #[test]
+    fn committed_gen1_starters_still_load_under_the_new_struct() {
+        // BACKWARD COMPAT PROOF: every ALREADY-COMMITTED gen-1 doc in data/presets/starters/ (which lacks the new
+        // gens/source_had_edits fields) STILL deserializes as Gen1Starter via the serde defaults — so the gallery
+        // + rebuild_index keep loading the shipped library un-re-promoted. They are edit-free, so the defaults
+        // (gens=0, source_had_edits=false) are the truthful values; their existing source_hash is preserved.
+        let dir = committed_starters_dir();
+        let mut loaded = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read committed starters dir") {
+            let path = entry.expect("dir entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if !path.is_file() || name == "index.json" || !name.ends_with(".json") {
+                continue; // skip the index + the checkpoint session dirs (e.g. branch-point/)
+            }
+            let doc: Gen1Starter =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read committed doc"))
+                    .unwrap_or_else(|e| panic!("committed starter {name:?} deserializes: {e}"));
+            assert_eq!(doc.source_hash.len(), 16, "{name}: 16 hex source_hash");
+            assert_eq!(doc.gens, 0, "{name}: pre-fix doc → gens defaults to 0");
+            assert!(
+                !doc.source_had_edits,
+                "{name}: pre-fix doc → source_had_edits defaults to false"
+            );
+            loaded += 1;
+        }
+        assert!(
+            loaded >= 6,
+            "the committed gen-1 library is present and loads ({loaded} docs)"
+        );
+    }
+
+    #[test]
+    fn gen1_doc_round_trips_through_serde_with_the_new_fields() {
+        // TEST (c) — the new `gens` + `source_had_edits` fields survive a serialize → deserialize round trip.
+        let doc = Gen1Starter {
+            name: "Eventful".to_string(),
+            caption: "eventful · 2 spp · edits".to_string(),
+            dynamics: "eventful".to_string(),
+            source_hash: "0123456789abcdef".to_string(),
+            source_seed: 0xDEAD_BEEF,
+            gens: 60,
+            source_had_edits: true,
+            config: StarterConfig {
+                roster: vec![("default".to_string(), 300)],
+                containment_level: 1,
+                temp_q: 500,
+                season: 2,
+            },
+        };
+        let json = serde_json::to_string_pretty(&doc).unwrap();
+        let back: Gen1Starter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, doc, "the doc round-trips byte-for-byte through serde");
+        assert_eq!(back.gens, 60);
+        assert!(back.source_had_edits);
+    }
+
+    #[test]
+    fn pre_fix_committed_starter_shape_still_deserializes() {
+        // TEST (d) — an OLD committed starter doc (NO gens / source_had_edits) deserializes via the serde
+        // defaults: gens → 0, source_had_edits → false. This is the EXACT shape of the already-committed starters
+        // (e.g. data/presets/starters/drift.json), so rebuild_index + the gallery still load them un-re-promoted.
+        let old = r#"{
+            "name": "Drift",
+            "caption": "drift · 3 spp · steady",
+            "dynamics": "drift",
+            "source_hash": "518347049d204604",
+            "source_seed": 16777275962096678196,
+            "config": {
+                "roster": [["default", 1227], ["ecoli", 110]],
+                "containment_level": 0,
+                "temp_q": 617,
+                "season": 1
+            }
+        }"#;
+        let doc: Gen1Starter = serde_json::from_str(old)
+            .expect("the pre-fix committed starter shape still deserializes");
+        assert_eq!(doc.gens, 0, "a missing gens defaults to 0");
+        assert!(
+            !doc.source_had_edits,
+            "a missing source_had_edits defaults to false"
+        );
+        assert_eq!(
+            doc.source_hash, "518347049d204604",
+            "the existing source_hash is preserved verbatim"
+        );
+        assert_eq!(doc.config.roster.len(), 2);
+    }
+
+    #[test]
+    fn gen1_doc_is_self_contained_re_verifiable() {
+        // TEST (e) — the gen-1 doc is SELF-CONTAINED re-verifiable: rebuild the stored config for the stored
+        // seed, run it EDIT-FREE for the stored `gens`, and the hash reproduces source_hash — with NO source gem.
+        let tmp = TempDir::new("gen1-reverify");
+        let gens = 50u32;
+        let gem = build_gem(
+            &edit_free_config(0x5E1F_0005),
+            gens,
+            "drift · 1 spp · steady",
+            &tmp.path().join("stage"),
+        );
+        let starters = tmp.path().join("starters");
+        let path =
+            promote_gen1(&gem, "drift", "Drift", &species_dir(), &starters).expect("promote gen-1");
+        let doc: Gen1Starter =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Re-run STRICTLY from the doc (config + source_seed + gens) — the gem is not consulted.
+        let search = doc.config.to_search_config(doc.source_seed);
+        let (env, _) = env_config_for(&search, &species_dir());
+        let env = env.expect("the stored config resolves");
+        let journal = build_journal(&[], doc.gens);
+        let stage = tmp.path().join("reverify-stage");
+        let recorded = record_episode(&env, doc.source_seed, &journal, &stage).expect("record");
+        let replayed = replay(&recorded.dir).expect("replay");
+        assert_eq!(replayed, recorded.hash, "record == replay (inv #3)");
+        assert_eq!(
+            hex16(replayed),
+            doc.source_hash,
+            "re-running the stored config for `gens` reproduces source_hash"
         );
     }
 
@@ -730,7 +1028,7 @@ mod tests {
             &starters,
         )
         .expect("promote checkpoint");
-        promote_gen1(&g_drift, "drift", "Drift", &starters).expect("promote gen-1");
+        promote_gen1(&g_drift, "drift", "Drift", &species_dir(), &starters).expect("promote gen-1");
         rebuild_index(&starters).expect("rebuild index");
 
         let idx: Vec<StarterIndexEntry> = serde_json::from_str(
@@ -805,7 +1103,8 @@ mod tests {
         write(&edit_free_config(0xF1), "flat · 1 spp · steady", 6000, "g6");
 
         let starters = tmp.path().join("starters");
-        let slugs = promote_default_set(&gems_dir, &starters, 8).expect("default set");
+        let slugs =
+            promote_default_set(&gems_dir, &species_dir(), &starters, 8).expect("default set");
         // One starter per distinct dynamics shape, alphabetical: boom-bust, drift, flat.
         assert_eq!(slugs, vec!["boom-bust", "drift", "flat"]);
 
@@ -827,8 +1126,13 @@ mod tests {
         );
 
         // A missing gems dir degrades to an empty set (the index is still rebuilt).
-        let empty = promote_default_set(&tmp.path().join("absent"), &tmp.path().join("st2"), 8)
-            .expect("empty default set");
+        let empty = promote_default_set(
+            &tmp.path().join("absent"),
+            &species_dir(),
+            &tmp.path().join("st2"),
+            8,
+        )
+        .expect("empty default set");
         assert!(empty.is_empty(), "no gems → no starters");
         assert!(
             tmp.path().join("st2").join("index.json").exists(),
