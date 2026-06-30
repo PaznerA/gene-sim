@@ -88,6 +88,27 @@ empirically validates the drama-weighted target → `discovery-dramaweights-impl
 - 🔁 **Rel-4 sqlite-vec sidecar** — SIGNED OFF; designed; executes when the roster size crosses the trigger (conditional —
   not warranted now).
 
+**🧬 FOUNDATIONAL EPIC — SBOL + BioBricks deep integration (user brief 2026-06-30; DESIGN-FIRST, needs sign-off):**
+> *"hluboká integrace s SBOL — nesmí proběhnout proces, který není v tomto jazyce definovaný; promysli i BioBricks
+> Foundation přístup."* Make **SBOL (Synthetic Biology Open Language)** the canonical genetic-design substrate with a
+> **closed-world** rule: **no genetic process executes unless it is defined as an SBOL construct** (a deterministic
+> validation gate in front of genotype→phenotype). Plus the **BioBricks** discipline: standard, characterized,
+> composable parts (registry-grounded `BBa_*`) under an assembly grammar → a real synbio sandbox. KEY: the model is
+> **already ontology-first** (`Locus.tags.so_term` = Sequence Ontology; real NCBI CDS; `crispr` edits `DnaSequence`) →
+> SBOL is a *formalization + gate*, not new biology. Candidate **new invariant (inv #8): the genetic vocabulary is
+> closed over SBOL.** Seed: `proposals/sbol-biobricks-integration-draft.md`.
+- `[ ]` **sbol-biobricks-integration-design** (`workflow`, RESEARCH+DESIGN) — `.js` authored, READY. Web-research SBOL3
+  vs SBOL2 / BioBricks assembly standards / iGEM registry / SBOL-tool licensing (inv #1) → adversarially verify the bio
+  claims → expand the seed into a pinned spec + ADR-draft + the inv #8 proposal + the **determinism re-pin plan** for
+  SB2. **DESIGN ONLY, doc-only, hash-neutral.** *(Run on the user's go — foundational; folds into the autonomous loop or on request.)*
+- `[def]` **SB1 sbol-model-validator-impl** — Rust SBOL3-subset data model (`Component`/`Feature`/`Sequence`/`Interaction`)
+  + the in-core well-formedness/role/grammar validator behind the inv #5 trait; `std`+serde (+ a pinned RDF/JSON-LD parser, justified). Hash-neutral (unwired). *dep: design.*
+- `[def]` **SB2 genome-sbol-grounding + closed-world GATE** 🔁🛑 — express `Genome`/`Locus` as SBOL Components + the validation gate before genotype→phenotype. **Likely a determinism RE-PIN (STOP-THE-LINE) — needs the design's re-pin plan + multi-ISA gate + sign-off.** *dep: SB1.*
+- `[def]` **SB3 biobrick-parts-catalog + assembly-grammar** — registry-grounded standard parts (datasheets via `Parameter`/SBOL `Measure`) + the composition grammar (brush = insert/replace a standard part). Mostly data + grammar. *dep: SB2.*
+- `[def]` **SB4 sbol-reference-validator-subprocess** (inv #1/#5) — optional pySBOL3/libSBOLj conformance at the process boundary. *dep: SB1.*
+- `[def]` **SB5 sbol-import-export** — round-trip designs to/from SBOL3 documents / SynBioHub. *dep: SB1.*
+- `[def]` **SB6 synbio-sandbox-ui** (renderer-only) — compose a species from standard parts (grammar-guided); read the SBOL design in the codex/specimen view. *dep: SB3.*
+
 ---
 
 ## ▶ LOG (append per item: date · item · PASS/RED · merge sha · note)
